@@ -13,7 +13,9 @@ version = "0.1.0"
 
 
 [tasks]
-test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run check-ledger"
+# 单元套件需要 -I src 才能 import alofa.*；capability 下的平台探测与账本门不需要。
+# 新增基础层文件后：① 加一条 unit 套件 ② 若文件在 core/ 下，同步 test_layering.mojo 的文件清单。
+test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run mojo run -I src tests/capability/test_layering.mojo && pixi run mojo run -I src tests/unit/test_core_error.mojo && pixi run mojo run -I src tests/unit/test_core_log.mojo && pixi run mojo run -I src tests/unit/test_core_ffi.mojo && pixi run mojo run -I src tests/unit/test_core_dtype.mojo && pixi run mojo run -I src tests/unit/test_core_tensor.mojo && pixi run mojo run -I src tests/unit/test_core_memory.mojo && pixi run mojo run -I src tests/unit/test_core_mmap.mojo && pixi run mojo run -I src tests/unit/test_verify_roofline.mojo && pixi run check-ledger"
 # 能力账本 CI 门：标了 verified / verified-remote / verified-env 的条目必须给出真实凭证，
 # 否则 CI 失败。门本身也含自检（tests/fixtures/ledger_bad.md 必须被拒绝）。
 # 详见 docs/plan/capability-ledger.md
