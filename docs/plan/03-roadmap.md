@@ -27,15 +27,16 @@
 
 | # | 交付 | 说明 |
 |---|---|---|
-| 0.1 | `core/`：dtype、tensor 视图、arena 分配器、对齐分配 | 张量只做视图，不拥有数据；分配走单一 arena |
-| 0.2 | `core/ffi/`：epoll / socket / timerfd / eventfd / mmap 绑定 | 已验证可行（`tests/capability/test_libc_ffi.mojo`，5/5 通过） |
-| 0.3 | `core/error.mojo` + `core/log.mojo` | 具名错误（禁止字符串错误码）；JSONL 日志可被 verify 消费 |
+| 0.1 | ✅ `core/`：dtype、tensor 视图、arena 分配器、对齐分配 | 张量只做视图，不拥有数据；分配走单一 arena。`evidence:tests/unit/test_core_dtype.mojo`（10/10）、`test_core_tensor.mojo`（11/11）、`test_core_memory.mojo`（9/9） |
+| 0.2 | ✅ `core/ffi/`：epoll / socket / timerfd / eventfd / mmap 绑定 | 平台探测 5/5（`tests/capability/test_libc_ffi.mojo`）+ 本项目绑定 `evidence:tests/unit/test_core_ffi.mojo`（11/11） |
+| 0.3 | ✅ `core/error.mojo` + `core/log.mojo` | 具名错误（禁止字符串错误码）；JSONL 日志可被 verify 消费。`evidence:test_core_error.mojo`（7/7）、`test_core_log.mojo`（8/8） |
 | 0.4 | ✅ **账本校验器** `tests/capability/ledger.mojo` | 解析表格行 + `std.os.stat` 判文件存在；入口 `pixi run check-ledger` |
 | 0.5 | ✅ **账本接入 CI**（`.github/workflows/ci.yml`） | 三类 `verified` 变体都必须给出真实凭证，见 Gate P0 第 2 条 |
-| 0.6 | 基准与回归框架骨架（`verify/roofline.mojo`） | 输出带宽/算力利用率，不输出裸 tok/s |
+| 0.6 | ✅ **基准骨架** `verify/roofline.mojo` | 输出带宽/算力利用率（整数千分比），不输出裸 tok/s；峰值由调用方传入，`evidence:tests/unit/test_verify_roofline.mojo`（13/13） |
+| 0.7 | ✅ 只读文件映射 + 页缓存提示 `core/mmap.mojo` | `evidence:tests/unit/test_core_mmap.mojo`（7/7，与 `FileHandle` 逐字节对比） |
 
 ### Gate P0
-1. `pixi run test` 全绿，且包含 capability 套件。
+1. ✅ **已通过（2026-09-16）**：`pixi run test` 全绿 —— 96 项，含 capability 套件（账本门 7/7、分层守门 4/4、平台探测 5/5、外部依赖 4/4）与 7 个基础层单元套件。
 2. ✅ **已验证（2026-09-16）**：账本出现"`verified` 但测试文件不存在"时 CI **会失败**。
    - **红测**：向真账本插入一行 `verified` + `evidence:tests/this_file_is_a_lie.mojo`
      → `test_real_ledger_passes` 失败，退出码 **1**，并报出具体行号与缺失路径。
@@ -44,7 +45,7 @@
      校验器必须拒绝它（4 处违规：文件不存在 / 缺 evidence / 缺 probe / 拼错标签）。
      这样门的有效性**每次 CI 都被重新验证**，而不是只在演示那一次成立 ——
      否则将来有人删掉存在性检查，真账本依然"通过"，门就悄悄失效了。
-3. `core/` 中不存在对 model / kernel 概念的引用（可用 grep 断言）。
+3. ✅ **已通过（2026-09-16）**：`tests/capability/test_layering.mojo`（4/4）断言 `core/` 中不存在上层概念（含注释与 import）。该门自带红测：故意违规的文本必须被判违规，否则门失效。Mojo 1.0 无目录遍历，故文件清单硬编码在测试内，并由"清单非空且每个文件可读"一条防止清单腐坏。
 
 ---
 
@@ -150,7 +151,7 @@
 
 | 阶段 | 周期 | 关键交付 | 一票否决的门 |
 |---|---|---|---|
-| P0 | 1–2 周 | 地基 + 账本机制 | ✅ 账本门已生效，且红测已固化为常驻自检 |
+| P0 | 1–2 周 | 地基 + 账本机制 | ✅ **已完成（2026-09-16）**：基础层 6 项 + 分层守门 + roofline 骨架，`pixi run test` 96 项全绿 |
 | P1 | 3–4 周 | CPU 端到端（含 tokenizer）+ CUDA bring-up | 与 HF 逐 token 一致；CUDA kernel 与标量后端逐值一致 |
 | P2 | 4–6 周 | KV + 调度 + 并发 | 吞吐 ≥ llama.cpp 0.7× |
 | P3 | **1–2 周** ↓ | 服务化（基于 `flare`）+ 多进程 | 100 并发 1 小时零错 |
