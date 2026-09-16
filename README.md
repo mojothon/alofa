@@ -1,5 +1,7 @@
 # alofa
 
+[![CI](https://github.com/mojothon/alofa/actions/workflows/ci.yml/badge.svg)](https://github.com/mojothon/alofa/actions/workflows/ci.yml)
+
 an inference engine in pure Mojo.
 
 > **alofa 不是一个"更快的推理引擎"，而是一个"敢于被人验证的推理引擎"。**
