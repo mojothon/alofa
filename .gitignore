@@ -1,0 +1,30 @@
+# pixi 环境（数百 MB，绝不入库）—— 可复现性由 pixi.lock 保证
+.pixi/
+
+# Mojo / Python 构建产物
+__pycache__/
+*.py[cod]
+*.mojoc
+build/
+dist/
+.mojo-version
+
+# 模型权重与数据（体积大、非源码）
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+
+# 文档构建输出
+site/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 本地临时文件
+*.log
+tmp/

@@ -1,0 +1,33 @@
+[workspace]
+authors = ["llango<rontomai@gmail.com>"]
+channels = [
+    "https://conda.modular.com/max/",
+    "conda-forge",
+    "https://repo.prefix.dev/modular-community",
+    "https://prefix.dev/mojo-force"
+]
+description = "an inference engine in pure Mojo."
+name = "alofa"
+platforms = ["linux-64"]  # TODO: add other platforms "osx-arm64",
+version = "0.1.0"
+
+
+[tasks]
+test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run check-ledger"
+# 能力账本 CI 门：标了 verified / verified-remote / verified-env 的条目必须给出真实凭证，
+# 否则 CI 失败。门本身也含自检（tests/fixtures/ledger_bad.md 必须被拒绝）。
+# 详见 docs/plan/capability-ledger.md
+check-ledger = "pixi run mojo run tests/capability/test_ledger.mojo"
+build = "rattler-build build -r src -c https://conda.modular.com/max/ -c https://prefix.dev/mojo-force -c https://repo.prefix.dev/modular-community   -c conda-forge --skip-existing=all"
+publish = { cmd = "bash scripts/publish.sh", env = { PREFIX_API_KEY = "$PREFIX_API_KEY" } }
+
+[dependencies]
+mojo = ">=1.0.0"
+python = ">=3.10,<=3.14"
+
+# --- alofa 的外部纯 Mojo 依赖（见 docs/plan/02-architecture.md §2.3）---
+# flare: 纯 Mojo 网络栈（reactor/scheduler/timer_wheel/reuseport/io_uring + HTTP1-3/QUIC/TLS）
+#        → L5/L6 服务层地基，避免自研事件循环（A7：不重复造轮子）。锁 0.2.x（0.x API 未冻结）
+flare = ">=0.2.0,<0.3.0"
+# json: 纯 Mojo SIMD 两遍解析 + 编译期反射序列化 → config.json / OpenAI API
+json = ">=0.1.2,<0.2.0"

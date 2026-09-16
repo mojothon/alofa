@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+
+context:
+  version: "0.1.0"
+
+package:
+  name: "alofa"
+  version: 0.1.0
+
+source:
+  - path: .
+  - path: ../LICENSE
+  - path: ../tests
+
+build:
+  script:
+    - mkdir -p ${PREFIX}/lib/mojo
+    - pixi run mojo precompile alofa
+    - cp alofa.mojoc ${PREFIX}/lib/mojo/alofa.mojoc
+requirements:
+  run:
+    - mojo >= 1.0.0
+
+tests:
+  - script:
+      # commands to run to test the package. If any of the commands
+      # returns with an error code, the test is considered failed.
+      - pixi run test
+
+    files:
+      # Extra files to be copied to the test directory from the "work directory"
+      source:
+        - alofa.mojoc
+        - pixi.toml
+        - tests
+
+about:
+  homepage: https://github.com/mojothon/alofa
+  license: MIT
+  license_file: LICENSE
+  summary: an inference engine in pure Mojo.. https://github.com/mojothon/alofa
+  repository: https://github.com/mojothon/alofa
