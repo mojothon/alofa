@@ -17,7 +17,7 @@
 > 这一点至关重要 —— 一个只会通过的门等于没有门。若有人删掉文件存在性检查，真账本依然"通过"，
 > 但这个 fixture 会让 `test_ledger.mojo` 立刻失败，暴露门已失效。
 
-**最后更新**：2026-09-16（第三次更新：**账本门落地并被 CI 强制**；标签拆为三类 `verified` 变体，无免检档）
+**最后更新**：2026-09-17（第四次更新：**P2 调度器门打通** —— §7 执行编排层七行由 `missing` 升为 `verified`，另增两行写明本轮**刻意不做**的东西）
 
 ---
 
@@ -167,13 +167,15 @@
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| 纯函数调度器（token budget，零分配） | `missing` | 创新点 3 |
-| chunked prefill | `missing` | — |
-| 抢占（重计算） + 抢占计数指标 | `missing` | — |
-| 批张量池（稳态零堆分配） | `missing` | — |
-| 调度 trace 录制 | `missing` | — |
-| 调度 trace 重放 + 极端场景断言 | `missing` | 让调度边界可脱离模型测试 |
-| 延迟护栏（最大等待拍数） | `missing` | 防止 MAX `--max-batch-size` 式的"等批次"延迟 |
+| 纯函数调度器（单一 token 预算） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（15/15 通过）<br>`pixi run mojo run -O0 -I src tests/unit/test_scheduler.mojo`<br>无 I/O、无时钟、无模型、无权重依赖；`step(input) -> Action` 是唯一入口，于是调度边界可以脱离模型被测（创新点 3） |
+| 调度器自身零堆分配（定容容器 + 源码门） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（类型层面：所有容器是编译期定长的 `InlineArray`；源码门扫描 `src/alofa/engine/scheduler.mojo` 不得出现 `List[` / `String(` / `Arena(` 等构造点，并有常驻红测 `tests/fixtures/bad_alloc.mojo` 必须被判违规）<br>⚠️ **这条证据的边界**：能拦住“给调度器加一个会增长的容器”，**拦不住** libc 里的小块分配，也**不等同**于进程级 RSS 不动 —— 账本就按这个口径写，不夸大成“进程零分配”。录 trace（`engine/trace.mojo`）**会**分配 String，所以录制是 `step` 之外的可选动作 |
+| chunked prefill | `verified` | `evidence:tests/unit/test_scheduler.mojo`（300 token 的 prompt 跨 19 拍切片：首尾相接、不重叠、每片不超过 `max_chunk`；同一拍不得给同一请求两个 chunk） |
+| 抢占（重计算） + 抢占计数指标 | `verified` | `evidence:tests/unit/test_scheduler.mojo`（并发抢占风暴 / KV 水位临界两个场景；被抢占者 KV 全作废并回到等待队列，累计抢占次数作为 `Action` 字段逐拍比对 —— 它是容量告警指标，不是调试字段）<br>⚠️ 只抢占 **RUNNING** 请求：抢占“半截 prefill”的请求会让 prefill 永远无法完成，那是伪装成策略的抖动<br>⚠️ 池子小到连一次 decode 增长都装不下时报 `capacity` 具名错误，**不静默丢 token**（有专门断言） |
+| 调度 trace 录制 | `verified` | `evidence:src/alofa/engine/trace.mojo` + `tests/fixtures/scheduler/*.trace`（格式：整数 + 定长字段，**不含浮点**；水位用千分数而非比例 → 逐字节门不会退化成容差门） |
+| 调度 trace 重放 + 极端场景断言 | `verified` | `evidence:tests/unit/test_scheduler.mojo`（6 个场景与 `scripts/dump_scheduler_reference.py` 这份**独立 Python 实现**逐字节相同；三条常驻负向对照：改坏的 trace、换一种抢占顺序、给调度器加堆容器，三者都必须被判红）<br>6 个场景：超长 prompt、并发抢占风暴、预算耗尽、0 预算、取消竞态、KV 水位临界 |
+| 延迟护栏（最大等待拍数） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（构造“队首长 prompt 每拍吃光预算”的最小复现：护栏生效时第 4 拍必须给短请求；把 `max_wait_ticks` 调到 99 该断言**实测会失败**）<br>护栏只在**等待者之间**插队，不越过 decode：它防的是“前面有个超长 prompt”，不是“预算被 decode 占满” —— 后者说明并发已饱和，插队只会把等待转嫁给已经占着 KV 的人 |
+| 批张量池（稳态零堆分配） | `missing` | 需 P2.5 与模型前向接线后才有意义；本轮调度器不碰张量，故不提前宣称 |
+| KV 物理块池（含 `freed_blocks` 这类外部释放） | `missing` | **本轮刻意不做**：没有物理块池时，每个块都归属于某个活跃请求，“引擎释放了一块”只会破坏 `blocks_used == 各请求占用之和` 这个不变量；一个只能填 0 的字段比没有字段更糟 —— 它读起来像能力 |
 
 ## 8. 服务层（L5 / L6）
 
@@ -275,3 +277,8 @@
 - **2026-09-17** —— **"语义自证"必须与"HF 对齐"分开标注**：`repetition_penalty` 走 HF 乘法语义并有真实 processor 可对照；`logit bias`、`frequency` / `presence` penalty 在 HF 4.41 里**没有对应 processor**，只能按 OpenAI / vLLM 加法语义实现并用边界用例钉住。把这两类混为一谈，等于让一个没有权威参照的算子顶着"已对齐 HF"的名头 —— 正是本账本要防的那种含糊。两种重复惩罚语义**字段名不共用**，避免调用方在两种不兼容的语义间无声切换。
 - **2026-09-17** —— **1.7 CUDA 只核状态、不写代码**：A100 验证机 `10.107.6.60:3389` 本轮实测连接超时，本机 TITAN X 为 Maxwell sm_52 → §4 新增一行标 `hardware-blocked`，写明**阻塞原因**（机器不可达 + 本地 ISA 不支持）与**解锁条件**（可达 + `MODULAR_NVPTX_COMPILER_PATH=/usr/local/cuda/bin/ptxas` + fp32 容差 1e-5 的逐值差分门）。写完不验的 kernel 比没有更危险：它会被后来者当成可用。§1.2 的"端到端 GPU kernel 数值正确"（向量加，`verified-remote`）与本行是两件事，不可互相顶替。
 - **2026-09-16** —— **差分门的"慢"是编译不是运行**：`mojo run` 跑这个套件要 ~100 s，而同一份代码 `mojo build` 出的可执行文件跑完全部三条测试只要 **0.34 s** —— 瓶颈是生成的 Unicode 表（`src/alofa/tokenizer/unicode_data.mojo`，13806 行）在 -O3 下的编译。**结论：不要用 TestSuite 打印的耗时判断性能**（它报告 209 s，而进程墙钟只有 0.34 s，计时本身不可信）。要测速度先 `mojo build`；CI 可用 `-O0`（27.7 s）把编译降下来。
+- **2026-09-17** —— **P2 调度器门打通（§7 七行由 `missing` 升为 `verified`）**：证据统一指向 `tests/unit/test_scheduler.mojo`（15/15）。调度器被做成“零分配、无 I/O、无时钟的纯状态机”，代价是策略里每一处“谁先谁后”都必须写下来（否则重放不可复现），好处是**抢占风暴、0 预算、取消撞车**这些边界不再需要 2GB 权重和 GPU 就能被测 —— 它们现在只是文本。
+- **2026-09-17** —— **参照物必须是独立实现，否则门恒真**：`scripts/dump_scheduler_reference.py` 用 Python 把同一份策略重写一遍并导出 trace；若 fixture 由被测实现自己导出，实现改坏了 fixture 会跟着改坏。比对是**逐字节**而不是容差 —— 调度器输出的是**决定**（这一拍给谁多少 token、抢占谁），两个决定之间不存在“差一点点”，差一个 token 就是另一个决定。配套三条常驻负向对照：改坏一拍 OUT 的 `bad.trace`、换一种抢占顺序的 `alt.trace`、给调度器加堆容器的 `bad_alloc.mojo`，三者都必须被判红。
+- **2026-09-17** —— **两个策略漏洞是被 fixture 逼出来的，不是想出来的**：① “取消先于到达”只说了一半 —— 取消名单还必须**挡住同拍的到达**，否则请求会先入队、再被服务，然后在下一拍消失（s05 第一版就抓到了它）；② 延迟护栏原定抢在 decode 之前，实测会让正在 decode 的请求一拍不进 —— 改为**只在等待者之间插队**：护栏防的是“队首有个超长 prompt 每拍吃光预算”，不是“预算被 decode 占满”，后者说明并发已饱和，插队只是把等待转嫁给已经占着 KV 的人。
+- **2026-09-17** —— **一个只能填 0 的字段比没有字段更糟**：架构草图里 `SchedInput` 有个 `freed_blocks`（引擎侧释放的块）。但没有物理块池时每个块都归属于某个活跃请求，这个字段只能填 0 —— 写出来读起来像能力。本轮不实现它，并在 §7 单列一行 `missing`，写明解锁条件（P2.1 物理块池落地，出现“不属于任何请求的块”，例如前缀缓存条目）。同理，抢占**只针对 RUNNING 请求**：抢占“半截 prefill”的请求会让 prefill 永远无法完成，那是伪装成策略的抖动。
+- **2026-09-17** —— **零分配这条证据必须写明边界**：所有容器是编译期定长 `InlineArray`，并用源码门（扫描 `List[` / `String(` / `Arena(` 等构造点，配常驻红测）钉住“没人把它改回会增长的样子”。但这条证据**拦不住** libc 里的小块分配，也**不等同**于进程级 RSS 不动，所以账本里就按这个口径写，不写成“进程零分配”。另外**录 trace 会分配 String** —— 因此录制是 `step` 之外的可选动作，稳态路径不碰它。
