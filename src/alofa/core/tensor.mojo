@@ -27,40 +27,134 @@ from alofa.core.ffi.mem import RawPtr
 # so the accessor that has to check it belongs beside it.
 comptime F32Ptr = Pointer[Float32, MutUntrackedOrigin]
 
+# The largest rank a view can describe. Eight is not a guess at what anybody
+# will need — it is the number past which a shape stops being a shape and
+# becomes a container, and this layer does not own one of those.
+comptime MAX_RANK = 8
+
+
+def rows_view(base: RawPtr, rows: Int, cols: Int) raises AlofaError -> TensorView:
+    """A `[rows, cols]` fp32 view over memory that already exists.
+
+    A shorter view over a longer allocation — how both phases share one buffer
+    without reallocating when the token count changes.
+
+    It lives in the core rather than in a caller because *a view is what this
+    layer is for*, and because the shape it builds has to be built the way every
+    other shape in a step is built: inline, with no container. A caller that
+    spelled the shape out would put the allocation one layer below the gate that
+    forbids it, which is the same allocation with a better alibi.
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "view needs a positive number of rows and columns",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    return TensorView(base, shape2(rows, cols), DT_FP32)
+
+
+def copy_dims(
+    src: InlineArray[Int, MAX_RANK],
+) -> InlineArray[Int, MAX_RANK]:
+    """A rank-bounded array is movable, not copyable — this is the copy.
+
+    Element by element, because the type refuses to be duplicated implicitly and
+    every caller here has a borrowed value it must not consume.
+    """
+    var out = InlineArray[Int, MAX_RANK](fill=1)
+    for i in range(MAX_RANK):
+        out[i] = src[i]
+    return out^
+
+
+def shape2(a: Int, b: Int) raises AlofaError -> Shape:
+    """A `[a, b]` shape, built without touching the allocator.
+
+    The hot path calls this once per row of scratch per step, and a shape that
+    allocated would be an allocation *per row per step* — unbounded in the one
+    place P2 says must be bounded. Ranks past `MAX_RANK` are refused rather than
+    truncated: a shape that quietly drops a dimension produces a view that is
+    exactly the right size for the wrong tensor.
+    """
+    return _shape_from(a, b, 1, 2)
+
+
+def shape3(a: Int, b: Int, c: Int) raises AlofaError -> Shape:
+    """A `[a, b, c]` shape, built without touching the allocator."""
+    return _shape_from(a, b, c, 3)
+
+
+def _shape_from(a: Int, b: Int, c: Int, rank: Int) raises AlofaError -> Shape:
+    var out = InlineArray[Int, MAX_RANK](fill=1)
+    out[0] = a
+    out[1] = b
+    out[2] = c
+    for i in range(rank):
+        if out[i] <= 0:
+            raise AlofaError(
+                ERR_OUT_OF_RANGE,
+                "a dimension must be positive",
+                "dim=" + String(i) + " value=" + String(out[i]),
+            )
+    return Shape(out^, rank)
+
 
 struct Shape(Copyable, Movable):
-    """A tensor's extents — the one place rank and element count are derived."""
+    """A tensor's extents — the one place rank and element count are derived.
 
-    var dims: List[Int]
+    Rank-bounded and inline: `dims` is a fixed-length register array, not a
+    heap container, so a shape is a value that can be built and copied inside a
+    loop that is not allowed to allocate. `Shape(list)` still exists for the
+    places that read a rank off a file — those run once, at load time — but
+    everything inside a step calls `shape2` / `shape3` instead.
+    """
 
-    def __init__(out self, dims: List[Int]):
-        self.dims = dims.copy()
+    var dims: InlineArray[Int, MAX_RANK]
+    var n: Int
+
+    def __init__(out self, dims: InlineArray[Int, MAX_RANK], n: Int):
+        self.dims = copy_dims(dims)
+        self.n = n
+
+    def __copyinit__(out self, other: Self):
+        self.dims = copy_dims(other.dims)
+        self.n = other.n
+
+    def copy(self) -> Shape:
+        return Shape(copy_dims(self.dims), self.n)
+
+    def __init__(out self, dims: List[Int]) raises AlofaError:
+        if len(dims) > MAX_RANK:
+            raise AlofaError(
+                ERR_OUT_OF_RANGE,
+                "rank is larger than a view can describe",
+                "rank=" + String(len(dims)) + " max=" + String(MAX_RANK),
+            )
+        self.dims = InlineArray[Int, MAX_RANK](fill=1)
+        self.n = len(dims)
+        for i in range(len(dims)):
+            self.dims[i] = dims[i]
 
     def rank(self) -> Int:
-        return len(self.dims)
+        return self.n
 
     def numel(self) -> Int:
-        """Total elements. An empty dims list is a scalar: one element."""
+        """Total elements. A rank of zero is a scalar: one element."""
         var total = 1
-        for d in self.dims:
-            total *= d
+        for i in range(self.n):
+            total *= self.dims[i]
         return total
 
-    def contiguous_strides(self) -> List[Int]:
+    def contiguous_strides(self) -> InlineArray[Int, MAX_RANK]:
         """Row-major (C-order) element strides, e.g. [2, 3] -> [3, 1]."""
-        var reversed_strides = List[Int]()
+        var strides = InlineArray[Int, MAX_RANK](fill=1)
         var acc = 1
-        var i = len(self.dims) - 1
+        var i = self.n - 1
         while i >= 0:
-            reversed_strides.append(acc)
+            strides[i] = acc
             acc *= self.dims[i]
             i -= 1
-
-        var strides = List[Int]()
-        var j = len(reversed_strides) - 1
-        while j >= 0:
-            strides.append(reversed_strides[j])
-            j -= 1
         return strides^
 
 
@@ -69,7 +163,7 @@ struct TensorView(Copyable, Movable):
 
     var data: RawPtr
     var shape: Shape
-    var strides: List[Int]
+    var strides: InlineArray[Int, MAX_RANK]
     var dtype: Int
     var byte_offset: Int
 
@@ -90,13 +184,13 @@ struct TensorView(Copyable, Movable):
         out self,
         data: RawPtr,
         shape: Shape,
-        strides: List[Int],
+        strides: InlineArray[Int, MAX_RANK],
         dtype: Int,
         byte_offset: Int = 0,
     ):
         self.data = data
         self.shape = shape.copy()
-        self.strides = strides.copy()
+        self.strides = copy_dims(strides)
         self.dtype = dtype
         self.byte_offset = byte_offset
 
@@ -168,21 +262,30 @@ struct TensorView(Copyable, Movable):
                 + String(length),
             )
 
-        var dims = List[Int]()
-        var i = 0
-        while i < self.rank():
-            dims.append(self.shape.dims[i])
-            i += 1
+        # The dims are copied out of an inline array into an inline array:
+        # `slice_dim` is how a view is narrowed, and narrowing must not be the
+        # one operation in a step that reaches for the heap.
+        var dims = copy_dims(self.shape.dims)
         dims[dim] = length
 
         return TensorView(
             self.data,
-            Shape(dims),
+            Shape(dims^, self.rank()),
             self.strides,
             self.dtype,
             self.byte_offset
             + start * self.strides[dim] * elem_size_bytes(self.dtype),
         )
+
+
+def view3(base: RawPtr, a: Int, b: Int, c: Int) raises AlofaError -> TensorView:
+    """A `[a, b, c]` fp32 view over memory that already exists.
+
+    Here rather than in a caller because a shape is rank-bounded metadata, and
+    the layers that run inside a busy loop are the ones that may not grow
+    anything: they call this instead of spelling the shape out.
+    """
+    return TensorView(base, shape3(a, b, c), DT_FP32)
 
 
 def f32_data(view: TensorView) raises AlofaError -> F32Ptr:
