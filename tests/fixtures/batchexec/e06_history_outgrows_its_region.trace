@@ -1,0 +1,74 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# one request decoded until its history would pass the region it was given: the plan refuses rather than writing past the end
+ADD r=7 b=40 n=16 k=1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,1 R=i=0 n=16 d=1955975312
+PLAN R=T=16 n=1 u=7808 d=1517975835
+ROW i=0 r=7 t=1 p=0 v=0
+ROW i=1 r=7 t=2 p=1 v=1
+ROW i=2 r=7 t=3 p=2 v=2
+ROW i=3 r=7 t=4 p=3 v=3
+ROW i=4 r=7 t=5 p=4 v=4
+ROW i=5 r=7 t=6 p=5 v=5
+ROW i=6 r=7 t=7 p=6 v=6
+ROW i=7 r=7 t=8 p=7 v=7
+ROW i=8 r=7 t=9 p=8 v=8
+ROW i=9 r=7 t=10 p=9 v=9
+ROW i=10 r=7 t=11 p=10 v=10
+ROW i=11 r=7 t=12 p=11 v=11
+ROW i=12 r=7 t=13 p=12 v=12
+ROW i=13 r=7 t=14 p=13 v=13
+ROW i=14 r=7 t=0 p=14 v=14
+ROW i=15 r=7 t=1 p=15 v=15
+FIN R=u=0 d=1517975835
+NEXT c=1,-,-,-,-,-,-,- R=h=7:16 p=7:1 d=768583503
+PLAN R=T=1 n=1 u=1024 d=1636181308
+ROW i=0 r=7 t=1 p=16 v=16
+FIN R=u=0 d=1636181308
+NEXT c=1,-,-,-,-,-,-,- R=h=7:17 p=7:1 d=1709592999
+PLAN R=T=1 n=1 u=1024 d=1709592999
+ROW i=0 r=7 t=1 p=17 v=17
+FIN R=u=0 d=1709592999
+NEXT c=1,-,-,-,-,-,-,- R=h=7:18 p=7:1 d=1783004690
+PLAN R=T=1 n=1 u=1024 d=1783004690
+ROW i=0 r=7 t=1 p=18 v=18
+FIN R=u=0 d=1783004690
+NEXT c=1,-,-,-,-,-,-,- R=h=7:19 p=7:1 d=1856416381
+PLAN R=T=1 n=1 u=1024 d=1856416381
+ROW i=0 r=7 t=1 p=19 v=19
+FIN R=u=0 d=1856416381
+NEXT c=1,-,-,-,-,-,-,- R=h=7:20 p=7:1 d=1929828072
+PLAN R=T=1 n=1 u=1024 d=1929828072
+ROW i=0 r=7 t=1 p=20 v=20
+FIN R=u=0 d=1929828072
+NEXT c=1,-,-,-,-,-,-,- R=h=7:21 p=7:1 d=2003239763
+PLAN R=T=1 n=1 u=1024 d=2003239763
+ROW i=0 r=7 t=1 p=21 v=21
+FIN R=u=0 d=2003239763
+NEXT c=1,-,-,-,-,-,-,- R=h=7:22 p=7:1 d=2076651454
+PLAN R=T=1 n=1 u=1024 d=2076651454
+ROW i=0 r=7 t=1 p=22 v=22
+FIN R=u=0 d=2076651454
+NEXT c=1,-,-,-,-,-,-,- R=h=7:23 p=7:1 d=2579498
+PLAN R=T=1 n=1 u=1024 d=2579498
+ROW i=0 r=7 t=1 p=23 v=23
+FIN R=u=0 d=2579498
+NEXT c=1,-,-,-,-,-,-,- R=h=7:24 p=7:1 d=75991189
+PLAN R=ERR=capacity
+FIN R=u=0 d=276675085

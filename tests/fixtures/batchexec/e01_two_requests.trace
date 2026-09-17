@@ -1,0 +1,44 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# two prompts of different length: the rows are request 7's run followed by request 9's, and each row's visible window is its own position, not its index in the block
+ADD r=7 b=4 n=3 k=1,2,3 R=i=0 n=3 d=1151780047
+ADD r=9 b=4 n=2 k=4,5 R=i=1 n=2 d=935935691
+PLAN R=T=5 n=2 u=3008 d=2082207628
+ROW i=0 r=7 t=1 p=0 v=0
+ROW i=1 r=7 t=2 p=1 v=1
+ROW i=2 r=7 t=3 p=2 v=2
+ROW i=3 r=9 t=4 p=0 v=0
+ROW i=4 r=9 t=5 p=1 v=1
+FIN R=u=0 d=2082207628
+NEXT c=6,7,-,-,-,-,-,- R=h=7:3,9:2 p=7:1,9:1 d=1480959774
+PLAN R=T=2 n=2 u=1344 d=135820490
+ROW i=0 r=7 t=6 p=3 v=3
+ROW i=1 r=9 t=7 p=2 v=2
+FIN R=u=0 d=135820490
+NEXT c=8,9,-,-,-,-,-,- R=h=7:4,9:3 p=7:1,9:1 d=404173505
+PLAN R=T=2 n=2 u=1344 d=404173505
+ROW i=0 r=7 t=8 p=4 v=4
+ROW i=1 r=9 t=9 p=3 v=3
+FIN R=u=0 d=404173505
+NEXT c=10,11,-,-,-,-,-,- R=h=7:5,9:4 p=7:1,9:1 d=672526520
+PLAN R=T=2 n=2 u=1344 d=672526520
+ROW i=0 r=7 t=10 p=5 v=5
+ROW i=1 r=9 t=11 p=4 v=4
+FIN R=u=0 d=672526520

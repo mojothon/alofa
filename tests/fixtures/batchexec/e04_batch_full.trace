@@ -1,0 +1,47 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# eight requests is the compiled limit: the ninth is refused by name instead of dropping someone already resident
+ADD r=100 b=4 n=2 k=1,2 R=i=0 n=2 d=1467124331
+ADD r=101 b=4 n=2 k=2,3 R=i=1 n=2 d=876453974
+ADD r=102 b=4 n=2 k=3,4 R=i=2 n=2 d=1810814648
+ADD r=103 b=4 n=2 k=4,5 R=i=3 n=2 d=1141940945
+ADD r=104 b=4 n=2 k=5,6 R=i=4 n=2 d=1230074510
+ADD r=105 b=4 n=2 k=6,7 R=i=5 n=2 d=2099917071
+ADD r=106 b=4 n=2 k=7,8 R=i=6 n=2 d=856946431
+ADD r=107 b=4 n=2 k=8,9 R=i=7 n=2 d=538144394
+ADD r=999 b=4 n=2 k=1,2 R=ERR=capacity
+PLAN R=T=16 n=8 u=8448 d=1380949557
+ROW i=0 r=100 t=1 p=0 v=0
+ROW i=1 r=100 t=2 p=1 v=1
+ROW i=2 r=101 t=2 p=0 v=0
+ROW i=3 r=101 t=3 p=1 v=1
+ROW i=4 r=102 t=3 p=0 v=0
+ROW i=5 r=102 t=4 p=1 v=1
+ROW i=6 r=103 t=4 p=0 v=0
+ROW i=7 r=103 t=5 p=1 v=1
+ROW i=8 r=104 t=5 p=0 v=0
+ROW i=9 r=104 t=6 p=1 v=1
+ROW i=10 r=105 t=6 p=0 v=0
+ROW i=11 r=105 t=7 p=1 v=1
+ROW i=12 r=106 t=7 p=0 v=0
+ROW i=13 r=106 t=8 p=1 v=1
+ROW i=14 r=107 t=8 p=0 v=0
+ROW i=15 r=107 t=9 p=1 v=1
+FIN R=u=0 d=1380949557

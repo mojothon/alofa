@@ -1,0 +1,23 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# a prompt longer than the row block cannot be queued whole, and the refusal has to be a name rather than a partial prompt
+ADD r=5 b=4 n=17 k=1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,1,2 R=ERR=capacity
+PLAN R=T=0 n=0 u=0 d=1460011322
+FIN R=u=0 d=1460011322

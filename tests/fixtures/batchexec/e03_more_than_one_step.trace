@@ -1,0 +1,58 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# three prompts that together are longer than the row block: the last request waits and keeps its queue, so a short step is a step and not a silent truncation
+ADD r=1 b=8 n=10 k=1,2,3,4,5,6,7,8,9,10 R=i=0 n=10 d=224544184
+ADD r=2 b=8 n=10 k=5,6,7,8,9,10,11,12,13,14 R=i=1 n=10 d=1038821080
+PLAN R=T=16 n=2 u=7872 d=607367683
+ROW i=0 r=1 t=1 p=0 v=0
+ROW i=1 r=1 t=2 p=1 v=1
+ROW i=2 r=1 t=3 p=2 v=2
+ROW i=3 r=1 t=4 p=3 v=3
+ROW i=4 r=1 t=5 p=4 v=4
+ROW i=5 r=1 t=6 p=5 v=5
+ROW i=6 r=1 t=7 p=6 v=6
+ROW i=7 r=1 t=8 p=7 v=7
+ROW i=8 r=1 t=9 p=8 v=8
+ROW i=9 r=1 t=10 p=9 v=9
+ROW i=10 r=2 t=5 p=0 v=0
+ROW i=11 r=2 t=6 p=1 v=1
+ROW i=12 r=2 t=7 p=2 v=2
+ROW i=13 r=2 t=8 p=3 v=3
+ROW i=14 r=2 t=9 p=4 v=4
+ROW i=15 r=2 t=10 p=5 v=5
+FIN R=u=0 d=607367683
+NEXT c=11,12,-,-,-,-,-,- R=h=1:10,2:6 p=1:1,2:4 d=352198988
+PLAN R=T=5 n=2 u=3008 d=239728521
+ROW i=0 r=1 t=11 p=10 v=10
+ROW i=1 r=2 t=11 p=6 v=6
+ROW i=2 r=2 t=12 p=7 v=7
+ROW i=3 r=2 t=13 p=8 v=8
+ROW i=4 r=2 t=14 p=9 v=9
+FIN R=u=0 d=239728521
+NEXT c=13,14,-,-,-,-,-,- R=h=1:11,2:10 p=1:1,2:1 d=1234877644
+PLAN R=T=2 n=2 u=1344 d=1837031200
+ROW i=0 r=1 t=13 p=11 v=11
+ROW i=1 r=2 t=14 p=10 v=10
+FIN R=u=0 d=1837031200
+NEXT c=15,1,-,-,-,-,-,- R=h=1:12,2:11 p=1:1,2:1 d=2105384215
+PLAN R=T=2 n=2 u=1344 d=2105384215
+ROW i=0 r=1 t=15 p=12 v=12
+ROW i=1 r=2 t=1 p=11 v=11
+FIN R=u=0 d=2105384215

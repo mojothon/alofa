@@ -1,0 +1,46 @@
+# alofa batch executor trace v1
+# Reference for the batch executor: row ownership and the step loop.
+# Written by scripts/dump_batch_executor_reference.py -- do not edit by hand.
+#
+#   ADD  r=<id> b=<budget> n=<count> k=<tokens>   -> i=<slot> n=<queued>
+#   FEED r=<id> k=<token>                         -> p=<queued>
+#   DROP r=<id>                                   -> i=<slot>
+#   PLAN                                          -> T=<rows> n=<served> u=<pool bytes>
+#   FIN                                           -> u=0 after the step gives its buffers back
+#   ROW  i=<row> r=<owner> t=<token> p=<position> v=<last visible key>
+#   NEXT c=<token per slot>                       -> h=<id:history> p=<id:queued>
+#
+# A refused operation carries ERR=<name> instead of a result: a scenario has to
+# be able to end in a refusal without truncating the file.
+#
+# ROW lines follow the PLAN they belong to and are compared in order: the row
+# block is the concatenation of the requests' runs, so the owner sequence is the
+# answer rather than a detail of how it was printed.
+# CFG mb=8 mr=16 mp=24 h=8 i=12 k=4 v=16 l=2 nh=2 nk=1 hd=4 c=9472
+# three requests, then the middle one leaves: its run becomes a hole and the next request's rows must take it rather than grow the block (policy: reverse slot order)
+ADD r=1 b=4 n=2 k=1,2 R=i=0 n=2 d=1722669228
+ADD r=2 b=4 n=3 k=3,4,5 R=i=1 n=3 d=83629846
+ADD r=3 b=4 n=2 k=6,7 R=i=2 n=2 d=1549261451
+PLAN R=T=7 n=3 u=4096 d=346436072
+ROW i=0 r=3 t=6 p=0 v=0
+ROW i=1 r=3 t=7 p=1 v=1
+ROW i=2 r=2 t=3 p=0 v=0
+ROW i=3 r=2 t=4 p=1 v=1
+ROW i=4 r=2 t=5 p=2 v=2
+ROW i=5 r=1 t=1 p=0 v=0
+ROW i=6 r=1 t=2 p=1 v=1
+FIN R=u=0 d=346436072
+NEXT c=8,9,10,-,-,-,-,- R=h=1:2,2:3,3:2 p=1:1,2:1,3:1 d=978633484
+DROP r=2 R=i=1 d=1222372921
+ADD r=4 b=4 n=2 k=11,12 R=i=1 n=2 d=676766340
+PLAN R=T=4 n=3 u=2240 d=1893116717
+ROW i=0 r=3 t=10 p=2 v=2
+ROW i=1 r=4 t=11 p=0 v=0
+ROW i=2 r=4 t=12 p=1 v=1
+ROW i=3 r=1 t=8 p=2 v=2
+FIN R=u=0 d=1893116717
+NEXT c=12,-,13,14,-,-,-,- R=h=1:3,4:2,3:3 p=1:1,4:0,3:1 d=931236569
+PLAN R=T=2 n=2 u=1344 d=1409216549
+ROW i=0 r=3 t=13 p=3 v=3
+ROW i=1 r=1 t=12 p=3 v=3
+FIN R=u=0 d=1409216549
