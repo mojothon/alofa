@@ -369,3 +369,9 @@
   scheduler 17 门恢复全绿。两次尝试（整条准入、串行 prefill）分别被「仍不收敛」和「记账
   被破坏」拦下 → 活锁确属**调度契约**问题，须先定契约（部分喂的 WAITING 请求是否持块、
   抢占是否保留 prefill 进度）再动代码，不要再试局部补丁。
+- **2026-09-18** —— 上一条「待查 `kv_room.extend` 分配粒度」**已收窄**：`extend` 委托
+  `space.append_tokens`（`runtime/kv/space.mojo:245`），后者在最后一块有空位时填充、否则
+  `pool.alloc_one()`，**按 `block_size` 按需分配、不多分** → 差异不来自分配粒度，而来自
+  `grow_to` 的 target：引擎传的是 `end`（`core.mojo:470`，prefill 片末）或 `fed[i] + n`
+  （`:555`，已喂 + 本拍生成数）。故下一步应**直接比对房间的 `rq_ntok[slot]` 与调度器的
+  `done[i]`**（差 1 个 token 即跨块时差 1 块）。未做。
