@@ -361,3 +361,11 @@
 
 - **2026-09-18** —— **撤回前一天记的「KV 池峰值 111/112（99%）」**：那个数字是上面那个 bug 造出来的假象（房间白发整条 prompt 的块），修好后同场景只到 99/112。账本那行改为「高占用下的正确性（不声称 95%）」，并新增两条 `missing`：**①** 物理池 >95% 且能跑完的场景不可达——要顶满需长驻留，而驻留总量高过水位就抢占乒乓活锁（七条各生成 8 token：512 拍不空闲）；**②** 引擎 `reclaim` 缓存与调度器 `cached` 账不同步，抛 `engine freed more blocks than the scheduler holds cached`（既有缺陷，已用修复前的代码对照确认）。
 - **2026-09-18** —— 活锁**修法尝试 1 失败并回滚**：`try_prefill` 加「整条序列（`prompt_len + max_new`）准入，池子空时才豁免」→ 抢占从 190 降到 **3**，但**仍不收敛**（300 拍、四条 `n_out` 全 0），且抢占门 `nothing was ever preempted` 转红。说明卡点不是晋升这一步：**部分喂的 `ST_WAITING` 请求仍持有已喂部分的块**，池子被它们占住，喂完的也升不动、decode 也拿不到块。**先定的契约是「prefill 分块期间，WAITING 请求是否继续持有块」**——在此定下之前，任何局部准入/晋升门槛都只是把活锁挪位置。代码已回滚。
+- **2026-09-18** —— 活锁**修法尝试 2 失败并回滚**：改为「同一时刻只允许一个 mid-prefill
+  请求」（`try_prefill` 里 `has_partial_prefill` 拦截）。无条件串行 → `s02_preempt_storm`
+  结束后**仍有活跃请求**（跑不完）、latency guard 门转红 → 串行代价太大；再改「只在
+  `blocks_used >= threshold_blocks()` 时才串行」→ 直接破坏记账不变量（`engine freed more
+  blocks than the scheduler holds cached`，即此前 ③/④ 修过的同一类）。**代码已回滚**，
+  scheduler 17 门恢复全绿。两次尝试（整条准入、串行 prefill）分别被「仍不收敛」和「记账
+  被破坏」拦下 → 活锁确属**调度契约**问题，须先定契约（部分喂的 WAITING 请求是否持块、
+  抢占是否保留 prefill 进度）再动代码，不要再试局部补丁。
