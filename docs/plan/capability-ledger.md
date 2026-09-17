@@ -375,3 +375,8 @@
   `grow_to` 的 target：引擎传的是 `end`（`core.mojo:470`，prefill 片末）或 `fed[i] + n`
   （`:555`，已喂 + 本拍生成数）。故下一步应**直接比对房间的 `rq_ntok[slot]` 与调度器的
   `done[i]`**（差 1 个 token 即跨块时差 1 块）。未做。
+- **2026-09-18** —— 上一条「比对 `rq_ntok` 与 `done`」**未取得数据**：探针
+  `test_probe_ntok_vs_done` 直接 FAIL 且**无任何打印**（不是编译错，原因未查明，已恢复文件）。
+  下一步别再新写探针：仓库里已有 `test_the_scheduler_and_the_room_count_the_same_blocks`
+  （PASS），应**照它的断言写法把它扩成「每拍自洽」**，既复用可用的访问路径，也顺带堵住
+  「早期分叉」这个漏检——它现在只验到末态。
