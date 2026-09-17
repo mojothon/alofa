@@ -1,0 +1,31 @@
+# alofa batch trace v1
+# scenario: s03_room_but_not_contiguous
+# the pool is filled by sixteen regions of 16384 and then every other one is given back: 131072 bytes are free, the largest hole is 16384, and there is no tail to fall back on, so borrowing two regions at once must be refused rather than split across two holes, while a single region must still take the first hole
+CFG c=262144 mh=24 mb=8 al=64
+GET s=16384 R=o=0 h=0 u=16384 n=1 d=173236799
+GET s=16384 R=o=16384 h=1 u=32768 n=2 d=1640783836
+GET s=16384 R=o=32768 h=2 u=49152 n=3 d=35030245
+GET s=16384 R=o=49152 h=3 u=65536 n=4 d=980220051
+GET s=16384 R=o=65536 h=4 u=81920 n=5 d=403650435
+GET s=16384 R=o=81920 h=5 u=98304 n=6 d=1582166059
+GET s=16384 R=o=98304 h=6 u=114688 n=7 d=517969959
+GET s=16384 R=o=114688 h=7 u=131072 n=8 d=523647133
+GET s=16384 R=o=131072 h=8 u=147456 n=9 d=644084064
+GET s=16384 R=o=147456 h=9 u=163840 n=10 d=1259769563
+GET s=16384 R=o=163840 h=10 u=180224 n=11 d=1219620801
+GET s=16384 R=o=180224 h=11 u=196608 n=12 d=1667043288
+GET s=16384 R=o=196608 h=12 u=212992 n=13 d=1018257302
+GET s=16384 R=o=212992 h=13 u=229376 n=14 d=2126727391
+GET s=16384 R=o=229376 h=14 u=245760 n=15 d=166091200
+GET s=16384 R=o=245760 h=15 u=262144 n=16 d=1296025131
+REL h=1 R=o=16384 u=245760 n=15 d=1590205337
+REL h=3 R=o=49152 u=229376 n=14 d=504117874
+REL h=5 R=o=81920 u=212992 n=13 d=885821978
+REL h=7 R=o=114688 u=196608 n=12 d=1718116787
+REL h=9 R=o=147456 u=180224 n=11 d=991655714
+REL h=11 R=o=180224 u=163840 n=10 d=581123834
+REL h=13 R=o=212992 u=147456 n=9 d=2073357289
+REL h=15 R=o=245760 u=131072 n=8 d=1077894850
+GET s=32768 R=ERR=capacity
+GET s=16384 R=o=16384 h=1 u=147456 n=9 d=783714644
+CLR R=u=0 n=0 d=1770128197

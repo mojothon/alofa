@@ -1,0 +1,9 @@
+# alofa batch trace v1
+# scenario: s06_refusals_are_named
+# every refusal is a named error: releasing an unknown borrow, borrowing zero bytes, admitting one request twice, dropping a request that is not batched
+CFG c=262144 mh=24 mb=8 al=64
+REL h=5 R=ERR=double_free
+GET s=0 R=ERR=invalid_argument
+ADD r=4 n=1 R=t=0 N=1 b=1 d=2097980741
+ADD r=4 n=1 R=ERR=invalid_argument
+DEL r=99 R=ERR=invalid_argument

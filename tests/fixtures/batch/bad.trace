@@ -1,0 +1,21 @@
+# alofa batch trace v1
+# scenario: bad
+# same as s01 with one wrong offset
+CFG c=262144 mh=24 mb=8 al=64
+ADD r=1 n=3 R=t=0 N=3 b=1 d=1039166390
+ADD r=2 n=5 R=t=3 N=8 b=2 d=1731724470
+ADD r=3 n=2 R=t=8 N=10 b=3 d=476803651
+GET s=35840 R=o=64 h=0 u=35840 n=1 d=789417748
+GET s=400 R=o=35840 h=1 u=36288 n=2 d=1502709880
+REL h=1 R=o=35840 u=35840 n=1 d=553068718
+REL h=0 R=o=0 u=0 n=0 d=1339784708
+DEL r=2 R=t=3 N=5 b=2 d=1850260435
+ADD r=4 n=5 R=t=3 N=10 b=3 d=305121553
+GET s=35840 R=o=0 h=0 u=35840 n=1 d=553068718
+GET s=400 R=o=35840 h=1 u=36288 n=2 d=1502709880
+REL h=1 R=o=35840 u=35840 n=1 d=553068718
+REL h=0 R=o=0 u=0 n=0 d=1339784708
+DEL r=1 R=t=0 N=7 b=2 d=1593129440
+DEL r=3 R=t=8 N=5 b=1 d=597019303
+DEL r=4 R=t=3 N=0 b=0 d=2142158185
+CLR R=u=0 n=0 d=1339784708

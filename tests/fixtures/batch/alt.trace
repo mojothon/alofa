@@ -1,0 +1,13 @@
+# alofa batch trace v1
+# scenario: alt
+# releasing both large anchors leaves one huge hole low down and one small one high up; an 8192-byte borrow fits in either, so this scenario is what pins the placement policy down (policy: best fit)
+CFG c=262144 mh=24 mb=8 al=64
+GET s=65536 R=o=0 h=0 u=65536 n=1 d=1051751729
+GET s=65536 R=o=65536 h=1 u=131072 n=2 d=1122053129
+GET s=8192 R=o=131072 h=2 u=139264 n=3 d=1304365774
+REL h=0 R=o=0 u=73728 n=2 d=312280087
+REL h=1 R=o=65536 u=8192 n=1 d=846436718
+GET s=8192 R=o=139264 h=0 u=16384 n=2 d=294875955
+REL h=2 R=o=131072 u=8192 n=1 d=494373604
+REL h=0 R=o=139264 u=0 n=0 d=1011885127
+CLR R=u=0 n=0 d=1011885127

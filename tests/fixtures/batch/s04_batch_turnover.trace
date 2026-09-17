@@ -1,0 +1,16 @@
+# alofa batch trace v1
+# scenario: s04_batch_turnover
+# four requests arrive, the middle one leaves, and a fifth takes the rows it had: batch rows are reused, not appended forever
+CFG c=262144 mh=24 mb=8 al=64
+ADD r=7 n=12 R=t=0 N=12 b=1 d=613045769
+ADD r=8 n=7 R=t=12 N=19 b=2 d=2084002978
+ADD r=9 n=9 R=t=19 N=28 b=3 d=1993269504
+ADD r=10 n=5 R=t=28 N=33 b=4 d=867523622
+DEL r=8 R=t=12 N=26 b=3 d=608543053
+ADD r=11 n=7 R=t=12 N=33 b=4 d=610000475
+DEL r=10 R=t=28 N=28 b=3 d=755101577
+ADD r=12 n=3 R=t=28 N=31 b=4 d=730918060
+DEL r=7 R=t=0 N=19 b=3 d=1675135643
+DEL r=9 R=t=19 N=10 b=2 d=1843328032
+DEL r=11 R=t=12 N=3 b=1 d=1841870610
+DEL r=12 R=t=28 N=0 b=0 d=925321647

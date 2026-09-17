@@ -1,0 +1,14 @@
+# alofa batch trace v1
+# scenario: s02_interleaved_lifetimes
+# three live regions whose middle one is freed first, so the next borrow has to step into the gap instead of climbing over everything
+CFG c=262144 mh=24 mb=8 al=64
+GET s=3584 R=o=0 h=0 u=3584 n=1 d=615545509
+GET s=19456 R=o=3584 h=1 u=23040 n=2 d=398312200
+GET s=512 R=o=23040 h=2 u=23552 n=3 d=1582836752
+REL h=1 R=o=3584 u=4096 n=2 d=952491389
+GET s=19456 R=o=3584 h=1 u=23552 n=3 d=1582836752
+REL h=0 R=o=0 u=19968 n=2 d=265911158
+GET s=3584 R=o=0 h=0 u=23552 n=3 d=1582836752
+REL h=2 R=o=23040 u=23040 n=2 d=872422853
+REL h=1 R=o=3584 u=3584 n=1 d=242077490
+REL h=0 R=o=0 u=0 n=0 d=1072635543

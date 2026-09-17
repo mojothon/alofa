@@ -1,0 +1,31 @@
+# alofa batch trace v1
+# scenario: s07_handle_pressure
+# twenty-four live borrows is the cap; the twenty-fifth must be refused rather than expanding the table
+CFG c=262144 mh=24 mb=8 al=64
+GET s=64 R=o=0 h=0 u=64 n=1 d=1274051316
+GET s=64 R=o=64 h=1 u=128 n=2 d=1938847761
+GET s=64 R=o=128 h=2 u=192 n=3 d=1576564473
+GET s=64 R=o=192 h=3 u=256 n=4 d=359416556
+GET s=64 R=o=256 h=4 u=320 n=5 d=478012675
+GET s=64 R=o=320 h=5 u=384 n=6 d=1633312035
+GET s=64 R=o=384 h=6 u=448 n=7 d=603173803
+GET s=64 R=o=448 h=7 u=512 n=8 d=759801658
+GET s=64 R=o=512 h=8 u=576 n=9 d=1591267726
+GET s=64 R=o=576 h=9 u=640 n=10 d=845083275
+GET s=64 R=o=640 h=10 u=704 n=11 d=1363762018
+GET s=64 R=o=704 h=11 u=768 n=12 d=344168235
+GET s=64 R=o=768 h=12 u=832 n=13 d=1225031221
+GET s=64 R=o=832 h=13 u=896 n=14 d=1072539028
+GET s=64 R=o=896 h=14 u=960 n=15 d=705097392
+GET s=64 R=o=960 h=15 u=1024 n=16 d=983847023
+GET s=64 R=o=1024 h=16 u=1088 n=17 d=1827628412
+GET s=64 R=o=1088 h=17 u=1152 n=18 d=202447468
+GET s=64 R=o=1152 h=18 u=1216 n=19 d=346944295
+GET s=64 R=o=1216 h=19 u=1280 n=20 d=336909727
+GET s=64 R=o=1280 h=20 u=1344 n=21 d=1861543248
+GET s=64 R=o=1344 h=21 u=1408 n=22 d=1213278781
+GET s=64 R=o=1408 h=22 u=1472 n=23 d=108156988
+GET s=64 R=o=1472 h=23 u=1536 n=24 d=1609967825
+GET s=64 R=ERR=capacity
+REL h=0 R=o=0 u=1472 n=23 d=1665569144
+GET s=64 R=o=0 h=0 u=1536 n=24 d=1609967825
