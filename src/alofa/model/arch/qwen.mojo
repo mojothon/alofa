@@ -29,7 +29,12 @@ from alofa.core.error import (
 )
 from alofa.core.ffi.mem import RawPtr
 from alofa.core.memory import Arena
-from alofa.core.tensor import F32Ptr, Shape, TensorView, f32_data
+from alofa.core.tensor import (
+    F32Ptr,
+    TensorView,
+    f32_data,
+    rows_view,
+)
 from alofa.core.text import parse_float64, parse_int
 from alofa.kernels.cpu.quant import (
     Q4_BLOCK,
@@ -709,24 +714,6 @@ struct QwenForward(Movable):
                 best_value = v
                 best = i
         return best
-
-
-def rows_view(base: RawPtr, rows: Int, cols: Int) raises AlofaError -> TensorView:
-    """A `[rows, cols]` fp32 view over memory that already exists.
-
-    A shorter view over a longer allocation — how both phases share one buffer
-    without reallocating when the token count changes.
-    """
-    if rows <= 0 or cols <= 0:
-        raise AlofaError(
-            ERR_INVALID_ARGUMENT,
-            "view needs a positive number of rows and columns",
-            "rows=" + String(rows) + " cols=" + String(cols),
-        )
-    var dims = List[Int]()
-    dims.append(rows)
-    dims.append(cols)
-    return TensorView(base, Shape(dims), DT_FP32)
 
 
 def copy_into(dst: RawPtr, dst_elem: Int, src: TensorView, n: Int) raises AlofaError:
