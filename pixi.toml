@@ -15,7 +15,23 @@ version = "0.1.0"
 [tasks]
 # 单元套件需要 -I src 才能 import alofa.*；capability 下的平台探测与账本门不需要。
 # 新增基础层文件后：① 加一条 unit 套件 ② 若文件在 core/ 下，同步 test_layering.mojo 的文件清单。
-test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run mojo run -I src tests/capability/test_layering.mojo && pixi run mojo run -I src tests/unit/test_core_error.mojo && pixi run mojo run -I src tests/unit/test_core_log.mojo && pixi run mojo run -I src tests/unit/test_core_ffi.mojo && pixi run mojo run -I src tests/unit/test_core_dtype.mojo && pixi run mojo run -I src tests/unit/test_core_tensor.mojo && pixi run mojo run -I src tests/unit/test_core_memory.mojo && pixi run mojo run -I src tests/unit/test_core_mmap.mojo && pixi run mojo run -I src tests/unit/test_verify_roofline.mojo && pixi run check-ledger"
+# tokenizer 差分门用 -O0：它要编译 13806 行的生成 Unicode 表，-O3 会把编译拖到 ~100 s
+# （同一个套件 mojo build 出来跑只要 0.34 s —— 慢的是编译不是运行，且 TestSuite 打印的
+# 耗时不可信：它报告 209 s 而进程墙钟只有 0.34 s）。
+test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run mojo run -I src tests/capability/test_layering.mojo && pixi run mojo run -I src tests/unit/test_core_error.mojo && pixi run mojo run -I src tests/unit/test_core_log.mojo && pixi run mojo run -I src tests/unit/test_core_ffi.mojo && pixi run mojo run -I src tests/unit/test_core_dtype.mojo && pixi run mojo run -I src tests/unit/test_core_tensor.mojo && pixi run mojo run -I src tests/unit/test_core_memory.mojo && pixi run mojo run -I src tests/unit/test_core_mmap.mojo && pixi run mojo run -I src tests/unit/test_verify_roofline.mojo && pixi run mojo run -O0 -I src tests/unit/test_tokenizer_parity.mojo && pixi run mojo run -I src tests/unit/test_layer0_parity.mojo && pixi run mojo run -O0 -I src tests/unit/test_sampler_parity.mojo && pixi run mojo run -O0 -I src tests/unit/test_q4_parity.mojo && pixi run mojo run -I src tests/unit/test_avx2_parity.mojo && pixi run check-ledger"
+# 整网数值门：标量后端跑 4 条 prompt 的 prefill + 128 token greedy 需要几分钟，
+# 所以必须先 build 再跑（mojo run 的默认优化级别下要慢一个数量级），也因此没有
+# 并入 test —— 它仍然由 scripts/dump_model_reference.py --full 的本地产物驱动。
+test-model = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_model_parity.mojo -o target/model_parity && ./target/model_parity"
+test-q4 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q4_greedy.mojo -o target/q4_greedy && ./target/q4_greedy"
+test-memory = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_memory_gate.mojo -o target/memory_gate && ./target/memory_gate"
+# 整网**向量后端**门：与 test-model 同一批 prompt、同一段 fp32 参考、同一条
+# cos 判据，只把后端参数换成 BACKEND_AVX2。同样不并入 test（2GB 权重 + 数分钟）。
+test-model-avx2 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_model_avx2_parity.mojo -o target/model_avx2_parity && ./target/model_avx2_parity"
+# 编译期红测：tests/fixtures/bad_backend.mojo 必须**编译失败**，且失败原因是
+# `unknown cpu backend`。拼错的后端常量若只是静默退化成标量，整网向量门会照绿
+# —— 而它绿的原因是向量路径一次都没跑过。
+test-backend-guard = "bash scripts/check_bad_backend.sh"
 # 能力账本 CI 门：标了 verified / verified-remote / verified-env 的条目必须给出真实凭证，
 # 否则 CI 失败。门本身也含自检（tests/fixtures/ledger_bad.md 必须被拒绝）。
 # 详见 docs/plan/capability-ledger.md

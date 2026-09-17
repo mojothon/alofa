@@ -19,6 +19,13 @@ models/
 # 文档构建输出
 site/
 
+# 编译出的测试可执行文件（pixi run test-model 会生成）
+target/
+
+# 整网参数导出（约 2 GB，由 scripts/dump_model_reference.py --full 本地重建）
+# 逐算子小切片（layer0/，约 9 MB）是入 fixture，不在此列。
+tests/fixtures/*/weights/
+
 # 编辑器与系统
 .idea/
 .vscode/
