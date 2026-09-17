@@ -1,0 +1,8 @@
+n_blocks	4
+block_size	16
+kv_cols	16
+q_cols	32
+n_heads	4
+n_kv_heads	2
+head_dim	8
+n_cases	11

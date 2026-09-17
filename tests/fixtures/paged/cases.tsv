@@ -1,0 +1,12 @@
+# name	scenario	req	ops	q_len	n_entries	then (block start length) * n_entries
+s01_c3_r1	s01_prompt_sharing	1	7	1	2	0	0	16	1	0	4
+s01_c3_r2	s01_prompt_sharing	2	7	1	2	0	0	5	2	0	1
+s01_c3_r3	s01_prompt_sharing	3	7	1	3	0	0	16	1	0	4	3	0	1
+s02_c3_r1	s02_split_divergence	1	6	2	1	0	0	8
+s02_c3_r2	s02_split_divergence	2	6	2	2	0	0	3	1	0	1
+s02_c3_r3	s02_split_divergence	3	6	2	2	0	0	7	2	0	1
+s03_c2_r1	s03_long_prompt_chain	1	5	3	3	0	0	16	1	0	16	2	0	8
+s03_c2_r2	s03_long_prompt_chain	2	5	3	3	0	0	16	1	0	4	3	0	1
+syn_midblock_scatter	-	0	0	1	3	2	3	4	3	7	5	2	11	4
+syn_midblock_shift	-	0	0	3	2	1	5	9	0	0	6
+syn_midblock_tight	-	0	0	2	3	2	1	6	3	9	3	1	13	2
