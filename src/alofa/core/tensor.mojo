@@ -13,9 +13,19 @@ Run:
     pixi run mojo run -I src tests/unit/test_core_tensor.mojo
 """
 
-from alofa.core.dtype import elem_size_bytes
-from alofa.core.error import ERR_OUT_OF_RANGE, ERR_SHAPE_MISMATCH, AlofaError
+from alofa.core.dtype import DT_FP32, elem_name, elem_size_bytes
+from alofa.core.error import (
+    ERR_OUT_OF_RANGE,
+    ERR_SHAPE_MISMATCH,
+    ERR_UNSUPPORTED,
+    AlofaError,
+)
 from alofa.core.ffi.mem import RawPtr
+
+# The element type every numerical layer starts from. It is named here, next to
+# the view, rather than in a compute module: a view is what carries the dtype,
+# so the accessor that has to check it belongs beside it.
+comptime F32Ptr = Pointer[Float32, MutUntrackedOrigin]
 
 
 struct Shape(Copyable, Movable):
@@ -173,3 +183,28 @@ struct TensorView(Copyable, Movable):
             self.byte_offset
             + start * self.strides[dim] * elem_size_bytes(self.dtype),
         )
+
+
+def f32_data(view: TensorView) raises AlofaError -> F32Ptr:
+    """Typed access to a contiguous fp32 view's elements.
+
+    Two things are checked rather than assumed. The dtype, because every
+    consumer here indexes in `Float32` units and a view that turned out to be
+    fp16 would read twice as far as it should. Contiguity, because a strided
+    view's elements are not `numel()` floats apart from each other, and a
+    slice of a tensor is exactly such a view.
+
+    The pointer is untracked, so its owner's lifetime is the caller's to
+    state — see `Arena.keep_alive` and `MappedFile.keep_alive`.
+    """
+    if view.dtype != DT_FP32:
+        raise AlofaError(
+            ERR_UNSUPPORTED,
+            "view is not fp32",
+            "dtype=" + elem_name(view.dtype),
+        )
+    if not view.is_contiguous():
+        raise AlofaError(
+            ERR_UNSUPPORTED, "view is not contiguous", "strides-mismatch"
+        )
+    return view.data.unsafe_offset(view.byte_offset).unsafe_bitcast[Float32]()
