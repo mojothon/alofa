@@ -205,6 +205,47 @@ def paged_gather[MAX_ENTRIES: Int](
             pd[unsafe_offset=out + c] = pc[unsafe_offset=src + c]
 
 
+def paged_scatter[MAX_ENTRIES: Int](
+    cache: TensorView,
+    table: PagedTable[MAX_ENTRIES],
+    first: Int,
+    src: TensorView,
+) raises AlofaError:
+    """Write `src`'s rows into the cache at positions `[first, first + n)`.
+
+    The write that fills a block and the read that attends over it must ask the
+    same table the same question, which is why this exists rather than a copy
+    into `(block, slot)` computed by the caller: a write at `first + j` by
+    arithmetic places a token where the request *would* have kept it had it not
+    shared a prefix, and every number downstream is then computed from a
+    history that is quietly somebody else's.
+
+    Refuses a write past the table instead of clamping. A clamped write is a
+    shorter context, and a shorter context surfaces as a missing token rather
+    than as an error — the caller must hear about it here.
+
+    Positions outside `[first, first + n)` are left exactly as they were, which
+    is what makes a block shared by two requests safe to write into twice: the
+    shared part is written with the same bytes both times.
+    """
+    var kv_cols = cache_cols(cache, table.block_size)
+    var kv_len = check_table(table, cache.shape.dims[0])
+    var n = rows_of(src, "src")
+    expect_matrix(src, n, kv_cols, "src")
+    if first < 0 or first + n > kv_len:
+        raise AlofaError(ERR_OUT_OF_RANGE, "scatter would write past the table")
+
+    var pc = f32_data(cache)
+    var ps = f32_data(src)
+    for j in range(n):
+        var dst = table.row_offset(first + j, kv_cols)
+        if dst < 0:
+            raise AlofaError(ERR_OUT_OF_RANGE, "page table leaves a hole")
+        var at = j * kv_cols
+        for c in range(kv_cols):
+            pc[unsafe_offset=dst + c] = ps[unsafe_offset=at + c]
+
+
 def paged_attention[MAX_ENTRIES: Int](
     dst: TensorView,
     q: TensorView,

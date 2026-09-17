@@ -1,0 +1,7 @@
+# name n_blocks block_size cols n_src first n_runs
+s01_fill_all 3 4 2 7 0 2
+s02_from_middle 3 4 2 3 2 2
+s03_across_runs 3 4 2 3 3 2
+s04_mid_block_start 3 4 2 4 0 2
+s05_shared_block 3 4 2 4 0 2
+s06_out_of_order 3 4 2 5 0 2
