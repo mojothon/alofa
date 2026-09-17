@@ -1,0 +1,18 @@
+# alofa kv trace v1
+# scenario: alt (block_size=16, variant=nosplit)
+# same plan as s02 but with node splitting disabled: prefixes only match up to the last fully matched node
+CFG bs=16 nb=112 nr=8 nn=32 nt=16
+OP=NEW r=1 T=7,7,7,7,7,7,7,7 R=m=0 o=- S=- A=0 u=1 f=111 d=726074879
+OP=COM r=1 R=m=0 N=1 S=0 u=1 f=111 d=564848087
+OP=NEW r=2 T=7,7,7,8 R=m=0 o=- S=- A=1 u=2 f=110 d=540094024
+OP=COM r=2 R=m=0 N=2 S=1 u=2 f=110 d=439604884
+OP=NEW r=3 T=7,7,7,7,7,7,7,9 R=m=0 o=- S=- A=2 u=3 f=109 d=776627695
+OP=COM r=3 R=m=0 N=3 S=2 u=3 f=109 d=1440841208
+OP=MAT T=7,7,7,7,7,7,7,9 R=m=8 H=3 o=0 u=3 f=109 d=642289970
+OP=MAT T=7,7,7,8 R=m=0 H=- o=- u=3 f=109 d=1991222379
+OP=MAT T=7,7 R=m=0 H=- o=- u=3 f=109 d=1192671141
+OP=REL r=1 R=X=- u=3 f=109 d=701172002
+OP=REL r=2 R=X=- u=3 f=109 d=1334718236
+OP=REL r=3 R=X=- u=3 f=109 d=2094307515
+OP=EVI v=1 R=X=0 u=2 f=110 d=1502701750
+OP=MAT T=7,7,7,7,7,7,7,7 R=m=0 H=- o=- u=2 f=110 d=1388209466

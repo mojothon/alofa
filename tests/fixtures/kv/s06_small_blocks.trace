@@ -1,0 +1,16 @@
+# alofa kv trace v1
+# scenario: s06_small_blocks (block_size=4, variant=split)
+# block_size=4: many blocks per request, sharing across a small block
+CFG bs=4 nb=112 nr=8 nn=32 nt=16
+OP=NEW r=1 T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 R=m=0 o=- S=- A=0,1,2,3,4 u=5 f=107 d=627415653
+OP=COM r=1 R=m=0 N=1,2 S=0,1,2,3,4 u=5 f=107 d=630957364
+OP=NEW r=2 T=1,2,3,4,5,6,7,8,9,10,99 R=m=10 o=0 S=0,1,2 A=5 u=6 f=106 d=1606861404
+OP=COM r=2 R=m=10 N=3,4 S=5 u=6 f=106 d=941718362
+OP=APP r=2 n=3 R=A=6 u=7 f=105 d=1346660265
+OP=REL r=1 R=X=- u=7 f=105 d=2053474386
+OP=NEW r=3 T=1,2,3,4,5,6,7,8,9,10 R=m=10 o=0 S=0,1,2 A=- u=7 f=105 d=1142568167
+OP=COM r=3 R=m=10 N=- S=- u=7 f=105 d=1766218343
+OP=REL r=2 R=X=6 u=6 f=106 d=1050688174
+OP=REL r=3 R=X=- u=6 f=106 d=1361091786
+OP=MAT T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 R=m=20 H=2 o=0 u=6 f=106 d=1003667029
+OP=MAT T=1,2,3,4,5,6,7,8,9,10,99 R=m=11 H=4 o=0 u=6 f=106 d=1832153186

@@ -1,0 +1,19 @@
+# alofa kv trace v1
+# scenario: s05_evict_and_reuse (block_size=16, variant=split)
+# evict a subtree, then watch the free list hand the blocks back in order
+CFG bs=16 nb=112 nr=8 nn=32 nt=16
+OP=NEW r=1 T=1,2,3,4,5,6,7,8,9,10 R=m=0 o=- S=- A=0 u=1 f=111 d=1487337163
+OP=COM r=1 R=m=0 N=1 S=0 u=1 f=111 d=965424885
+OP=NEW r=2 T=1,2,3,4,5,6,7,8,9,10,21 R=m=10 o=0 S=0 A=1 u=2 f=110 d=1374589421
+OP=COM r=2 R=m=10 N=2 S=1 u=2 f=110 d=1222668258
+OP=NEW r=3 T=1,2,3,4,5,6,7,8,9,10,22 R=m=10 o=0 S=0 A=2 u=3 f=109 d=1804944404
+OP=COM r=3 R=m=10 N=3 S=2 u=3 f=109 d=245020779
+OP=REL r=1 R=X=- u=3 f=109 d=846459216
+OP=REL r=2 R=X=- u=3 f=109 d=353795453
+OP=REL r=3 R=X=- u=3 f=109 d=310345621
+OP=MAT T=1,2,3,4,5,6,7,8,9,10,21 R=m=11 H=2 o=0 u=3 f=109 d=2100404511
+OP=EVI v=1 R=X=0,1,2 u=0 f=112 d=317485828
+OP=MAT T=1,2,3,4,5,6,7,8,9,10 R=m=0 H=- o=- u=0 f=112 d=317485828
+OP=NEW r=4 T=1,2,3,4,5,6,7,8,9,10 R=m=0 o=- S=- A=2 u=1 f=111 d=1657165489
+OP=COM r=4 R=m=0 N=1 S=2 u=1 f=111 d=1921612126
+OP=REL r=4 R=X=- u=1 f=111 d=5868439

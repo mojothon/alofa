@@ -1,0 +1,16 @@
+# alofa kv trace v1
+# scenario: s01_prompt_sharing (block_size=16, variant=split)
+# three requests over one cached prompt: share, diverge, re-match
+CFG bs=16 nb=112 nr=8 nn=32 nt=16
+OP=NEW r=1 T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 R=m=0 o=- S=- A=0,1 u=2 f=110 d=1692755692
+OP=COM r=1 R=m=0 N=1,2 S=0,1 u=2 f=110 d=820552837
+OP=MAT T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 R=m=20 H=2 o=0 u=2 f=110 d=1707507241
+OP=NEW r=2 T=1,2,3,4,5,50 R=m=5 o=0 S=0 A=2 u=3 f=109 d=729455219
+OP=COM r=2 R=m=5 N=3,4 S=2 u=3 f=109 d=1605158638
+OP=NEW r=3 T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,99 R=m=20 o=0 S=0,1 A=3 u=4 f=108 d=1576277138
+OP=COM r=3 R=m=20 N=5 S=3 u=4 f=108 d=1111809336
+OP=REL r=1 R=X=- u=4 f=108 d=1041623691
+OP=REL r=2 R=X=- u=4 f=108 d=915547226
+OP=REL r=3 R=X=- u=4 f=108 d=2001733793
+OP=MAT T=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 R=m=20 H=2 o=0 u=4 f=108 d=1644309036
+OP=MAT T=1,2,3,4,5,50 R=m=6 H=4 o=0 u=4 f=108 d=325311546
