@@ -43,7 +43,7 @@ comptime FIXTURE = "tests/fixtures/scheduler/"
 comptime SCHED_SRC = "src/alofa/engine/scheduler.mojo"
 comptime BAD_ALLOC_SRC = "tests/fixtures/bad_alloc.mojo"
 
-comptime SCENARIOS = 6
+comptime SCENARIOS = 7
 
 
 struct ReplayStats:
@@ -55,6 +55,7 @@ struct ReplayStats:
     var max_blocks: Int
     var max_tokens: Int
     var final_blocks: Int
+    var final_cached: Int
     var final_live: Int
     var budget_breaks: Int
     var capacity_breaks: Int
@@ -69,6 +70,7 @@ struct ReplayStats:
         self.max_blocks = 0
         self.max_tokens = 0
         self.final_blocks = 0
+        self.final_cached = 0
         self.final_live = 0
         self.budget_breaks = 0
         self.capacity_breaks = 0
@@ -139,7 +141,9 @@ def replay(
             stats.capacity_breaks += 1
         if sch.blocks_used > stats.max_blocks:
             stats.max_blocks = sch.blocks_used
-        if sch.blocks_used != sch.blocks_held():
+        # 占用 = 活跃请求持有的 + 前缀缓存占着的。缓存那部分由引擎归还，
+        # 但"账是否平"每拍都必须从两边重算。
+        if sch.blocks_used != sch.blocks_held() + sch.cached_blocks:
             stats.accounting_breaks += 1
         if sch.blocks_used > cfg.threshold_blocks() and sch.n_running() > 0:
             # 有可抢占对象却把水位留在阈值之上 = 抢占没做干净。
@@ -162,8 +166,27 @@ def replay(
 
     stats.preempt_total = sch.preempt_total
     stats.final_blocks = sch.blocks_used
+    stats.final_cached = sch.cached_blocks
     stats.final_live = sch.n_live()
     return got^
+
+
+def replay_scheduler(path: String) raises AlofaError -> Scheduler:
+    """重放到底，把调度器本身交出来（要给"归还之后归零"这条性质用）。
+
+    只喂输入、不看输出 —— 逐字节比对是 `replay` 的事，这里要的是终局状态。
+    """
+    var lines = lines_of(path)
+    var sch = Scheduler(parse_config(lines[0]))
+    var idx = 1
+    while idx < len(lines):
+        var halves = parts_of(lines[idx], " OUT=")
+        if len(halves) != 2:
+            raise AlofaError(1, "trace line must be 'IN=... OUT=...'")
+        var tick_in = parse_input(halves[0])
+        _ = sch.step(tick_in)
+        idx += 1
+    return sch^
 
 
 def scenario_names() -> List[String]:
@@ -174,6 +197,7 @@ def scenario_names() -> List[String]:
     out.append("s04_zero_budget")
     out.append("s05_cancel_race")
     out.append("s06_kv_watermark")
+    out.append("s07_cache_freed")
     return out^
 
 
@@ -209,22 +233,74 @@ def test_every_scenario_replays_byte_exact() raises:
 
 
 def test_the_pool_is_empty_once_every_request_is_gone() raises:
-    """所有请求结束后 `blocks_used` 必须归零 —— 占用是推导出来的，不是记出来的。
+    """所有请求结束后，剩下的占用必须**全部**是前缀缓存，且一次归还就能归零。
 
     这条门盯着的是"增量记账漂移"：加的时候少算、放的时候多减，两侧各自看起来
-    都正常，只有归零这一刻会露出来。
+    都正常，只有归零这一刻会露出来。完成即发布（块换主人不退池），所以归零要
+    靠引擎把缓存还回来 —— 若还回来的数量和调度器记着的缓存对不上，这里就会响。
     """
     var names = scenario_names()
     for name in names:
         var stats = ReplayStats()
         var seen = List[Int]()
         _ = replay(FIXTURE + name + ".trace", stats, seen)
-        if name != "s04_zero_budget":
-            assert_true(
-                stats.final_blocks == 0,
-                name + " 结束后仍占用 " + String(stats.final_blocks) + " 块",
-            )
-            assert_true(stats.final_live == 0, name + " 结束后仍有活跃请求")
+        if name == "s04_zero_budget":
+            # 0 预算：请求还活着，这是它存在的意义。
+            continue
+        assert_true(stats.final_live == 0, name + " 结束后仍有活跃请求")
+        assert_equal(stats.final_blocks, stats.final_cached)
+        var sch = replay_scheduler(FIXTURE + name + ".trace")
+        assert_equal(sch.blocks_held(), 0)
+        assert_equal(sch.blocks_used, sch.cached_blocks)
+        var inp = SchedInput()
+        inp.add_freed_blocks(sch.cached_blocks)
+        _ = sch.step(inp)
+        assert_equal(sch.blocks_used, 0)
+        assert_equal(sch.cached_blocks, 0)
+
+
+def test_a_finished_request_hands_its_blocks_to_the_cache() raises:
+    """完成即发布：块换了主人，占用不降 —— 归还只能走 `freed_blocks`。
+
+    反面是"完成即归零"：那样调度器会以为块空着，而池子里其实还被缓存占着，
+    于是它放行一个装不下的批次。
+    """
+    var sch = Scheduler(SchedConfig(16, 16, 16, 12, 1000, 8))
+    var first = SchedInput()
+    first.add_arrival(1, 16, 1)
+    _ = sch.step(first)
+    var second = SchedInput()
+    var act = sch.step(second)
+    assert_equal(act.n_finished, 1)
+    assert_equal(sch.blocks_held(), 0)
+    assert_true(
+        sch.cached_blocks > 0, "请求完成后块既没回池子也没进缓存 —— 账漏了"
+    )
+    assert_equal(sch.blocks_used, sch.cached_blocks)
+    var back = SchedInput()
+    back.add_freed_blocks(sch.cached_blocks)
+    _ = sch.step(back)
+    assert_equal(sch.cached_blocks, 0)
+    assert_equal(sch.blocks_used, 0)
+
+
+def test_a_return_of_blocks_nobody_cached_is_refused() raises:
+    """归还数超过缓存数必须具名拒绝 —— 静默夹住会让两本账从此分家。
+
+    调度器与引擎各记一本账；它们一旦对不上，唯一的信号就是这个数字。
+    """
+    var sch = Scheduler(SchedConfig(16, 16, 16, 12, 1000, 8))
+    var inp = SchedInput()
+    inp.add_freed_blocks(1)
+    var refused = False
+    var kind = String("")
+    try:
+        _ = sch.step(inp)
+    except err:
+        refused = True
+        kind = err.name()
+    assert_true(refused, "凭空归还的块竟然被接受了")
+    assert_true(kind == "invalid_argument", "拒绝必须是具名错误，得到 " + kind)
 
 
 def test_a_bad_trace_is_rejected() raises:

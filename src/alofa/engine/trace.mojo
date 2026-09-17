@@ -124,7 +124,17 @@ def input_line(inp: SchedInput) -> String:
             if i > 0:
                 finished += ","
             finished += String(inp.finished[i])
-    return IN_PREFIX + "A=" + arrivals + "|C=" + cancels + "|F=" + finished
+    return (
+        IN_PREFIX
+        + "A="
+        + arrivals
+        + "|C="
+        + cancels
+        + "|F="
+        + finished
+        + "|R="
+        + String(inp.freed_blocks)
+    )
 
 
 def action_line(act: Action) -> String:
@@ -198,10 +208,10 @@ def parse_input(text: String) raises AlofaError -> SchedInput:
         raise AlofaError(ERR_PARSE, "input line must start with IN=")
     var body = value_after(text, "=")
     var groups = parts_of(body, "|")
-    if len(groups) != 3:
-        raise AlofaError(ERR_PARSE, "input line must have three groups")
+    if len(groups) != 4:
+        raise AlofaError(ERR_PARSE, "input line must have four groups")
     var inp = SchedInput()
-    for g in range(3):
+    for g in range(4):
         var field = groups[g]
         var items = value_after(field, "=")
         if items == EMPTY:
@@ -217,6 +227,8 @@ def parse_input(text: String) raises AlofaError -> SchedInput:
                     parse_int(triple[1]),
                     parse_int(triple[2]),
                 )
+            elif g == 3:
+                inp.add_freed_blocks(parse_int(items))
             else:
                 var req = parse_int(item)
                 if g == 1:

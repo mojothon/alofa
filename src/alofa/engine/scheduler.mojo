@@ -55,12 +55,27 @@ Accounting
 ----------
 
 KV occupancy is *derived* from sequence lengths: `ceil((done + generated) /
-block_size)` per request, summed incrementally into `blocks_used`. There is
-deliberately **no `freed_blocks` input** this round even though the architecture
-sketch has one: with no physical pool yet (P2.1), every block is owned by a live
-request, so "the engine freed some blocks" cannot happen without breaking the
-invariant `blocks_used == sum of per-request blocks`. A field that can only ever
-be zero is worse than no field — it reads as capability.
+block_size)` per request, summed incrementally into `blocks_used`. The scheduler
+counts blocks, it does not own them: the physical pool lives one layer down, in
+`runtime/kv`, and is driven by the engine.
+
+Two kinds of occupancy therefore have to be told apart, because they are freed
+by different owners:
+
+* **Per-request blocks** — freed by the scheduler itself, when it releases a
+  request (preempted, cancelled).
+* **Cache blocks** — a finished request's sequence is *published* to the prefix
+  cache, so its blocks stay occupied after the request is gone. The scheduler
+  keeps counting them under `cached_blocks`; it cannot free them, because
+  eviction is the engine's call.
+
+`freed_blocks` is the channel back: blocks the engine released from the cache
+since the last tick. Without it the scheduler would go on counting blocks that
+are already back in the pool, and would refuse work that fits — a leak dressed
+up as back-pressure. Reporting more freed than the scheduler believes are
+cached is a real inconsistency, so it is a named error rather than a clamp.
+
+The invariant is `blocks_used == blocks_held() + cached_blocks`.
 
 Allocation
 ----------
@@ -193,6 +208,9 @@ struct SchedInput:
     var n_arrived: Int
     var n_cancelled: Int
     var n_finished: Int
+    # Blocks the engine returned to the pool since the last tick, that no live
+    # request ever owned: prefix-cache eviction. See the module docstring.
+    var freed_blocks: Int
 
     def __init__(out self):
         self.arr_id = InlineArray[Int, MAX_BATCH](fill=0)
@@ -203,12 +221,22 @@ struct SchedInput:
         self.n_arrived = 0
         self.n_cancelled = 0
         self.n_finished = 0
+        self.freed_blocks = 0
 
     def clear(mut self):
         """Reset for the next tick without letting go of the buffers."""
         self.n_arrived = 0
         self.n_cancelled = 0
         self.n_finished = 0
+        self.freed_blocks = 0
+
+    def add_freed_blocks(mut self, n: Int) raises AlofaError:
+        """Report blocks the engine released from the prefix cache this tick."""
+        if n < 0:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "freed_blocks must not be negative"
+            )
+        self.freed_blocks += n
 
     def add_arrival(mut self, req: Int, prompt_len: Int, max_new: Int) raises AlofaError:
         if self.n_arrived >= MAX_BATCH:
@@ -319,7 +347,10 @@ struct Scheduler:
     # Scratch: cleared at the top of every step, never read across ticks. It is
     # a field rather than a local so that `step` needs no per-tick buffer.
     var progressed: InlineArray[Int, MAX_BATCH]
+    # Blocks the scheduler believes are occupied, in total: live requests' plus
+    # the prefix cache's. Freed by two different owners — see the docstring.
     var blocks_used: Int
+    var cached_blocks: Int
     var preempt_total: Int
     var tick_seq: Int
 
@@ -335,6 +366,7 @@ struct Scheduler:
         self.preempt_count = InlineArray[Int, MAX_BATCH](fill=0)
         self.progressed = InlineArray[Int, MAX_BATCH](fill=0)
         self.blocks_used = 0
+        self.cached_blocks = 0
         self.preempt_total = 0
         self.tick_seq = 0
 
@@ -357,6 +389,7 @@ struct Scheduler:
         self.preempt_count = InlineArray[Int, MAX_BATCH](fill=0)
         self.progressed = InlineArray[Int, MAX_BATCH](fill=0)
         self.blocks_used = 0
+        self.cached_blocks = 0
         self.preempt_total = 0
         self.tick_seq = 0
 
@@ -397,11 +430,34 @@ struct Scheduler:
         return self.wait_ticks[slot]
 
     def blocks_held(self) raises AlofaError -> Int:
-        """Blocks implied by live sequence lengths — the accounting invariant."""
+        """Blocks implied by live sequence lengths.
+
+        Together with `cached_blocks` this closes the accounting:
+        `blocks_used == blocks_held() + cached_blocks`.
+        """
         var total = 0
         for i in range(MAX_BATCH):
             if self.state[i] != ST_FREE:
                 total += blocks_for(self.done[i] + self.generated[i], self.cfg.block_size)
+        return total
+
+    def blocks_wanted(self) raises AlofaError -> Int:
+        """Blocks the queued requests still owe the pool.
+
+        `blocks_held` counts what is already written; this counts what is still
+        owed by requests that have been admitted but not served yet. Yielding to
+        the cache has to leave room for both: a cache allowed to fill the whole
+        budget leaves the next request nothing to start on, and the engine then
+        sits on work it can never begin.
+        """
+        var total = 0
+        for i in range(MAX_BATCH):
+            if self.state[i] == ST_WAITING:
+                var want = blocks_for(
+                    self.prompt_len[i], self.cfg.block_size
+                ) - blocks_for(self.done[i], self.cfg.block_size)
+                if want > 0:
+                    total += want
         return total
 
     def digest(self) -> Int:
@@ -418,6 +474,7 @@ struct Scheduler:
             h = (h * DIGEST_MUL + self.wait_ticks[i]) % DIGEST_MOD
             h = (h * DIGEST_MUL + self.preempt_count[i]) % DIGEST_MOD
         h = (h * DIGEST_MUL + self.blocks_used) % DIGEST_MOD
+        h = (h * DIGEST_MUL + self.cached_blocks) % DIGEST_MOD
         h = (h * DIGEST_MUL + self.preempt_total) % DIGEST_MOD
         return h
 
@@ -450,10 +507,40 @@ struct Scheduler:
         self.preempt_count[slot] = 0
         self.state[slot] = ST_WAITING
 
-    def release(mut self, slot: Int) raises AlofaError:
-        self.blocks_used -= blocks_for(
+    def release(mut self, slot: Int, to_cache: Bool) raises AlofaError:
+        """Drop a request's own view of its blocks.
+
+        `to_cache` keeps the occupancy: a finished request's sequence is
+        published to the prefix cache, so its blocks do not come back to the
+        pool, they change owner. Only the engine can hand them back, and it says
+        so through `freed_blocks`. Cancellation and preemption are the opposite:
+        nothing was published, so the blocks really are free.
+        """
+        var held = blocks_for(
             self.done[slot] + self.generated[slot], self.cfg.block_size
         )
+        if to_cache:
+            # What is published is the whole sequence: every prompt token plus
+            # every token asked for. A request is finished when it has written
+            # that many, so `max_new` is exact here — and `generated` is not.
+            # `generated` counts decode steps, and the first token of a
+            # continuation is chosen by the step that finishes the prompt. It is
+            # one short, every time, and a whole block short whenever that token
+            # is the one that crosses a block boundary.
+            held = blocks_for(
+                self.prompt_len[slot] + self.max_new[slot], self.cfg.block_size
+            )
+            # The live request was charged one block at a time, and the last of
+            # those charges was a token short. Nothing comes back to the pool —
+            # the blocks change owner — so the pool book keeps its count and
+            # picks up the difference, or it would go on believing the pool has
+            # room it does not have.
+            self.blocks_used += held - blocks_for(
+                self.done[slot] + self.generated[slot], self.cfg.block_size
+            )
+            self.cached_blocks += held
+        else:
+            self.blocks_used -= held
         self.ids[slot] = 0
         self.prompt_len[slot] = 0
         self.done[slot] = 0
@@ -542,19 +629,33 @@ struct Scheduler:
         for i in range(MAX_BATCH):
             self.progressed[i] = 0
 
+        # 0. Blocks the engine handed back from the prefix cache. This has to be
+        #    first: it is last tick's news, and every decision below is made
+        #    against the occupancy it produces.
+        if inp.freed_blocks > 0:
+            if inp.freed_blocks > self.cached_blocks:
+                raise AlofaError(
+                    ERR_INVALID_ARGUMENT,
+                    "engine freed more blocks than the scheduler holds cached",
+                )
+            self.cached_blocks -= inp.freed_blocks
+            self.blocks_used -= inp.freed_blocks
+
         # 1. Cancels first: a request that arrives and is cancelled in the same
-        #    tick must never have been queued.
+        #    tick must never have been queued. Nothing was published, so the
+        #    blocks really come back.
         for i in range(inp.n_cancelled):
             var slot = self.find(inp.cancelled[i])
             if slot >= 0:
-                self.release(slot)
+                self.release(slot, False)
 
-        # 2. Engine-reported completion (EOS / stop string).
+        # 2. Engine-reported completion (EOS / stop string). The sequence is
+        #    published to the prefix cache, so its blocks stay occupied.
         for i in range(inp.n_finished):
             var slot = self.find(inp.finished[i])
             if slot >= 0:
                 act.add_finished(self.ids[slot])
-                self.release(slot)
+                self.release(slot, True)
 
         # 3. One more tick waited — before arrivals, so a new request starts at 0.
         for i in range(MAX_BATCH):
@@ -601,7 +702,7 @@ struct Scheduler:
                 budget -= 1
                 if self.generated[di] >= self.max_new[di]:
                     act.add_finished(self.ids[di])
-                    self.release(di)
+                    self.release(di, True)
             di += 1
 
         # 7. Latency guard: a request that has waited `max_wait_ticks` is
@@ -621,6 +722,11 @@ struct Scheduler:
                 budget = self.try_prefill(i, budget, act)
 
         # 9. Watermark preemption: recompute, newest running request first.
+        #    Preemption cannot always get under the limit, because cached blocks
+        #    are not preemptable — that is the engine's call, and it is the
+        #    engine's job to keep the cache small enough. Breaking out is the
+        #    honest outcome: a scheduler that freed blocks it does not own would
+        #    be writing a number that the pool is about to contradict.
         var limit = self.cfg.threshold_blocks()
         while self.blocks_used > limit:
             if not self.preempt_one(act, -1):

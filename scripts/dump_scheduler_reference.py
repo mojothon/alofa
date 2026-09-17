@@ -95,6 +95,9 @@ class Scheduler:
         self.preempt_count = [0] * MAX_BATCH
         self.progressed = [0] * MAX_BATCH
         self.blocks_used = 0
+        # 完成即发布到前缀缓存：块换了主人，没有回池子。只有引擎能把它们还
+        # 回来（freed_blocks）。不变量：blocks_used == blocks_held + cached。
+        self.cached_blocks = 0
         self.preempt_total = 0
         self.tick_seq = 0
 
@@ -121,6 +124,7 @@ class Scheduler:
             ):
                 h = (h * DIGEST_MUL + value) % DIGEST_MOD
         h = (h * DIGEST_MUL + self.blocks_used) % DIGEST_MOD
+        h = (h * DIGEST_MUL + self.cached_blocks) % DIGEST_MOD
         h = (h * DIGEST_MUL + self.preempt_total) % DIGEST_MOD
         return h
 
@@ -145,10 +149,19 @@ class Scheduler:
         self.preempt_count[slot] = 0
         self.state[slot] = ST_WAITING
 
-    def release(self, slot: int) -> None:
-        self.blocks_used -= blocks_for(
-            self.done[slot] + self.generated[slot], self.cfg.block_size
-        )
+    def release(self, slot: int, to_cache: bool) -> None:
+        held = blocks_for(self.done[slot] + self.generated[slot], self.cfg.block_size)
+        if to_cache:
+            # 发布的是整条序列：prompt 全长 + 要求生成的每一个 token。generated 数的是
+            # decode 拍，而续写的第一个 token 是「把 prompt 喂完的那一步」选出来的，
+            # 不算一拍 —— 它每次都少一个 token，跨块时就少一整块。
+            whole = blocks_for(
+                self.prompt_len[slot] + self.max_new[slot], self.cfg.block_size
+            )
+            self.blocks_used += whole - held
+            self.cached_blocks += whole
+        else:
+            self.blocks_used -= held
         self.ids[slot] = 0
         self.prompt_len[slot] = 0
         self.done[slot] = 0
@@ -215,22 +228,29 @@ class Scheduler:
         self.wait_ticks[slot] = 0
         return budget - chunk
 
-    def step(self, arrivals, cancels, finished) -> dict:
+    def step(self, arrivals, cancels, finished, freed_blocks: int = 0) -> dict:
         act = {"t": 0, "P": [], "D": [], "X": [], "F": [], "C": 0, "K": 0}
         self.tick_seq += 1
         act["t"] = self.tick_seq
         self.progressed = [0] * MAX_BATCH
 
+        # 0. 引擎从缓存里还回来的块：上一拍的消息，必须最早入账。
+        if freed_blocks:
+            if freed_blocks > self.cached_blocks:
+                raise ValueError("engine freed more blocks than are cached")
+            self.cached_blocks -= freed_blocks
+            self.blocks_used -= freed_blocks
+
         for req in cancels:
             slot = self.find(req)
             if slot >= 0:
-                self.release(slot)
+                self.release(slot, False)
 
         for req in finished:
             slot = self.find(req)
             if slot >= 0:
                 act["F"].append(self.ids[slot])
-                self.release(slot)
+                self.release(slot, True)
 
         for i in range(MAX_BATCH):
             if self.state[i] == ST_WAITING:
@@ -269,7 +289,7 @@ class Scheduler:
             budget -= 1
             if self.generated[i] >= self.max_new[i]:
                 act["F"].append(self.ids[i])
-                self.release(i)
+                self.release(i, True)
 
         # 延迟护栏：等待够久的请求排在其它**等待者**之前（不越过 decode）。
         for i in range(MAX_BATCH):
@@ -297,9 +317,11 @@ def join_or_dash(items) -> str:
     return "-" if not items else ",".join(str(x) for x in items)
 
 
-def input_line(arrivals, cancels, finished) -> str:
+def input_line(arrivals, cancels, finished, freed: int = 0) -> str:
     a = "-" if not arrivals else ",".join(f"{r}:{p}:{m}" for r, p, m in arrivals)
-    return f"IN=A={a}|C={join_or_dash(cancels)}|F={join_or_dash(finished)}"
+    return (
+        f"IN=A={a}|C={join_or_dash(cancels)}|F={join_or_dash(finished)}|R={freed}"
+    )
 
 
 def action_line(act: dict) -> str:
@@ -315,12 +337,45 @@ def action_line(act: dict) -> str:
     )
 
 
+def reclaim_tail(cfg: Config, ticks, variant: str = "newest", cap: int = 256):
+    """补上"引擎回收缓存"的拍：主干里队列被缓存卡住时插一拍，末尾再排空。
+
+    完成即发布以后，缓存会占着块；纯调度器重放里没人回收，队列就再也排不空 ——
+    那不是调度器的错，是场景少了一个角色。补拍是确定性的（每拍把当时缓存的
+    量原样还回去），Mojo 侧照着重放即可。
+
+    ⚠️ 这个"角色"必须**贯穿**主干，不能只在结尾补：否则缓存会把池子吃满、
+    并发掉到 1，抢占顺序就再也影响不到输出 —— 抗原 s02 会悄悄失效。
+    """
+    sch = Scheduler(cfg, variant=variant)
+    out = []
+    for tick in ticks:
+        freed = tick[3] if len(tick) > 3 else 0
+        out.append((tick[0], tick[1], tick[2], freed))
+        act = sch.step(tick[0], tick[1], tick[2], freed)
+        stalled = not act["P"] and any(
+            sch.state[i] == ST_WAITING for i in range(MAX_BATCH)
+        )
+        if sch.cached_blocks and stalled:
+            out.append(([], [], [], sch.cached_blocks))
+            sch.step([], [], [], sch.cached_blocks)
+    while sum(1 for s in sch.state if s) > 0 and len(out) < cap:
+        freed = sch.cached_blocks
+        out.append(([], [], [], freed))
+        sch.step([], [], [], freed)
+    return out
+
+
 def run(cfg: Config, ticks, variant: str = "newest"):
     sch = Scheduler(cfg, variant=variant)
     lines = [cfg.line()]
-    for arrivals, cancels, finished in ticks:
-        act = sch.step(arrivals, cancels, finished)
-        lines.append(f"{input_line(arrivals, cancels, finished)} {action_line(act)}")
+    for tick in ticks:
+        arrivals, cancels, finished = tick[0], tick[1], tick[2]
+        freed = tick[3] if len(tick) > 3 else 0
+        act = sch.step(arrivals, cancels, finished, freed)
+        lines.append(
+            f"{input_line(arrivals, cancels, finished, freed)} {action_line(act)}"
+        )
     return lines, sch
 
 
@@ -374,6 +429,25 @@ def scenarios():
     ticks = [([(1, 16, 3), (2, 16, 3), (3, 16, 3)], [], [])] + empty(23)
     out.append(("s06_kv_watermark", cfg, ticks))
 
+    # 7. 前缀缓存归还：完成即发布到缓存（块换了主人，没回池子），只有引擎的
+    #    freed_blocks 能把它们还回来。这条通道不接上，缓存会把 blocks_used
+    #    一路顶高，后面的请求永远排不上 —— 看起来像"池子太小"，其实是账没接。
+    #    水位取 1000‰：这个场景要验的是归还通道，不是抢占。
+    cfg = Config(budget=16, chunk=16, block_size=16, capacity=12, watermark=1000, max_wait=8)
+    ticks = [
+        ([(1, 16, 1), (2, 16, 1)], [], [], 0),
+        ([], [], [], 0),
+        ([(3, 16, 1), (4, 16, 1)], [], [], 0),
+        ([], [], [], 0),
+        ([], [], [], 0),
+        ([(5, 16, 1), (6, 16, 1)], [], [], 4),   # 引擎清掉 4 个缓存块
+        ([], [], [], 0),
+        ([(7, 16, 1), (8, 16, 1)], [], [], 2),   # 再还 2 个
+        ([], [], [], 0),
+        ([], [], [], 1),                          # 部分归还
+    ] + empty(6)
+    out.append(("s07_cache_freed", cfg, ticks))
+
     return out
 
 
@@ -390,13 +464,17 @@ def main() -> None:
 
     produced = {}
     for name, cfg, ticks in scenarios():
+        base = ticks
+        # s04 故意永远排不空（0 预算），其余场景补上"引擎回收缓存"的收尾拍。
+        if name != "s04_zero_budget":
+            ticks = reclaim_tail(cfg, ticks)
         lines, sch = run(cfg, ticks)
         write(f"{name}.trace", lines)
         print(
             f"    preempt_total={sch.preempt_total} "
             f"blocks_used={sch.blocks_used} live={sum(1 for s in sch.state if s)}"
         )
-        produced[name] = (cfg, ticks, lines)
+        produced[name] = (cfg, ticks, lines, base)
 
     # 抗原一：故意改坏一拍的 OUT（把 s01 第 1 拍的切片终点从 16 改成 15）。
     # 重放门必须判红；若它判绿，说明逐字节比对根本没在比。
@@ -408,8 +486,10 @@ def main() -> None:
 
     # 抗原二：换一个同样自洽但不同的策略（抢占最老的而不是最新的）跑**有抢占**
     # 的场景。Mojo 的输出必须与之不同 —— 否则 fixture 只分辨得了格式，分辨不了策略。
-    s02_cfg, s02_ticks, s02_lines = produced["s02_preempt_storm"]
-    alt_lines, _ = run(s02_cfg, s02_ticks, variant="oldest")
+    s02_cfg, _, s02_lines, s02_base = produced["s02_preempt_storm"]
+    # 只跑主干、不补回收拍：回收拍是策略相关的（缓存量不同），喂给另一种策略会
+    # 触发"归还数超过缓存数"。抗原要验的是"输出字节不同"，不是"输入序列不同"。
+    alt_lines, _ = run(s02_cfg, s02_base, variant="oldest")
     write("alt.trace", alt_lines)
     if alt_lines == s02_lines:
         raise SystemExit("alt 策略与默认策略产生了同样的字节 —— 这条抗原无效")
