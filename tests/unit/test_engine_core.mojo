@@ -85,7 +85,10 @@ comptime DEEP_BLOCKS_PER_REQ = (DEEP_PROMPT + DEEP_GENS + DEEP_BLOCK - 1) // DEE
 # A budget the queue cannot fit in, with generations long enough that the
 # requests pile up instead of finishing one by one. Everything the cache is
 # tempted to keep, these five need.
-comptime DEEP_TIGHT_CAP = 48
+comptime DEEP_TIGHT_CAP = 60
+# 取 60 而不是更小的数：五条请求的稳态足迹合计 55 块，准入按水位的判据
+# 只在它们的足迹自己就越线时才挡。要验的是「已经跑完的请求把缓存留下、
+# 和队列抢同一份预算」，不是「门口把人劝回去」。
 comptime DEEP_TIGHT_REQS = 5
 comptime DEEP_TIGHT_PROMPT = 37
 comptime DEEP_TIGHT_GENS = 5
@@ -234,28 +237,35 @@ def test_two_requests_share_one_step() raises:
 
 
 def test_preemption_is_exercised_and_the_request_still_finishes() raises:
-    """Four requests, room for three: something has to be thrown away.
+    """失效的成本落在缓存上 —— 而不是落在「四条并发把池子撑爆」上。
 
-    The gate asserts that it *was*. A suite that only ever runs the happy path
-    would leave this claim untested while appearing to cover it.
+    四条请求分两批到达。前两条先跑完，把整条序列发布进前缀缓存；缓存没有
+    可以被驱逐的请求，所以它不可抢占。后两条到达时，它们自己的稳态足迹
+    （合计 4 块）仍在水位之内，准入放行；但叠上缓存之后 blocks_used 越线，
+    第 9 步就在这里把正在跑的请求顶出去。
+
+    旧写法是让四条并发把足迹堆过水位来挤出一次抢占 —— 那样的状态现在进不
+    来：准入会在门口挡掉它，因为那样的状态本来谁也跑不完。    这条门要验的就是「抢占发生了，而且受害者重算之后仍然跑完」。
     """
     var arena = Arena(1 << 16)
-    # 4 blocks of 16 tokens, watermark 900‰ → a fourth decoder is evicted.
-    #
-    # 容量取 6：四条请求各自 16 个 prompt + 3 个生成 = 19 个 token = 2 块，四条
-    # 共 8 块，装不下。
-    #
-    # 这里曾经写的是 8（正好装下），理由是"容量若真按装不下设，池子会先被缓存占
-    # 住"——也就是说，那扇门是靠缓存不肯让位才挤出一次抢占的。那个 bug 已经修了
-    # （缓存现在会让位给排队的人），于是 8 不再触发任何抢占，门也就不再验它声称
-    # 要验的东西。现在容量是真的装不下，抢占是真的因为装不下。
-    var core = toy_core(SchedConfig(ROWS, ROWS, 16, 6, 900, 8))
-    var toks = int_map(arena.alloc(256 * 8))
-    for i in range(4):
-        var req = 40 + i * 20
-        core.submit(req, toks, fill(toks, req, 16), 3)
+    # 水位 5 块 = 容量 8 × 625‰。前两条跑完留下 4 块缓存；后两条的稳态足迹
+    # 4 块（准入放行），叠加缓存后 8 块 —— 正好压住硬容量而不越过它。
+    var core = toy_core(SchedConfig(ROWS, ROWS, 16, 8, 625, 8))
 
+    # 第一批：跑完之后，整条序列以缓存的形式留在池子里。
+    for i in range(2):
+        var req = 40 + i * 20
+        var own = int_map(arena.alloc(256 * 8))
+        core.submit(req, own, fill(own, req, 16), 3)
     _ = drive(core, arena)
+
+    # 第二批：缓存已经占了 4 块，这两条会让 blocks_used 越过水位。
+    for i in range(2, 4):
+        var req = 40 + i * 20
+        var own = int_map(arena.alloc(256 * 8))
+        core.submit(req, own, fill(own, req, 16), 3)
+    _ = drive(core, arena)
+
     assert_true(core.preempt_total() > 0, "nothing was ever preempted")
     for i in range(4):
         var req = 40 + i * 20

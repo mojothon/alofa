@@ -137,6 +137,19 @@ class Scheduler:
             raise ValueError(f"duplicate request id {req}")
         if blocks_for(prompt_len, self.cfg.block_size) > self.cfg.capacity:
             raise ValueError(f"prompt {prompt_len} does not fit the kv pool")
+        # 准入按水位判据，而不是原始容量：一旦并发序列的稳态足迹超过
+        # threshold()，第 9 步就会每拍抢占，而被抢占者从零重算 —— 谁也跑不完。
+        # 在这里拒绝，是为了让那个状态不可达。首个请求一律准入，否则过紧的
+        # 水位会一条都进不来。缓存不计入判据：它不可抢占，不是并发足迹。
+        committed = 0
+        for i in range(MAX_BATCH):
+            if self.state[i] != ST_FREE:
+                committed += blocks_for(
+                    self.prompt_len[i] + self.max_new[i], self.cfg.block_size
+                )
+        whole = blocks_for(prompt_len + max_new, self.cfg.block_size)
+        if committed > 0 and committed + whole > self.cfg.threshold():
+            raise ValueError("concurrent sequences exceed the kv watermark")
         slot = next((i for i in range(MAX_BATCH) if self.state[i] == ST_FREE), -1)
         if slot < 0:
             raise ValueError("scheduler is full")
@@ -394,13 +407,21 @@ def scenarios():
     ticks = [([(1, 300, 8)], [], [])] + empty(31)
     out.append(("s01_long_prompt", cfg, ticks))
 
-    # 2. 并发抢占风暴：6 个请求 × 64 token，各生成 8 token（含 decode 后每个
-    #    最多 5 块 = 30 块），池子 32 块、水位 600‰（阈值 19 块）→ 抢占必须真
-    #    的发生。工作集（30 块）故意留在硬容量（32 块）之内：一旦它顶到硬容量，
-    #    调度器会按设计报 ERR_CAPACITY（宁可响亮地失败，也不静默抖动），
-    #    那是另一条断言（见 test_scheduler.mojo），不是这个场景要验的东西。
-    cfg = Config(budget=32, chunk=32, block_size=16, capacity=32, watermark=600, max_wait=8)
-    ticks = [([(i, 64, 8) for i in range(1, 7)], [], [])] + empty(39)
+    # 2. 并发抢占风暴：超限不再由「并发足迹顶破水位」制造 —— 那样的 state 现在被
+    #    准入拦在门外，而它本也不该到达（抢占者跑不完）。改由**前缀缓存**制造：
+    #    前两条跑完，各自把整条序列发布进缓存（缓存不可抢占），把 blocks_used
+    #    顶到阈值；随后三条并发到达 —— 它们自身的稳态足迹合规、准入放行，但叠加
+    #    缓存后就过线了，第 9 步开始抢占，受害者从零重算，形成风暴。
+    #    收尾靠 reclaim_tail 补的「引擎归还缓存」：缓存一退，请求才跑得完。
+    cfg = Config(budget=32, chunk=32, block_size=16, capacity=12, watermark=500, max_wait=8)
+    ticks = (
+        [([(1, 16, 1)], [], [])]
+        + empty(3)
+        + [([(2, 16, 1)], [], [])]
+        + empty(3)
+        + [([(3, 16, 3), (4, 16, 3), (5, 16, 3)], [], [])]
+        + empty(40)
+    )
     out.append(("s02_preempt_storm", cfg, ticks))
 
     # 3. 预算耗尽：预算 8、4 个请求各 32 token → 每拍最多 8 个 token。
@@ -424,9 +445,20 @@ def scenarios():
     ] + empty(8)
     out.append(("s05_cancel_race", cfg, ticks))
 
-    # 6. KV 水位临界：池子刚好装得下全部 prompt，decode 一涨就过水位 → 抢占。
-    cfg = Config(budget=32, chunk=32, block_size=16, capacity=8, watermark=500, max_wait=8)
-    ticks = [([(1, 16, 3), (2, 16, 3), (3, 16, 3)], [], [])] + empty(23)
+    # 6. KV 水位临界：同 s02 的机制（缓存顶高 → 水位抢占），但池子更宽裕，用来验
+    #    「水位是策略线、硬容量是物理线」这两件事没有混起来：抢占全程把 blocks_used
+    #    拉回阈值之内，任何一拍都没有越过硬容量。
+    cfg = Config(budget=32, chunk=32, block_size=16, capacity=16, watermark=500, max_wait=8)
+    ticks = (
+        [([(1, 16, 1)], [], [])]
+        + empty(3)
+        + [([(2, 16, 1)], [], [])]
+        + empty(3)
+        + [([(3, 16, 1)], [], [])]
+        + empty(3)
+        + [([(4, 16, 3), (5, 16, 3), (6, 16, 3)], [], [])]
+        + empty(40)
+    )
     out.append(("s06_kv_watermark", cfg, ticks))
 
     # 7. 前缀缓存归还：完成即发布到缓存（块换了主人，没回池子），只有引擎的

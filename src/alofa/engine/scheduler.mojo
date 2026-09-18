@@ -490,6 +490,24 @@ struct Scheduler:
         var need = blocks_for(prompt_len, self.cfg.block_size)
         if need > self.cfg.capacity_blocks:
             raise AlofaError(ERR_CAPACITY, "prompt does not fit in the kv pool")
+        # Admission is judged against the watermark, not the raw capacity:
+        # once the steady-state footprint of the concurrent sequences passes
+        # `threshold_blocks()`, step 9 preempts on every tick and a preempted
+        # request restarts from zero, so nothing ever finishes. Refusing here
+        # keeps that state unreachable. The first request is always admitted,
+        # otherwise a tight watermark could admit nobody at all.
+        var committed = 0
+        for i in range(MAX_BATCH):
+            if self.state[i] != ST_FREE:
+                committed += blocks_for(
+                    self.prompt_len[i] + self.max_new[i], self.cfg.block_size
+                )
+        var whole = blocks_for(prompt_len + max_new, self.cfg.block_size)
+        if committed > 0:
+            if committed + whole > self.cfg.threshold_blocks():
+                raise AlofaError(
+                    ERR_CAPACITY, "concurrent sequences exceed the kv watermark"
+                )
         var slot = -1
         var i = 0
         while slot < 0 and i < MAX_BATCH:
