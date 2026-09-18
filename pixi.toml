@@ -23,10 +23,9 @@ test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capabi
 # 逐 token 相同（greedy，所以一个 token 不同就是一个不同）。它跑的是真实的 0.5B
 # 权重，所以要 build 再跑，也因此没有并入 test —— 与 test-model / test-q4 同理。
 test-batch-forward = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_batch_forward.mojo -o target/batch_forward && ./target/batch_forward"
-# CI 监视：`gh run watch` 在非交互模式下报 "run ID required when not running
-# interactively"，因为它不会替你猜要看哪一次运行。所以必须先取 run-id 再喂进去。
-# 用 `-q '.[0].databaseId'` 取最新一次；`--interval 10` 免得每 3 秒打一次 GitHub API。
-ci-watch = "gh run watch $(gh run list --limit 1 --json databaseId -q '.[0].databaseId') --exit-status --interval 10"
+# CI 监视：见 scripts/ci_watch.sh —— 绑定到当前 HEAD 的运行，而不是列表第一条，
+# 否则推送刚落地的几秒里会误监视到上一次运行（往往是上一次的失败），结论相反。
+ci-watch = "scripts/ci_watch.sh"
 # 整网数值门：标量后端跑 4 条 prompt 的 prefill + 128 token greedy 需要几分钟，
 # 所以必须先 build 再跑（mojo run 的默认优化级别下要慢一个数量级），也因此没有
 # 并入 test —— 它仍然由 scripts/dump_model_reference.py --full 的本地产物驱动。
