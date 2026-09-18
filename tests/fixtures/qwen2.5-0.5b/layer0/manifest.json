@@ -1,0 +1,14 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B",
+ "layer": 0,
+ "n_tokens": 16,
+ "n_tensors": 26,
+ "payload_bytes": 9088512,
+ "python": "3.11.3",
+ "generated_with": "scripts/dump_model_reference.py",
+ "n_prompts": 4,
+ "vocab_size": 151936,
+ "greedy_tokens": 128,
+ "max_positions": 512,
+ "weights_bytes": 1976393216
+}

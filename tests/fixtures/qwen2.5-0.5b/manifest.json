@@ -1,0 +1,7 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B",
+ "vocab_size": 151665,
+ "n_cases": 5736,
+ "python": "3.11.3",
+ "generated_with": "scripts/dump_reference.py"
+}

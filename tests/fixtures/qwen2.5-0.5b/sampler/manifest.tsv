@@ -1,0 +1,9 @@
+generator	scripts/dump_sampler_reference.py
+seed	1885667171979196296
+vocab	151936
+n_prompts	4
+n_cases	9
+n_export_draws	64
+n_sample_ids	32
+n_dist_samples	50000
+min_tokens_to_keep	1

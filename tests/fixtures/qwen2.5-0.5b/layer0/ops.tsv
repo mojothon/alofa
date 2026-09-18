@@ -1,0 +1,11 @@
+rmsnorm	embed_out,norm_w	norm_out
+linear_bias	norm_out,q_w,q_b	q_out
+linear_bias	norm_out,k_w,k_b	k_out
+linear_bias	norm_out,v_w,v_b	v_out
+rope	q_out,k_out,cos,sin	q_rot,k_rot
+attention	q_rot,k_rot,v_out	attn_out
+linear	attn_out,o_w	o_out
+add	embed_out,o_out	hidden1
+rmsnorm	hidden1,norm2_w	norm2_out
+silu	gate_out	silu_out
+swiglu	gate_out,up_out	swiglu_out

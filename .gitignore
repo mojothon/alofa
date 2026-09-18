@@ -38,3 +38,6 @@ tmp/
 
 # AI 工具本地工作数据（含对项目的内部判断，不属于源码）
 .codebuddy/
+
+# 测试夹具中的模型权重（1.9 GB，不入库；其余小夹具需要入库，CI 依赖它们）
+tests/fixtures/qwen2.5-0.5b/weights/tensors.f32
