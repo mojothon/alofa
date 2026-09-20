@@ -231,6 +231,55 @@ def swiglu(dst: TensorView, gate: TensorView, up: TensorView) raises AlofaError:
         )
 
 
+def rope_shapes(
+    out_q: TensorView,
+    out_k: TensorView,
+    q: TensorView,
+    k: TensorView,
+    cos: TensorView,
+    sin: TensorView,
+    head_dim: Int,
+) raises AlofaError -> Int:
+    """`rope` 的形状契约；返回 token 数，其余维度调用方自己从 view 上读。
+
+    两个后端共用这一份检查，而不是各抄一遍：形状契约抄两遍就会漂移，而漂移的
+    那一侧会以「形状检查通过、但读到了别人的内存」的形式出现 —— 那是比数值不
+    一致难查得多的失败。
+
+    这里只判契约、不碰算术，所以把标量版改成调它不会改变算出的任何一个数。
+    """
+    if head_dim <= 0 or head_dim % 2 != 0:
+        raise AlofaError(
+            ERR_UNSUPPORTED,
+            "head dimension must be positive and even",
+            "head_dim=" + String(head_dim),
+        )
+    var tokens = rows_of(q, "q")
+    var q_cols = cols_of(q, "q")
+    var k_cols = cols_of(k, "k")
+    if rows_of(k, "k") != tokens:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH, "q and k must have the same token count", ""
+        )
+    if q_cols % head_dim != 0 or k_cols % head_dim != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "channel count is not a whole number of heads",
+            "q_cols=" + String(q_cols) + " k_cols=" + String(k_cols),
+        )
+    expect_matrix(out_q, tokens, q_cols, "out_q")
+    expect_matrix(out_k, tokens, k_cols, "out_k")
+    # The tables are per token over one head's channels, `[tokens, head_dim]`.
+    if rows_of(cos, "cos") < tokens or cols_of(cos, "cos") != head_dim:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "cos table must be [tokens, head_dim]",
+            "rows=" + String(rows_of(cos, "cos")) + " cols=" + String(cols_of(cos, "cos")),
+        )
+    expect_matrix(sin, rows_of(cos, "cos"), head_dim, "sin")
+    return tokens
+
+
 def rope(
     out_q: TensorView,
     out_k: TensorView,
@@ -257,36 +306,10 @@ def rope(
     The tables are indexed by token, so a caller decoding from a KV cache passes
     the row for the token's absolute position, not for its index in the batch.
     """
-    if head_dim <= 0 or head_dim % 2 != 0:
-        raise AlofaError(
-            ERR_UNSUPPORTED,
-            "head dimension must be positive and even",
-            "head_dim=" + String(head_dim),
-        )
-    var tokens = rows_of(q, "q")
+    var tokens = rope_shapes(out_q, out_k, q, k, cos, sin, head_dim)
     var q_cols = cols_of(q, "q")
     var k_cols = cols_of(k, "k")
-    if rows_of(k, "k") != tokens:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH, "q and k must have the same token count", ""
-        )
-    if q_cols % head_dim != 0 or k_cols % head_dim != 0:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH,
-            "channel count is not a whole number of heads",
-            "q_cols=" + String(q_cols) + " k_cols=" + String(k_cols),
-        )
-    expect_matrix(out_q, tokens, q_cols, "out_q")
-    expect_matrix(out_k, tokens, k_cols, "out_k")
     var half = head_dim // 2
-    # The tables are per token over one head's channels, `[tokens, head_dim]`.
-    if rows_of(cos, "cos") < tokens or cols_of(cos, "cos") != head_dim:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH,
-            "cos table must be [tokens, head_dim]",
-            "rows=" + String(rows_of(cos, "cos")) + " cols=" + String(cols_of(cos, "cos")),
-        )
-    expect_matrix(sin, rows_of(cos, "cos"), head_dim, "sin")
 
     var pq = f32_data(q)
     var pk = f32_data(k)
@@ -319,6 +342,51 @@ def rope(
                 pok[unsafe_offset=base + d + half] = b * pc[
                     unsafe_offset=table + d + half
                 ] + a * ps[unsafe_offset=table + d + half]
+
+
+def attention_shapes(
+    dst: TensorView,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    scores: TensorView,
+    n_heads: Int,
+    n_kv_heads: Int,
+    head_dim: Int,
+) raises AlofaError -> Int:
+    """`attention` 的形状契约；返回 query 条数，key 条数调用方自己从 `k` 上读。
+
+    与 `rope_shapes` 同理：两后端共用一份，只判契约不碰算术。
+    """
+    if n_heads <= 0 or n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
+        raise AlofaError(
+            ERR_UNSUPPORTED,
+            "head counts must be positive with n_kv_heads dividing n_heads",
+            "n_heads=" + String(n_heads) + " n_kv_heads=" + String(n_kv_heads),
+        )
+    var q_len = rows_of(q, "q")
+    var kv_len = rows_of(k, "k")
+    if rows_of(v, "v") != kv_len:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH, "k and v must have the same token count", ""
+        )
+    if q_len > kv_len:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "more queries than keys: a query cannot attend to the future",
+            "q_len=" + String(q_len) + " kv_len=" + String(kv_len),
+        )
+    expect_matrix(q, q_len, n_heads * head_dim, "q")
+    expect_matrix(dst, q_len, n_heads * head_dim, "dst")
+    expect_matrix(k, kv_len, n_kv_heads * head_dim, "k")
+    expect_matrix(v, kv_len, n_kv_heads * head_dim, "v")
+    if scores.numel() < q_len * kv_len:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "score scratch is too small",
+            "got=" + String(scores.numel()) + " want=" + String(q_len * kv_len),
+        )
+    return q_len
 
 
 def attention(
@@ -354,34 +422,8 @@ def attention(
     that a disagreement with a fused backend can be localized to the pass that
     differs.
     """
-    if n_heads <= 0 or n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
-        raise AlofaError(
-            ERR_UNSUPPORTED,
-            "head counts must be positive with n_kv_heads dividing n_heads",
-            "n_heads=" + String(n_heads) + " n_kv_heads=" + String(n_kv_heads),
-        )
-    var q_len = rows_of(q, "q")
+    var q_len = attention_shapes(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
     var kv_len = rows_of(k, "k")
-    if rows_of(v, "v") != kv_len:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH, "k and v must have the same token count", ""
-        )
-    if q_len > kv_len:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH,
-            "more queries than keys: a query cannot attend to the future",
-            "q_len=" + String(q_len) + " kv_len=" + String(kv_len),
-        )
-    expect_matrix(q, q_len, n_heads * head_dim, "q")
-    expect_matrix(dst, q_len, n_heads * head_dim, "dst")
-    expect_matrix(k, kv_len, n_kv_heads * head_dim, "k")
-    expect_matrix(v, kv_len, n_kv_heads * head_dim, "v")
-    if scores.numel() < q_len * kv_len:
-        raise AlofaError(
-            ERR_SHAPE_MISMATCH,
-            "score scratch is too small",
-            "got=" + String(scores.numel()) + " want=" + String(q_len * kv_len),
-        )
 
     var pq = f32_data(q)
     var pk = f32_data(k)

@@ -43,11 +43,18 @@ from alofa.kernels.cpu.quant import (
     matmul_q4_f32_bias,
     quantize_q4_0,
 )
+
+from alofa.kernels.cpu.avx2 import (
+    matmul_q4_f32 as matmul_q4_f32_vec,
+    matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
+)
 from alofa.kernels.cpu.avx2 import (
     add as add_vec,
+    attention as attention_vec,
     linear as linear_vec,
     linear_bias as linear_bias_vec,
     rmsnorm as rmsnorm_vec,
+    rope as rope_vec,
     swiglu as swiglu_vec,
 )
 from alofa.kernels.cpu.scalar import (
@@ -92,7 +99,8 @@ comptime Q4_NO_SLOT = -1
 #
 # ⚠️ 不是所有算子都有向量版本：`rope` 与 `attention` 本轮只有标量实现，整网
 # 跑在 `BACKEND_AVX2` 上时它们仍然走标量。这一点写在 `backend_label` 的文档与
-# 账本里，不假装覆盖。
+# 账本里，不假装覆盖。（量化通路 2026-09-20 起**有**向量实现了，见
+# `q4_matmul_k`；那条注释曾在三处说过它「只有标量」，现已一并改掉。）
 #
 # ⚠️ 后端是**方法**的参数，不是结构体的参数。不是设计偏好，是被编译器逼的：
 # Mojo 1.0.0（ed45d567）在"参数化结构体 + 会抛错误的构造函数"上会直接把编译
@@ -125,7 +133,8 @@ def backend_label[backend: Int]() -> String:
     判断，比各写一遍更难说谎。
 
     ⚠️ 它说明的是"这一次前向用了哪套算子实现"，**不等于**"每个算子都向量化
-    了"：`rope`、`attention`，以及量化通路目前只有标量实现。
+    了"：`rope` 与 `attention` 仍然只有标量实现，向量后端里它们走标量。
+    （量化通路曾经也在这个名单里，2026-09-20 起已随 `q4_matmul_k` 分后端。）
     """
     comptime if uses_vector_backend[backend]():
         return "avx2"
@@ -161,6 +170,30 @@ def linear_bias_k[backend: Int](
         linear_bias(dst, x, w, b)
 
 
+def q4_matmul_k[backend: Int](
+    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int
+) raises AlofaError:
+    """按 `backend` 分发的 q4_0 融合投影（无偏置）。
+
+    两条实现的契约与数值完全一致（向量版对同一份 fixture 的九条用例与标量版同为
+    逐位一致，见 `tests/unit/test_q4_matmul_vec.mojo`），差别只是速度。
+    """
+    comptime if uses_vector_backend[backend]():
+        matmul_q4_f32_vec(dst, x, blocks, rows, cols)
+    else:
+        matmul_q4_f32(dst, x, blocks, rows, cols)
+
+
+def q4_matmul_bias_k[backend: Int](
+    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int, bias: F32Ptr
+) raises AlofaError:
+    """按 `backend` 分发的 q4_0 融合投影（带偏置）。"""
+    comptime if uses_vector_backend[backend]():
+        matmul_q4_f32_bias_vec(dst, x, blocks, rows, cols, bias)
+    else:
+        matmul_q4_f32_bias(dst, x, blocks, rows, cols, bias)
+
+
 def add_k[backend: Int](dst: TensorView, a: TensorView, b: TensorView) raises AlofaError:
     """按 `backend` 分发的逐元素加。"""
     comptime if uses_vector_backend[backend]():
@@ -177,6 +210,39 @@ def swiglu_k[backend: Int](
         swiglu_vec(dst, gate, up)
     else:
         swiglu(dst, gate, up)
+
+
+def rope_k[backend: Int](
+    out_q: TensorView,
+    out_k: TensorView,
+    q: TensorView,
+    k: TensorView,
+    cos: TensorView,
+    sin: TensorView,
+    head_dim: Int,
+) raises AlofaError:
+    """按 `backend` 分发的旋转位置编码。"""
+    comptime if uses_vector_backend[backend]():
+        rope_vec(out_q, out_k, q, k, cos, sin, head_dim)
+    else:
+        rope(out_q, out_k, q, k, cos, sin, head_dim)
+
+
+def attention_k[backend: Int](
+    dst: TensorView,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    scores: TensorView,
+    n_heads: Int,
+    n_kv_heads: Int,
+    head_dim: Int,
+) raises AlofaError:
+    """按 `backend` 分发的注意力。"""
+    comptime if uses_vector_backend[backend]():
+        attention_vec(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
+    else:
+        attention(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
 
 
 def q4_slot_count(n_layers: Int) -> Int:
@@ -451,6 +517,7 @@ struct QwenForward(Movable):
         ⚠️ 只有 fp32 通路分后端；量化通路（`matmul_q4_f32`）本轮只有标量实现，
         `backend` 参数在量化通路上不起作用，这一点没写在调用点上 —— 因为"量化
         通路还有没有向量实现"是一个会在下一轮变的事实，而签名不该跟着翻烧饼。
+        （2026-09-20：它变了。现在两条通路都按 `backend` 分发。）
         """
         if not self.q4_enabled or slot == Q4_NO_SLOT:
             if has_bias:
@@ -485,9 +552,11 @@ struct QwenForward(Movable):
             var out_row = dst_p.unsafe_offset(r * out * 4)
             var in_row = x_p.unsafe_offset(r * cols * 4)
             if has_bias:
-                matmul_q4_f32_bias(out_row, in_row, blocks, out, cols, f32_data(bias))
+                q4_matmul_bias_k[backend](
+                    out_row, in_row, blocks, out, cols, f32_data(bias)
+                )
             else:
-                matmul_q4_f32(out_row, in_row, blocks, out, cols)
+                q4_matmul_k[backend](out_row, in_row, blocks, out, cols)
 
     def require(imm self, name: String) raises AlofaError:
         """Fail with the parameter's name if it is not in the file."""
@@ -629,7 +698,7 @@ struct QwenForward(Movable):
                 self.params.view(p + "self_attn.v_proj.bias"),
                 True,
             )
-            rope(q_rot, k_rot, q, k, table_cos, table_sin, self.cfg.head_dim)
+            rope_k[backend](q_rot, k_rot, q, k, table_cos, table_sin, self.cfg.head_dim)
 
             # Append this step's keys and values, then attend over everything
             # stored so far — the store is what makes the two phases the same
@@ -637,7 +706,7 @@ struct QwenForward(Movable):
             copy_into(self.k_store[layer], pos0 * kv_dim, k_rot, t * kv_dim)
             copy_into(self.v_store[layer], pos0 * kv_dim, v, t * kv_dim)
 
-            attention(
+            attention_k[backend](
                 attn_out,
                 q_rot,
                 rows_view(self.k_store[layer], kv_len, kv_dim),
