@@ -120,6 +120,77 @@ def rmsnorm(
             col += 1
 
 
+def _gemm_tile[RB: Int](
+    po: F32Ptr,
+    px: F32Ptr,
+    pw: F32Ptr,
+    bias: F32Ptr,
+    has_bias: Bool,
+    row0: Int,
+    cols: Int,
+    inner: Int,
+) -> None:
+    """`RB` 行 × 全部 `cols` 列：列外层、`k` 中层、行内层。
+
+    循环次序是**唯一**被改动的东西：老写法是「行外层、列内层」，于是 `w` 的
+    每一列在每一行上都被重读一遍 —— 一个 `rows` 行的前向把整个权重矩阵读了
+    `rows` 遍。批 = 8 的 decode 和 32 token 的 prefill，摊到每个 token 上的
+    字节数和批 = 1 一样（fp32 每 token 1.976 GB）。
+
+    这里把 `RB` 行捏成一块，一块走完一遍 `w`：`w[col][:]` 从 DRAM 进来一次，
+    被 `RB` 行复用。于是权重总流量除以约 `RB`（严格是 `rows / ceil(rows/RB)`）。
+    量出来的证据在 `scripts/bench_gemm_rows.mojo`。
+
+    ⚠️ **逐位兼容是硬约束，不是"在容差内"**：每个输出各自一个 f64×4 累加器，
+    按**同样的 `k` 次序**累加，求和顺序与老写法一步一步对应 ——
+    ① 偏置进 0 号通道（只加一次，见 `_gemm` 的注释）；② 4 个一组做乘加；
+    ③ `reduce_add()`；④ `inner % 4` 的尾巴**顺序**加在 reduce 之后（所以
+    `tail[r]` 的初值是 `reduce_add()` 的结果，不是 0 —— 浮点加法不满足结合律，
+    `0+t0+t1` 与 `r+t0+t1` 是两个数）。切分/换序不改变任何一次浮点运算，
+    差 1 ulp 就是 bug。
+
+    `RB` 取 1/2/4/8 由 `_gemm` 按剩余行数派发：`RB` 行累加器要占 `RB` 个
+    ymm 寄存器，取 16 会溢出到栈而失去意义。
+    """
+    var acc = InlineArray[SIMD[DType.float64, W_F64], RB](
+        fill=SIMD[DType.float64, W_F64](Float64(0))
+    )
+    var tail = InlineArray[Float64, RB](fill=Float64(0))
+    for col in range(cols):
+        var w_base = col * inner
+
+        comptime for r in range(RB):
+            acc[r] = SIMD[DType.float64, W_F64](Float64(0))
+            if has_bias:
+                acc[r][0] = Float64(bias[unsafe_offset=col])
+        var k = 0
+        while k + W_F64 <= inner:
+            var wv = pw.unsafe_load[width=W_F64](w_base + k).cast[
+                DType.float64
+            ]()
+
+            comptime for r in range(RB):
+                var xv = px.unsafe_load[width=W_F64](
+                    (row0 + r) * inner + k
+                ).cast[DType.float64]()
+                acc[r] += xv * wv
+            k += W_F64
+
+        comptime for r in range(RB):
+            tail[r] = acc[r].reduce_add()
+        while k < inner:
+            var wk = Float64(pw[unsafe_offset=w_base + k])
+
+            comptime for r in range(RB):
+                tail[r] += Float64(
+                    px[unsafe_offset=(row0 + r) * inner + k]
+                ) * wk
+            k += 1
+
+        comptime for r in range(RB):
+            po[unsafe_offset=(row0 + r) * cols + col] = Float32(tail[r])
+
+
 def _gemm(
     dst: TensorView,
     x: TensorView,
@@ -131,6 +202,10 @@ def _gemm(
 
     内层在 f64 通道里跑，理由写在文件头。偏置先播进累加器（而不是最后再加），
     与标量版一致 —— 浮点加法不满足结合律，"先加"和"后加"是两个数。
+
+    行按 8/4/2/1 分块交给 `_gemm_tile`，块内权重只读一遍：
+    **批和预填的每 token 字节数因此除以约 `RB`**，这是唯一被改的东西
+    （`rows == 1` 的那条 decode 通路形状与老写法一致）。
     """
     var rows = rows_of(x, "x")
     var inner = cols_of(x, "x")
@@ -147,34 +222,21 @@ def _gemm(
     var pw = f32_data(w)
     var po = f32_data(dst)
 
-    for row in range(rows):
-        var x_base = row * inner
-        for col in range(cols):
-            var w_base = col * inner
-            var acc = SIMD[DType.float64, W_F64](Float64(0))
-            if has_bias:
-                # 偏置只加**一次**：放在 0 号通道里，其余通道是 0。播满四条通道
-                # 会让偏置被加四遍 —— 那不是"差一点"，是错四倍，而且只在带偏置
-                # 的投影上错（Qwen2 的 q/k/v 恰好都是），不带的那些全对，于是
-                # 很容易被当成"某个 head 的问题"。
-                acc[0] = Float64(bias[unsafe_offset=col])
-            var k = 0
-            while k + W_F64 <= inner:
-                var xv = px.unsafe_load[width=W_F64](x_base + k).cast[
-                    DType.float64
-                ]()
-                var wv = pw.unsafe_load[width=W_F64](w_base + k).cast[
-                    DType.float64
-                ]()
-                acc += xv * wv
-                k += W_F64
-            var total = acc.reduce_add()
-            while k < inner:
-                total += Float64(px[unsafe_offset=x_base + k]) * Float64(
-                    pw[unsafe_offset=w_base + k]
-                )
-                k += 1
-            po[unsafe_offset=row * cols + col] = Float32(total)
+    var row = 0
+    while row < rows:
+        var left = rows - row
+        if left >= 8:
+            _gemm_tile[8](po, px, pw, bias, has_bias, row, cols, inner)
+            row += 8
+        elif left >= 4:
+            _gemm_tile[4](po, px, pw, bias, has_bias, row, cols, inner)
+            row += 4
+        elif left >= 2:
+            _gemm_tile[2](po, px, pw, bias, has_bias, row, cols, inner)
+            row += 2
+        else:
+            _gemm_tile[1](po, px, pw, bias, has_bias, row, cols, inner)
+            row += 1
 
 
 def linear(dst: TensorView, x: TensorView, w: TensorView) raises AlofaError:
