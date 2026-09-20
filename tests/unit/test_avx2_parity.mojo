@@ -30,17 +30,21 @@ from std.testing import TestSuite, assert_equal, assert_true
 from alofa.core.dtype import DT_FP32
 from alofa.core.memory import Arena
 from alofa.core.tensor import Shape, TensorView, f32_data
-from alofa.core.text import parse_float64, read_text
+from alofa.core.text import parse_float64, parse_int, read_text
 from alofa.kernels.cpu.avx2 import add as add_v
+from alofa.kernels.cpu.avx2 import attention as attention_v
 from alofa.kernels.cpu.avx2 import linear as linear_v
 from alofa.kernels.cpu.avx2 import linear_bias as linear_bias_v
 from alofa.kernels.cpu.avx2 import rmsnorm as rmsnorm_v
+from alofa.kernels.cpu.avx2 import rope as rope_v
 from alofa.kernels.cpu.avx2 import swiglu as swiglu_v
 from alofa.kernels.cpu.scalar import (
     add,
+    attention,
     linear,
     linear_bias,
     rmsnorm,
+    rope,
     swiglu,
 )
 from alofa.model.loader import TensorFile, config_value
@@ -172,6 +176,43 @@ def test_swiglu_matches_the_reference() raises:
     store.keep_alive()
 
 
+def test_rope_and_attention_match_the_reference() raises:
+    """`rope` 与 `attention` 的向量版对着 HF 导出的同一份输入输出判。
+
+    镜像 `test_layer0_parity.mojo` 里两个同名测试：同一 fixture、同一容差
+    （1e-5 × 量级），换一份 fixture 或放宽一点，这个门就再也说不清自己在判什么。
+    """
+    var store = TensorFile(FIXTURE)
+    var arena = Arena(1 << 20)
+    var head_dim = parse_int(config_value(CONFIG, "head_dim"))
+    var q = store.view("q_out")
+    var k = store.view("k_out")
+    var tokens = q.shape.dims[0]
+    var out_q = scratch(arena, tokens, q.shape.dims[1])
+    var out_k = scratch(arena, tokens, k.shape.dims[1])
+    rope_v(out_q, out_k, q, k, store.view("cos"), store.view("sin"), head_dim)
+    assert_close("rope.q", out_q, store.view("q_rot"))
+    assert_close("rope.k", out_k, store.view("k_rot"))
+
+    var n_heads = parse_int(config_value(CONFIG, "n_heads"))
+    var n_kv_heads = parse_int(config_value(CONFIG, "n_kv_heads"))
+    var attn = scratch(arena, tokens, n_heads * head_dim)
+    var scores = scratch(arena, tokens, tokens)
+    attention_v(
+        attn,
+        store.view("q_rot"),
+        store.view("k_rot"),
+        store.view("v_out"),
+        scores,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+    )
+    assert_close("attention", attn, store.view("attn_out"))
+    arena.keep_alive()
+    store.keep_alive()
+
+
 def assert_agree(op: String, got: TensorView, want: TensorView) raises:
     """两个后端对同一输入的差，按**该算子自己的量级**判。
 
@@ -241,8 +282,104 @@ def test_vector_kernels_agree_with_the_scalar_backend() raises:
     swiglu_v(vg, gate, store.view("up_out"))
     swiglu(sg, gate, store.view("up_out"))
     assert_agree("swiglu", vg, sg)
+
+    var head_dim = parse_int(config_value(CONFIG, "head_dim"))
+    var n_heads = parse_int(config_value(CONFIG, "n_heads"))
+    var n_kv_heads = parse_int(config_value(CONFIG, "n_kv_heads"))
+    var q_raw = store.view("q_out")
+    var k_raw = store.view("k_out")
+    var qv = scratch(arena, tokens, q_raw.shape.dims[1])
+    var qs = scratch(arena, tokens, q_raw.shape.dims[1])
+    var kv_vec = scratch(arena, tokens, k_raw.shape.dims[1])
+    var kv_sca = scratch(arena, tokens, k_raw.shape.dims[1])
+    rope_v(qv, kv_vec, q_raw, k_raw, store.view("cos"), store.view("sin"), head_dim)
+    rope(qs, kv_sca, q_raw, k_raw, store.view("cos"), store.view("sin"), head_dim)
+    assert_agree("rope.q", qv, qs)
+    assert_agree("rope.k", kv_vec, kv_sca)
+
+    var av = scratch(arena, tokens, n_heads * head_dim)
+    var sa_attn = scratch(arena, tokens, n_heads * head_dim)
+    var sv = scratch(arena, tokens, tokens)
+    var ss = scratch(arena, tokens, tokens)
+    attention_v(
+        av, qv, kv_vec, store.view("v_out"), sv, n_heads, n_kv_heads, head_dim
+    )
+    attention(
+        sa_attn, qs, kv_sca, store.view("v_out"), ss, n_heads, n_kv_heads, head_dim
+    )
+    assert_agree("attention", av, sa_attn)
     arena.keep_alive()
     store.keep_alive()
+
+
+def test_tail_is_written_when_the_shape_is_not_divisible() raises:
+    """负向对照：形状不整除时，`rope`/`attention` 的标量尾巴**必须被写到**。
+
+    `head_dim=6` 时半个头只有 3 个通道，凑不满一个 8 通道向量；注意力那 6 个通道
+    也凑不满两个 4 通道向量 —— 这两个形状让主循环**一次都不执行**，全程走尾巴。
+    fixture 里的 head_dim=64 恰好整除，于是尾巴从未被跑到；这里的 6 就是为了让它
+    被跑到。
+
+    输出先填哨兵：尾巴若被丢掉，最后一个元素仍是哨兵，这条会**具名失败**，而不
+    是"恰好整除所以看起来没事"。
+    """
+    var arena = Arena(1 << 16)
+    var head_dim = 6
+    var n_heads = 2
+    var n_kv_heads = 1
+    var tokens = 2
+    var kv_len = 3
+    var q_cols = n_heads * head_dim
+    var kv_cols = n_kv_heads * head_dim
+
+    var q = scratch(arena, tokens, q_cols)
+    var cos = scratch(arena, tokens, head_dim)
+    var sin = scratch(arena, tokens, head_dim)
+    for i in range(tokens * q_cols):
+        f32_data(q)[unsafe_offset=i] = Float32(i % 7) - Float32(3)
+    for i in range(tokens * head_dim):
+        f32_data(cos)[unsafe_offset=i] = Float32(i % 5) * Float32(0.25) - Float32(0.5)
+        f32_data(sin)[unsafe_offset=i] = Float32(i % 3) * Float32(0.125) - Float32(0.25)
+
+    var vq = scratch(arena, tokens, q_cols)
+    var vk = scratch(arena, tokens, q_cols)
+    var sq = scratch(arena, tokens, q_cols)
+    var sk = scratch(arena, tokens, q_cols)
+    for i in range(tokens * q_cols):
+        f32_data(vq)[unsafe_offset=i] = Float32(-7)
+        f32_data(vk)[unsafe_offset=i] = Float32(-7)
+        f32_data(sq)[unsafe_offset=i] = Float32(-7)
+        f32_data(sk)[unsafe_offset=i] = Float32(-7)
+
+    rope_v(vq, vk, q, q, cos, sin, head_dim)
+    rope(sq, sk, q, q, cos, sin, head_dim)
+    assert_agree("rope.tail", vq, sq)
+    assert_agree("rope.tail.k", vk, sk)
+    assert_true(
+        f32_data(vq)[unsafe_offset=tokens * q_cols - 1] != Float32(-7),
+        "rope 的最后一个元素还是哨兵 —— 向量 kernel 把标量尾巴丢掉了",
+    )
+
+    var ka = scratch(arena, kv_len, kv_cols)
+    var va = scratch(arena, kv_len, kv_cols)
+    for i in range(kv_len * kv_cols):
+        f32_data(ka)[unsafe_offset=i] = Float32(i % 5) * Float32(0.5) - Float32(1)
+        f32_data(va)[unsafe_offset=i] = Float32(i % 4) - Float32(1.5)
+    var out_v = scratch(arena, tokens, q_cols)
+    var out_s = scratch(arena, tokens, q_cols)
+    var sc_v = scratch(arena, tokens, kv_len)
+    var sc_s = scratch(arena, tokens, kv_len)
+    for i in range(tokens * q_cols):
+        f32_data(out_v)[unsafe_offset=i] = Float32(-7)
+        f32_data(out_s)[unsafe_offset=i] = Float32(-7)
+    attention_v(out_v, vq, ka, va, sc_v, n_heads, n_kv_heads, head_dim)
+    attention(out_s, sq, ka, va, sc_s, n_heads, n_kv_heads, head_dim)
+    assert_agree("attention.tail", out_v, out_s)
+    assert_true(
+        f32_data(out_v)[unsafe_offset=tokens * q_cols - 1] != Float32(-7),
+        "attention 的最后一个元素还是哨兵 —— 向量 kernel 把标量尾巴丢掉了",
+    )
+    arena.keep_alive()
 
 
 def add_head_only(dst: TensorView, a: TensorView, b: TensorView) raises:
