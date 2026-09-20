@@ -17,7 +17,7 @@
 > 这一点至关重要 —— 一个只会通过的门等于没有门。若有人删掉文件存在性检查，真账本依然"通过"，
 > 但这个 fixture 会让 `test_ledger.mojo` 立刻失败，暴露门已失效。
 
-**最后更新**：2026-09-17（第四次更新：**P2 调度器门打通** —— §7 执行编排层七行由 `missing` 升为 `verified`，另增两行写明本轮**刻意不做**的东西）
+**最后更新**：2026-09-18（**N/M 快照不再腐烂** —— 手写的测试条数全部升级为机器核验的 `evidence:…?count=N`，新增 `check-counts` 门与 `ledger-sync`；同时订正本轮暴露出的三处漂移）
 
 ---
 
@@ -45,10 +45,10 @@
 | 能力 | 状态 | 证据 / 说明 |
 |---|---|---|
 | Mojo 1.0.0 工具链可用 | `verified-env` | `probe:pixi run mojo --version` → `Mojo 1.0.0 (ed45d567)` |
-| libc FFI（`external_call`） | `verified` | `evidence:tests/capability/test_libc_ffi.mojo`（5/5 通过）<br>`pixi run mojo run tests/capability/test_libc_ffi.mojo` |
-| `socket()` / `epoll_create1()` / `timerfd_create()` / `eventfd()` | `verified` | `evidence:tests/capability/test_libc_ffi.mojo`（实测返回有效 fd 12/13/14/15） |
-| `setsockopt(SO_REUSEPORT)` | `verified` | `evidence:tests/capability/test_libc_ffi.mojo`（`test_reuseport_setsockopt`） |
-| **`flare` / `json` 可导入**（含 `flare.runtime.Reactor`、`flare.http.HttpServer`） | `verified` | `evidence:tests/capability/test_deps.mojo`（4/4 通过）<br>`pixi run mojo run tests/capability/test_deps.mojo`<br>注：import 在模块顶层，**编译失败即断言失败** |
+| libc FFI（`external_call`） | `verified` | `evidence:tests/capability/test_libc_ffi.mojo?count=5`<br>`pixi run mojo run tests/capability/test_libc_ffi.mojo` |
+| `socket()` / `epoll_create1()` / `timerfd_create()` / `eventfd()` | `verified` | `evidence:tests/capability/test_libc_ffi.mojo?count=5`（实测返回有效 fd 12/13/14/15） |
+| `setsockopt(SO_REUSEPORT)` | `verified` | `evidence:tests/capability/test_libc_ffi.mojo?count=5`（`test_reuseport_setsockopt`） |
+| **`flare` / `json` 可导入**（含 `flare.runtime.Reactor`、`flare.http.HttpServer`） | `verified` | `evidence:tests/capability/test_deps.mojo?count=4`<br>`pixi run mojo run tests/capability/test_deps.mojo`<br>注：import 在模块顶层，**编译失败即断言失败** |
 | **CUDA kernel 在 A100 上数值正确** | `verified-remote` | `evidence:tests/gpu/vecadd.mojo`（实测 `c[999] = 2997.0` ✓）<br>`./scripts/a100.sh run 4 tests/gpu/vecadd.mojo`<br>⚠️ 需 A100 远程机；本地跑必失败，故**不加入 `pixi run test`** |
 | `fork()` 多进程 | `partial` | 在编译产物中可用；**在 `mojo run`（JIT）下会崩溃编译器** → 只能由 e2e 套件验证 |
 | Mojo 标准库 async / 并发 | `missing` | 官方 roadmap Phase 2 **未开始** |
@@ -87,8 +87,8 @@
 
 | 后端 | 状态 | 证据 / 说明 |
 |---|---|---|
-| `scalar` (fp32) | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（13/13 通过，逐算子对 Hugging Face）<br>`evidence:tests/unit/test_model_parity.mojo`（整网 4/4 通过，含 128 token greedy 逐 token 相等）<br>作为数值 oracle：只按公式顺序写，**不做任何重排**，供后续向量后端对照 |
-| `avx2` (8×fp32 / 4×fp64) | `verified` | `evidence:tests/unit/test_avx2_parity.mojo`（7/7，已并入 `pixi run test`）：rmsnorm / q·k·v 投影 / o 投影 / 残差加 / 第二道 RMSNorm / swiglu，**与标量后端同一份 fixture、同一条容差**（`1e-5 × max(1, |参考|ₘₐₓ)`）<br>与标量后端**逐位相同**（五个算子最大绝对差实测 **0.0**）—— 这是量出来的，不是假设的：同一条比较在偏置写错时确实红过<br>累加仍在 **f64 通道**（4 道）：点积有抵消，换成 f32 累加时相对误差约 `√n · 2^-24`，抵消严重处能吃掉整个 1e-5 判据 —— 与标量同一理由，**这一层当判据不当最快路径**<br>⚠️ **本轮不宣称指令，也不宣称性能**：模块名说的是"按 8 通道 f32 / 4 通道 f64 写的向量 kernel"，是否真的降成 VEX 编码指令**没有做 objdump 核验**；性能数字要等 §10 roofline 接入后才有资格谈<br>负向对照专钉**尾巴**：fixture 里 896 / 4864 恰好都能被通道数整除，标量尾巴**从未被真正执行过**；故另写一个只跑主循环、丢掉尾巴的版本，喂长度 10（非 8 的倍数）的输入，必须判红（实测相差 10.0）<br>另有一条：主机若没有 AVX2 则**具名失败**，不静默跳过 —— 会跳过的门在 CI 上永远绿，而它绿的原因是没跑<br>**已接入整网（2026-09-17）**：`prefill` / `step` / `run` 带编译期参数 `backend`（`BACKEND_SCALAR` / `BACKEND_AVX2`），五个算子（rmsnorm / linear / linear_bias / add / swiglu）按它静态分发<br>`evidence:tests/unit/test_model_avx2_parity.mojo`（`pixi run test-model-avx2`，依赖 2 GB 权重，**不进 `pixi run test`**）：与标量整网门**同一批 prompt、同一段 fp32 参考、同一条判据**（logits 余弦 ≥ 0.999 且 argmax 全等、128 token greedy 逐 token 相等、逐 token 解码与整段 prefill 落点一致）<br>⚠️ **`rope` / `attention` 与量化通路仍只有标量实现** —— 整网跑在`BACKEND_AVX2` 上时它们是混跑的，不假装全覆盖<br>⚠️ **"跑的确实是向量后端"这件事，数值上证明不了**：两个后端在这些形状上逐位相同（这是设计目标，也是上一轮量出来的），任何数值比较都区分不了它们。守着它的是两样东西：① `backend_label` 与算子分发**共用同一个判断**（要谎报得把同一个判断改两遍）；② `pixi run test-backend-guard` 这道**编译期红测** —— `tests/fixtures/bad_backend.mojo` 必须编译失败且原因是 `unknown cpu backend`，否则拼错的后端常量会静默退化成标量、整网向量门照绿<br>⚠️ 后端是**方法**参数不是结构体参数，不是设计偏好：Mojo 1.0.0（ed45d567）在"参数化结构体 + 会抛错误的构造函数"上会直接把编译器进程搞崩，最小复现写在 `tests/fixtures/bad_backend.mojo` 的注释里<br>⚠️ 仍然**不宣称指令、不宣称性能** |
+| `scalar` (fp32) | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（逐算子对 Hugging Face）<br>`evidence:tests/unit/test_model_parity.mojo`（整网 4/4 通过，含 128 token greedy 逐 token 相等）<br>作为数值 oracle：只按公式顺序写，**不做任何重排**，供后续向量后端对照 |
+| `avx2` (8×fp32 / 4×fp64) | `verified` | `evidence:tests/unit/test_avx2_parity.mojo?count=9`（已并入 `pixi run test`）：rmsnorm / q·k·v 投影 / o 投影 / 残差加 / 第二道 RMSNorm / swiglu，**与标量后端同一份 fixture、同一条容差**（`1e-5 × max(1, |参考|ₘₐₓ)`）<br>与标量后端**逐位相同**（五个算子最大绝对差实测 **0.0**）—— 这是量出来的，不是假设的：同一条比较在偏置写错时确实红过<br>累加仍在 **f64 通道**（4 道）：点积有抵消，换成 f32 累加时相对误差约 `√n · 2^-24`，抵消严重处能吃掉整个 1e-5 判据 —— 与标量同一理由，**这一层当判据不当最快路径**<br>⚠️ **本轮不宣称指令，也不宣称性能**：模块名说的是"按 8 通道 f32 / 4 通道 f64 写的向量 kernel"，是否真的降成 VEX 编码指令**没有做 objdump 核验**；性能数字要等 §10 roofline 接入后才有资格谈<br>负向对照专钉**尾巴**：fixture 里 896 / 4864 恰好都能被通道数整除，标量尾巴**从未被真正执行过**；故另写一个只跑主循环、丢掉尾巴的版本，喂长度 10（非 8 的倍数）的输入，必须判红（实测相差 10.0）<br>另有一条：主机若没有 AVX2 则**具名失败**，不静默跳过 —— 会跳过的门在 CI 上永远绿，而它绿的原因是没跑<br>**已接入整网（2026-09-17）**：`prefill` / `step` / `run` 带编译期参数 `backend`（`BACKEND_SCALAR` / `BACKEND_AVX2`），五个算子（rmsnorm / linear / linear_bias / add / swiglu）按它静态分发<br>`evidence:tests/unit/test_model_avx2_parity.mojo`（`pixi run test-model-avx2`，依赖 2 GB 权重，**不进 `pixi run test`**）：与标量整网门**同一批 prompt、同一段 fp32 参考、同一条判据**（logits 余弦 ≥ 0.999 且 argmax 全等、128 token greedy 逐 token 相等、逐 token 解码与整段 prefill 落点一致）<br>⚠️ **`rope` / `attention` 仍只有标量实现** —— 整网跑在 `BACKEND_AVX2` 上时它们是混跑的，不假装全覆盖。（量化通路不属于这个名单了：2026-09-20 起它随 `q4_matmul_k[backend]` 分后端，见 §「matmul（q4 dequant 融合）」行与当日变更日志）<br>⚠️ **"跑的确实是向量后端"这件事，数值上证明不了**：两个后端在这些形状上逐位相同（这是设计目标，也是上一轮量出来的），任何数值比较都区分不了它们。守着它的是两样东西：① `backend_label` 与算子分发**共用同一个判断**（要谎报得把同一个判断改两遍）；② `pixi run test-backend-guard` 这道**编译期红测** —— `tests/fixtures/bad_backend.mojo` 必须编译失败且原因是 `unknown cpu backend`，否则拼错的后端常量会静默退化成标量、整网向量门照绿<br>⚠️ 后端是**方法**参数不是结构体参数，不是设计偏好：Mojo 1.0.0（ed45d567）在"参数化结构体 + 会抛错误的构造函数"上会直接把编译器进程搞崩，最小复现写在 `tests/fixtures/bad_backend.mojo` 的注释里<br>⚠️ 仍然**不宣称指令、不宣称性能** |
 | `avx512` (16×fp32) | `hardware-blocked` | 本机无此指令集 |
 | `neon` (4×fp32) | `hardware-blocked` | 本机为 x86 |
 | `cuda` (sm_80) | `partial` | 开发机 Maxwell sm_52 不可用；**但 A100 验证机已跑通端到端 kernel（§1.2）** → 不再是 `hardware-blocked`。正确性可验；**性能数字须标注共享环境并报 roofline 利用率** |
@@ -109,31 +109,31 @@
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| dtype 描述与量化元数据（含 q4_0 / q4_k / q8_0 块布局编译期元数据） | `verified` | `evidence:tests/unit/test_core_dtype.mojo`（10/10 通过） |
-| 张量视图（不拥有数据；形状 / 步幅 / 类型 / 偏移） | `verified` | `evidence:tests/unit/test_core_tensor.mojo`（11/11 通过） |
-| arena 分配器（bump + 对齐 + 整块重置） | `verified` | `evidence:tests/unit/test_core_memory.mojo`（9/9 通过） |
-| 只读文件映射 + 页缓存提示 | `verified` | `evidence:tests/unit/test_core_mmap.mojo`（7/7 通过；与 `FileHandle` 逐字节对比） |
-| 具名错误类型（`AlofaError` + 错误码常量） | `verified` | `evidence:tests/unit/test_core_error.mojo`（7/7 通过） |
-| 结构化日志（JSONL，`verify` 可直接解析） | `verified` | `evidence:tests/unit/test_core_log.mojo`（8/8 通过） |
-| 平台原语绑定（socket / epoll / timerfd / eventfd / openat / mmap / madvise / mlock） | `verified` | `evidence:tests/unit/test_core_ffi.mojo`（11/11 通过）<br>注：`tests/capability/test_libc_ffi.mojo` 是不依赖本项目的**平台探测**，与之互补 |
-| **分层守门**（L0 不得出现上层概念，含注释与 import） | `verified` | `evidence:tests/capability/test_layering.mojo`（4/4 通过）<br>`pixi run test` 每次执行；含**红测自检**：故意违规的文本必须被判违规，否则门本身失效 |
+| dtype 描述与量化元数据（含 q4_0 / q4_k / q8_0 块布局编译期元数据） | `verified` | `evidence:tests/unit/test_core_dtype.mojo?count=10` |
+| 张量视图（不拥有数据；形状 / 步幅 / 类型 / 偏移） | `verified` | `evidence:tests/unit/test_core_tensor.mojo?count=15` |
+| arena 分配器（bump + 对齐 + 整块重置） | `verified` | `evidence:tests/unit/test_core_memory.mojo?count=9` |
+| 只读文件映射 + 页缓存提示 | `verified` | `evidence:tests/unit/test_core_mmap.mojo?count=7`（；与 `FileHandle` 逐字节对比） |
+| 具名错误类型（`AlofaError` + 错误码常量） | `verified` | `evidence:tests/unit/test_core_error.mojo?count=7` |
+| 结构化日志（JSONL，`verify` 可直接解析） | `verified` | `evidence:tests/unit/test_core_log.mojo?count=8` |
+| 平台原语绑定（socket / epoll / timerfd / eventfd / openat / mmap / madvise / mlock） | `verified` | `evidence:tests/unit/test_core_ffi.mojo?count=11`<br>注：`tests/capability/test_libc_ffi.mojo` 是不依赖本项目的**平台探测**，与之互补 |
+| **分层守门**（L0 不得出现上层概念，含注释与 import） | `verified` | `evidence:tests/capability/test_layering.mojo?count=4`<br>`pixi run test` 每次执行；含**红测自检**：故意违规的文本必须被判违规，否则门本身失效 |
 
 ## 4. 算子层（L1）
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| 量化 dequant（q4_0） | `verified` | `evidence:tests/unit/test_q4_parity.mojo`（7/7，layer 0 四个真实投影矩阵，q_w/o_w 各 25088 块）**零容差逐位比较**<br>能做到零容差是因为可以：结果只取决于 4 位 nibble 与 fp16 缩放因子，两者都是精确的（半精度能表示的数单精度都能精确表示，故 fp16→fp32 是**精确转换**）—— 于是"差 1 ulp"不是舍入，是**布局读错**<br>块布局（32 值 / 18 字节、fp16 缩放小端、低半字节在前、`v=(nibble-8)*d`）是 **GGML q4_0 的外部事实**，故解量化属格式一致性检验<br>⚠️ **fp32→q4_0 的量化步是我方的格式转换，没有外部参照**，算法显式写在 `scripts/dump_q4_reference.py` 里；不许笼统写成"与 llama.cpp 一致"<br>两条负向对照常驻：高低半字节装反必须被零容差断言抓住；解出的值必须**确实**落在 `{-8d…7d}` 台阶上（否则"逐位相等"可能只是抄了原值） |
+| 量化 dequant（q4_0） | `verified` | `evidence:tests/unit/test_q4_parity.mojo?count=10`（layer 0 四个真实投影矩阵，q_w/o_w 各 25088 块）**零容差逐位比较**<br>能做到零容差是因为可以：结果只取决于 4 位 nibble 与 fp16 缩放因子，两者都是精确的（半精度能表示的数单精度都能精确表示，故 fp16→fp32 是**精确转换**）—— 于是"差 1 ulp"不是舍入，是**布局读错**<br>块布局（32 值 / 18 字节、fp16 缩放小端、低半字节在前、`v=(nibble-8)*d`）是 **GGML q4_0 的外部事实**，故解量化属格式一致性检验<br>⚠️ **fp32→q4_0 的量化步是我方的格式转换，没有外部参照**，算法显式写在 `scripts/dump_q4_reference.py` 里；不许笼统写成"与 llama.cpp 一致"<br>两条负向对照常驻：高低半字节装反必须被零容差断言抓住；解出的值必须**确实**落在 `{-8d…7d}` 台阶上（否则"逐位相等"可能只是抄了原值） |
 | 量化 dequant（q4_k / q8_0 / int8 / fp8） | `missing` | — |
-| **量化步（fp32 → q4_0 块流）** | `verified` | `evidence:tests/unit/test_q4_parity.mojo`（10/10：与 `scripts/dump_q4_reference.py` 的离线实现**逐字节相同**，1.03 MB 块流零容差）<br>取整规则是这里唯一值得一提的地方：`round` 取**最近、并列取偶**（IEEE 默认），改成截断会让每个值平均偏小半个台阶 —— **负向对照专门钉这一点**：测试里另写一个截断版量化器，它必须与参考相差若干字节（实测 641074 字节），否则"逐字节比较"根本没在比取整。这类错误最阴：输出照样流利，只是分布整体偏了一点点，任何带容差的判据都放它过去<br>**块内缩放因子改按 MSE 选（2026-09-17）**：仍是`一个 fp16 scale + 32 个 nibble` 的块布局，只是不再取 `amax/7` —— 先用 `amax/7` 起个头量化一次，再对固定的 nibble 取重建误差的最小二乘解`d* = Σ(x·s)/Σ(s²)`（`s = nibble - 8`），迭代两轮<br>为什么值得：朴素写法为了让最大值够到台阶顶，把台阶钉在分布最稀疏的地方；MSE 解允许最大值被裁掉一点点，把台阶挪到分布密集处。实测 q/k/v/o 四个矩阵（另加整网 3 个权重）：**相对 L2 误差 10.75% → 10.34%**（cos 0.9942 → 0.9947）<br>**第三条负向对照**：测试里另写一个只改缩放因子选法（`amax/7`）、取整规则保持一致的旧规则版本，它必须与参考不同（实测相差 121846 字节）。这条是必需的，因为**参照物（fixture）是同一次导出的产物**—— 把实现退回 `amax/7`，参照物会跟着一起退，逐字节比较照样绿<br>顺带纠正上一行的一个说法：Mojo 侧**会**量化（加载期 `enable_q4` 一次），只是**推理期不量化** |
+| **量化步（fp32 → q4_0 块流）** | `verified` | `evidence:tests/unit/test_q4_parity.mojo?count=10`（与 `scripts/dump_q4_reference.py` 的离线实现**逐字节相同**，1.03 MB 块流零容差）<br>取整规则是这里唯一值得一提的地方：`round` 取**最近、并列取偶**（IEEE 默认），改成截断会让每个值平均偏小半个台阶 —— **负向对照专门钉这一点**：测试里另写一个截断版量化器，它必须与参考相差若干字节（实测 641074 字节），否则"逐字节比较"根本没在比取整。这类错误最阴：输出照样流利，只是分布整体偏了一点点，任何带容差的判据都放它过去<br>**块内缩放因子改按 MSE 选（2026-09-17）**：仍是`一个 fp16 scale + 32 个 nibble` 的块布局，只是不再取 `amax/7` —— 先用 `amax/7` 起个头量化一次，再对固定的 nibble 取重建误差的最小二乘解`d* = Σ(x·s)/Σ(s²)`（`s = nibble - 8`），迭代两轮<br>为什么值得：朴素写法为了让最大值够到台阶顶，把台阶钉在分布最稀疏的地方；MSE 解允许最大值被裁掉一点点，把台阶挪到分布密集处。实测 q/k/v/o 四个矩阵（另加整网 3 个权重）：**相对 L2 误差 10.75% → 10.34%**（cos 0.9942 → 0.9947）<br>**第三条负向对照**：测试里另写一个只改缩放因子选法（`amax/7`）、取整规则保持一致的旧规则版本，它必须与参考不同（实测相差 121846 字节）。这条是必需的，因为**参照物（fixture）是同一次导出的产物**—— 把实现退回 `amax/7`，参照物会跟着一起退，逐字节比较照样绿<br>顺带纠正上一行的一个说法：Mojo 侧**会**量化（加载期 `enable_q4` 一次），只是**推理期不量化** |
 | **整网 q4_0 前向通路**（24 层全部投影走块流） | `verified` | `evidence:tests/unit/test_q4_greedy.mojo`（1/1：4 条 prompt × 128 步教师强制贪心，与 fp32 参考一致 **418/512 = 0.8164**）<br>门是 0.75 的下限，**它判的是"通路在工作"不是"质量达标"**：高低半字节装反会得到 0.0，前向悄悄退回 fp32 会得到 1.0，两头都被抓住（后者另由 `model.q4_enabled` 直接断言）<br>⚠️ **路线图里"一致率 ≥ 0.90"那条没过**，见下一行；本轮的 0.75 是"算的东西是对的"的下限，不是把 0.90 改小 |
 | **整网 q4_0 教师强制贪心一致率 ≥ 0.90** | `missing` | **实测 0.8164**（输出投影留在 fp32 时；连它一起量化是 0.77），仍未达门<br>缩放因子这一路**已经走到底了**：按 MSE 选（见上一行）把一致率从 **0.800 抬到 0.8164**（+1.6 个百分点），而权重相对 L2 误差只从 10.75% 降到 10.34% —— 另一个数据点同样说明尺度选择已经到顶：在 q_w 上把 `amax/7` 整体乘一个系数扫一遍，最优是 **×0.90（10.23%）**，而逐块 MSE 解是 10.34%，两者只差 1%，说明"每块一个 scale"这个自由度本身已经榨干<br>**真正的约束是格式，不是选法**：每 32 个元素共用一个 fp16 缩放因子（cos 0.9947），落到 151936 维 argmax 上就是约两成位置翻盘<br>**不放宽门，也不假装达标**。下一步（本轮没做，别当成已有）：格式级改动 —— q4_K（超级块内再给一层 scale）、逐通道/逐行 scale，或带激活重要性矩阵（imatrix）的 scale 选择；这些都是**换块布局**，要新写 dequant 与配套的门 |
-| RMSNorm | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（对参考输入/输出对，最大偏差 1e-5 量级；平方和与倒数平方根在 `Float64` 中累加，以免 oracle 自身的舍入成为被怀疑对象） |
-| SwiGLU（含 `silu`） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（`silu` 与 `swiglu` 各有一条；参照物是 HF `act_fn` 的**真实输出**与 `down_proj` 的**真实输入**，脚本不自己乘一遍） |
-| RoPE | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（cos/sin 表由参考导出，Mojo 只做查表与旋转；**不复现 `inv_freq`** —— 复现它本身就是一类事故源） |
-| GQA 因果注意力（非分页） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（14 头 / 2 KV 头；`q_len` 可与 `kv_len` 不同，于是 prefill 与单步 decode 是**同一段代码**）<br>`evidence:tests/unit/test_model_parity.mojo`（`test_incremental_decode_matches_full_prefill`：逐 token 解码与整段 prefill 落点一致） |
-| GQA 因果注意力（分页 / block table） | `verified` | `evidence:tests/unit/test_paged_attention.mojo`（11/11）<br>`src/alofa/kernels/cpu/paged.mojo`：**只改行的地址**（`j * kv_cols` → `table.row_offset(j, kv_cols)`），算术与顺序和连续 oracle 逐字相同 → 与 `scalar.attention` **逐位相等**（11 个用例、0 个元素不同）。公式本身另由 `scripts/dump_paged_reference.py` 这份**独立 Python 实现**按 1e-5 相对容差钉住，唯一跨语言差异来源是 `exp` 的最后一位<br>⚠️ 本轮走标量后端；GPU 路径见 §4（本机 sm_52 阻塞） |
-| matmul（fp32） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（q/k/v/o 四条投影，含带 bias 与不带 bias 两条路径；权重按 `[out, in]` 行主序，与 HF 存储一致，故加载时**没有转置**这一步可忘） |
-| matmul（q4 dequant 融合） | `verified` | `evidence:tests/unit/test_q4_parity.mojo`（解出的权重 × 真实激活，fp64 累加，容差沿用 layer0 的同一判据 1e-5 相对）<br>"融合"是被检验的那件事本身：nibble 读到寄存器里直接乘缩放与激活累加，**不物化解量化后的权重** —— 若先解量化再走通用 matmul，被测的就只是通用 matmul 了<br>累加用 `Float64`，与 `scalar.mojo` 的 `_gemm` 同一理由：这一层当判据不当最快路径 |
+| RMSNorm | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（对参考输入/输出对，最大偏差 1e-5 量级；平方和与倒数平方根在 `Float64` 中累加，以免 oracle 自身的舍入成为被怀疑对象） |
+| SwiGLU（含 `silu`） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（`silu` 与 `swiglu` 各有一条；参照物是 HF `act_fn` 的**真实输出**与 `down_proj` 的**真实输入**，脚本不自己乘一遍） |
+| RoPE | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（cos/sin 表由参考导出，Mojo 只做查表与旋转；**不复现 `inv_freq`** —— 复现它本身就是一类事故源） |
+| GQA 因果注意力（非分页） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（14 头 / 2 KV 头；`q_len` 可与 `kv_len` 不同，于是 prefill 与单步 decode 是**同一段代码**）<br>`evidence:tests/unit/test_model_parity.mojo`（`test_incremental_decode_matches_full_prefill`：逐 token 解码与整段 prefill 落点一致） |
+| GQA 因果注意力（分页 / block table） | `verified` | `evidence:tests/unit/test_paged_attention.mojo?count=11`<br>`src/alofa/kernels/cpu/paged.mojo`：**只改行的地址**（`j * kv_cols` → `table.row_offset(j, kv_cols)`），算术与顺序和连续 oracle 逐字相同 → 与 `scalar.attention` **逐位相等**（11 个用例、0 个元素不同）。公式本身另由 `scripts/dump_paged_reference.py` 这份**独立 Python 实现**按 1e-5 相对容差钉住，唯一跨语言差异来源是 `exp` 的最后一位<br>⚠️ 本轮走标量后端；GPU 路径见 §4（本机 sm_52 阻塞） |
+| matmul（fp32） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`（q/k/v/o 四条投影，含带 bias 与不带 bias 两条路径；权重按 `[out, in]` 行主序，与 HF 存储一致，故加载时**没有转置**这一步可忘） |
+| matmul（q4 dequant 融合） | `verified` | `evidence:tests/unit/test_q4_parity.mojo?count=10`（解出的权重 × 真实激活，fp64 累加，容差沿用 layer0 的同一判据 1e-5 相对）<br>"融合"是被检验的那件事本身：nibble 读到寄存器里直接乘缩放与激活累加，**不物化解量化后的权重** —— 若先解量化再走通用 matmul，被测的就只是通用 matmul 了<br>累加用 `Float64`，与 `scalar.mojo` 的 `_gemm` 同一理由：这一层当判据不当最快路径<br>`evidence:tests/unit/test_q4_matmul_vec.mojo`（2026-09-20 新增，专用夹具 `tests/fixtures/.../q4vec/`，48 KB）：同一批期望值上的**结构性**差分门 —— 块/行取 1/3/5/7/11/17/28/152、行数取 1/2/3/5/7/13，**专门用来把 SIMD 尾巴露出来**<br>⚠️ 两条 evidence 互补，缺一不可：原 fixture 四个用例的 `cols` 全是 896（**28 块/行**，能被 1/2/4/7/14/28 整除），任何「按 N 块展开、余数走标量尾巴」的写法都会**全套绕过尾巴** —— 与 2026-09-17 在 avx2 上踩的坑同一类：fixture 的形状恰好避开了唯一没被走过的分支<br>三条常驻负向对照（省掉 `-8` / 高低半字节装反 / 丢掉最后一块）的「不可见用例」用**显式名单**约束而非降阈值：不可见的原因多是数学上不可观测（±交替正好相消、整行同值、近零块），名单之外多出一处不可见就红<br>⚠️ **已知弱点（留着，将来改判据时回头看）**：`1e-5 × max(1, |ref|)` 在 `|ref| ≪ 1` 时退化成**绝对** 1e-5 —— `const_row` 一例参考值约 1.8e-5，于是「少读一整块」（贡献约 5e-6）躲过了判据；故单列一条要求：两个真实用例（`real13` / `down_like`）必须判红<br><br>**向量实现（`avx2.mojo`，2026-09-20）**：同一 fixtures、同一期望值、同一判据，换一个核再跑一遍 `check_kernel_against_reference`；九条用例与标量版**逐位一致**（含两条真实数据用例）。切法是**按 `j % 8` 分通道**（块内第 j 个量化值固定配到第 `j%8` 条通道）而不是按连续段切，所以尾巴由块布局本身给定（每块的数据字节刚好两个 8 字节），`cols` 必须是 32 的倍数这一约束与标量版同源。`bench` 侧新增 `q4_0/avx2` 一栏（`scripts/bench_decode_roofline.mojo`）；本机 `down_proj` 4864×896：标量 3.59–3.71 周期/元素 → 向量 **1.19–1.25**（约 3×）。<br>⚠️ **累加仍在 f64**（与标量同一理由），但它作为一个**被测对象**存在：`_matmul_q4_f32acc` 走 f32 累加，实测九条用例最大相对偏差 **8.38e-08**（`real13`；门限 1e-5，低 120 倍），速度再快 1.4×。**没有**把它设为默认 —— 换的是判据层的算术，要先回答「相消最严重的那处还剩多少余量」，今天没人量过。 |
 | **CUDA kernel 与标量后端逐值差分**（路线图 1.7：RMSNorm / RoPE / matmul 三个 kernel） | `hardware-blocked` | **阻塞原因**：A100 验证机 `10.107.6.60:3389` 于 2026-09-17 实测连接超时（`scripts/a100.sh` 不可用）；本机 GTX TITAN X 为 Maxwell sm_52，现代 CUDA 栈与 MAX 均不支持<br>**解锁条件**：① A100 可达 ② 环境变量 `MODULAR_NVPTX_COMPILER_PATH=/usr/local/cuda/bin/ptxas`（绕过 MAX 对驱动 ≥580 的要求）③ 门为 fp32 容差 1e-5 的**逐值差分，只验正确性不报性能**<br>⚠️ 本轮**未写任何 CUDA 代码**：写完不验的 kernel 比没有更危险，它会被后来者当成可用<br>区分：§1.2 的"端到端 GPU kernel 数值正确"（向量加）已作为远端观测条目单独成立，本机可复现的**算子级** CUDA 差分仍是本行状态 |
 | MAX 内核复用（`linalg` / `layout` / `quantization`） | `missing` | 需隔离层；注意 MAX 导入路径有迁移风险 |
 
@@ -155,44 +155,45 @@
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| `BlockPool`（物理池 + 空闲链 + refcount） | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（12/12，7 个场景）<br>`src/alofa/runtime/kv/pool.mojo`：定容 `InlineArray` 空闲栈 + refcount；**摘要覆盖整个空间**（refcount 数组 + 空闲链顺序 + 全部请求 + 全部节点），把空闲链初始化倒过来，门**实测会红**（首处 `A=0,1` vs `A=111,110`） |
-| `PageTable`（请求 → 块序列） | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（`KvSpace` 的请求视图：块 id + 每块 token 长度 + 私有尾块标记；**连续追同一块合并成一项** —— refcount 按“视图条目”计，不按“有多少个节点贡献了它”计） |
-| `RadixNode` 前缀树（token 粒度映射到 block 粒度） | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（`src/alofa/runtime/kv/radix.mojo`：匹配是 **token 粒度**、持有是 **block 粒度**；匹配停在中间节点时按 `starts[p] + ntok[node]` 截断，不越读父节点的块数组）<br>✅ **已接入 attention**（2.2）：`runtime/kv/paging.mojo` 把请求页表拷成内核可读的 `PagedTable`（含**块内起始槽位**），`kernels/cpu/paged.mojo` 直接用 `(block, start, length)` 寻址；门断言"重放出的表"与夹具逐项一致，于是拼接这一环本身也被验过 |
-| 三视图共享 refcount 的一致性 | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（`check_invariants()` **从两个视图重算**每个块的持有数，再与 `pool.refcnt` 逐块比对；另加 `n_free + used == MAX_BLOCKS` 与空闲链成员精确匹配）<br>**负向对照常驻**：多一次 `retain`，不变量门必须报 >0（已实测报红） |
-| 节点分裂（metadata-only，不新分配块） | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（分裂前后 `pool.used` 不变、节点数 +1；父节点释放自己不再覆盖的尾块，子节点**沿用**原块 —— 前缀共享的收益来自元数据重排，不来自拷贝） |
-| KV 寻址零堆分配（定容容器 + 源码门） | `verified` | `evidence:tests/unit/test_kv_pool.mojo`（`runtime/kv/` 下 4 个源文件全部扫构造点，不得出现 `List[` / `String(` / `Arena(` 等；常驻红测 `tests/fixtures/bad_kv_alloc.mojo` 必须被判违规）<br>⚠️ **边界同 §7 调度器那条**：拦得住“加一个会增长的容器”，拦不住 libc 小块分配，不等于进程 RSS 不动 |
+| `BlockPool`（物理池 + 空闲链 + refcount） | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（7 个场景）<br>`src/alofa/runtime/kv/pool.mojo`：定容 `InlineArray` 空闲栈 + refcount；**摘要覆盖整个空间**（refcount 数组 + 空闲链顺序 + 全部请求 + 全部节点），把空闲链初始化倒过来，门**实测会红**（首处 `A=0,1` vs `A=111,110`） |
+| `PageTable`（请求 → 块序列） | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（`KvSpace` 的请求视图：块 id + 每块 token 长度 + 私有尾块标记；**连续追同一块合并成一项** —— refcount 按“视图条目”计，不按“有多少个节点贡献了它”计） |
+| `RadixNode` 前缀树（token 粒度映射到 block 粒度） | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（`src/alofa/runtime/kv/radix.mojo`：匹配是 **token 粒度**、持有是 **block 粒度**；匹配停在中间节点时按 `starts[p] + ntok[node]` 截断，不越读父节点的块数组）<br>✅ **已接入 attention**（2.2）：`runtime/kv/paging.mojo` 把请求页表拷成内核可读的 `PagedTable`（含**块内起始槽位**），`kernels/cpu/paged.mojo` 直接用 `(block, start, length)` 寻址；门断言"重放出的表"与夹具逐项一致，于是拼接这一环本身也被验过 |
+| 三视图共享 refcount 的一致性 | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（`check_invariants()` **从两个视图重算**每个块的持有数，再与 `pool.refcnt` 逐块比对；另加 `n_free + used == MAX_BLOCKS` 与空闲链成员精确匹配）<br>**负向对照常驻**：多一次 `retain`，不变量门必须报 >0（已实测报红） |
+| 节点分裂（metadata-only，不新分配块） | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（分裂前后 `pool.used` 不变、节点数 +1；父节点释放自己不再覆盖的尾块，子节点**沿用**原块 —— 前缀共享的收益来自元数据重排，不来自拷贝） |
+| KV 寻址零堆分配（定容容器 + 源码门） | `verified` | `evidence:tests/unit/test_kv_pool.mojo?count=12`（`runtime/kv/` 下 4 个源文件全部扫构造点，不得出现 `List[` / `String(` / `Arena(` 等；常驻红测 `tests/fixtures/bad_kv_alloc.mojo` 必须被判违规）<br>⚠️ **边界同 §7 调度器那条**：拦得住“加一个会增长的容器”，拦不住 libc 小块分配，不等于进程 RSS 不动 |
 | 频率感知淘汰（2Q + 复合评分） | `missing` | 创新点 2；**须有回放数据才可上线** |
-| 采样器（top-k / top-p / min-p / 温度 / 重复惩罚 / logit bias） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo`（11/11，9 条逐阶段用例 × 32 次采样）<br>温度 / top-k / top-p / min-p / repetition penalty 用 **HF 4.41 的真实 warper 与 processor** 交叉核对**存活集合**（`scripts/dump_sampler_reference.py` 按其 `_get_logits_warper` 的自身顺序施加）<br>⚠️ **logit bias、frequency / presence penalty 在 HF 4.41 里没有对应 processor**，采用 OpenAI / vLLM 加法语义，属**语义自证**（由正负 bias、跨 top-k 边界、被 top-p 裁掉等边界用例钉住），**不是 HF 对齐**；两种重复惩罚语义字段名不共用<br>PRNG 自研 SplitMix64（`core/rng.mojo`），参考侧同一整数算法 → 采样出的 **token id 精确相等**（非容差相等） |
-| 采样分布正确性（卡方 / TVD 检验） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo`（固定均匀序列 50000 次采样：TVD 0.00766 ≤ 0.05，卡方 23.05 ≤ 80）直击 `llm-mojo` 的分布错误<br>**负向对照常驻**：用温度减半的诱饵分布跑同一检验，TVD 0.4253 必须被判失败 —— 一个不会失败的拟合门等于没有门 |
+| 采样器（top-k / top-p / min-p / 温度 / 重复惩罚 / logit bias） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo?count=11`（9 条逐阶段用例 × 32 次采样）<br>温度 / top-k / top-p / min-p / repetition penalty 用 **HF 4.41 的真实 warper 与 processor** 交叉核对**存活集合**（`scripts/dump_sampler_reference.py` 按其 `_get_logits_warper` 的自身顺序施加）<br>⚠️ **logit bias、frequency / presence penalty 在 HF 4.41 里没有对应 processor**，采用 OpenAI / vLLM 加法语义，属**语义自证**（由正负 bias、跨 top-k 边界、被 top-p 裁掉等边界用例钉住），**不是 HF 对齐**；两种重复惩罚语义字段名不共用<br>PRNG 自研 SplitMix64（`core/rng.mojo`），参考侧同一整数算法 → 采样出的 **token id 精确相等**（非容差相等） |
+| 采样分布正确性（卡方 / TVD 检验） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo?count=11`（固定均匀序列 50000 次采样：TVD 0.00766 ≤ 0.05，卡方 23.05 ≤ 80）直击 `llm-mojo` 的分布错误<br>**负向对照常驻**：用温度减半的诱饵分布跑同一检验，TVD 0.4253 必须被判失败 —— 一个不会失败的拟合门等于没有门 |
 
 ## 7. 执行编排层（L4）
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| 纯函数调度器（单一 token 预算） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（15/15 通过）<br>`pixi run mojo run -O0 -I src tests/unit/test_scheduler.mojo`<br>无 I/O、无时钟、无模型、无权重依赖；`step(input) -> Action` 是唯一入口，于是调度边界可以脱离模型被测（创新点 3） |
-| 调度器自身零堆分配（定容容器 + 源码门） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（类型层面：所有容器是编译期定长的 `InlineArray`；源码门扫描 `src/alofa/engine/scheduler.mojo` 不得出现 `List[` / `String(` / `Arena(` 等构造点，并有常驻红测 `tests/fixtures/bad_alloc.mojo` 必须被判违规）<br>⚠️ **这条证据的边界**：能拦住“给调度器加一个会增长的容器”，**拦不住** libc 里的小块分配，也**不等同**于进程级 RSS 不动 —— 账本就按这个口径写，不夸大成“进程零分配”。录 trace（`engine/trace.mojo`）**会**分配 String，所以录制是 `step` 之外的可选动作 |
-| chunked prefill | `verified` | `evidence:tests/unit/test_scheduler.mojo`（300 token 的 prompt 跨 19 拍切片：首尾相接、不重叠、每片不超过 `max_chunk`；同一拍不得给同一请求两个 chunk） |
-| 抢占（重计算） + 抢占计数指标 | `verified` | `evidence:tests/unit/test_scheduler.mojo`（并发抢占风暴 / KV 水位临界两个场景；被抢占者 KV 全作废并回到等待队列，累计抢占次数作为 `Action` 字段逐拍比对 —— 它是容量告警指标，不是调试字段）<br>⚠️ 只抢占 **RUNNING** 请求：抢占“半截 prefill”的请求会让 prefill 永远无法完成，那是伪装成策略的抖动<br>⚠️ 池子小到连一次 decode 增长都装不下时报 `capacity` 具名错误，**不静默丢 token**（有专门断言） |
+| 纯函数调度器（单一 token 预算） | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`<br>`pixi run mojo run -O0 -I src tests/unit/test_scheduler.mojo`<br>无 I/O、无时钟、无模型、无权重依赖；`step(input) -> Action` 是唯一入口，于是调度边界可以脱离模型被测（创新点 3） |
+| 调度器自身零堆分配（定容容器 + 源码门） | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`（类型层面：所有容器是编译期定长的 `InlineArray`；源码门扫描 `src/alofa/engine/scheduler.mojo` 不得出现 `List[` / `String(` / `Arena(` 等构造点，并有常驻红测 `tests/fixtures/bad_alloc.mojo` 必须被判违规）<br>⚠️ **这条证据的边界**：能拦住“给调度器加一个会增长的容器”，**拦不住** libc 里的小块分配，也**不等同**于进程级 RSS 不动 —— 账本就按这个口径写，不夸大成“进程零分配”。录 trace（`engine/trace.mojo`）**会**分配 String，所以录制是 `step` 之外的可选动作 |
+| chunked prefill | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`（300 token 的 prompt 跨 19 拍切片：首尾相接、不重叠、每片不超过 `max_chunk`；同一拍不得给同一请求两个 chunk） |
+| 抢占（重计算） + 抢占计数指标 | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`（并发抢占风暴 / KV 水位临界两个场景；被抢占者 KV 全作废并回到等待队列，累计抢占次数作为 `Action` 字段逐拍比对 —— 它是容量告警指标，不是调试字段）<br>⚠️ 只抢占 **RUNNING** 请求：抢占“半截 prefill”的请求会让 prefill 永远无法完成，那是伪装成策略的抖动<br>⚠️ 池子小到连一次 decode 增长都装不下时报 `capacity` 具名错误，**不静默丢 token**（有专门断言） |
 | 调度 trace 录制 | `verified` | `evidence:src/alofa/engine/trace.mojo` + `tests/fixtures/scheduler/*.trace`（格式：整数 + 定长字段，**不含浮点**；水位用千分数而非比例 → 逐字节门不会退化成容差门） |
-| 调度 trace 重放 + 极端场景断言 | `verified` | `evidence:tests/unit/test_scheduler.mojo`（6 个场景与 `scripts/dump_scheduler_reference.py` 这份**独立 Python 实现**逐字节相同；三条常驻负向对照：改坏的 trace、换一种抢占顺序、给调度器加堆容器，三者都必须被判红）<br>6 个场景：超长 prompt、并发抢占风暴、预算耗尽、0 预算、取消竞态、KV 水位临界 |
-| 延迟护栏（最大等待拍数） | `verified` | `evidence:tests/unit/test_scheduler.mojo`（构造“队首长 prompt 每拍吃光预算”的最小复现：护栏生效时第 4 拍必须给短请求；把 `max_wait_ticks` 调到 99 该断言**实测会失败**）<br>护栏只在**等待者之间**插队，不越过 decode：它防的是“前面有个超长 prompt”，不是“预算被 decode 占满” —— 后者说明并发已饱和，插队只会把等待转嫁给已经占着 KV 的人 |
-| 批张量池（稳态零堆分配） | `verified` | `evidence:tests/unit/test_batch_pool.mojo`（12/12）<br>`src/alofa/engine/batch.mojo`：借用拿到的是**句柄**而不是指针（释放后同一个槽位会给别人）；池子不拥有内存，构造时收一个指针加容量；全部簿记是编译期定长的 `InlineArray`，**没有空闲链表** —— 每次放置都从“活着的借用”重导出可用空隙，于是不存在两套会互相漂移的账<br>7 个场景与 `scripts/dump_batch_reference.py` 这份**独立 Python 实现**逐字节相同：分配是“决定”不是数值，两种放置之间不存在“差一点点”<br>两条不依赖参照物的性质：**活着的借用不共享任何一个字节**（每个区间写自己的标记再逐字读回 —— 把放置往旁边挪一格，这条实测会红），**峰值不漂移**（20 个相同执行步之后 high-water 与第一步相同；否则稳态不稳，之后测的吞吐就是关于另一个池子的数字）<br>**拒绝必须是具名错误**：池子填满后隔一个释放，剩 131072 字节可用而最大空洞只有 16384 —— 借两块必须报 `capacity` 而不是绕回去或跨两个空洞凑；第 25 个活的借用同样是 `capacity`；重复释放是 `double_free`<br>3 条常驻负向对照：`alt.trace`（同一组操作改用 best-fit 放置，且**要求它至少挪动一处偏移**，否则那 6 个逐字节比对只是在验文件格式）、`bad.trace`（一处偏移挪一格）、给池子加堆容器的 `bad_batch_alloc.mojo`<br>⚠️ 证据的边界：拦得住“给池子加一个会增长的容器”，**拦不住** libc 的小块分配，也不等于进程级 RSS 不动；且这一层本身**不比对数值**（借到的字节里算得对不对由下面两行负责） |
-| 批组装（每请求一段连续行） | `verified` | `evidence:tests/unit/test_batch_pool.mojo`（12/12）<br>`BatchSlots` 给每个请求一段**连续**、且**不与别人重叠**的行：两个请求共用一行时，某一层会从别人的 token 上读出自己的激活，产出的每一个数都看起来合理 —— 与分页内核读错块是同一种失败<br>断言从外面重算：逐行统计所有者，**重复覆盖与未被覆盖都必须为 0**；同一请求被加两次是具名错误（一次 add 会让它拿到两段行，而某一层只会读其中一段）<br>⚠️ 只在**行归属**这一层成立；“注意力按请求分块”由 executor 接走（下一行） |
-| 批执行器（注意力按请求分块） | `verified` | `evidence:tests/unit/test_batch_executor.mojo`（10/10）<br>`src/alofa/engine/executor.mojo` 把 2.5 的两层接进前向：每个请求拿到一段**连续行**，每一行被交给注意力时都带上**自己的** K/V 基址、`upto`（能看到的最末一个 key）与 `pos`（rope 用）—— 于是“不同请求的行互相 attend”不是靠一张可能被丢掉的 mask 挡住的，而是**地址上不存在**：一行从来拿不到别人的地址<br>6 个场景与 `scripts/dump_batch_executor_reference.py` 这份**独立 Python 实现**逐字节相同（ADD/FEED/DROP/PLAN/ROW/FIN/NEXT 全序列 + 每步摘要 `d=`），摘要覆盖全部请求槽与全部行，不变量**每一步从外面重算**（缺陷计数不为 0 即红，而不是只在结尾查一次）<br>3 条常驻负向对照：`alt.trace`（换一种行分配策略，且**要求它真的不一样**，否则 6 个逐字节比对只是在验文件格式）、`bad.trace`（某一行的可见窗口挪一格）、给忙碌循环加堆容器的 `bad_executor_alloc.mojo`<br>每一步向 2.5 的池子借 15 块、步末全部归还：实测 `used==0`、`n_live==0`、峰值不漂移<br>⚠️ 边界：这一门**不比对数值**（注意力算得对不对由 §7 的分页门与下一行的批一致性门负责），它验的是行归属、每行的窗口与簿记 |
+| 调度 trace 重放 + 极端场景断言 | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`（6 个场景与 `scripts/dump_scheduler_reference.py` 这份**独立 Python 实现**逐字节相同；三条常驻负向对照：改坏的 trace、换一种抢占顺序、给调度器加堆容器，三者都必须被判红）<br>6 个场景：超长 prompt、并发抢占风暴、预算耗尽、0 预算、取消竞态、KV 水位临界 |
+| 延迟护栏（最大等待拍数） | `verified` | `evidence:tests/unit/test_scheduler.mojo?count=17`（构造“队首长 prompt 每拍吃光预算”的最小复现：护栏生效时第 4 拍必须给短请求；把 `max_wait_ticks` 调到 99 该断言**实测会失败**）<br>护栏只在**等待者之间**插队，不越过 decode：它防的是“前面有个超长 prompt”，不是“预算被 decode 占满” —— 后者说明并发已饱和，插队只会把等待转嫁给已经占着 KV 的人 |
+| 批张量池（稳态零堆分配） | `verified` | `evidence:tests/unit/test_batch_pool.mojo?count=12`<br>`src/alofa/engine/batch.mojo`：借用拿到的是**句柄**而不是指针（释放后同一个槽位会给别人）；池子不拥有内存，构造时收一个指针加容量；全部簿记是编译期定长的 `InlineArray`，**没有空闲链表** —— 每次放置都从“活着的借用”重导出可用空隙，于是不存在两套会互相漂移的账<br>7 个场景与 `scripts/dump_batch_reference.py` 这份**独立 Python 实现**逐字节相同：分配是“决定”不是数值，两种放置之间不存在“差一点点”<br>两条不依赖参照物的性质：**活着的借用不共享任何一个字节**（每个区间写自己的标记再逐字读回 —— 把放置往旁边挪一格，这条实测会红），**峰值不漂移**（20 个相同执行步之后 high-water 与第一步相同；否则稳态不稳，之后测的吞吐就是关于另一个池子的数字）<br>**拒绝必须是具名错误**：池子填满后隔一个释放，剩 131072 字节可用而最大空洞只有 16384 —— 借两块必须报 `capacity` 而不是绕回去或跨两个空洞凑；第 25 个活的借用同样是 `capacity`；重复释放是 `double_free`<br>3 条常驻负向对照：`alt.trace`（同一组操作改用 best-fit 放置，且**要求它至少挪动一处偏移**，否则那 6 个逐字节比对只是在验文件格式）、`bad.trace`（一处偏移挪一格）、给池子加堆容器的 `bad_batch_alloc.mojo`<br>⚠️ 证据的边界：拦得住“给池子加一个会增长的容器”，**拦不住** libc 的小块分配，也不等于进程级 RSS 不动；且这一层本身**不比对数值**（借到的字节里算得对不对由下面两行负责） |
+| 批组装（每请求一段连续行） | `verified` | `evidence:tests/unit/test_batch_pool.mojo?count=12`<br>`BatchSlots` 给每个请求一段**连续**、且**不与别人重叠**的行：两个请求共用一行时，某一层会从别人的 token 上读出自己的激活，产出的每一个数都看起来合理 —— 与分页内核读错块是同一种失败<br>断言从外面重算：逐行统计所有者，**重复覆盖与未被覆盖都必须为 0**；同一请求被加两次是具名错误（一次 add 会让它拿到两段行，而某一层只会读其中一段）<br>⚠️ 只在**行归属**这一层成立；“注意力按请求分块”由 executor 接走（下一行） |
+| 批执行器（注意力按请求分块） | `verified` | `evidence:tests/unit/test_batch_executor.mojo?count=12`<br>`src/alofa/engine/executor.mojo` 把 2.5 的两层接进前向：每个请求拿到一段**连续行**，每一行被交给注意力时都带上**自己的** K/V 基址、`upto`（能看到的最末一个 key）与 `pos`（rope 用）—— 于是“不同请求的行互相 attend”不是靠一张可能被丢掉的 mask 挡住的，而是**地址上不存在**：一行从来拿不到别人的地址<br>6 个场景与 `scripts/dump_batch_executor_reference.py` 这份**独立 Python 实现**逐字节相同（ADD/FEED/DROP/PLAN/ROW/FIN/NEXT 全序列 + 每步摘要 `d=`），摘要覆盖全部请求槽与全部行，不变量**每一步从外面重算**（缺陷计数不为 0 即红，而不是只在结尾查一次）<br>3 条常驻负向对照：`alt.trace`（换一种行分配策略，且**要求它真的不一样**，否则 6 个逐字节比对只是在验文件格式）、`bad.trace`（某一行的可见窗口挪一格）、给忙碌循环加堆容器的 `bad_executor_alloc.mojo`<br>每一步向 2.5 的池子借 15 块、步末全部归还：实测 `used==0`、`n_live==0`、峰值不漂移<br>⚠️ 边界：这一门**不比对数值**（注意力算得对不对由 §7 的分页门与下一行的批一致性门负责），它验的是行归属、每行的窗口与簿记 |
 | 批一致性（批大小 1/2/4/8 与单请求逐 token 相同） | `verified` | `evidence:tests/unit/test_batch_forward.mojo`（4/4；重门，需要 2GB 权重，`pixi run test-batch-forward`，故意不进 `pixi run test`）<br>同一批 prompt 走两遍：**一批 N 条** 与 **一条一条跑**（`QwenForward.prefill`/`step`，也就是 `test_model_parity` 拿去和 Hugging Face 对过的那条路径），greedy 解码、逐 token **相等** —— greedy 让“第 3 个 token 不同”就是一个不同，而不是差一点点<br>N = 1 / 2 / 4 / 8：8 条请求的 prompt 合计 88 行 > 行块 64，所以这一门**真的把一次 prefill 切成两拍** —— 短的一拍也必须是对的一拍<br>2 条常驻负向对照：**不同 prompt 必须解出不同续写**（否则“批次与单请求一致”对任何实现都成立，包括不看输入的实现）；**交换两条请求的 prompt 必须被察觉**（交换后既**不等于**该槽位的基线、又**等于**它实际拿到的那条 prompt 的基线）—— 这才让逐字节比对成为“行归属”的证据<br>⚠️ 参照物是**本树的串行前向**，与批路径共享 kernel：这是刻意的，被比较的是**编排**（行归属、每行的 pos、每行的窗口、KV 区域），而串行路径只有一条请求、不可能在这些上出错；参照物本身对 Hugging Face 的一致性由 §5 的模型门负责 |
-| 引擎循环（调度器 ↔ 批执行器接线） | `verified` | `evidence:tests/unit/test_engine_core.mojo`（10/10，已进 `pixi run test`）<br>`src/alofa/engine/core.mojo` 把 2.0 的调度器与 2.5b 的批执行器接成一个忙碌循环：调度器出**决定**（谁 prefill、给 `[start, end)` 这一段、谁 decode、谁被抢占），执行器出**行**；被验的只有两者之间的**翻译** —— 切片喂给谁、prefill 结束那一拍白送的第一个 token 与之后 decode 出来的 token 怎么拼成同一份 transcript、抢占后重算要作废什么<br>argmax **由测试注入**（每槽一个整数，不跑模型）：贪心 argmax 是一行代码，这一门要验的是**时序**；也正因为期望值写成 `expected_token(请求, 第几个 token)` 而与「第几拍产生的」无关，同一份期望才能同时管住「抢占后被推回 prompt、重新生成一遍」的请求<br>3 条常驻负向对照：① 抢占场景**断言 `preempt_total > 0`** —— 声称「抢占安全」却从头到尾没抢占过的门，是穿着戏服的 happy path；② **把请求从执行器手里抽走再要一拍，必须报 `invalid_argument`**（静默服务一个空请求更省事，也更会藏 bug）；③ 给循环加堆容器的 `bad_executor_alloc.mojo`<br>每一拍都从两边重算「谁还活着」：引擎说谁 resident、执行器说它握着谁，二者不一致的那一拍**照样产出一串看起来是 token 的数**<br>⚠️ 边界：这一门**不比对数值**（续写得对不对由上一行的批一致性重门负责），也不意味着 KV 物理块池已接入 —— 执行器用的是自己构造时写死的 KV 区域（见下一行） |
-| KV 物理块池（含 `freed_blocks` 这类外部释放） | `verified` | `evidence:tests/unit/test_kv_room.mojo`（10/10，已进 `pixi run test`）<br>`src/alofa/engine/kv_room.mojo` 是唯一做这层翻译的地方：调度器**数**块但不拥有块，`runtime/kv` 拥有块但只会说 radix 树操作。三件只活在这一层的事：① prefill 到达是**切片**，一次入场是多次 `append_tokens`，而「prompt 有多长」是另一件事实（它决定半个 prompt 不许进缓存）；② 完成的请求**换主人**（`commit` 发布到树），块变成「没有主人的占用」= 前缀缓存；③ 缓存的块只从**一扇门**回来 —— 驱逐是引擎的决定（只有引擎知道压力），还回多少**实测**（缓存块数前后之差）而不是记账<br>引擎侧接线（`src/alofa/engine/core.mojo`）：prefill 首片 `admit`、续片 `grow_to`、`settle` 后按「prompt + 已生成」对齐长度（给目标值不给增量）、完成 `publish` 再 `drop`、抢占与取消直接 `drop`；归还经 `SchedInput.freed_blocks` 回报调度器，两条规则都在调度器决定之前执行：**缓存让位给活着的请求**（缓存 ≤ 容量 − 持有）与**水位**（缓存顶高水位时先回收，免得调度器为还不了的块去抢占）<br>5 个场景与 `scripts/dump_kv_room_reference.py` 这份**独立 Python 实现**逐字节相同（`u/f/c/d`），且每拍从视图重算不变量、断言 `used + n_free == MAX_BLOCKS`；3 条常驻负向对照：`bad_room.trace`（改坏一拍）、`alt_room.trace`（换 prompt，必须判红 —— 否则只验了格式）、`bad_room_alloc.mojo`（给房间加堆容器）<br>不依赖参照物的性质：相同 prompt 的第二条 `last_matched == 32` 且 `last_fresh == 0`、池子用量不变；发布后 `used` 不降、回收后块真的回池且上报数等于实测；**未发布的 drop 必须真的回池**；`reclaim` 对活着的请求必须还回 0<br>⚠️ 边界：`runtime/kv` 并发上限 `MAX_REQUESTS`（8）、单序列上限 `MAX_SEQ_TOKENS`（64），第 9 条报 `capacity`、超长报 `out_of_range` —— 限制被**断言**而非绕过（悄悄少给几块会在几拍后变成「少一个答案」）。调度器的占用仍是**算术**的、房间的才是**物理**的，二者不要求相等（前缀共享让物理更少、节点粒度让物理可能更多），物理池满时房间具名拒绝。⚠️ 执行器的 KV 已从这张块表取地址（见后两行）；房间给了块之后，前向读到的位置由**表**决定，不是由算术决定 |
-| 分页注意力接入引擎循环（前向从块表取地址） | `verified` | `evidence:tests/unit/test_paged_scatter.mojo`（5/5，已进 `pixi run test`）+ `tests/unit/test_batch_forward.mojo`（重门，真实 0.5B fp32 权重）<br>块池布局：一个块**持有每一层各一个槽**，所以请求的表在每层都叫同一批块号 —— `engine/executor.mojo` 把层号折进块 id（`layer * MAX_BLOCKS + block`），于是整个块池只有**一个**视图、在构造时建好，忙碌循环里不再构造形状（每步每层建一个 `List` 正是这一层的源码门要挡住的事）<br>`kernels/cpu/paged.mojo` 新增 `paged_scatter`：写**经过**表，与读经过同一张表。写按算术放（`j // block_size`）会把 token 放进「它若不共享前缀本会占用的块」，之后每一步都是从别人的历史里算出来的数；写越界报 `out_of_range` 而不是截断（截断是悄悄变短的上下文）<br>房间与执行器的交接只有一处：房间 `page_table()` 拷出表 → 引擎 `sync_page_table()` 在 `admit` / `grow_to` **之后立刻**交过去；表按 `hist + n` **裁剪**后再用 —— 房间可以为还没到的 token 预留整块（切片 prefill），而注意力不许读没人写过的位<br>批一致性重门跑在**乱序块号**下：块刻意不按连续区域的顺序排，所以「批与串行逐 token 相同」这句话是关于**页表**的 —— 前向若按算术取地址，数就不同<br>⚠️ 边界：`rows_view` 构造视图（形状是 `List`）在执行器 `forward` 里仍然存在 —— 块池的**账**是零分配的，视图构造不是 |
-| 共享前缀只算未命中的那一段（前缀缓存省的是算术） | `verified` | `evidence:tests/unit/test_batch_forward.mojo`（6/6，真实 0.5B fp32 权重，重门）+ `tests/unit/test_batch_executor.mojo`（12/12，已进 `pixi run test`）<br>引擎层**端到端**已验（`tests/unit/test_engine_core.mojo` 11/11）：同一个 prompt 提交两次，第二次的第一拍**只跑一行**且 `history_of == 6` —— 此前这条链路只是「编译通过 + 单元绿」，房间 → 引擎 → 执行器这一段没人跑过；常驻对照是同一引擎里的冷 prompt：7 行、history 0。| KV 池高占用下的正确性 | `verified` | `evidence:tests/unit/test_engine_core.mojo`（13/13）：四条请求同时在池（峰值 = 四条块数之和），全部跑完且**逐 token 等于逐条跑的基线**；每拍重算 `used + n_free == MAX_BLOCKS`、房间 `invariants()==0`、两本账 `defects()==0`<br>⚠️ **不声称 95%**：2026-09-18 撤回前一天记的「峰值 111/112」——那个数字是被下面那行的记账 bug 造出来的（房间白发整条 prompt 的块），修好后同一场景只到 99/112，边界见下面两行 |
-| 分块 prefill 下的两本账 | `verified` | `evidence:tests/unit/test_engine_core.mojo`：**已修**：引擎原来在 `settle` 里把 KV 序列长度设成「整条 prompt + 已生成」，无视 prefill 只喂到第 16 个 token —— 房间因此白发整条 prompt 的块（实测第一拍：房间 15 块、调度器账 4 块；七条跑下来差 10 块），水位 950‰ **全程不触发**，池子只靠房间抛 `capacity` 兜住。现在按「已喂到的位置」grow，分块下两本账差 ≤ 1（`test_the_scheduler_and_the_room_count_the_same_blocks`；旧行为下该门差 10 块、红）|
+| 引擎循环（调度器 ↔ 批执行器接线） | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`（已进 `pixi run test`）<br>`src/alofa/engine/core.mojo` 把 2.0 的调度器与 2.5b 的批执行器接成一个忙碌循环：调度器出**决定**（谁 prefill、给 `[start, end)` 这一段、谁 decode、谁被抢占），执行器出**行**；被验的只有两者之间的**翻译** —— 切片喂给谁、prefill 结束那一拍白送的第一个 token 与之后 decode 出来的 token 怎么拼成同一份 transcript、抢占后重算要作废什么<br>argmax **由测试注入**（每槽一个整数，不跑模型）：贪心 argmax 是一行代码，这一门要验的是**时序**；也正因为期望值写成 `expected_token(请求, 第几个 token)` 而与「第几拍产生的」无关，同一份期望才能同时管住「抢占后被推回 prompt、重新生成一遍」的请求<br>3 条常驻负向对照：① 抢占场景**断言 `preempt_total > 0`** —— 声称「抢占安全」却从头到尾没抢占过的门，是穿着戏服的 happy path；② **把请求从执行器手里抽走再要一拍，必须报 `invalid_argument`**（静默服务一个空请求更省事，也更会藏 bug）；③ 给循环加堆容器的 `bad_executor_alloc.mojo`<br>每一拍都从两边重算「谁还活着」：引擎说谁 resident、执行器说它握着谁，二者不一致的那一拍**照样产出一串看起来是 token 的数**<br>⚠️ 边界：这一门**不比对数值**（续写得对不对由上一行的批一致性重门负责），也不意味着 KV 物理块池已接入 —— 执行器用的是自己构造时写死的 KV 区域（见下一行） |
+| KV 物理块池（含 `freed_blocks` 这类外部释放） | `verified` | `evidence:tests/unit/test_kv_room.mojo?count=10`（已进 `pixi run test`）<br>`src/alofa/engine/kv_room.mojo` 是唯一做这层翻译的地方：调度器**数**块但不拥有块，`runtime/kv` 拥有块但只会说 radix 树操作。三件只活在这一层的事：① prefill 到达是**切片**，一次入场是多次 `append_tokens`，而「prompt 有多长」是另一件事实（它决定半个 prompt 不许进缓存）；② 完成的请求**换主人**（`commit` 发布到树），块变成「没有主人的占用」= 前缀缓存；③ 缓存的块只从**一扇门**回来 —— 驱逐是引擎的决定（只有引擎知道压力），还回多少**实测**（缓存块数前后之差）而不是记账<br>引擎侧接线（`src/alofa/engine/core.mojo`）：prefill 首片 `admit`、续片 `grow_to`、`settle` 后按「prompt + 已生成」对齐长度（给目标值不给增量）、完成 `publish` 再 `drop`、抢占与取消直接 `drop`；归还经 `SchedInput.freed_blocks` 回报调度器，两条规则都在调度器决定之前执行：**缓存让位给活着的请求**（缓存 ≤ 容量 − 持有）与**水位**（缓存顶高水位时先回收，免得调度器为还不了的块去抢占）<br>5 个场景与 `scripts/dump_kv_room_reference.py` 这份**独立 Python 实现**逐字节相同（`u/f/c/d`），且每拍从视图重算不变量、断言 `used + n_free == MAX_BLOCKS`；3 条常驻负向对照：`bad_room.trace`（改坏一拍）、`alt_room.trace`（换 prompt，必须判红 —— 否则只验了格式）、`bad_room_alloc.mojo`（给房间加堆容器）<br>不依赖参照物的性质：相同 prompt 的第二条 `last_matched == 32` 且 `last_fresh == 0`、池子用量不变；发布后 `used` 不降、回收后块真的回池且上报数等于实测；**未发布的 drop 必须真的回池**；`reclaim` 对活着的请求必须还回 0<br>⚠️ 边界：`runtime/kv` 并发上限 `MAX_REQUESTS`（8）、单序列上限 `MAX_SEQ_TOKENS`（64），第 9 条报 `capacity`、超长报 `out_of_range` —— 限制被**断言**而非绕过（悄悄少给几块会在几拍后变成「少一个答案」）。调度器的占用仍是**算术**的、房间的才是**物理**的，二者不要求相等（前缀共享让物理更少、节点粒度让物理可能更多），物理池满时房间具名拒绝。⚠️ 执行器的 KV 已从这张块表取地址（见后两行）；房间给了块之后，前向读到的位置由**表**决定，不是由算术决定 |
+| 分页注意力接入引擎循环（前向从块表取地址） | `verified` | `evidence:tests/unit/test_paged_scatter.mojo?count=5`（已进 `pixi run test`）+ `tests/unit/test_batch_forward.mojo`（重门，真实 0.5B fp32 权重）<br>块池布局：一个块**持有每一层各一个槽**，所以请求的表在每层都叫同一批块号 —— `engine/executor.mojo` 把层号折进块 id（`layer * MAX_BLOCKS + block`），于是整个块池只有**一个**视图、在构造时建好，忙碌循环里不再构造形状（每步每层建一个 `List` 正是这一层的源码门要挡住的事）<br>`kernels/cpu/paged.mojo` 新增 `paged_scatter`：写**经过**表，与读经过同一张表。写按算术放（`j // block_size`）会把 token 放进「它若不共享前缀本会占用的块」，之后每一步都是从别人的历史里算出来的数；写越界报 `out_of_range` 而不是截断（截断是悄悄变短的上下文）<br>房间与执行器的交接只有一处：房间 `page_table()` 拷出表 → 引擎 `sync_page_table()` 在 `admit` / `grow_to` **之后立刻**交过去；表按 `hist + n` **裁剪**后再用 —— 房间可以为还没到的 token 预留整块（切片 prefill），而注意力不许读没人写过的位<br>批一致性重门跑在**乱序块号**下：块刻意不按连续区域的顺序排，所以「批与串行逐 token 相同」这句话是关于**页表**的 —— 前向若按算术取地址，数就不同<br>⚠️ 边界：`rows_view` 构造视图（形状是 `List`）在执行器 `forward` 里仍然存在 —— 块池的**账**是零分配的，视图构造不是 |
+| 共享前缀只算未命中的那一段（前缀缓存省的是算术） | `verified` | `evidence:tests/unit/test_batch_forward.mojo`（6/6，真实 0.5B fp32 权重，重门）+ `tests/unit/test_batch_executor.mojo`（12/12，已进 `pixi run test`）<br>引擎层**端到端**已验（`tests/unit/test_engine_core.mojo` 11/11）：同一个 prompt 提交两次，第二次的第一拍**只跑一行**且 `history_of == 6` —— 此前这条链路只是「编译通过 + 单元绿」，房间 → 引擎 → 执行器这一段没人跑过；常驻对照是同一引擎里的冷 prompt：7 行、history 0。| KV 池高占用下的正确性 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`：四条请求同时在池（峰值 = 四条块数之和），全部跑完且**逐 token 等于逐条跑的基线**；每拍重算 `used + n_free == MAX_BLOCKS`、房间 `invariants()==0`、两本账 `defects()==0`<br>⚠️ **不声称 95%**：2026-09-18 撤回前一天记的「峰值 111/112」——那个数字是被下面那行的记账 bug 造出来的（房间白发整条 prompt 的块），修好后同一场景只到 99/112，边界见下面两行 |
+| 分块 prefill 下的两本账 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`：**已修**：引擎原来在 `settle` 里把 KV 序列长度设成「整条 prompt + 已生成」，无视 prefill 只喂到第 16 个 token —— 房间因此白发整条 prompt 的块（实测第一拍：房间 15 块、调度器账 4 块；七条跑下来差 10 块），水位 950‰ **全程不触发**，池子只靠房间抛 `capacity` 兜住。现在按「已喂到的位置」grow，分块下两本账差 ≤ 1（`test_the_scheduler_and_the_room_count_the_same_blocks`；旧行为下该门差 10 块、红）|
 | 物理池 >95% 且能跑完的场景 | `missing` | 在当前实现下**不可达**：`MAX_ROWS=64` 只能逐条 prefill，先完成的先释放，分块下峰值 98/112（87%）；要顶满就得让请求长驻留，而驻留总量一旦高过水位，抢占就在两条请求之间来回抢、谁也完不成（七条各生成 8 个 token：512 拍仍不空闲；容量预算 48 / 阈值 45 下四条同样活锁）。解锁条件：让抢占真正缓解而不是循环——受害者重算时应优先拿回块，或水位只在「有等待者需要块」时触发 |
-| 缓存让位与缓存账的时序 | `verified` | `evidence:tests/unit/test_engine_core.mojo`（14/14）：五条请求分一个装不下的预算（48），缓存必须让位，否则排队的请求永远拿不到块。修了两处：① **缓存占死预算**——yield 只按「已在跑的」算，缓存把预算吃满，四条请求在剩下的块里互相抢占，有一条一个 token 都没生成；现在按 `blocks_used + blocks_wanted()` 算，缓存只留别人用不到的。② **引擎交回调度器尚未记账的块**——上一拍发布的序列要等本拍 `step` 才进 `cached_blocks`，reclaim 却发生在 `step` 之前，于是下一拍的 `freed_blocks` 大于调度器认为的缓存，抛 `ERR_INVALID_ARGUMENT`；现在只交回调度器已记账的部分。负向对照：把 ① 改回旧算法，该门红在「512 拍从未空闲」 |
+| 缓存让位与缓存账的时序 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`：五条请求分一个装不下的预算（60），缓存必须让位，否则排队的请求永远拿不到块。修了两处：① **缓存占死预算**——yield 只按「已在跑的」算，缓存把预算吃满，四条请求在剩下的块里互相抢占，有一条一个 token 都没生成；现在按 `blocks_used + blocks_wanted()` 算，缓存只留别人用不到的。② **引擎交回调度器尚未记账的块**——上一拍发布的序列要等本拍 `step` 才进 `cached_blocks`，reclaim 却发生在 `step` 之前，于是下一拍的 `freed_blocks` 大于调度器认为的缓存，抛 `ERR_INVALID_ARGUMENT`；现在只交回调度器已记账的部分。负向对照：把 ① 改回旧算法，该门红在「512 拍从未空闲」 |
 | 共享前缀下的缓存账 | `missing` | 调度器 `release(to_cache=True)` 按「每条已完成序列自己的块数」累加缓存，而房间的前缀树去重后只占一份 → 两本账不同源（调度器高估）。**首 token 归属那条已修**（见下），剩下的只有去重这一条。**回滚过一次**「让引擎把差额延后一拍用 `freed_blocks` 报出」：两本账当时对齐了，但随后撞 `id list overflow`，且回收与修正同拍叠加会超账。解锁：缓存占用数只能由房间报告，调度器不得自行推算——`SchedInput` 需要一个独立的「缓存增量」通道 |**第二次尝试也已回滚**（2026-09-18）：给 `SchedInput` 加绝对值通道 `cached_now`，房间每拍报真值覆盖调度器的和。失败原因不是实现细节：调度器的 `release` 比房间的 `publish` **晚一拍**（完成消息延后送达），于是「对齐到上一拍真值 + 本拍 release 整条」仍在叠加——实测对齐到 36 之后又加上两条的 24，得 60，而房间是 48；补 `cache_pending` 让引擎多跑一拍也没能把 60 降下来。真正的解锁是「调度器不再自己维护缓存账」，而这跟「调度器是纯整数函数、重放门不依赖房间」直接冲突（参考实现没有房间，报不出真值，那时调度器又必须能自己算）→ 属于架构取舍。
-| 过载 + 长 prompt 的抢占活锁 | `verified` | `evidence:tests/unit/test_engine_core.mojo`（两条门：抢占确实发生，且受害者重算后仍跑完全程）<br>`evidence:tests/unit/test_scheduler.mojo`（trace 逐字节：抢占发生后拍末 blocks_used 回到阈值内、无一拍越过硬容量）<br>原探针（未固化为门）：容量 10 块、4 条请求各 20 prompt（16 行一拍 → 跨两片）+ 3 生成、块 4 字节 → 300 拍、**190 次抢占、0 个 token 产出**（⚠️ 该数字取自 `watermark_permille=8`，即水位 **0 块**的病态配置，不是默认——`SchedConfig` 第 5 个参数是水位千分比，早先误当成了预算）。**默认水位 950 重测仍不收敛**：容量 10、块 4、4 条 20 prompt + 3 → 400 拍、`outs=3 3 1 1`、抢占 258 → 活锁在默认水位下**依然成立**，只是程度较轻（两条能跑完）；前提是池子装不下在飞的序列（4×6=24 > 10），而准入与晋升都不做容量规划，于是「抢占归零 → 重喂」变成循环。**根因**（逐拍探针订正）：第 5 步「晋升」无条件把 `done >= prompt_len` 的请求全转成 `ST_RUNNING`，**不看池子能否容纳它们的 decode 增长** → 同拍多条一起晋升 → 第 6 步 decode 时 `ensure_room` 装不下 → 抢占（`scheduler.mojo:570-571` 把 `done`/`generated` 归零）→ 打回 `ST_WAITING` 从头再喂 → 循环。逐拍证据：60 拍内所有请求 `state` **始终为 1（WAITING）**，从未进入 RUNNING；某条 `done` 刚到 20，下一拍即 `done=0` 且 `preempt_count+1`。`max_wait_ticks` 越小 → 强制 prefill 越密集 → 同拍晋升越多 → 抢占越多，故默认 8 比 900 更糟。**不是记账问题**（两本账一致）。⚠️ 早先写的「喂一半被抢占」是**错的**：抢占只针对 `ST_RUNNING`（`:564`），部分喂的是 `ST_WAITING`，不会被抢占。修法方向：晋升加容量门槛（装得下整条序列才晋升）——属调度器预算类改动，但会改单拍决策 → scheduler 的 14 条 trace 需重导（Python 参考同步改） |
-| 已发布序列的块数 | `verified` | `evidence:tests/unit/test_engine_core.mojo`（16/16）：调度器按 `done + generated` 算一条已发布序列占多少块，而 `generated` 数的是 decode 拍——续写的**第一个 token 由「把 prompt 喂完的那一步」产出，不算一拍**，于是每条少记一个 token；跨块时少一整块（实测四条：44 对 48）。改按 `prompt_len + max_new` 记，并顺带补齐 `blocks_used`（它留着的是按拍算的旧数，否则池账比缓存账少同样多）。新门 `test_a_published_sequence_is_counted_whole`：37+8=45 token 是 4 字节块的 12 块，44 是 11——**块粒度 8 时两者都是 6 块，同一个 bug 会溜过去**（现有那两个门正是块粒度 8，当时全绿） |
-| 引擎空闲判定与块释放 | `verified` | `evidence:tests/unit/test_engine_core.mojo`（15/15）：批里最后一条请求完成后，消息要到下一拍才到调度器，`has_work` 却只看引擎自己的 state → 它宣布空闲，那条请求永不 `release`，实测 11 块永久占用（每批泄漏一次）。对称地，房间已回收的缓存块若没被下一拍带走，调度器会一直为它们记账（实测 32 块）。修：`has_work` 也认 `n_report` 与 `room.freed_pending`；新增 `room.take_freed_upto()`——回收按节点整块释放，可能多于请求量，多出的留到下一拍再报。空闲时两本账归零。负向对照：去掉这两个条件 → 该门红在「仍有块被持有」 |
+| 过载 + 长 prompt 的抢占活锁 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`（两条门：抢占确实发生，且受害者重算后仍跑完全程）<br>`evidence:tests/unit/test_scheduler.mojo?count=17`（trace 逐字节：抢占发生后拍末 blocks_used 回到阈值内、无一拍越过硬容量）<br>原探针（未固化为门）：容量 10 块、4 条请求各 20 prompt（16 行一拍 → 跨两片）+ 3 生成、块 4 字节 → 300 拍、**190 次抢占、0 个 token 产出**（⚠️ 该数字取自 `watermark_permille=8`，即水位 **0 块**的病态配置，不是默认——`SchedConfig` 第 5 个参数是水位千分比，早先误当成了预算）。**默认水位 950 重测仍不收敛**：容量 10、块 4、4 条 20 prompt + 3 → 400 拍、`outs=3 3 1 1`、抢占 258 → 活锁在默认水位下**依然成立**，只是程度较轻（两条能跑完）；前提是池子装不下在飞的序列（4×6=24 > 10），而准入与晋升都不做容量规划，于是「抢占归零 → 重喂」变成循环。**根因**（逐拍探针订正）：第 5 步「晋升」无条件把 `done >= prompt_len` 的请求全转成 `ST_RUNNING`，**不看池子能否容纳它们的 decode 增长** → 同拍多条一起晋升 → 第 6 步 decode 时 `ensure_room` 装不下 → 抢占（`scheduler.mojo:570-571` 把 `done`/`generated` 归零）→ 打回 `ST_WAITING` 从头再喂 → 循环。逐拍证据：60 拍内所有请求 `state` **始终为 1（WAITING）**，从未进入 RUNNING；某条 `done` 刚到 20，下一拍即 `done=0` 且 `preempt_count+1`。`max_wait_ticks` 越小 → 强制 prefill 越密集 → 同拍晋升越多 → 抢占越多，故默认 8 比 900 更糟。**不是记账问题**（两本账一致）。⚠️ 早先写的「喂一半被抢占」是**错的**：抢占只针对 `ST_RUNNING`（`:564`），部分喂的是 `ST_WAITING`，不会被抢占。修法方向：晋升加容量门槛（装得下整条序列才晋升）——属调度器预算类改动，但会改单拍决策 → scheduler 的 14 条 trace 需重导（Python 参考同步改） |
+| 已发布序列的块数 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`：调度器按 `done + generated` 算一条已发布序列占多少块，而 `generated` 数的是 decode 拍——续写的**第一个 token 由「把 prompt 喂完的那一步」产出，不算一拍**，于是每条少记一个 token；跨块时少一整块（实测四条：44 对 48）。改按 `prompt_len + max_new` 记，并顺带补齐 `blocks_used`（它留着的是按拍算的旧数，否则池账比缓存账少同样多）。新门 `test_a_published_sequence_is_counted_whole`：37+8=45 token 是 4 字节块的 12 块，44 是 11——**块粒度 8 时两者都是 6 块，同一个 bug 会溜过去**（现有那两个门正是块粒度 8，当时全绿） |
+| 引擎空闲判定与块释放 | `verified` | `evidence:tests/unit/test_engine_core.mojo?count=16`：批里最后一条请求完成后，消息要到下一拍才到调度器，`has_work` 却只看引擎自己的 state → 它宣布空闲，那条请求永不 `release`，实测 11 块永久占用（每批泄漏一次）。对称地，房间已回收的缓存块若没被下一拍带走，调度器会一直为它们记账（实测 32 块）。修：`has_work` 也认 `n_report` 与 `room.freed_pending`；新增 `room.take_freed_upto()`——回收按节点整块释放，可能多于请求量，多出的留到下一拍再报。空闲时两本账归零。负向对照：去掉这两个条件 → 该门红在「仍有块被持有」 |
 房间 `admit` 时就知道重合多少（`last_matched`），引擎把这个数交给执行器 `add` 的 `matched`：命中的 token **入队但不建行** —— 历史从 `matched` 起算，队列里只剩没算过的那些。省下来的是**行**，行就是算术<br>**最后一行永远要算**：它的 logits 是第一个生成的 token。一个被完整命中的 prompt（`matched == n`）跑一行，不是零行 —— 零行就没有 logits，请求无从开口；`matched > n` 具名拒绝（`out_of_range`）<br>证据是端到端的：同一个 prompt 跑两遍，第二遍沿用第一遍的**同一批块**（`drop` 只忘地址、不清字节，这正是前缀缓存的定义）、`matched = n - 1`，跑一行，生成的 token 与串行**逐 token 相同**。配套常驻负向对照：谎报命中（`matched = n - 1` 但指向没人写过的块）必须产出**不同**的 token —— 否则上面那条可以因为「压根没读缓存位置」而白过<br>⚠️ 边界：命中的字节必须与本地计算**逐位相同**才成立（同机、同权重、同路径、同位置 —— 换 backend / 跨机未验）；执行器**不校验**块里真的是那段前缀，它信任房间 —— 谎报由上面的对照拦，不由类型拦 |
-| paged attention（block table 索引） | `verified` | `evidence:tests/unit/test_paged_attention.mojo`（11/11）<br>两类断言用两把尺子：**寻址用逐位相等**（`paged_gather` 与参照导出的连续行逐位一致；分页 kernel 与连续 oracle 逐位一致 —— 没有重排就没有"差一点点"的余地，差一个 ulp 就是地址算错），**公式用 1e-5 容差**（期望值来自 `scripts/dump_paged_reference.py`，与 Mojo 不共享任何代码）<br>**5 条常驻负向对照**：改坏一个元素的 `expected_bad.tsv`、用错 GQA 映射（`h % n_kv_heads`）的 `expected_hmap.tsv`、给 kernel 加堆容器的 `bad_paged_alloc.mojo`、把每段 run 的尾槽灌成垃圾值后输出必须逐位不变、共享同一块的两个请求必须读到同一段字节<br>⚠️ 夹具里的表是 `KvSpace` 对 2.1 真实操作序列重放出来的（8 例），另 3 例是 `syn_*` 块内偏移用例：当前树只从根共享、请求都从槽位 0 分配，**块内起始的 run 走 `KvSpace` 造不出来、走 `PagedTable` 造得出来**，内核就必须对它负责 |
+| paged attention（block table 索引） | `verified` | `evidence:tests/unit/test_paged_attention.mojo?count=11`<br>两类断言用两把尺子：**寻址用逐位相等**（`paged_gather` 与参照导出的连续行逐位一致；分页 kernel 与连续 oracle 逐位一致 —— 没有重排就没有"差一点点"的余地，差一个 ulp 就是地址算错），**公式用 1e-5 容差**（期望值来自 `scripts/dump_paged_reference.py`，与 Mojo 不共享任何代码）<br>**5 条常驻负向对照**：改坏一个元素的 `expected_bad.tsv`、用错 GQA 映射（`h % n_kv_heads`）的 `expected_hmap.tsv`、给 kernel 加堆容器的 `bad_paged_alloc.mojo`、把每段 run 的尾槽灌成垃圾值后输出必须逐位不变、共享同一块的两个请求必须读到同一段字节<br>⚠️ 夹具里的表是 `KvSpace` 对 2.1 真实操作序列重放出来的（8 例），另 3 例是 `syn_*` 块内偏移用例：当前树只从根共享、请求都从槽位 0 分配，**块内起始的 run 走 `KvSpace` 造不出来、走 `PagedTable` 造得出来**，内核就必须对它负责 |
+| 垂直切片（一句真文本走完 tokenizer → model → engine → sampler） | `verified` | `evidence:tests/unit/test_vertical_slice.mojo`（4/4；重门，需 1.9GB 权重，`pixi run test-slice`，故意不进 `pixi run test`）+ `src/alofa/cli.mojo`（`pixi run generate`）<br>**这一行补的是一个真实存在的洞**：此前每一层都有自己的门且都是绿的，但**没有任何一处把它们串起来跑过** —— `test_engine_core.mojo` 的文件头自己写明 argmax 由测试注入。2026-09-17 预告过"各层各自绿、拼起来崩到 0/512"，这一行就是把那条路径固定成每天能走一遍的东西。<br>实测（真权重，scalar 后端）：`"The capital of France is"` → 贪心 `" Paris. It is the largest city in Europe and the second largest in the world"`；采样（温度 1.0、seed 固定）`":\nA: Paris B: not sure C: london D: BERLIN"`，两条路都说到 Paris。<br>**负向对照（本行的关键）**：温度 0.01 的采样必须**逐字等于**贪心 —— 若 `run_sampled` 悄悄退化成 argmax（logits 取错行、`build` 没被调用），"说出 Paris"照样全绿而采样路径一次都没生效过；温度趋零时分布塌到 argmax 上，两条独立路径必须给同一个答案。而温度 1.0 时两者**不同**（上面两段文本），一正一反才构成完整证据。<br>**本行真正的收获是两条契约，都不是猜测、都是撞出来的**：<br>① `tick` 内部硬编码 `model.argmax`，sampler 此前**没有任何介入点**。而采样循环**不能**加进 `core.mojo`：那个文件既是 `step_path_sources()` 之一（`test_core_tensor` 在其中查 `List[Int]()`），又是零分配门的 `SOURCE`（`test_engine_core` 在其中查 `List[`），而 `Sampler.build` 只收 `history: List[Int]`、**没有指针重载**。实测在那里加一个 `history_of` 会让**两个门同时变红** —— 门是对的，那是真承诺，于是循环内联在 `src/alofa/cli.mojo`，`core.mojo` 一字未改（236 项与全部 trace fixture 不受影响）。<br>② **同名常量两个取值**：`MAX_BATCH` 在 `engine/batch.mojo` 是 **8**、在 `engine/scheduler.mojo` 是 **32**；`core.mojo` 经 `executor` 拿到的是 **8**。垂直切片最初从 `scheduler` 导入，拿 32 去遍历只有 8 个槽的 `ex.live`，实测崩在 `Assert Error: index 8`。这不是类型能挡住的（`range()` 两端都是 `Int`），只能靠"从哪导入"这一行注释守住 —— 已写进 `src/alofa/cli.mojo`。<br>⚠️ 由此留下一个**未收回的边界**：这条采样路径**不在** §7 的零分配承诺内（每拍为每个活跃请求建一个历史列表），它只服务单请求 CLI；要进忙碌循环，必须先给 `Sampler` 一个指针版 `build`，那时这个循环才搬得进引擎。<br>⚠️ 边界：只验 **1 条请求、16 个 token、scalar 后端、单条序列 37 token**。不验 AVX2、不验批、不验流式输出（逐 token decode 的 UTF-8 边界未验），也不验生成质量 —— 0.5B 模型答得对不对不在这条门的职责内，它只负责"链路通" |
 
 ## 8. 服务层（L5 / L6）
 
@@ -200,7 +201,7 @@
 |---|---|---|
 | **依赖 `flare` reactor 作为事件循环** | 已决策（未接入） | 原"自研 epoll"方案被推翻；`flare` 0.2.0 已提供 reactor/scheduler/timer_wheel/watchdog/reuseport/io_uring（§1.3） |
 | reactor 线程 + engine 独占线程的双线程模型 | `missing` | 见 `02-architecture.md` §6.1；调度决策留 reactor 以保持可重放零锁 |
-| libc 事件循环原语（自研**回退**路径） | `verified` | `evidence:tests/capability/test_libc_ffi.mojo`（5/5）：`socket`/`epoll_create1`/`timerfd_create`/`eventfd`/`SO_REUSEPORT` |
+| libc 事件循环原语（自研**回退**路径） | `verified` | `evidence:tests/capability/test_libc_ffi.mojo?count=5`：`socket`/`epoll_create1`/`timerfd_create`/`eventfd`/`SO_REUSEPORT` |
 | HTTP/1.1 解析与连接状态机 | `missing` | 优先用 `flare.http`；不稳则自建 |
 | 发送队列与背压 | `missing` | — |
 | SSE 流式输出 | `missing` | — |
@@ -214,13 +215,13 @@
 
 | 能力 | 状态 | 证据 |
 |---|---|---|
-| 预分词器（**无正则依赖**，手工实现 Qwen2 / GPT-2 规则） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`（4560 条参考用例逐 id 全等）<br>参考的两个项目死在这里；这里用**手写分支匹配器**替代正则引擎：收缩形式、字母串、数字、标点、换行、尾随空白六类按最左优先取最长，贪心与回溯由代码显式表达 |
-| NFC 归一化（分解 / 规范排序 / 重组，含 Hangul 与多元分解） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`<br>**表是生成而非手写的**（`scripts/gen_unicode_tables.py`）；多元分解（如 U+1E5D）与组合类排序漏一条，整句就会落到不同的 merge 序列上 |
-| BPE（**按 rank 合并**，同 rank 取最左） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`<br>贪心从左到右会挑错对；这里每轮全量扫描取 rank 最小者 |
-| added token 切分（**最长匹配**） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`（语料含句中出现的 added token） |
-| 词表 / 合并表加载（**离线 fixture，不启 Python**） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`<br>fixture 由 `scripts/dump_reference.py` 生成，但测试进程只读 TSV —— 差分门可在任何机器上重跑 |
-| id → 文本还原（含非法 UTF-8 替换） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`（往返用例逐条对比**归一化后**的输入） |
-| 4560 条差分用例（与 HF 逐 id 一致 + 往返） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo`（3/3 通过，0 处不一致）<br>**P1 门**：对不一致**零容忍**（0/4560），而不是容忍 0.1% —— 差分断言的是字节级等价 |
+| 预分词器（**无正则依赖**，手工实现 Qwen2 / GPT-2 规则） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`（4560 条参考用例逐 id 全等）<br>参考的两个项目死在这里；这里用**手写分支匹配器**替代正则引擎：收缩形式、字母串、数字、标点、换行、尾随空白六类按最左优先取最长，贪心与回溯由代码显式表达 |
+| NFC 归一化（分解 / 规范排序 / 重组，含 Hangul 与多元分解） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`<br>**表是生成而非手写的**（`scripts/gen_unicode_tables.py`）；多元分解（如 U+1E5D）与组合类排序漏一条，整句就会落到不同的 merge 序列上 |
+| BPE（**按 rank 合并**，同 rank 取最左） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`<br>贪心从左到右会挑错对；这里每轮全量扫描取 rank 最小者 |
+| added token 切分（**最长匹配**） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`（语料含句中出现的 added token） |
+| 词表 / 合并表加载（**离线 fixture，不启 Python**） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`<br>fixture 由 `scripts/dump_reference.py` 生成，但测试进程只读 TSV —— 差分门可在任何机器上重跑 |
+| id → 文本还原（含非法 UTF-8 替换） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`（往返用例逐条对比**归一化后**的输入） |
+| 4560 条差分用例（与 HF 逐 id 一致 + 往返） | `verified` | `evidence:tests/unit/test_tokenizer_parity.mojo?count=3`（0 处不一致）<br>**P1 门**：对不一致**零容忍**（0/4560），而不是容忍 0.1% —— 差分断言的是字节级等价 |
 | Unigram | `missing` | — |
 | WordPiece | `missing` | — |
 | `tokenizer.json` 加载 | `missing` | 当前只读 off线 TSV fixture；直接读 HF `tokenizer.json` 尚未实现 |
@@ -233,13 +234,13 @@
 |---|---|---|
 | oracle 差分框架（logits 余弦 / argmax） | `verified` | `evidence:tests/unit/test_model_parity.mojo`（余弦在 `Float64` 中累加：151936 维的 fp32 累加误差与被测间隙同量级时，相似度本身就不可信）<br>参照物是**导出的 fixture 而非实时调 Python** —— 被测代码变了，答案不会跟着变 |
 | greedy 逐 token 相等校验 | `verified` | `evidence:tests/unit/test_model_parity.mojo`（4 条 prompt × 128 token，逐 token 相等）<br>这是三条判据里最强的一条：能通过余弦却在第 30 步分叉的实现，在这里一定失败 |
-| 逐算子中间张量差分（定位用） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo`（13/13）<br>每个算子各自持有"参考实际看到的输入"与"参考实际产出的输出" → 失败时**只有该算子的测试红**，而不必在整网里二分 |
-| top-k 集合比较 / 分布检验（卡方 / TVD） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo` 存活集合用 **FNV-1a 指纹做零容差比较**（只比数量会放过"对的个数、错的成员"）<br>并列取值的合成行**只比集合不比顺序**：`torch.sort` 在并列值上顺序未定义，逐元素比会 flaky；而真实 logits 几乎不并列 → 把 `>=` 写成 `>` 在真实数据上测不出来，在**量化后**一定会并列。该门已用变异测试验证过会红（改一个比较符 → 4 个测试失败） |
-| 分布检验（卡方 / TVD） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo`（序列固定 → 断言确定性，**不会 flaky**；TVD / 卡方同时与参考值比对，不仅与阈值比对） |
-| roofline **骨架**（采集 + 利用率报告接口，峰值由调用方传入） | `verified` | `evidence:tests/unit/test_verify_roofline.mojo`（13/13 通过）<br>**不内置任何机型常数**：峰值是构造参数，≤0 直接报错 → 杜绝"抄规格书当实测" |
+| 逐算子中间张量差分（定位用） | `verified` | `evidence:tests/unit/test_layer0_parity.mojo?count=13`<br>每个算子各自持有"参考实际看到的输入"与"参考实际产出的输出" → 失败时**只有该算子的测试红**，而不必在整网里二分 |
+| top-k 集合比较 / 分布检验（卡方 / TVD） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo?count=11` 存活集合用 **FNV-1a 指纹做零容差比较**（只比数量会放过"对的个数、错的成员"）<br>并列取值的合成行**只比集合不比顺序**：`torch.sort` 在并列值上顺序未定义，逐元素比会 flaky；而真实 logits 几乎不并列 → 把 `>=` 写成 `>` 在真实数据上测不出来，在**量化后**一定会并列。该门已用变异测试验证过会红（改一个比较符 → 4 个测试失败） |
+| 分布检验（卡方 / TVD） | `verified` | `evidence:tests/unit/test_sampler_parity.mojo?count=11`（序列固定 → 断言确定性，**不会 flaky**；TVD / 卡方同时与参考值比对，不仅与阈值比对） |
+| roofline **骨架**（采集 + 利用率报告接口，峰值由调用方传入） | `verified` | `evidence:tests/unit/test_verify_roofline.mojo?count=15`<br>**不内置任何机型常数**：峰值是构造参数，≤0 直接报错 → 杜绝"抄规格书当实测" |
 | roofline 报告（真实 kernel / 真实硬件） | `missing` | 骨架已在上一行通过验证，但尚未接入任何算子 → **未产出任何性能数字** |
 | 性能回归门（PR 级） | `missing` | — |
-| 能力账本 CI 校验 | `verified` | `evidence:tests/capability/test_ledger.mojo`（7/7 通过）<br>`pixi run check-ledger`<br>**自证循环**：这一条的 evidence 正是校验账本本身的那个测试 —— 账本用自己声明的门来证明自己可信 |
+| 能力账本 CI 校验 | `verified` | `evidence:tests/capability/test_ledger.mojo?count=7`<br>`pixi run check-ledger`<br>**自证循环**：这一条的 evidence 正是校验账本本身的那个测试 —— 账本用自己声明的门来证明自己可信 |
 
 ## 11. 对外承诺（兑现能力）
 
@@ -386,3 +387,321 @@
   - **下一步构造必须满足**：某一拍同拍「有请求完成并把整条序列发布进缓存」**且**「还有别的请求处于 RUNNING」—— 只有如此第 9 步才有可抢对象；并且要有 **≥2 个 RUNNING**，否则 `test_a_different_policy_is_detected` 这条抗原仍会失效（抢谁都一样 → alt 与默认策略同字节）。\r\n
   - 代码已回滚待下次开工（改动已在上述两处定位清楚），工作区保持干净。
 - **2026-09-18** —— **抢钝活锁已修（准入）**，并订正本日早先那条「实施到一半、主动回滚」：准入已落地并通过全量 239 项。\r\n  - **准入**：`admit` 改按 `threshold_blocks()` 判「已提交序列的整条足迹 + 本请求整条序列」，而非硬容量；首个请求一律放行（否则过紧的水位一条都进不来）。缓存不进判据 —— 它不可抢占，也不是并发足迹。\r\n  - **认知订正（重要）**：trace 的 `C` 字段是 **抢占总次数**（参考 `act["C"] = preempt_total`），**不是**缓存量。早先据此断言「缓存没涨」是错的；真实故障是请求**活不过一拍** —— prefill 那一拍它仍是 `WAITING`（晋升发生在下一拍开头），第 9 步抢不到它，而旧的 `max_new=1` 又让它在超限的同一拍就跑完，于是永远没有可抢占对象。场景改用「多条需要多拍 decode 的请求」后抢占即发生（`preempt_total=54`）。\r\n  - **两条门的重建**：`s02_preempt_storm` / `s06_kv_watermark` 与引擎层两条门改由**前缀缓存**制造超限 —— 先让若干请求跑完并发布进缓存，再放入足迹自身合规的新请求。场景由搜索选出（约束：抢占 > 0、拍末 `blocks_used <= threshold`、全部请求最终完成、`newest` 与 `oldest` 抢占对象不同以保住抗原）。\r\n  - **判定边界（拦得住什么）**：拦得住「并发足迹自身越过水位」的组合 —— 它们在门口就被 `capacity` 具名错误拒绝。**拦不住**：缓存 + 并发足迹合计越过水位，这条路径**依然会抢占**；它靠引擎归还缓存（`room` 的 reclaim）收敛，而不是靠准入 —— 所以「抢占 + 受害者重算后仍跑完」这件事仍然被真实地验着，没有被准入旁路掉。\r\n
+- **2026-09-18** —— **N/M 快照从「散文」升级为「机器可核验」**（新增 `evidence:…?count=N` 语法、`check-counts` 门、`ledger-sync` 刷新工具）。
+  - **为什么必须做**：`check-ledger` 只校验 evidence **文件存在**，从来不看括号里写的数字。于是那些数字安静腐烂 —— 本轮实跑对照发现三处：① `test_engine_core.mojo` 在账本 §7 四个不同位置写着 **10/10 / 14/14 / 15/15 / 16/16**，实测只有 **16** 是对的；② `test_scheduler.mojo` 写 15，实测 **17**（本轮新增两道题后没同步）；③ `test_batch_executor.mojo` 写 10，实测 **12**。另有 §7「缓存让位」一行说预算是 **48**，而 `DEEP_TIGHT_CAP` 早已改成 **60** —— 同一类腐烂溢出到了常量上。
+  - **修法**：数字从散文里拎出来变成结构化后缀 `?count=N`；`scripts/run_tests.sh` 在跑测试的过程中顺带产出 `target/test_counts.tsv`（各套件自报通过条数），`check-counts` 拿它逐项核对。**零额外时间** ——不需要再跑一遍测试。
+  - **两个方向的都查**（见 `test_ledger_counts.mojo` 的负向对照）：写了却不一致 → 报错；**跑过却不登记 `?count=`** → 同样报错。后者是关键 —— 若只有「写了才查」，最省事的应对就变成「干脆一个都不写」，门会在最宽松的地方失效。清单缺失时门**失败而非跳过**。
+  - **`?count=` 的可维护性**：手改 60+ 处不现实，配 `pixi run ledger-sync` 一条命令把数字刷回来（内部走行级替换 + keepends，不重排换行，不碰变更日志里的历史快照）。
+  - 附带的清理：删除根目录 `core/rng.mojo`（一份从未入库、78 行、与 `src/alofa/core/rng.mojo` 只有注释措辞差异的旧草稿）与空转的 `tests/test_main.mojo`（只有一句 `print("test")`）；并将 `pixi run test` 的套件清单从 pixi.toml 的长命令搬到 `scripts/run_tests.sh` 单一维护。
+  - **顺手写明一处「没被覆盖」的事实**：重资产门（`test_model_parity` / `test_batch_forward` / `test_q4_greedy` / `test_memory_gate`）不在 `pixi run test` 里，本机清单查不到它们 → 这几行的 N/M 仍是**手工记录**，不在自动核验范围内。这是已知边界，不是遗漏。
+- **2026-09-18** —— **P1 第 4 步：垂直切片打通**（新增 `src/alofa/cli.mojo`、`tests/unit/test_vertical_slice.mojo`）。
+  - **为什么必须做**：此前每层都有自己的门且都是绿的，但**没有任何一处把它们串起来跑过** —— `test_engine_core.mojo` 的文件头自己写明 argmax 由测试注入。2026-09-17 预告过「各层各自绿、拼起来崩到 0/512」，这一刀就是把那条路径固定成每天能走一遍的东西。
+  - **实测**（真权重 1.9 GB、scalar 后端）：`"The capital of France is"` → 贪心 `" Paris. It is the largest city in Europe and the second largest in the world"`；采样（温度 1.0、seed 固定）`":\nA: Paris B: not sure C: london D: BERLIN"`。两条路都说到 Paris。
+  - **新入口**：`pixi run generate`（跑一次，人读）+ `pixi run test-slice`（带断言的门）。后者是重资产门 —— 需 1.9 GB 权重，故意不进 `pixi run test`，与 `test-model` 同级。
+  - **负向对照**：温度 0.01 的采样必须**逐字等于**贪心。若采样路径悄悄退化成 argmax（logits 取错行、`build` 没被调用），「说出 Paris」照样全绿而采样一次都没生效过；而温度 1.0 时两者**不同**（上面两段文本），一正一反才构成完整证据。
+  - **撞出来的两条契约**（详见 §7 那一行的正文）：① 采样循环**进不了** `core.mojo` —— 那个文件既是 `step_path_sources()` 之一又是零分配门的 `SOURCE`，两门都查 `List[`，而 `Sampler.build`只收 `history: List[Int]`、无指针重载，实测在那里加一个 `history_of` 会让**两个门同时变红**（门是对的，那是真承诺）→ 循环内联在 `src/alofa/cli.mojo`，`core.mojo` 一字未改。⚠️ 由此留下未收回的边界：**这条采样路径不在 §7 的零分配承诺内**（每拍为每个活跃请求建一个历史列表），它只服务单请求 CLI；要进忙碌循环必须先给 `Sampler` 一个指针版 `build`。② `MAX_BATCH` **同名两个取值**：`engine/batch.mojo` 是 **8**、`engine/scheduler.mojo` 是 **32**，`core.mojo` 经 `executor` 拿到的是 8；从 scheduler 导入会拿 32 遍历只有 8 个槽的 `ex.live`，实测崩在 `Assert Error: index 8`。类型系统挡不住（`range()` 两端都是 `Int`），只能靠「从哪导入」那一行注释守住。
+  - **第 5 步（config.json + safetensors 加载）尚未开始** —— 本机 `~/.cache/huggingface` 里`config.json` 与 `model.safetensors`（954 MB，bf16）都在，前提具备。
+- **2026-09-18** —— **P2 第 7 项诊断：量化一致率 0.8164 到底伤在哪（定位完成，未修）**。
+  - 新增 `scripts/diag_q4_proj.py`（须用 `/home/rontom/anaconda3/bin/python`，pixi 的没 torch）：**逐个投影单独量化**、其余保持 fp32，再跑与 `test_q4_greedy.mojo` **同构**的教师强制一致率。fp32 自洽 **1.0000**，故下面的数字可以互相比。
+  - **结论：不是某个投影的量化误差特别大，而是「输出投影」对同等误差更敏感。**三个投影的相对 L2 几乎一样（q **10.07%** / o **9.56%** / down **9.98%**），一致率却单调变差 ——**q_proj 0.9297 → o_proj 0.9062 → down_proj 0.8594**。`o_proj` 的误差**比 q_proj 还小**却更伤一致率，这就把「误差大」和「位置敏感」分开了。
+  - 机制：q/k/v 的误差要过 softmax 与 RMSNorm，被部分吸收；**`o_proj` / `down_proj` 直接写进残差流**，误差原样传给后面每一层；`down_proj` 还要先经 4864 维求和再投影回 896，故最差。所谓「量化输出投影反而更差」（门的文件头：留它 fp32 是 0.80、连它一起量化是 0.77）**不是它量得更差，而是它是每层最后写进残差的那一笔**。
+  - 累积：单独量化 q_proj（512 步口径）0.9688、k_proj 0.9512，而**全部量化才 0.8164** ——总损失是 **24 层 × 7 个投影**的叠加，不是单个投影主导。故只优化某一个投影的 scale 选法（上一轮已做、已榨干）天花板很低；要 0.90 得同时降低**所有**投影的误差 —— 换块布局仍是主要路径。
+  - ⚠️ 口径边界：上面 0.9297 / 0.9062 / 0.8594 是**单 prompt、128 步**快速档（只用于相对排序）；门的 512 步档本轮只跑完 q（0.9688）与 k（0.9512）两个，其余仍在跑。
+  - **第 6 项（Q4_K）未交付**：`scripts/dump_q4k_reference.py` 已写（布局、量化、解量化），但后 4 个子块的 scale 与 min **共用 `scales[j-4]` 的高 2 位**，事后取 max 对齐会把 min 抬高（实测 37 → 53），相对 L2 反而从 q4_0 的 10% **恶化到 49%**，比不做还差。正解是 GGML 的**联合量化**（`make_qx_quants`）：先按误差最小解出 (scale, min)，压进 6 bit 时让高 2 位**自然**落进同一区间。本机无外网、无法核对 llama.cpp 逐位细节 → 文件头已明写**不声称这是真实的 GGUF Q4_K**，也不声称误差更低。
+  - **第 8 项（共享前缀下的缓存账）未动手**：账本该行已**回滚两次**，根因是架构取舍 ——「缓存占用只能由房间报告」与「调度器是纯整数函数、重放门不依赖房间」直接冲突，不是实现细节问题。
+- **2026-09-18** —— **P3 第 10 项：A100 恢复（根因是 SSH 端口，不是机器故障）**；第 11 项进行中。
+  - `lcl@10.107.6.60` 的 SSH 监听 **3389**，22 / 2222 实测全关（ping 一直通，RTT 0.3 ms）。账本 2026-09-17 记的「连接超时」就是 `scripts/a100.sh` 一直敲 22 造成的。已修：新增 `REMOTE_PORT`（默认 3389），sync / run / shell / probe 全部带上。
+  - 第二个坑（更难查）：pixi 环境**不可重定位** —— `.pixi/envs/default/share/max/modular.cfg`硬编码本机绝对路径（`package_root` / `cache_dir` / `path`），rsync 到远程后 mojo 报 `unable to locate module 'std'`（连 `print` / `range` 都找不到，**看着像语法错误，实为环境问题**）。`a100.sh sync` 结尾已自动 `sed` 重写。远程 `/home/rontom` 建不了（无权限），符号链接方案不可用。
+  - 实测（GPU 4）：`gpu-query` → A100-PCIE-40GB / CC 8.0 / 驱动 560.35.03；`tests/gpu/vecadd.mojo` → `*** GPU VECADD PASS *** c[999]= 2997.0`，与 §1.2 记录一致 → §1.2 重新可复现。
+  - ⚠️ **CUDA 差分仍未通过，§4 那一行不因此改判**：新增 `tests/gpu/test_cuda_diff.mojo`（RMSNorm，以 `kernels/cpu/scalar.rmsnorm` 为参照，fp32 **相对**容差 1e-5，与 AVX2 门同一个数，**只验正确性不报性能**）—— **编译通过，但运行到 `arena created` 后段错误**，尚未定位。按铁律不把没验过的 kernel 算作可用，故本行状态**维持不变**。该门故意不进 `pixi run test`（本地 sm_52 必失败）。
+  - **第 11 项**：本机**有外网** → 下 tarball → rsync → 远程 cmake（远程无外网）。⚠️ `git clone` 会超时（curl 能通但 git 不行）→ 改用 v0.4.1 tarball（**无 submodule**，可放心用）；cmake 须显式 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`（否则 `CMAKE_CUDA_COMPILER-NOTFOUND`）+ `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80`。远程已有 gguf：`/app/lcl/models/Llama-3-Taiwan-70B-Q/`（Q4_0 / Q5_K_M / f16）。编译进行中，`llama-bench` 尚未产出 → 250 行「与 llama.cpp 同机同 prompt 对比」仍 `missing`。
+- **2026-09-18** —— **P3 第 11 项：llama.cpp 基准通路打通，拿到首个同机同模型 CPU 对比数字。
+  - llama.cpp v0.4.1 已在 A100 机编译完成（`llama-bench` / `llama-cli` / `llama-completion` 均在）：
+    cmake 须 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80`
+    （不给 nvcc 绝对路径会 `CMAKE_CUDA_COMPILER-NOTFOUND`）。源码走本机下载 tarball 再 rsync（远程无外网）。
+  - **同机同模型**：远程只有 70B gguf，与 alofa 跑的 Qwen2.5-0.5B 对不上 → 本机把 HF 权重转成
+    `qwen25-05b-f32.gguf`（**f32**，1.98 GB，290 tensors）rsync 过去，两边才是同一个模型。
+  - **实测（A100 机 CPU，`-ngl 0`，fp32，greedy，同一 prompt）**：
+    `llama-completion` decode **5.94 tok/s**（`-t 1`）/ **25.18 tok/s**（`-t 8`）；
+    alofa **1.13 tok/s**（`mojo build -O2`；引擎墙钟 14198 ms / 16 new tokens，含 prefill）。
+    alofa 侧新加了引擎墙钟输出（`monotonic_ns`，只包 prefill+decode，**不含**权重 mmap 与分词）。
+  - ⚠️ **边界（不可省略）**：① alofa 走 **`BACKEND_SCALAR`** —— `rope` / `attention` 本轮只有标量实现，
+    AVX2 尚未跑通整网，故 **1.13 是下界，不是 alofa 的水平**；② alofa 数字含 prefill，llama.cpp 的
+    eval time 是**纯 decode**；③ 两者 prompt token 数不同（5 vs 13，tokenizer/BOS 差异）；
+    ④ **共享机**（6 卡全忙、其他进程在跑）→ 有噪声，**不作吞吐门定论**。
+  - 未做：AVX2 档、CUDA 档（后者要等第 10 项 CUDA 差分通过）。第 11 项**仍不算完成**：
+    250 行「与 llama.cpp 同机同 prompt 对比」要有 alofa 自己的 GPU/AVX2 数字才算数。
+- **2026-09-18** —— **补测 AVX2 档：CPU 基线从「下界」改成 alofa 的真实水平**（接上条）。
+  - `cli.mojo` 的 `generate` 改成 `generate[backend: Int = BACKEND_SCALAR]`（后端是**编译期**参数），
+    `main` 现在**标量与 AVX2 各跑一遍贪心、两段的文本都打印** —— 同一 prompt 下二者逐字相同
+    才配叫基线；AVX2 覆盖 `rmsnorm` / `linear` / `linear_bias` / `add` / `swiglu` 五个算子，
+    `rope` 与 `attention` 本轮仍只有标量实现。
+  - **实测（A100 机 CPU，`-ngl 0`，fp32，greedy，同一 prompt，16 new tokens 含 prefill）**：
+    标量 **1.15 tok/s**（13969 ms）→ AVX2 **2.82 tok/s**（5667 ms），**2.46×**；
+    **两段文本逐字相同**（均为 " Paris. It is the largest city in Europe and the second largest in the world"）。
+  - 对 llama.cpp 单线程 5.94 tok/s：alofa 由 0.19×（标量）升到 **0.48×**（AVX2）。
+    剩余差距的主要来源是 `rope` / `attention` 仍走标量，以及 llama.cpp 可多线程。
+  - ⚠️ 边界不变：alofa 数字含 prefill 而 llama.cpp 的 eval 是纯 decode；prompt token 数 5 vs 13；共享机有噪声。
+  - 第 11 项**仍缺 CUDA 档**（要等 CUDA 差分通过才拿得到）。
+- **2026-09-18** —— **CUDA 差分门的段错误已修，并首次通过**（接 AVX2 档那条）。
+  - **根因不是 GPU**：`tests/gpu/test_cuda_diff.mojo` 少了 `arena.keep_alive()`。`Arena.__deinit__`
+    会 `munmap`，而 `arena` 变量的**最后一次使用**是第三个 `scratch(...)`（第 91 行），比
+    `fill(x, 1)`（第 92 行）还早 → Mojo 在第一个写之前就把整块映射释放了 → 段错误。
+    ⚠️ **栈把它指到 `fill:84` 是误导**：GPU 那半边从头到尾没问题。
+  - 定位方法（可复用）：逐步做 /tmp 探针 —— ①纯 CPU 复现（本地与远程都过）②保留 GPU import
+    与 kernel 但只跑 CPU（过）③GPU 全流程内联在 `main`（过，`diff=0.0`）④与真实文件 `diff`，
+    唯一实质差异就是那句 `keep_alive`。
+  - ⚠️ `scripts/a100.sh run` **不 rsync**（只 ssh + `mojo run`）→ 改完源码必须先
+    `./scripts/a100.sh sync`，否则一直在跑远端旧文件（本次为此白跑了一轮）。
+  - **结果**：`*** RMSNORM GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 5.0350770950317384e-05`
+    （fp32 相对容差 1e-5，与 AVX2 门同一个数；A100 卡 0）。
+  - ⚠️ **这不等于拿到了 GPU 档**：`src/alofa/kernels/` 只有 `cpu/`，产品代码里**没有**任何
+    `DeviceContext` / `std.gpu` 引用 —— alofa 目前**没有端到端 GPU 推理路径**。本门只证明
+    `rmsnorm` 这一个核与标量后端逐位一致。要定 250 行的 GPU 数字，还得先把前向搬到 GPU。
+- **2026-09-18** —— **AVX2 补到 `rope`/`attention`：正确，但对 CPU 基线没有可测影响**（接 AVX2 档那条）。
+  - 做法：`avx2.mojo` 新增向量版 `rope` / `attention`；`scalar.mojo` 里两者的**形状契约**抽成
+    `rope_shapes` / `attention_shapes` 供两个后端共用 —— 契约抄两遍就会漂移，而漂移的那一侧会以
+    「形状检查通过、却读到别人的内存」的形式出现，那比数值不一致难查得多。`qwen.mojo` 加
+    `rope_k[backend]` / `attention_k[backend]` 并接到调用点。
+  - **数值**：`rope` 与标量**逐位相同**（无累加，f32 8 通道）；`attention` 的值归约也逐位相同
+    （沿通道切、每个通道各自**顺序**累加 `j`，没重排累加顺序）；只有打分点积是 4 通道 f64 归约，
+    属文件头已声明允许的重排。实测向量 vs 标量**最大绝对差 0.0**。
+  - 门：`tests/unit/test_avx2_parity.mojo` 7 → **9** 项（新增「对 HF 参考」一项，并把 rope/attention
+    接进「与标量互比」）。另加**不整除形状的尾巴对照**：`head_dim=6` 让 `rope` 的向量主循环
+    **一次都不执行**、全程走尾巴，输出先填哨兵 —— 尾巴若被丢掉就具名失败，而不是「恰好整除
+    所以看起来没事」（fixture 的 head_dim=64 恰好整除，尾巴从未被跑到）。
+  - ⚠️ **实测没有提速**：同一进程内 AVX2/标量 的比值三次为 2.43 / 2.88 / 2.69（绝对数 5345–6679 ms），
+    与本轮之前的 2.47 **完全重合**，差异落在共享机噪声里。**不把这次改动记成提速。**
+  - 原因是算术上的，不是没测准：本工作负载每 token 的矩阵乘约 152M 次乘加（含 `lm_head` 的
+    896×151936），而 attention 约 14×21×64 ≈ 1.9 万次 —— **约 0.012%**。向量化一个占万分之
+    一的算子，量级上就不可能在端到端计时里被测到。
+  - 推论（**未验证**，是下一步的假设而非结论）：batch-1 decode 每 token 要流过约 2 GB fp32 权重，
+    实测 5.3 s / 16 token ≈ 6 GB/s，与**内存带宽**的量级相符。若成立，下一步的杠杆是**减少权重
+    流量**（Q4 已实现，但垂直切片没开），而不是继续向量化算力 —— 后者要验证得先量带宽。
+- **2026-09-18** —— **batch-1 decode 确认是内存带宽受限**（先前「推论（未验证）」终结；工具
+  `scripts/bench_decode_roofline.mojo`，新建）。
+  - 判据不靠我自己的算术：三个数（**本机**可用读带宽、**本机** f64 FMA 吞吐、**当下 kernel**
+    在权重常驻 cache 时能达到的 GFLOP/s）全由同一台机现场测出，再交给
+    `src/alofa/verify/roofline.mojo` 的 `Roofline.bottleneck` 判 —— 它是交叉相乘比大小，**没有
+    容差可调**，所以「把阈值放宽一点让它成立」这条路不存在。
+  - **算术强度为何恒为 0.5 flops/byte**：批大小为 1 时每个 fp32 权重必须被读一次、也只被用
+    一次，`2·N·K` 次浮点运算对 `4·N·K` 字节。没有任何分块技巧能绕开 —— 这是问题本身的
+    性质，不是 `_gemm` 的写法问题。
+  - **远程机（正是 CPU tok/s 基线所在那台）**：读带宽上限 9.25 GB/s；本机 f64 FMA 47.1
+    GFLOP/s；当下 kernel 上限 7.27 GFLOP/s。平衡点 5.09（对机器）/ 0.79（对当下 kernel）
+    flops/byte，两侧都高于 0.5 → **memory**。`lm_head`（151936×896）实测 6.86 GB/s = 读带宽
+    上限的 **741‰**，纯读同样字节 ÷ 实测 = **0.741** —— 算术操作只让它比「把这块权重原样
+    扫一遍」慢 35%。
+  - **本机 i7-9700K 同结论**：读带宽 12.0 GB/s、机器 70.7 GFLOP/s、kernel 9.53 GFLOP/s，
+    平衡点 5.91 / 0.80；`lm_head` 跑到 11.0 GB/s = **917‰** 上限，纯读/实测 0.917。（本机比
+    远程更贴近上限，两台都判 memory；远程是共享机，最后那 26% 里可能有一部分是别人的。）
+  - **端到端交叉校验**：每 token 要流的 fp32 权重是 2.108 GB（hidden 层 65.1 MB × 24 +
+    `lm_head` 544.5 MB），按实测 6.86 GB/s 是 **307 ms**；而 ~334 ms/token（5345 ms / 16 token）
+    里 **92% 就是这笔流量**。顺带校准了早先那个粗算的 ≈6 GB/s。
+  - ⚠️ **因此算力侧的剩余空间是有界的**：`_gemm` 换成完美实现，这一档最多快
+    **1/0.741 ≈ 1.35×**（本机只剩 9%）。**8× 级的杠杆只有减少每个权重的字节** —— Q4 已实现
+    但垂直切片没开；开了之后 AI 从 0.5 升到约 4 flops/byte，仍在机器平衡点 5.09 之下，所以
+    那时 kernel 自身的效率会成为新的限制。
+  - 第二根杠杆：`_gemm` 只跑到机器 f64 FMA 吞吐的 **15%**（远程 7.27 / 47.1）—— 累加器只有
+    一条链，`acc += xv*wv` 被 FMA 延迟按住。**但在字节降下来之前修它收不到多少，别反了顺序。**
+  - 第三根杠杆是**批**：今天 `_gemm` 是行外层，多行照样把 w 重读一遍，批大小 M 拿不到任何
+    复用。真想吃批的收益得先改循环次序。
+- **2026-09-18** —— **`verify/roofline.mojo` 的 `bottleneck()` 在真实量级上整数溢出**（已修）。
+  - 溢出有两处：`difference * 1000 <= TOLERANCE * larger` 的两侧，以及 `flops × 带宽峰值` /
+    `bytes × 算力峰值` 这两个交叉乘积本身。真实数字下一次前向是 2.7e8 flops / 5.4e8 字节、
+    峰值 1.5e10 B/s 与 7.2e10 FLOP/s → 乘积 3.9e19，越过 Int64 上界后绕回负数。
+  - 症状**完全静默**：上面那条 `lm_head` 明明 AI=0.5 ≪ 平衡点 4.75，先被判 `balanced`，换一个
+    更大的峰值后又被判 `compute`。溢出不是「总是判 balanced」，是**判什么都可能**。
+  - 修法：两个峰值先按 `UNIT=1e6` 缩成「每微秒」再乘（两侧同缩，截断误差 ≤1e-6，离判
+    balanced 用的 50‰ 容差还差五个数量级）；峰值小到除以 UNIT 会变 0 时退回更小的 UNIT。
+  - ⚠️ **为什么原来 13 条测试全绿**：它们用的都是 4 MB 与 1e9 这种数，乘积到不了 1e18，永远
+    碰不到这条路径 —— **小数的付讫责任在大数量级上是不成立的**。补了
+    `tests/unit/test_verify_roofline.mojo` 两条真实量级用例（13 → **15** 项，含算力受限方向的
+    对称一条），并**证明它敏感**：旧公式在同一批数上算出 `diff*1000=-8.76e18`、
+    `tol*larger=-8.25e18`，`-8.76e18 <= -8.25e18` 成立 → 错判 balanced；新公式判否。
+- **2026-09-18** —— **修正上一条**：两处数字没签名，一条建议被今天的实测推翻。
+  - 上一条写的「实测 ~334 ms/token（5345 ms / 16 token）」**没有出处**。账本里唯一有出处的
+    端到端数字是本体记者第 440 行：远程 AVX2 **5667 ms / 16 token = 354 ms/token**（2.82
+    tok/s）。按远程带宽地板 307 ms 算，解释度是 **87%，不是 92%**。是我把数字记岔了。
+  - ⚠️ 更要紧的一句是漏掉的限定：**只有 AVX2 档贴着带宽上限**。远程**标量**档是
+    13969 ms / 16 = **873 ms/token**，地板只解释了 **35%** —— 标量侧从来就是**算力受限**，
+    上一条把它笼统写成「batch-1 decode 是内存带宽受限」，少了一句 ` backend 限定`。
+  - 上一条把「减少每个权重的字节（开 Q4）」列为**杠杆 ①**。今天按同一路径量过了：
+    **这条建议是错的**，见下一条。错的根源是：量化通路虽然「已实现」，却从来没被**量过速度**，我把它
+    当成了一根现成的杠杆。
+- **2026-09-18** —— **Q4 通路首次端到端测速：今天不该开**（`cli.mojo` 现在自含答案）。
+  - `cli.mojo` 的 `generate` 加了 `quantize` 参数，返回一趟的完整测量（文本 + 引擎耗时 +
+    **量化耗时**），`main` 把四档打在同一张表里。量化耗时（~6 s 本机 / ~8 s 远程，每次
+    加载付一次）单独记，**不进 tok/s** —— 混进去的话，胜负会随 `n_new` 漂移。
+  - **同进程 A/B**（`mojo build -O2`，同一份权重、同一 prompt，16 new tokens 含 prefill）：
+    | 档 | 本机 i7-9700K | A100 远程机 |
+    | --- | --- | --- |
+    | fp32/scalar | 9983–10694 ms → 1.50–1.60 tok/s | 14153–14336 ms → 1.12–1.13 tok/s |
+    | **fp32/avx2** | **3780–3875 ms → 4.13–4.23 tok/s** | **5679–5718 ms → 2.80–2.82 tok/s** |
+    | q4_0/scalar | 9397–9512 ms → 1.70 tok/s | 18016–19611 ms → 0.82–0.89 tok/s |
+    | q4_0/avx2 | 7933–8166 ms → 1.96–2.02 tok/s | 15785–15996 ms → 1.00–1.01 tok/s |
+    | **q4 / fp32（同档）** | 标量 1.06–1.14×；**avx2 0.47–0.49×** | 标量 0.73–0.79×；**avx2 0.36×** |
+  - ⚠️ **第一次跑出来是 q4 快 6.5×**：那是远程 fp32/scalar 冷启动 121898 ms（正常 ~14000）
+    造成的离群值 —— 同一进程里第三条标量 15410 ms 才是对的。**单次跑就是碰运气，每场 A/B 都要重复**：本机
+    第一次也给出假的 1.50×（1.9 GB 权重冷页），重复三次才落到 1.06–1.14×。
+  - **为什么字节少 7.1× 却拿不到 2.76×**（就地量 `down_proj` 4864×896，17.43 MB fp32 → 2.45 MB q4）：
+    `fp32/avx2` 1.50 ms / 5.83 GFLOP/s / **自己的访存地板÷实测 = 0.847**；
+    `fp32/scalar` 4.52 ms / 1.93 GFLOP/s / 0.280；
+    **`q4_0/scalar` 4.18 ms / 2.09 GFLOP/s / 0.043** —— 它高出自己的访存地板 **23×**，是个纯算力活。
+    且它跟 fp32 标量站在同一堵墙上：**每 flop 吞吐几乎一样（2.09 vs 1.93 GFLOP/s）**，因为
+    两者的每权重开销都是标量指令，而量化省掉的是它们都不花的时间。
+  - **结论**：「带宽受限」是 **AVX2 fp32 这条路的属性**（roofline 判 memory、达到读上限 748–851‰），
+    不是一根能拉动的杠杆 —— **流量还没压下去之前先得让解量化跟上**。今天唯一的正确答案是
+    **不开 Q4**：它把最好的那条路（fp32/avx2）拖慢 2.1–2.8×。<br>⚠️ **2026-09-20 复核：这条结论没有推翻，也还没被条件更好的数据顶掉。** 量化核向量化之后**核级**确实快了约 3×（当日 `down_proj` 4864×896 同进程 best-of-7：3.59–3.71 → **1.19–1.25 周期/元素**），但**端到端**同档 `q4 / fp32` 在六次跑里散成 **0.61–2.16×**，连符号都会变（第 5 次 Q4 反而慢）—— 这台上今天**量不出稳定结论**。**在它被认真重测之前，本条「不开 Q4」继续有效。**
+  - 顺带交叉校验：远程 fp32/avx2 量出 2.80–2.82 tok/s，与账本已记的 2.82 自洽 —— 这条通路可信。
+  - 质量代价（**必须跟着速度一起报**）：q4 档贪心文本整体跑偏（本机、远程都变成
+    " a 1000-word essay on the history of the United States."，而 fp32 是 " Paris. It is..."）。
+    与 `test_q4_greedy` 已记的逐步一致率 0.80 自洽：自由续写 16 步的存活率约 0.8^16 ≈ 3%。
+  - **下一步**：把 `matmul_q4_f32` 向量化（SIMD 拆 nibble + 多条 f64 累加链），对着现有 q4 fixture
+    做差分门；**达标线不是「比 fp32/scalar 快」，而是压到自己的访存地板附近**（那个「自己的访存地板÷实测」要接近 fp32/avx2 的
+    0.847，而不是今天的 0.043）。在那之前 `cli.mojo` 默认不开 Q4，`test_q4_greedy` 也别动了。<br>    ⚠️ **2026-09-20 补记（这条达标线没达到，且很可能够不着）**：向量版实测该比值 **0.089–0.20**，离 0.847 差一个量级。更该说的是**这条达标线本身定错了**：它的分母「自己的访存地板」依赖同进程里同一次量出的读带宽上限，于是同一台机器三次跑出 0.51 / 1.44 / 0.65（`fp32/avx2` 这一栏自己就在抖）；换成不依赖当次测量的口径，达到 0.847 需要约 **0.2 周期/元素**，而光「4 位 → 浮点」的拆包与换算就要吃掉好几个周期/元素。**判据改成端到端 tok/s 上「值不值得开」**。2026-09-20 在这一项上做了三次，三条都是"量不出结论"：单次顺序跑 0.61–2.16×；重复交错 0.98–1.29×（区间重合）；只 decode + 每 token 中位数 + 预热 + 32 token 后，同一份二进制的两次运行分别给 1.05–1.10× 与 0.99–1.18×（**不可复现**）。**当晚把根因查清之后，答案换了形式**：核级（`down_proj` 4864×896，同进程相邻测量、best-of-3）`q4_0/avx2` = **1.539 ms** vs `fp32/avx2` = **1.485 ms** → **q4 慢 3.6%**；因为 fp32 已经跑在读带宽的 **78%**（访存受限），而 q4 把省下的 7.11× 字节**全花在解量化的算术上**（只用了 10.6% 的带宽）。所以端到端的"效应"本来就只有 **±5%**，小过本机噪声 **±10%** —— 2026-09-18 那条「不开 Q4」**继续有效，但理由变了**：不是"量不出来"，而是"现在确实没有收益"，且瓶颈在**可优化的解量化算术**、不在**硬天花板般的带宽**（详见当日变更日志）。
+- **2026-09-20** —— **给 `matmul_q4_f32` 的向量化先铺夹具和负向对照（今天没动内核）**：
+  新夹具 `tests/fixtures/.../q4vec/`（48 KB / 9 用例，由 `scripts/dump_q4_matmul_cases.py`
+  导出），新门 `tests/unit/test_q4_matmul_vec.mojo`（**5/5**，已进 `pixi run test`）。
+  - **为什么要另开一份夹具**：原 `q4/` 四个用例的 `cols` 全是 896 —— **每行正好 28 个块**，
+    而 28 能被 1/2/4/7/14/28 整除，于是任何「按 N 块展开、余数走标量尾巴」的写法都能
+    **全套绕过尾巴**；`rows` 全是 128/896，同样躲过行方向的尾部。这与 2026-09-17 在 avx2
+    上踩的坑同一类 —— **fixture 的形状恰好避开了唯一没被走过的分支**。新夹具的块/行取
+    1/3/5/7/11/17/28/152、行数取 1/2/3/5/7/13，并留两条真实用例：`real13`（真实 q_w ×
+    真实 `norm_out`）与 `down_like`（down_proj 的真实长度 4864 × 真实 `swiglu_out`）。
+  - 另覆盖三种数值情形：全零块（`d == 0`）、全部值踩在 ±amax（nibble 只剩 0/15，用来抓
+    漏掉 `-8` 偏移）、一堆 1e-8 夹一个 1.0（累加顺序一变相对差就放大）。
+  - **三条常驻负向对照**：省掉 `-8` / 高低半字节装反 / 丢掉最后一块。它们的「不可见用例」
+    用**显式名单**约束而非降阈值 —— 名单外多一处不可见就红；并单列一条要求：两个真实用例
+    必须判红。实测：`no_offset` 拒 7/8（看不见 `tail7`）、`swapped` 拒 4/8（看不见
+    `odd_blocks`/`tail7`/`tail11`/`const_row`）、`dropped` 拒 7/8（看不见 `const_row`）。
+  - ⚠️ **量出本项目统一判据的一处弱点（已知边界，留着）**：全项目统一的
+    `1e-5 × max(1, |ref|)` 在 `|ref| ≪ 1` 时退化成**绝对** 1e-5 —— `const_row` 一例参考值
+    约 1.8e-5，于是「少读一整块」（贡献约 5e-6）躲过了判据。**这不是变异无害，是判据在这里
+    没牙**；将来改判据时回头看这一条。
+  - ⚠️ **新发现的账本校验器边界（做实验证的，不是猜的）**：`extract_field(row,
+    "evidence:")` **只取每行第一次出现** —— 同一行里的第二条 evidence 既不做文件存在校验、
+    也不做 `?count=` 计数校验。证法：把行内**首条**路径写错 → `check-ledger` 红（6/7）；
+    把**第二条**的 `?count=5` 改成 4 → `check-counts` 照样 9/9 绿。所以新门的 N/M **没有**
+    以 `?count=` 形式写进能力行 —— 写一个没人核的数字比不写更差（这正是「三个互不相容的数字并存很久」那个坑要防的）。它的 5/5 只写在这里，
+    改天按 `pixi run test` 的输出复核。修复校验器（改成核每一行里的全部 evidence）是一件
+    独立的事，先记为已知边界。
+  - `q4vec/blocks.bin` 已按 `q4/blocks.bin` 的先例加 `.gitignore` 例外，并逐个确认夹具里
+    没有别的文件被 `*.bin` 连带忽略。
+  - **还没做的事**：向量化内核一行没写，所以本行不升级、不宣称任何性能。下一步是把
+    `matmul_q4_f32` 的 SIMD 版接进这个已经活着的门 —— 门现在的形态保证了尾巴一旦写错，
+    它是**必然红**的（这条断言的资格是上面三条对照给的）。
+- **2026-09-20** —— **`matmul_q4_f32` 的向量版本落地：接过上一轮的差分门、接进模型层分发；核级快约 3×，但端到端今天没测出稳定结论**：
+  - **选择器先做好，这是上一轮的兑现**：同一份 9 用例夹具（`q4vec/`）、同一期望值、同一判据
+    （`1e-5 × max(1, |ref|)`），只是把传进去的核换成向量版，两条用例摊的是同一条比较，
+    于是「换个核就换一套阈值」这种事没有地方发生。门 **7/7**（6 条原有的 + 1 条下面要说的偏差测量），
+    已进 `pixi run test`。
+  - ⚠️ **门第一次就红了，这就是它的用处**：`odd_blocks` 偏差 13.28。根因与硬件无关 ——
+    Mojo 的 `SIMD.fma(a, b)` 语义是 **`self * a + b`**（实测 `3.fma(5, 7) == 22`），不是 `a*b + self`；
+    照直觉写会得到 `(a+b)*n` 型的结果，而在 `-O0` 下它只表现为「数不对」，看不出是约数问题。
+    源码里已写成反驳式注释，防止有人把它「优化」回去。
+  - **矢量的切法**：一个 q4_0 块 = 2 字节缩放 + 16 字节装 32 个 nibble（低半字节是第 j 个、
+    高半字节是第 j+16 个）。拆成两半各 8 字节之后，**第 j 个量化值固定落在第 `j % 8` 条通道上**，
+    每块的四次乘加各有一条累加链；`d` **折进 x**，整行只在行末归约一次。**这里不需要尾巴处理**：
+    每块的数据字节刚好是两个完整的 8 字节，余数由块布局固定给出 —— 与上次那个坑的区别是，
+    上次是「head_dim 恰好整除，于是尾巴从头到尾没被跑到」，这里是「换模型也不会变」。
+  - **性能（本机，`down_proj` 4864×896，同一进程内 best-of-7）**：标量 **3.59–3.71 周期/元素**
+    （4.34–4.52 ms）→ 向量 **1.19–1.25**（1.44–1.51 ms），约 **3×**。对照组：「只把这块 2.45 MB
+    块流读完」只要 **40–51 µs** —— 差 30 倍，所以瓶颈**全在计算侧**，不是访存（`_gemm` 那套
+    「按带宽算」的直觉在这里不成立，别拿过来用）。
+  - ⚠️ **四种结构都试了，两种「对症」的猜测被自己的数据否掉**（同进程 best-of-7，周期/元素）：
+    每块归约 + 单链 1.25 / 每块归约 + 四链 1.37 / 整行归约 1.25 / **整行归约 + `d` 折进 x 1.19**（采纳）。
+    试过按 4 行分组以便跨行复用 x —— `InlineArray` 的下标走了栈，**反而慢 40%**，已回退并写进注释。
+    「四条独立的链能把 4 周期乘加延迟盖住」这个推断是错的：**它是被嵌在 docs 里的一条建议，
+    不是被量出来的结论**，今天第一次量就成了负数。
+  - ⚠️ **顺产量了「累加换 f32 值不值」**：f32 累加 **0.83 周期/元素（≈1.01 ms）**，比 f64 版再快 **1.4×**，
+    九条用例的最大相对偏差实测 **8.38e-08**（`real13`，门限 1e-5，**低 120 倍**），其中 `down_like` 8.98e-09。
+    **没有**把它设为默认：换的是判据层的算术，而理由恰好写在 avx2 那行 —— 「点积有抵消，f32 累加在
+    抵消严重处能吃掉整个 1e-5 判据」。要动它得先回答「相消最严重那处还剩多少余量」，今天没人量过；
+    它以 `_matmul_q4_f32acc` 的形式**只作为被测对象**存在，不接任何调用路径。
+  - **模型层分发**：新增 `q4_matmul_k[backend]` / `q4_matmul_bias_k[backend]`，读的是与 `backend_label`
+    **同一个判断** `uses_vector_backend`。四处曾经写着「量化通路本轮只有标量实现」的注释
+    （`qwen.mojo` 三处、`cli.mojo` 一处）已改成事实 —— 留着就是假地图，而这张图会被用来决定要不要开 Q4。
+  - **端到端（本机，16 new tokens 含 prefill，`target/cli` 同进程四路）—— 今天**没测出结论**，以下是全部六次：
+
+    | 次 | fp32/scalar | fp32/avx2 | q4_0/scalar | q4_0/avx2 | **q4 / fp32（avx2 档）** |
+    |---|---|---|---|---|---|
+    | 1 | 1.356 | 2.603 | 1.596 | 4.144 | 1.59× |
+    | 2 | 0.882 | 1.634 | 1.381 | 3.529 | 2.16× |
+    | 3 | 1.076 | 2.152 | 1.341 | 3.699 | 1.72× |
+    | 4 | 1.621 | **4.512** | 1.637 | **4.573** | 1.01× |
+    | 5 | 1.625 | **4.524** | 1.514 | **2.761** | **0.61×** ← Q4 更慢 |
+    | 6 | 0.733 | 1.859 | 1.400 | 3.520 | 1.89× |
+
+    比值散在 **0.61–2.16×**，而且**符号会变**（第 5 次 Q4 反而慢）。绝对 tok/s 本身也抖得离谱：
+    同一份 `fp32/avx2` 六次给出 1.63–4.52 tok/s（**2.8×**），第 4/5 次连着两 ~4.5，又在第 6 次掉回 1.86。
+    ⚠️ **原因没查明**（页缓存命中 / 调频 / 邻居负载都没排除），所以**不许拿它去解释任何别的数字** ——
+    能写下的只有：`cli` 的四个 arm 每档只跑一遍、顺序执行，这个精度不够回答「该不该开 Q4」。
+    对照：上面 micro 档是**交错 best-of-7**，它的 3× 才是我今天唯一敢报的速度结论。
+    **下一步是把「每 arm 重复 + 交错」这套做法搬进 `cli.mojo`，而不是再多跑几遍同样的东西。**
+  - 顺带在两个后端都等的 `q4_0` 上校对了一件事：标量/向量两档吐出的 16 个 token **逐位相同**
+    （第 4 次：`[264, 220, 16, 15, 15, 15, 37328, 8895, 389, 279, 3840, 315, 279, 3639, 4180, 13]`，两档一致）；
+    这是**一致性**而非性能门，也**不是**一道会因为回归而红的自动化门。
+  - ⚠️ **质量代价没变，必须跟着速度一起报**：`q4_0` 的自由续写文本仍然与 fp32 不同（cli 打印
+    `文本一致: False`），`test_q4_greedy` 的教师强制贪心一致率仍是 **418/512 = 0.81640625**（今日重跑，
+    逐位等于已记基线 —— 顺带说明这道门在**默认（标量）后端**下跑，它**没有**走今天新写的向量核）。
+    **速度快了不等于量化够好**：0.90 那条质量门仍是 `missing`。
+  - **还没做的事**：① 「AVX2 + q4」**没有**端到端的数值门 —— 今天只有「两个后端各跑一遍、文本逐位相同」这种
+    同一进程对照，它没有 fixture，也不是一道会因为坏掉而红的门（`backend_label` 那条只证明名字与分发共用一个判断）。
+    ② f32 累加的余量（见上）。③ `lm_head` 仍未量化（这让 Q4 的天花板从 7.1× 掉到约 2.8×）。
+
+- **2026-09-20** —— **端到端 A/B 改成「每 arm 重复 + 交错 + 轮间转顺序」（`cli.mojo` 新增 `bench_ab`），并据此订正上午那条「量不出结论」的归因**：
+  - **做法**：`generate` 拆成 `run_slice`（模型由调用方给，可复用同一份权重跑很多趟）+ `generate`（加载一次、跑一趟）。A/B 现在把 fp32 与 q4 两份权重**各加载一次**，然后 `BENCH_REPS=4` 轮 × 四档，轮内四档全跑，第 `r` 轮从第 `r` 档起（`arm = (r + k) % 4`）—— 四轮下来每档恰好各占一次第一/二/三/四个位置，「排在前面所以快」这个偏差是被摊平的，而不是由某一次的顺序决定。模型复用要 `reset()`：KV 缓存是实例字段，上一趟的历史不清掉下一趟的 prefill 会带着旧位置一起算。
+  - **判定只有一条**：比**区间重不重合**，不比均值。比值区间取最保守的两端（`q_min/f_max … q_max/f_min`），因为它假设两次测量的抖动方向相反 —— 这正是上午那六次里实际发生的事。重合 = 这份数据区分不出两者，照旧记「量不出结论」。
+  - **本机实测（16 new tokens 含 prefill，`mojo build -O2 -I src`，同一进程、同一份权重、同一个 prompt）**：
+
+    | 轮 | fp32/scalar | fp32/avx2 | q4_0/scalar | q4_0/avx2 |
+    |---|---|---|---|---|
+    | 1 | 1.60 | 3.64 | 1.61 | 4.52 |
+    | 2 | 1.64 | 4.53 | 1.62 | 4.62 |
+    | 3 | 1.63 | 4.09 | 1.62 | 4.68 |
+    | 4 | 1.59 | 4.19 | 1.61 | 4.42 |
+
+    `q4 / fp32（标量档）` = **0.98× … 1.02×**；`q4 / fp32（avx2 档）` = **0.98× … 1.29×** —— **两个都区间重合，判定仍然是「量不出结论」**（avx2 档重合的原因具体是：`fp32/avx2` 最好那次 4.53 高于 `q4_0/avx2` 最差那次 4.42）。
+  - ⚠️ **上午那条 2.8× 抖动的归因要订正**：改用同进程交错重复之后，比值散度从 0.61–2.16× 收成 0.98–1.29×，绝对值也从 `fp32/avx2` 的 1.63–4.52 收成 3.64–4.53。所以那 2.8× **主要不是机器噪声，而是「四个 arm 各跑一遍、顺序执行」这个测量方式本身造成的** —— 上午写的「原因没查明（页缓存 / 调频 / 邻居负载都没排除）」那句过强了，真正没查明的只剩残余的约 ±12%。**「先改测量方式，再谈结论」这一步被自己的数据证实了。**
+  - ⚠️ **不许反过来读**：区间重合 ≠ Q4 没变快。能写的是「今天这份数据不足以回答」，**不是**「Q4 与 fp32 一样快」。两点只作为**下一次往哪测**的线索记录：① 标量档 `q4` 1.61–1.62 对 `fp32` 1.59–1.64 完全重合（该档走的是标量核，今天新写的向量核不参与）；② avx2 档 `q4` 的下界 4.42 比 `fp32` 的下界 3.64 高约 1.21×，且 `q4_0/avx2` 自己更稳（4.42–4.68，±3% 对 ±12%）。
+  - ⚠️ **第 1 轮天生吃亏**：权重是 mmap，惰性读页发生在第一轮前向里（`cli` 打的「权重加载 fp32: 0 ms」就是这个意思，别把它当加载成本）。这也是四个变体必须交错、不能各跑一遍的第二个理由 —— 顺序跑的话这份成本只落在第一个 arm 头上。
+  - **下一步**：区间仍重合，剩下的障碍是 `fp32/avx2` 那一档自己的抖动（3.64–4.53，±12%）。要分离，要么降抖动（更长的生成、把 decode 与 prefill 分开量），要么加轮数 —— ⚠️ 加轮数只会让区间更宽、判定更保守（min 更低、max 更高），它**不是**让结论变好看的旋钮。
+
+- **2026-09-20（第二次，当晚）** —— **继续降抖动：prefill/decode 分开 + 每 token 中位数 + 预热轮 + 32 新 token，并补「同轮配对比值」口径。最后仍是「量不出结论」，但这次的证据比前两次都强：同一份二进制的两次运行给出了相反的结论**：
+  - **改了什么**（`cli.mojo`）：① `run_slice` **逐拍计时**，把 `prefill`（整段 prompt 的一次前向，固定成本）与 `decode`（每 token）分开记 —— 混在一起 tok/s 会随 `n_new` 漂移，且那一次性开销会稀释真正要测的差别；② 主统计量改成**每 token 时间的中位数**（一个被打断的 token 能把 16 个样本的均值推走 6%，推不动中位数），均值口径保留作对照；③ 开跑前加一轮**预热（2 个 token，结果丢弃）** —— 权重是 mmap 的，而**一个 decode step 会把全部权重读一遍**，所以两个 token 就够把每一页摸过；缺页量的是内核的页管理，不该由第 1 轮第一个跑的那档来付；④ 生成长度 16 → **32**（`MAX_GEN`=32 是引擎给一条请求的上限，没有更长的余地）；⑤ 新增**同轮配对比值**（第 i 轮 `q4 ÷ fp32`）作主口径 —— 交错本来就是为了让这个比值成立；各档自己的非配对区间保留作**保守对照**，它会被"这一轮整体快慢"这个共模因子撑宽。逐拍计时写在 `cli.mojo` 而不是引擎里，是因为 `engine/core.mojo` 有零分配源码门。
+  - **抖动降下来过，但没站住**：第 1 次运行（`fp32/avx2`，中位数口径）`1.79 … 1.85` / `4.66 … 4.98` tok/s = **±3.4%**（前一版是 ±12%）；第 2 次运行又回到 **4.50 … 5.39（±18%）**，原因是第 3 轮**整轮**掉到 4.50。所以"抖动降到 ±3%"这个说法**不成立**，账本只写"降下来过，没站住"。
+
+    | 运行 | 轮 | fp32/scalar | fp32/avx2 | q4_0/scalar | q4_0/avx2 |
+    |---|---|---|---|---|---|
+    | 第 1 次 | 1 | 1.80 | 4.66 | 1.82 | 4.99 |
+    | 第 1 次 | 2 | 1.79 | 4.80 | 1.87 | 5.27 |
+    | 第 1 次 | 3 | 1.83 | 4.88 | 1.88 | 5.18 |
+    | 第 1 次 | 4 | 1.85 | 4.98 | 1.88 | 5.22 |
+    | 第 2 次 | 1 | 1.92 | 5.39 | 1.90 | 5.35 |
+    | 第 2 次 | 2 | 1.89 | 5.19 | 1.86 | 5.42 |
+    | 第 2 次 | 3 | 1.68 | **4.50** | 1.87 | 5.30 |
+    | 第 2 次 | 4 | 1.89 | 5.18 | 1.88 | 5.22 |
+
+    （32 新 token，**只 decode**，每 token 时间的中位数，tok/s；同一进程、同一份权重、同一个 prompt）
+  - ⚠️ **今天最有价值的新事实：抖动是 fp32 那一侧的，不是 q4 的**。两次运行共 8 个样本/档：`q4_0/avx2` = 4.99–5.27 与 5.22–5.42（**±1–2%**）、`q4_0/scalar` = 1.82–1.88 与 1.86–1.90；而 `fp32/avx2` = 4.66–4.98 与 **4.50–5.39**、`fp32/scalar` = 1.79–1.85 与 **1.68–1.92**。而且 fp32 的偏离**方向全是向下掉速**（从不向上），q4 八个样本里一次掉速都没有。→ 前面所有"量不出结论"的失败，**卡的是 fp32 这一侧，不是量化通路**。
+  - ⚠️ **结论：仍是「量不出结论」—— 这是第三次独立确认，而这次的证据不是区间重合，是结论不可复现**：第 1 次运行的 `q4/fp32（avx2 档）` 配对比值 **1.05× … 1.10×（整串 > 1.0）**，非配对区间也不重合（4.99 > 4.98）—— 差一点就要写"q4 更快"；第 2 次同一份二进制给 **0.99× … 1.18×（含 1.0）**，当场把它推翻。→ **任何单次运行的结论都不可信，哪怕它做了重复与交错。**
+  - 未做的判定：① 不因为"fp32 侧更抖"就反过来说 q4 更好 —— 抖是**测量**的性质，不是**通路**的性质；② 不拿第 1 次运行那个不重合的区间当结论；③ 也不把 fp32 的掉速算作 fp32 的"真实性能"（那会让 q4 显快，属于自己造结论）。2026-09-18 那条「不开 Q4」**继续有效**。
+  - **下一步**：查 fp32 侧**整轮掉速**的根因。待验证的**假说**（不是结论）：fp32 是 2.1 GB / 4 KB 页 ≈ 52.5 万页，q4 只有 ≈ 13 万页 → TLB / 页表压力不成比例，且 fp32 每 token 要流 4× 的字节。在它查清之前，本机这条端到端通路给不出稳定的答案。
+
+- **2026-09-20（第三次，深夜）** —— **查 fp32 侧整轮掉速的根因：三条假说，两条被证伪，剩下那条不在我们的代码里**：
+  - **假说 A（页 / TLB / 缺页）→ 证伪**。`cli.mojo` 加了逐档的 `/proc/self/stat` 采样（Δminflt / Δmajflt / Δstime）与邻居 runq。两次运行共 **32 个样本，Δmajflt 全为 0**；Δminflt **恒定**（fp32 档 3568、q4 档 3610 —— 那是每趟 `run_slice` 新建 arena 的匿名页，与掉速无关）；Δstime 0–190 ms，且与掉速无关。→ fp32 的权重（文件映射，1.976 GB）**全程常驻**，没有被回收、没有读盘。
+    - 顺带确认了结构上的不对称：fp32 档权重是**文件映射**，q4 档权重在**匿名** `q4_arena` 里。但这次量下来，这个差别**没有造成**掉速。
+  - **假说 B（带宽争抢：fp32 贴着天花板所以更脆）→ 证伪**。正对照：在第 3 轮整轮期间跑一个已知强度的读带宽占用者（numpy 512 MB 反复求和，**7.9 GB/s × 55 s**）。结果是**四档同幅掉速**：`fp32/scalar` −14%、`fp32/avx2` −12%、`q4_0/scalar` −10%、`q4_0/avx2` −14%。若机制是带宽争抢，每 token 流 1.976 GB 的 `fp32/avx2` 必须远惨于只流 0.746 GB 的 `q4_0/avx2`；实测两者一样。
+    - ⚠️ **顺带修正一个会误导判断的数**：账本里的"本机读带宽 12.0 GB/s"是**单线程**读带宽，**不是整机上限**（本机是双通道 DDR4）。这次同一脚本实测峰值 **15.03 GB/s** —— 也就是说**同一台机器不同时刻在 12.0–15.0 GB/s 之间漂**，又是一条"分母依赖当次测量"的实例（见测量规矩 ④）。"fp32 在 80% 天花板"说的是**单线程**天花板，不代表机器带宽见底；这也解释了为什么一个 7.9 GB/s 的邻居没能压垮它。
+  - **假说 D（机器过载：邻居抢 CPU 时间 / 共享 L3）→ 与数据一致，但未证明**。四档同幅掉速正是"CPU 时间份额被稀释"的签名；本机 runq **6–27（8 核）**、loadavg 常年 10–12。⚠️ 写成"一致"而不是"证明"：我没法把 VS Code / Chrome 关掉来验证（那不是我的进程），所以只写到"**其余两条已排除，这条与数据一致**"。
+  - ⚠️ **修正今天早些时候写进账本的一条**：「抖动是 fp32 侧，不是 q4 侧」**站不住**。那是从 2 次运行 8 个样本里的 **1 个异常轮**（第 2 次第 3 轮的 4.50）读出来的。第 4 次运行里 `fp32/avx2` 4.68–5.10（**±4.3%**）与 `q4_0/avx2` 5.02–5.42（**±3.8%**）**一样大**。
+  - **本次最有价值的副产品 —— 量化收益的真相（先修两个算术错误，再做一次核级实测）**：
+    - ⚠️ **"量化把每 token 字节降到 1/4"是错的**：q4_0 是 **32 个值 18 字节**（16 B nibble + 2 B fp16 scale）= 每值 0.5625 B → 相对 fp32 是 **7.11×**；而 `lm_head` **不量化**（与 `embed_tokens` 绑定共用，`tensors.tsv` 里两者 offset 都是 0，136.13M 参数 = 0.544 GB）。所以 q4 档每 token 仍要流 **0.746 GB** = fp32 的 **38%（2.65×）**，其中未量化的 `lm_head` 自己就占 **73%**。
+    - **核级（`down_proj` 4864×896，同一进程相邻测量，best-of-3）**：`fp32/avx2` = **1.485 ms**（11.74 GB/s = 读峰值的 **78%**，访存受限）；`q4_0/avx2` = **1.539 ms**（1.59 GB/s = 自己访存地板的 **10.6%**，**算术受限**）→ **`q4_0/avx2` 比 `fp32/avx2` 慢 3.6%**。（此前那条"核级 ~3×"是拿 q4/**标量** 4.415 ms 当参照物比出来的 —— 对"该不该开量化"这个问题，参照物搞错了：该比的是 `fp32/avx2`。）
+    - → **"该不该开量化"的答案不是"量不出结论"，而是"现在基本没有收益"**：按上面的每元素速度推算，端到端上限 ≈ **1.03×**（（357.85M×1.036 + 136.13M）÷ 494.1M），实测 0.98–1.15× 与之相符。也就是说**效应本身（±5%）比本机噪声（±10%）还小** —— 三番五次量不出来不是测量不够好，是真的没有可量的差别。
+    - 但 **`q4_0/avx2` 只用了 10.6% 的带宽 → 它的限制是算术，而算术是可以优化的**（带宽是硬天花板，算术不是）。若把它做到 ~0.11 ns/元素（现在 0.353 ns/元素），端到端上限约 **1.9×**。这是"还值不值得往量化里投入"的判断依据，也是下一步唯一说得通的杠杆。
+  - 门：`check-ledger` / `check-counts` 待跑；`mojo build -O2` 无 error。改动仍未提交。
+
+- **2026-09-20（订正，紧接上一条）** —— ⚠️ 账本里"每 token 流 2.108 GB"是**旧的高估**，别再引用：它按 65.1 MB/层 × 24 + `lm_head` 0.5445 GB 得来，而每层实为 **59.6 MB**（q/k/v/o/gate/up/down = 14,909,440 参数）。**权威数是权重文件的字节数 1,976,393,216 B = 1.976 GB = 494.1M 参数**（= 24 层 357.85M + `lm_head` 136.13M；`lm_head` 与 `embed_tokens` 绑定共用一份字节）。已写进 `cli.mojo` 的 `BYTES_PER_TOKEN_FP32/Q4` 与文件头。
+  - 连带影响两条：① "q4 端到端天花板 2.76×" 改为 **2.65×**（(1431/7.11 + 544.5) ÷ 1976）；② 那条"端到端交叉校验（2.108 GB ÷ 带宽 → 307 ms，实测 354 ms = 87%）"的分子要按 1.976 GB 重算（≈ **60%**）—— **它不再支持"AVX2 档已达带宽上限"这个说法**，待重测，在此之前别当作已验证结论往外引。
