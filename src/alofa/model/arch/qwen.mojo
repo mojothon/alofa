@@ -19,6 +19,8 @@ Run:
     pixi run mojo build -O2 -I src tests/unit/test_model_parity.mojo -o /tmp/mp
 """
 
+from std.runtime.asyncrt import TaskGroup, parallelism_level
+
 from alofa.core.dtype import DT_FP32
 from alofa.core.error import (
     ERR_INVALID_ARGUMENT,
@@ -30,10 +32,13 @@ from alofa.core.error import (
 from alofa.core.ffi.mem import RawPtr
 from alofa.core.memory import Arena
 from alofa.core.tensor import (
+    MAX_RANK,
     F32Ptr,
+    Shape,
     TensorView,
     f32_data,
     rows_view,
+    shape2,
 )
 from alofa.core.text import parse_float64, parse_int
 from alofa.kernels.cpu.quant import (
@@ -192,6 +197,309 @@ def q4_matmul_bias_k[backend: Int](
         matmul_q4_f32_bias_vec(dst, x, blocks, rows, cols, bias)
     else:
         matmul_q4_f32_bias(dst, x, blocks, rows, cols, bias)
+
+
+# ---------------------------------------------------------------------------
+# 把一次投影切成几片并发跑
+#
+# 一次 decode 的输出是 `out` 个标量，第 c 个是 `w` 的第 c 行与 `x` 的点积 —— 它们
+# 之间**没有任何依赖**，这就是全部的并行度。切 `inner`（那个归约维）会引入跨片
+# 归约（原子加，或再一趟合并），那是**额外**的同步，不是这里要拿的东西。
+#
+# ⚠️ Mojo 1.0.0 没有线程模块：`thread` / `threading` / `concurrent` / `parallel`
+# 逐个 import 过，全是 `unable to locate module`。可用的只有 `runtime.asyncrt`
+# 这层协程 + `TaskGroup`，`parallelism_level()` 报的就是核数。所以下面量到的
+# 「并发收益」里**含这套运行时的调度开销** —— 它若把收益吃掉，那也是结论。
+#
+# ⚠️ 分片视图是**栈上的局部量**，协程按值捕获（`TensorView` 是 Copyable），所以
+# 这里一次堆分配都没有。这不是洁癖：一次 decode 有 **169 次**投影（24 层 × 7 +
+# 输出投影），每片一次 malloc 就把调度开销从 µs 级抬到十 µs 级。
+# ---------------------------------------------------------------------------
+
+# 片数的上限。超过核数再加片只会让最后几片排队，还多付调度。
+comptime MAX_SHARDS = 16
+
+
+def shard_count(n_out: Int, shards: Int) -> Int:
+    """这次投影实际切成几片。
+
+    片数不许超过输出个数：多出来的片是空的，可**空片也要付一次调度**。
+    `shards <= 1` 一律退化成 1 片 —— 那条路就是原来的直呼，语义与性能都不变。
+    """
+    if shards <= 1:
+        return 1
+    var n = shards
+    if n > n_out:
+        n = n_out
+    if n > MAX_SHARDS:
+        n = MAX_SHARDS
+    return n
+
+
+def shard_shape(a: Int, b: Int) -> Shape:
+    """二维 fp32 视图的形状，且**不抛错**。
+
+    协程里用不了 `shape2`（它抛错，而 `TaskGroup.create_task` 只收不抛错的协
+    程），所以分片视图的形状在这里现造。代价是它只支持二维 —— 一次投影本来也
+    只有二维。
+    """
+    var dims = InlineArray[Int, MAX_RANK](fill=1)
+    dims[0] = a
+    dims[1] = b
+    return Shape(dims, 2)
+
+
+# ⚠️ 协程的参数只能是**平凡值**（指针与整数）。这不是风格问题：把 `TensorView`
+# 直接传进协程，实测会**静默写到别处去** —— 参数槽在 `wait()` 之前就失效了，而
+# 每片算的又是同一个值，于是"对不对"看起来像随机的（2026-09-20 复现：把分片视
+# 图绑成循环外的具名变量就对，绑在循环里就错）。所以分片视图一律在协程**内**
+# 用指针和整数现造。
+async def _linear_shard[backend: Int](
+    d: RawPtr,
+    x: RawPtr,
+    w: RawPtr,
+    b: RawPtr,
+    rows: Int,
+    cols: Int,
+    inner: Int,
+    has_bias: Bool,
+):
+    """一片输出上的投影（带不带偏置由 `has_bias` 决定）。
+
+    ⚠️ 参数不能叫 `out`：它是参数传递约定关键字，写进参数表会被当成 `out` 约定
+    解析（"expected argument name"），故这里用 `cols`。
+
+    ⚠️ `linear_k` 是 `raises` 的，而 `TaskGroup.create_task` 只收**不抛错**的协程
+    （`RaisingCoroutine` 传不进去）。分片只是把同一次计算切成几段，段内的形状
+    规则与全量那次**一模一样**，契约由调用方在进协程之前用同一次直呼验过 ——
+    这里的 `except` 不是"吞掉错误"。
+    """
+    var dv = TensorView(d, shard_shape(rows, cols), DT_FP32)
+    var xv = TensorView(x, shard_shape(rows, inner), DT_FP32)
+    var wv = TensorView(w, shard_shape(cols, inner), DT_FP32)
+    var bv = TensorView(b, shard_shape(1, cols), DT_FP32)
+    try:
+        if has_bias:
+            linear_bias_k[backend](dv, xv, wv, bv)
+        else:
+            linear_k[backend](dv, xv, wv)
+    except err:
+        _ = err
+
+
+async def _q4_shard[backend: Int](
+    d: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+):
+    """同上，q4_0 通路：一片输出行，配上它在块流里那一段。"""
+    try:
+        if has_bias:
+            q4_matmul_bias_k[backend](d, x, blocks, rows, cols, bias)
+        else:
+            q4_matmul_k[backend](d, x, blocks, rows, cols)
+    except err:
+        _ = err
+
+
+def linear_k_shards[backend: Int](
+    dst: TensorView, x: TensorView, w: TensorView, shards: Int
+) raises AlofaError:
+    """把投影按输出切成 `shards` 片并发跑。
+
+    批为 1（decode）时切**输出列**：`w` 的每片是一段连续的行，`dst` 的每片是一
+    段连续的元素。批大于 1（prefill）时列不连续（`dst` 是行主序），于是改切
+    **输出行**：`dst` 与 `x` 各自切一段连续的行，`w` 共享。
+    """
+    if dst.shape.rank() != 2 or x.shape.rank() != 2 or w.shape.rank() != 2:
+        linear_k[backend](dst, x, w)
+        return
+    var rows = dst.shape.dims[0]
+    var out = dst.shape.dims[1]
+    var inner = x.shape.dims[1]
+    var split = out if rows == 1 else rows
+    var n = shard_count(split, shards)
+    if n <= 1:
+        linear_k[backend](dst, x, w)
+        return
+
+    var d0 = dst.data.unsafe_offset(dst.byte_offset)
+    var x0 = x.data.unsafe_offset(x.byte_offset)
+    var w0 = w.data.unsafe_offset(w.byte_offset)
+    var tg = TaskGroup()
+    var per = split // n
+    var rem = split - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        if rows == 1:
+            tg.create_task(
+                _linear_shard[backend](
+                    d0.unsafe_offset(c0 * 4),
+                    x0,
+                    w0.unsafe_offset(c0 * inner * 4),
+                    d0,
+                    1,
+                    cnt,
+                    inner,
+                    False,
+                )
+            )
+        else:
+            tg.create_task(
+                _linear_shard[backend](
+                    d0.unsafe_offset(c0 * out * 4),
+                    x0.unsafe_offset(c0 * inner * 4),
+                    w0,
+                    d0,
+                    cnt,
+                    out,
+                    inner,
+                    False,
+                )
+            )
+        c0 += cnt
+    tg.wait()
+
+
+def linear_bias_k_shards[backend: Int](
+    dst: TensorView, x: TensorView, w: TensorView, b: TensorView, shards: Int
+) raises AlofaError:
+    """同上，带偏置。
+
+    偏置跟着输出列走：切列时每片只取自己那几列的偏置，切行时整份偏置每片都要
+    （一行里的每一列都要加它自己那个偏置）。
+    """
+    if dst.shape.rank() != 2 or x.shape.rank() != 2 or w.shape.rank() != 2:
+        linear_bias_k[backend](dst, x, w, b)
+        return
+    var rows = dst.shape.dims[0]
+    var out = dst.shape.dims[1]
+    var inner = x.shape.dims[1]
+    var split = out if rows == 1 else rows
+    var n = shard_count(split, shards)
+    if n <= 1:
+        linear_bias_k[backend](dst, x, w, b)
+        return
+
+    var d0 = dst.data.unsafe_offset(dst.byte_offset)
+    var x0 = x.data.unsafe_offset(x.byte_offset)
+    var w0 = w.data.unsafe_offset(w.byte_offset)
+    var b0 = b.data.unsafe_offset(b.byte_offset)
+    var tg = TaskGroup()
+    var per = split // n
+    var rem = split - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        if rows == 1:
+            tg.create_task(
+                _linear_shard[backend](
+                    d0.unsafe_offset(c0 * 4),
+                    x0,
+                    w0.unsafe_offset(c0 * inner * 4),
+                    b0.unsafe_offset(c0 * 4),
+                    1,
+                    cnt,
+                    inner,
+                    True,
+                )
+            )
+        else:
+            tg.create_task(
+                _linear_shard[backend](
+                    d0.unsafe_offset(c0 * out * 4),
+                    x0.unsafe_offset(c0 * inner * 4),
+                    w0,
+                    b0,
+                    cnt,
+                    out,
+                    inner,
+                    True,
+                )
+            )
+        c0 += cnt
+    tg.wait()
+
+
+def q4_matmul_k_shards[backend: Int](
+    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int, shards: Int
+) raises AlofaError:
+    """同上，q4_0 通路：按输出行切，`blocks` 里每行是 `cols/Q4_BLOCK` 个块。"""
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q4_matmul_k[backend](dst, x, blocks, rows, cols)
+        return
+    var row_bytes = cols // Q4_BLOCK * Q4_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        # 偏置指针在 has_bias=False 时不会被读，这里传 `dst` 只是占位。
+        tg.create_task(
+            _q4_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                cnt,
+                cols,
+                dst,
+                False,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
+def q4_matmul_bias_k_shards[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    shards: Int,
+) raises AlofaError:
+    """同上，带偏置。"""
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q4_matmul_bias_k[backend](dst, x, blocks, rows, cols, bias)
+        return
+    var row_bytes = cols // Q4_BLOCK * Q4_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        tg.create_task(
+            _q4_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                cnt,
+                cols,
+                bias.unsafe_offset(c0),
+                True,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
+def default_shards() -> Int:
+    """默认的片数：核数。
+
+    ⚠️ 只是**供调用方参考**的一个数，不是模型自己去读的环境：把它打印出来比让
+    它悄悄生效更难骗人。
+    """
+    return parallelism_level()
 
 
 def add_k[backend: Int](dst: TensorView, a: TensorView, b: TensorView) raises AlofaError:
@@ -378,6 +686,10 @@ struct QwenForward(Movable):
     var q4_arena: Arena
     var q4_blocks: List[RawPtr]
     var q4_enabled: Bool
+    # 一次投影切成几片并发跑。1 = 不切（与加这个字段之前完全同一条代码路径）。
+    # 它是**实例**的属性而不是方法的参数：一次前向里有 169 次投影，让调用方每
+    # 次都把这个数传一遍，只是给了 169 个把它传错的机会。
+    var shards: Int
 
     def __init__(
         out self,
@@ -396,6 +708,9 @@ struct QwenForward(Movable):
         self.params = TensorFile(params_dir)
         self.max_tokens = max_tokens
         self.kv_len = 0
+        # 默认不切：默认值必须是"和加这个字段之前一模一样"的那条路，否则一次
+        # 升级就悄悄改了所有已有门跑的东西。
+        self.shards = 1
         self.cos = self.params.view(COS)
         self.sin = self.params.view(SIN)
 
@@ -474,6 +789,21 @@ struct QwenForward(Movable):
             self.require(p + "mlp.up_proj.weight")
             self.require(p + "mlp.down_proj.weight")
 
+    def set_shards(mut self, shards: Int) raises AlofaError:
+        """设置一次投影切成几片并发跑。`shards <= 1` 表示不切。
+
+        为什么是显式设置而不是让它默认等于核数：这是一台 **8 核常年 runq 6–27**
+        的机器，"核数"在这里不等于"我能用多少核"。默认值保持 1（与加这个字段
+        之前完全同一条代码路径），要看并发的收益必须由调用方**明说**。
+        """
+        if shards < 0 or shards > MAX_SHARDS:
+            raise AlofaError(
+                ERR_OUT_OF_RANGE,
+                "shard count must be between 0 and the maximum",
+                "shards=" + String(shards) + " max=" + String(MAX_SHARDS),
+            )
+        self.shards = shards
+
     def enable_q4(mut self) raises AlofaError:
         """把所有投影矩阵就地压成 q4_0，之后的前向走量化通路。
 
@@ -521,9 +851,11 @@ struct QwenForward(Movable):
         """
         if not self.q4_enabled or slot == Q4_NO_SLOT:
             if has_bias:
-                linear_bias_k[backend](dst, x, self.params.view(name), bias)
+                linear_bias_k_shards[backend](
+                    dst, x, self.params.view(name), bias, self.shards
+                )
             else:
-                linear_k[backend](dst, x, self.params.view(name))
+                linear_k_shards[backend](dst, x, self.params.view(name), self.shards)
             return
 
         var t_rows = dst.shape.dims[0]
@@ -552,11 +884,11 @@ struct QwenForward(Movable):
             var out_row = dst_p.unsafe_offset(r * out * 4)
             var in_row = x_p.unsafe_offset(r * cols * 4)
             if has_bias:
-                q4_matmul_bias_k[backend](
-                    out_row, in_row, blocks, out, cols, f32_data(bias)
+                q4_matmul_bias_k_shards[backend](
+                    out_row, in_row, blocks, out, cols, f32_data(bias), self.shards
                 )
             else:
-                q4_matmul_k[backend](out_row, in_row, blocks, out, cols)
+                q4_matmul_k_shards[backend](out_row, in_row, blocks, out, cols, self.shards)
 
     def require(imm self, name: String) raises AlofaError:
         """Fail with the parameter's name if it is not in the file."""

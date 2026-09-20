@@ -48,6 +48,7 @@ SUITES=(
   "tests/unit/test_sampler_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_matmul_vec.mojo|-O0 -I src"
+  "tests/unit/test_parallel_shards.mojo|-O2 -I src"
   "tests/unit/test_avx2_parity.mojo|-I src"
   "tests/unit/test_scheduler.mojo|-O0 -I src"
   "tests/unit/test_kv_pool.mojo|-O0 -I src"
