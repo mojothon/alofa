@@ -701,6 +701,28 @@ def test_the_engine_refuses_what_it_cannot_hold() raises:
     arena.keep_alive()
 
 
+def test_a_watermark_rejection_does_not_leave_a_pending_request() raises:
+    """A rejected admission must not keep the engine permanently busy.
+
+    The scheduler rejects a sequence whose steady-state footprint exceeds the
+    watermark. The engine has already queued the submission, so it must clear
+    that arrival when prepare propagates the capacity error.
+    """
+    var arena = Arena(1 << 16)
+    var core = toy_core(SchedConfig(16, 16, 16, 4, 500, 8))
+    var toks = int_map(arena.alloc(256 * 8))
+    core.submit(901, toks, fill(toks, 901, 32), 4)
+
+    var name = ""
+    try:
+        _ = core.prepare()
+    except err:
+        name = err.name()
+    assert_equal(name, "capacity", "超过 KV 水位的首请求必须被拒绝")
+    assert_true(not core.has_work(), "被拒绝的 arrival 仍让 engine 保持 busy")
+    arena.keep_alive()
+
+
 def test_a_decode_for_an_absent_request_is_refused() raises:
     """Pull the request out from under the scheduler and ask for a tick.
 

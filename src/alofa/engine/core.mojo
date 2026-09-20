@@ -404,7 +404,23 @@ struct EngineCore:
                 var want2 = self.sched.blocks_used - limit
                 _ = self.room.reclaim(want2 if want2 < budget else budget)
 
-        self.act = self.sched.step(self.inp)
+        try:
+            self.act = self.sched.step(self.inp)
+        except err:
+            # An admission can fail after submit() queued the engine slot. Keep
+            # arrivals the scheduler accepted, but retire rejected slots so
+            # has_work() cannot retry the same impossible request forever.
+            for i in range(self.n_arrivals):
+                var slot = self.arrivals[i]
+                if self.sched.find(self.ids[slot]) < 0:
+                    self.ids[slot] = 0
+                    self.p_len[slot] = 0
+                    self.p_new[slot] = 0
+                    self.fed[slot] = 0
+                    self.n_out[slot] = 0
+                    self.state[slot] = ST_FREE
+            self.n_arrivals = 0
+            raise err.copy()
         self.n_evicted = 0
 
         # The scheduler drops a cancelled request, so the engine must drop it too:

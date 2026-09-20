@@ -510,25 +510,68 @@ def test_the_watermark_preempts_without_breaking_capacity() raises:
 
 
 def test_a_pool_too_small_fails_loudly() raises:
-    """容量小到装不下一个 decode 步时，报具名错误，而不是静默抖动或丢 token。
+    """完整序列装不下 KV 池时，首个 admission 就报具名 capacity 错误。
 
-    另一种写法是"抢不到就这一拍不算"，那会让请求看起来在生成、实际在原地
-    打转 —— 正是本项目要避免的静默失败。
+    不能先运行 prompt、再在 decode 中等待硬容量失败，否则请求已经进入了
+    可能反复重算的状态。
     """
     var cfg = SchedConfig(32, 32, 16, 2, 900, 8)
     var sch = Scheduler(cfg)
     var inp = SchedInput()
     inp.add_arrival(1, 32, 4)
-    var act = sch.step(inp)
-    assert_equal(act.tokens(), 32)
 
-    inp.clear()
     var raised = False
     try:
         _ = sch.step(inp)
     except err:
         raised = err.name() == "capacity"
-    assert_true(raised, "KV 池装不下时必须报 capacity，而不是静默继续")
+    assert_true(raised, "完整序列装不下 KV 池时必须立即报 capacity")
+    assert_equal(sch.n_live(), 0)
+    assert_equal(sch.blocks_used, 0)
+
+
+def test_a_single_request_over_watermark_fails_before_livelock() raises:
+    """单请求稳态占用超过水位时，必须 admission 失败而不是反复重算。
+
+    硬容量能容纳 3 个 block，但水位只有 2 个 block。若首请求绕过水位检查，
+    它会在每次 decode 后被抢占并从 prompt 重算，永远不能完成。
+    """
+    var cfg = SchedConfig(32, 32, 16, 4, 500, 8)
+    var sch = Scheduler(cfg)
+    var inp = SchedInput()
+    inp.add_arrival(1, 32, 4)
+
+    var raised = False
+    try:
+        _ = sch.step(inp)
+    except err:
+        raised = err.name() == "capacity"
+    assert_true(raised, "单请求超过 KV 水位时必须在 admission 报 capacity")
+    assert_equal(sch.n_live(), 0)
+    assert_equal(sch.blocks_used, 0)
+
+
+def test_arrival_admission_is_atomic_on_a_late_rejection() raises:
+    """A rejected arrival must roll back earlier arrivals from the same tick.
+
+    The scheduler is pure and the engine submits a batch as one event. Leaving
+    the first request admitted after the second fails would split one caller
+    operation into a hidden partial commit.
+    """
+    var cfg = SchedConfig(32, 32, 16, 4, 500, 8)
+    var sch = Scheduler(cfg)
+    var inp = SchedInput()
+    inp.add_arrival(1, 16, 1)
+    inp.add_arrival(2, 32, 4)
+
+    var raised = False
+    try:
+        _ = sch.step(inp)
+    except err:
+        raised = err.name() == "capacity"
+    assert_true(raised, "后到请求超过水位时必须报 capacity")
+    assert_equal(sch.n_live(), 0)
+    assert_equal(sch.blocks_used, 0)
 
 
 def alloc_violations(path: String) raises AlofaError -> Int:

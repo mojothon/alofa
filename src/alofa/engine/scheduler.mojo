@@ -494,8 +494,7 @@ struct Scheduler:
         # once the steady-state footprint of the concurrent sequences passes
         # `threshold_blocks()`, step 9 preempts on every tick and a preempted
         # request restarts from zero, so nothing ever finishes. Refusing here
-        # keeps that state unreachable. The first request is always admitted,
-        # otherwise a tight watermark could admit nobody at all.
+        # keeps that state unreachable, including when this is the first request.
         var committed = 0
         for i in range(MAX_BATCH):
             if self.state[i] != ST_FREE:
@@ -503,11 +502,10 @@ struct Scheduler:
                     self.prompt_len[i] + self.max_new[i], self.cfg.block_size
                 )
         var whole = blocks_for(prompt_len + max_new, self.cfg.block_size)
-        if committed > 0:
-            if committed + whole > self.cfg.threshold_blocks():
-                raise AlofaError(
-                    ERR_CAPACITY, "concurrent sequences exceed the kv watermark"
-                )
+        if committed + whole > self.cfg.threshold_blocks():
+            raise AlofaError(
+                ERR_CAPACITY, "concurrent sequences exceed the kv watermark"
+            )
         var slot = -1
         var i = 0
         while slot < 0 and i < MAX_BATCH:
@@ -683,14 +681,28 @@ struct Scheduler:
         # 4. Arrivals — minus anything cancelled on this very tick. Cancelling
         #    first is not enough on its own: the cancel list has to also *block*
         #    the arrival, or a request that arrives and is cancelled in the same
-        #    tick gets queued and then served.
-        for i in range(inp.n_arrived):
-            var blocked = False
-            for j in range(inp.n_cancelled):
-                if inp.cancelled[j] == inp.arr_id[i]:
-                    blocked = True
-            if not blocked:
-                self.admit(inp.arr_id[i], inp.arr_prompt[i], inp.arr_max_new[i])
+        #    tick gets queued and then served. Admission is atomic for this
+        #    batch: a later rejection must not leave an earlier arrival orphaned.
+        var admitted = InlineArray[Int, MAX_BATCH](fill=0)
+        var n_admitted = 0
+        try:
+            for i in range(inp.n_arrived):
+                var blocked = False
+                for j in range(inp.n_cancelled):
+                    if inp.cancelled[j] == inp.arr_id[i]:
+                        blocked = True
+                if not blocked:
+                    self.admit(
+                        inp.arr_id[i], inp.arr_prompt[i], inp.arr_max_new[i]
+                    )
+                    admitted[n_admitted] = inp.arr_id[i]
+                    n_admitted += 1
+        except err:
+            for i in range(n_admitted):
+                var slot = self.find(admitted[i])
+                if slot >= 0:
+                    self.release(slot, False)
+            raise err.copy()
 
         # 5. Promotion: a fully prefilled request starts decoding next. Costs no
         #    tokens — the prefill already happened on an earlier tick.
