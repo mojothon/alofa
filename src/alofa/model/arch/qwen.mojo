@@ -219,6 +219,9 @@ def q4_matmul_bias_k[backend: Int](
 # 片数的上限。超过核数再加片只会让最后几片排队，还多付调度。
 comptime MAX_SHARDS = 16
 
+# 实测过的最多片数。`default_shards()` 取它作上限：只启用量过的那一档。
+comptime SHARDS_MEASURED = 8
+
 
 def shard_count(n_out: Int, shards: Int) -> Int:
     """这次投影实际切成几片。
@@ -494,12 +497,22 @@ def q4_matmul_bias_k_shards[backend: Int](
 
 
 def default_shards() -> Int:
-    """默认的片数：核数。
+    """默认的片数：核数，但**不超过 8**。
 
-    ⚠️ 只是**供调用方参考**的一个数，不是模型自己去读的环境：把它打印出来比让
-    它悄悄生效更难骗人。
+    8 是本机（8 核）实测到最好的那一档：`scripts/bench_model_shards.mojo` 给
+    `shards=8` **1.66–1.84×**（批 = 1 的单流 decode，fp32/avx2，两次运行复现）。
+    ⚠️ 超过 8 的片数**没有量过**，所以它不是一个"越多越好"的证据：这里取 8 是
+    "只启用量过的那一档"。
+
+    ⚠️ 批大于 1 时分片改切**输出行**，那条路**没量过**（同上，只量了批 = 1）。
+    批越大，串行段（注意力 / RMSNorm / RoPE / 残差）占比越高，加速只会更小。
     """
-    return parallelism_level()
+    var n = parallelism_level()
+    if n < 1:
+        return 1
+    if n > SHARDS_MEASURED:
+        return SHARDS_MEASURED
+    return n
 
 
 def add_k[backend: Int](dst: TensorView, a: TensorView, b: TensorView) raises AlofaError:
@@ -686,7 +699,8 @@ struct QwenForward(Movable):
     var q4_arena: Arena
     var q4_blocks: List[RawPtr]
     var q4_enabled: Bool
-    # 一次投影切成几片并发跑。1 = 不切（与加这个字段之前完全同一条代码路径）。
+    # 一次投影切成几片并发跑。1 = 不切（与加这个字段之前完全同一条代码路径）；
+    # 默认是核数（上限 8），见 `default_shards()`。
     # 它是**实例**的属性而不是方法的参数：一次前向里有 169 次投影，让调用方每
     # 次都把这个数传一遍，只是给了 169 个把它传错的机会。
     var shards: Int
@@ -708,9 +722,10 @@ struct QwenForward(Movable):
         self.params = TensorFile(params_dir)
         self.max_tokens = max_tokens
         self.kv_len = 0
-        # 默认不切：默认值必须是"和加这个字段之前一模一样"的那条路，否则一次
-        # 升级就悄悄改了所有已有门跑的东西。
-        self.shards = 1
+        # 默认按核数切（`default_shards()`，上限是实测过的 8）。端到端实测见
+        # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
+        # 想退回不切就显式 `set_shards(1)` —— 那条路与分片之前逐位相同。
+        self.shards = default_shards()
         self.cos = self.params.view(COS)
         self.sin = self.params.view(SIN)
 
