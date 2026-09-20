@@ -138,8 +138,20 @@ struct Roofline(Copyable, Movable):
         machine's balance point (`peak_flops / peak_bandwidth`) by
         cross-multiplying, so the answer never depends on a division.
         """
-        var lhs = counter.flops * self.peak_bandwidth_bytes_per_s
-        var rhs = counter.bytes_moved * self.peak_flops_per_s
+        # ⚠️ 直接交叉相乘会在**真实量级上整数溢出**：两侧是 `flops × 带宽峰值` 与
+        # `bytes × 算力峰值`。一次真前向是 2.7e8 flops / 5.4e8 字节，本机峰值是
+        # 1.5e10 B/s 与 7.2e10 FLOP/s —— 第二个乘积到 3.9e19，越过 Int64 上界后绕
+        # 回负数，于是明明带宽受限的工作负载被判成**算力受限**，且没有任何征兆。
+        #
+        # 所以先把两个峰值换成「每 UNIT」的量再乘：两侧同缩一个 UNIT，比较结果不变，
+        # 而整数截断的相对误差 ≤ 1e-6 —— 离判 balanced 用的 50‰ 容差还有五个数量级。
+        # 峰值小到除以 UNIT 会变成 0 时把 UNIT 退回去：两个峰值在构造时就已被要求为正。
+        comptime PEAK_SCALE = 1_000_000
+        var unit = PEAK_SCALE
+        while self.peak_bandwidth_bytes_per_s // unit == 0 or self.peak_flops_per_s // unit == 0:
+            unit //= 1000
+        var lhs = counter.flops * (self.peak_bandwidth_bytes_per_s // unit)
+        var rhs = counter.bytes_moved * (self.peak_flops_per_s // unit)
 
         var difference = lhs - rhs
         if difference < 0:
@@ -148,7 +160,12 @@ struct Roofline(Copyable, Movable):
         if rhs > larger:
             larger = rhs
 
-        if difference * 1000 <= BALANCE_TOLERANCE_PERMILLE * larger:
+        # ⚠️ `difference * 1000 <= TOLERANCE * larger` 会**整数溢出**：真实 workload
+        #（`bytes` 到 5e8、峰值到 1e10）让两侧乘积到 1e18 量级，再乘 1000 就越过
+        # Int64 上界并绕回负数 —— 于是明明带宽受限的工作负载被判成 `balanced`，
+        # 且判得毫无征兆。先除后乘。`// 1000` 丢的精度远小于绕回负数的代价。
+        var slack = larger // 1000 * BALANCE_TOLERANCE_PERMILLE
+        if difference <= slack:
             return BOTTLENECK_BALANCED
         elif lhs < rhs:
             return BOTTLENECK_MEMORY

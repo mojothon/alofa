@@ -76,6 +76,41 @@ def test_balanced_at_the_balance_point() raises:
     assert_equal(roofline.bottleneck(counter), BOTTLENECK_BALANCED)
 
 
+def test_bottleneck_survives_realistic_magnitudes() raises:
+    """真实量级下 cross-multiply 曾经**整数溢出**，把带宽受限判成 balanced。
+
+    这里用一次真前向的量级：`bytes` 到 5e8、峰值到 1e10，两侧乘积就是 2.5e18 与
+    5e18。它们本身还装得进 Int64，但旧实现要再乘 1000（容差是千分比），一乘就
+    越过 Int64 上界绕回负数 —— 负的 `difference` 恒小于等于任何东西，于是判定变成
+    了「永远 balanced」。
+
+    ⚠️ 这个 bug **只能**在真实量级上出现：本文件其余用例都用 4 MB 和 1e9 这种数，
+    乘积到不了 1e18，所以它们全绿，而真正跑起来的时候这道门是哑的。留这条大数用
+    例不是为了覆盖率好看，是为了让「万一有人把整数改窄」当场被抓住。
+
+    期望值是可以手算的：平衡点是 1 GB/s 对 1 GFLOP/s，即 1 flop/byte；这条的算术
+    强度是 0.5 flops/byte，只有平衡点的一半 —— 差了一倍，当然不该判成 balanced。
+    """
+    # 一台真机器的两个峰值：10 GB/s 带宽、70 GFLOP/s 算力 → 平衡点 7 flops/byte。
+    var roofline = Roofline(10_000_000_000, 70_000_000_000)
+    # `bytes × 算力峰值` = 5e8 × 7e10 = 3.5e19，溢出。
+    var counter = Counter("real_scale", 500_000_000, 250_000_000, 50_000_000)
+    assert_equal(roofline.bottleneck(counter), BOTTLENECK_MEMORY)
+
+
+def test_realistic_magnitudes_also_classify_compute() raises:
+    """同一量级的算力受限也必须照判 —— 别让修一边把另一边弄坏。
+
+    与上一条反着来，而且换一边溢出：`flops × 带宽峰值` = 1e9 × 1e10 = 1e19，越过
+    Int64 上界后绕回**正数**，rhs 也可能被比下去 —— 溢出不是「总是判 balanced」，
+    是「判什么都可能」，所以两个方向都得留。
+    """
+    var roofline = Roofline(10_000_000_000, 70_000_000_000)
+    # 强度 10 flops/byte，高于平衡点 7。
+    var counter = Counter("real_scale_flops", 100_000_000, 1_000_000_000, 50_000_000)
+    assert_equal(roofline.bottleneck(counter), BOTTLENECK_COMPUTE)
+
+
 def test_bottleneck_names_are_stable() raises:
     assert_equal(bottleneck_name(BOTTLENECK_MEMORY), "memory")
     assert_equal(bottleneck_name(BOTTLENECK_COMPUTE), "compute")
