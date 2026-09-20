@@ -4,6 +4,7 @@ help:
 	@echo "Available commands:"
 	@echo "  make test          - Run tests (includes capability ledger gate)"
 	@echo "  make check-ledger  - Verify capability ledger (verified must have real evidence)"
+	@echo "  make check-counts  - Verify ledger ?count=N against the counts from the last test run"
 	@echo "  make package   - Precompile Mojo files"
 	@echo "  make upload    - Upload package to Prefix"
 	@echo "  make publish   - Publish package to Prefix"
@@ -17,6 +18,9 @@ test:
 
 check-ledger:
 	pixi run check-ledger
+
+check-counts:
+	pixi run check-counts
 
 package:
 	pixi run mojo precompile src/alofa/ -o alofa.mojoc

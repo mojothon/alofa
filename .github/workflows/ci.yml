@@ -41,3 +41,10 @@ jobs:
 
       - name: 运行测试
         run: pixi run test
+
+      # N/M 快照门：账本里写的 `?count=N` 必须与本次实测条数一致。
+      # 必须跟在 **同一个 job 的 test 之后** —— 清单 target/test_counts.tsv 是 test
+      # 跑的过程中顺带产出的。别把它放进 capability-ledger job：那里没跑 test，清单
+      # 必然缺失，而这道门按设计在缺清单时是失败的（静默跳过会让门退化成装饰）。
+      - name: 校验账本里的 N/M 快照
+        run: pixi run check-counts

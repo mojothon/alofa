@@ -13,12 +13,16 @@ version = "0.1.0"
 
 
 [tasks]
+# 套件清单（含各自的编译参数）在 scripts/run_tests.sh 里单一维护，这里只负责串起来。
 # 单元套件需要 -I src 才能 import alofa.*；capability 下的平台探测与账本门不需要。
-# 新增基础层文件后：① 加一条 unit 套件 ② 若文件在 core/ 下，同步 test_layering.mojo 的文件清单。
+# 新增基础层文件后：① 在 run_tests.sh 加一条 ② 若文件在 core/ 下，同步
+# test_layering.mojo 的文件清单 ③ 跑 `pixi run ledger-sync` 刷新账本里的 ?count=。
 # tokenizer 差分门用 -O0：它要编译 13806 行的生成 Unicode 表，-O3 会把编译拖到 ~100 s
 # （同一个套件 mojo build 出来跑只要 0.34 s —— 慢的是编译不是运行，且 TestSuite 打印的
 # 耗时不可信：它报告 209 s 而进程墙钟只有 0.34 s）。
-test = "pixi run mojo run tests/test_main.mojo && pixi run mojo run tests/capability/test_libc_ffi.mojo && pixi run mojo run tests/capability/test_deps.mojo && pixi run mojo run -I src tests/capability/test_layering.mojo && pixi run mojo run -I src tests/unit/test_core_error.mojo && pixi run mojo run -I src tests/unit/test_core_log.mojo && pixi run mojo run -I src tests/unit/test_core_ffi.mojo && pixi run mojo run -I src tests/unit/test_core_dtype.mojo && pixi run mojo run -I src tests/unit/test_core_tensor.mojo && pixi run mojo run -I src tests/unit/test_core_memory.mojo && pixi run mojo run -I src tests/unit/test_core_mmap.mojo && pixi run mojo run -I src tests/unit/test_verify_roofline.mojo && pixi run mojo run -O0 -I src tests/unit/test_tokenizer_parity.mojo && pixi run mojo run -I src tests/unit/test_layer0_parity.mojo && pixi run mojo run -O0 -I src tests/unit/test_sampler_parity.mojo && pixi run mojo run -O0 -I src tests/unit/test_q4_parity.mojo && pixi run mojo run -I src tests/unit/test_avx2_parity.mojo && pixi run mojo run -O0 -I src tests/unit/test_scheduler.mojo && pixi run mojo run -O0 -I src tests/unit/test_kv_pool.mojo && pixi run mojo run -O0 -I src tests/unit/test_paged_attention.mojo && pixi run mojo run -O0 -I src tests/unit/test_paged_scatter.mojo && pixi run mojo run -O0 -I src tests/unit/test_batch_pool.mojo && pixi run mojo run -O0 -I src tests/unit/test_batch_executor.mojo && pixi run mojo run -O0 -I src tests/unit/test_engine_core.mojo && pixi run mojo run -O0 -I src tests/unit/test_kv_room.mojo && pixi run check-ledger"
+# run_tests.sh 会顺带产出 target/test_counts.tsv（各套件自报的通过条数），
+# check-counts 据此核对账本里的 N/M 快照 —— 见 scripts/ledger_sync.py 的说明。
+test = "bash scripts/run_tests.sh && pixi run check-ledger"
 # 批一致性重门：同一批 prompt 在「1/2/4/8 条请求一批」与「一条一条跑」两种走法下必须
 # 逐 token 相同（greedy，所以一个 token 不同就是一个不同）。它跑的是真实的 0.5B
 # 权重，所以要 build 再跑，也因此没有并入 test —— 与 test-model / test-q4 同理。
@@ -39,10 +43,24 @@ test-model-avx2 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/
 # `unknown cpu backend`。拼错的后端常量若只是静默退化成标量，整网向量门会照绿
 # —— 而它绿的原因是向量路径一次都没跑过。
 test-backend-guard = "bash scripts/check_bad_backend.sh"
+# 垂直切片：一句真文本走完 tokenizer → model → engine → sampler（真权重，一次约 40 s）。
+# 这是全链路唯一被真正执行过的接缝，见 src/alofa/cli.mojo 的文件头。
+generate = "pixi run mojo run -O0 -I src src/alofa/cli.mojo"
+# 垂直切片**门**：同上但带断言 —— greedy 必须说出 Paris，且低温采样必须收敛到贪心
+# （后者是负向对照：若 sampler 没真正介入，两条路会"碰巧"一致而门形同虚设）。
+# 不并入 test：需要那 1.9 GB 权重，与 test-model 同级。
+test-slice = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_vertical_slice.mojo -o target/vertical_slice && ./target/vertical_slice"
 # 能力账本 CI 门：标了 verified / verified-remote / verified-env 的条目必须给出真实凭证，
 # 否则 CI 失败。门本身也含自检（tests/fixtures/ledger_bad.md 必须被拒绝）。
 # 详见 docs/plan/capability-ledger.md
 check-ledger = "pixi run mojo run tests/capability/test_ledger.mojo"
+# N/M 快照门：账本里每个 `?count=N` 必须与本次实测条数一致（target/test_counts.tsv）。
+# 必须排在 `pixi run test` **之后** —— 那份清单由 test 顺带产出；清单缺失时这道门会
+# 失败，而不是静默跳过（跳过等于它只是个装饰）。
+check-counts = "pixi run mojo run tests/capability/test_ledger_counts.mojo"
+# 把账本里的 N/M 快照刷新成本次实测值。改完记得 `git diff` 看看漂了什么 —— 那正是
+# 这道门要暴露的东西。先用 --dry-run 看结果：pixi run ledger-sync -- --dry-run
+ledger-sync = "pixi run python scripts/ledger_sync.py"
 build = "rattler-build build -r src -c https://conda.modular.com/max/ -c https://prefix.dev/mojo-force -c https://repo.prefix.dev/modular-community   -c conda-forge --skip-existing=all"
 publish = { cmd = "bash scripts/publish.sh", env = { PREFIX_API_KEY = "$PREFIX_API_KEY" } }
 
