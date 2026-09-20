@@ -9,28 +9,52 @@ an inference engine in pure Mojo.
 
 ---
 
-## 当前状态（诚实声明）
+## 当前状态
 
-**`v0.1.0` — 仅有地基与规划，没有任何推理能力。**
+**到下面这些东西为止的能力，是被测试证明过的；没有列出来的，一律当作还没有。**
 
-唯一被验证的东西是工具链假设。详见 [`docs/plan/capability-ledger.md`](docs/plan/capability-ledger.md) —— **该账本是本项目唯一的事实来源**，README 不得出现账本中非 `verified` 的能力。
+[`docs/plan/capability-ledger.md`](docs/plan/capability-ledger.md) 是本项目**唯一的事实来源**。
+README 不得出现账本里未标 `verified` 的能力；账本的分级由 `pixi run check-ledger` 在 CI 里强制执行
+（它自己也有一条指向自己的证据，账本用它自己的门来证明自己可信）。
 
-| 已验证 | 证据 |
+### 已验证（`verified`，均可复现）
+
+| 能力 | 证据 |
 |---|---|
-| Mojo 1.0.0 工具链可用 | `Mojo 1.0.0 (ed45d567)` |
-| libc FFI（`external_call`）可用 | `tests/capability/test_libc_ffi.mojo` |
-| `socket` / `epoll_create1` / `timerfd_create` / `eventfd` / `SO_REUSEPORT` | 同上，5/5 测试通过 |
-| **`flare` / `json` 可导入**（含 `flare.runtime.Reactor`、`flare.http.HttpServer`） | `tests/capability/test_deps.mojo`，4/4 通过 |
-| **CUDA kernel 在 A100 上数值正确** | `tests/gpu/vecadd.mojo`，实测 `c[999] = 2997.0` ✓（**仅远程验证机**） |
-| **能力账本被 CI 强制** | `tests/capability/test_ledger.mojo`（7/7）；`pixi run check-ledger` |
+| Mojo 1.0.0 工具链 | `Mojo 1.0.0 (ed45d567)` |
+| libc FFI、平台原语（socket / epoll / timerfd / eventfd / `SO_REUSEPORT`） | `tests/capability/test_libc_ffi.mojo` |
+| `flare` / `json` 可导入（`flare.runtime.Reactor`、`flare.http.HttpServer`） | `tests/capability/test_deps.mojo` |
+| **CUDA kernel 在 A100 上数值正确**（`c[999] = 2997.0`） | `tests/gpu/vecadd.mojo`（**仅远程验证机**） |
+| 标量后端 `scalar` (fp32) / 向量后端 `avx2` | `tests/unit/test_layer0_parity.mojo`、`tests/unit/test_avx2_parity.mojo` |
+| L0 地基：张量视图、arena、mmap、具名错误、结构化日志、分层守门 | `tests/unit/test_core_*.mojo`、`tests/capability/test_layering.mojo` |
+| 算子：RMSNorm / SwiGLU / RoPE / GQA 注意力（非分页 + 分页）/ matmul（fp32、q4 融合） | `tests/unit/test_layer0_parity.mojo`、`tests/unit/test_paged_attention.mojo`、`tests/unit/test_q4_parity.mojo` |
+| q4_0 量化：解量化、量化步、**整网 q4_0 前向通路**（24 层投影走块流） | `tests/unit/test_q4_parity.mojo`、`tests/unit/test_q4_greedy.mojo` |
+| Qwen2.5 0.5B fp32 架构：prefill + greedy 逐 token 与 HuggingFace 一致 | `tests/unit/test_model_parity.mojo` |
+| **权重常驻内存门**（加载 + 生成 32 token 后峰值 RSS ≤ 1.15× 权重；实测 1.006×） | `tests/unit/test_memory_gate.mojo` |
+| KV：物理块池 + 分页视图 + 基数树前缀视图，三视图共享 refcount；前缀分裂零拷贝 | `tests/unit/test_kv_pool.mojo`、`tests/unit/test_kv_room.mojo` |
+| 调度：纯函数 `step(state, input) -> Action`、chunked prefill、抢占、延迟护栏、trace 录制与重放 | `tests/unit/test_scheduler.mojo` |
+| 批处理：批张量池、批执行器、**批大小 1/2/4/8 与单请求逐 token 相同** | `tests/unit/test_batch_pool.mojo`、`tests/unit/test_batch_executor.mojo`、`tests/unit/test_batch_forward.mojo` |
+| 引擎循环：调度器 ↔ 批执行器接线、缓存让位、共享前缀只算未命中段、抢占活锁修复 | `tests/unit/test_engine_core.mojo` |
+| 采样器：top-k / top-p / min-p / 温度 / 重复惩罚 / logit bias，分布经卡方与 TVD 检验 | `tests/unit/test_sampler_parity.mojo` |
+| Tokenizer：预分词器（无正则依赖）、NFC 归一化、BPE、added token、id→文本还原，**4560 条差分与 HF 逐 id 一致** | `tests/unit/test_tokenizer_parity.mojo` |
+| **垂直切片**：一句真文本走完 tokenizer → model → engine → sampler（真权重、端到端） | `tests/unit/test_vertical_slice.mojo`<br>`pixi run test-slice` / `pixi run generate` |
 
-> 未列出的一切能力（推理、KV cache、tokenizer、服务层等）**均为未实现**。请勿假设可用。
+### 还没有（`missing` / `hardware-blocked`，请勿假设可用）
+
+这些同样是事实的一部分，写在这里是为了避免"看起来已经能用"：
+
+- **只有命令行生成，没有服务层。** `pixi run generate` 能跑一句真文本（见下），但没有 HTTP / OpenAI 兼容 API、没有流式 SSE、没有并发服务。
+- ⚠️ 垂直切片只验 **1 条请求 / 16 个 token / scalar 后端**：不验 AVX2、不验批、不验流式输出的 UTF-8 边界，也不验生成质量。它只负责"链路通"。
+- **不能自己加载模型权重。** 模型不支持 HF `config.json` / safetensors / GGUF，权重目前来自本机导出的 fp32 裸二进制 + TSV 索引（见 `scripts/dump_model_reference.py`）。
+- **只有一个模型架构**（Qwen2.5 0.5B，fp32）；Llama / Mistral 未开始。
+- **量化只有 q4_0 一种格式**（q4_k / q8_0 / int8 / fp8 未开始），且整网 q4_0 的教师强制贪心一致率实测 **0.8164**，未达到自己设的 ≥0.90 质量门 → 这条在账本里按 `missing` 如实记录。
+- **没有任何性能数字。** 唯一被接受的性能基准是同机同 prompt 对比 llama.cpp，尚未做。
 
 ### 两台验证机
 
 | 环境 | 用途 | 约束 |
 |---|---|---|
-| 开发机（i7-9700K / AVX2 / Maxwell sm_52 GPU 不可用 / ~13 GB 可用内存） | CPU 路径的端到端验证 | GPU 不可用 |
+| 开发机（i7-9700K / AVX2 / Maxwell sm_52 GPU 不可用 / ~13 GB 可用内存） | CPU 路径的端到端验证 | 无 AVX-512，本地 GPU 不可用 |
 | **A100 远程验证机**（6×A100 共 280 GB / 128 vCPU / 755 GB RAM） | CUDA 正确性与性能基准 | **无外网**（须 rsync 同步 `.pixi`）；**共享机，只能用空闲卡** |
 
 ```bash
@@ -38,6 +62,50 @@ an inference engine in pure Mojo.
 ./scripts/a100.sh sync                           # 同步项目（含 .pixi）
 ./scripts/a100.sh run 4 tests/gpu/vecadd.mojo    # 在 GPU 4 上跑 kernel 冒烟测试
 ```
+
+## 怎么用
+
+```bash
+pixi run test             # 全部套件（约 4.5 min），末尾自动跑账本门
+pixi run check-ledger     # 只校验账本：每个 verified 都要有真实证据
+pixi run check-counts     # 校验账本里的 ?count=N 是否等于本次实测条数（须在 test 之后）
+pixi run ledger-sync      # 套件条数变了？一条命令把账本里的 ?count=N 刷新回来
+```
+
+重资产门（要 2 GB 权重并先 `mojo build -O2`，所以**不并进 `pixi run test`**）：
+
+```bash
+pixi run test-model           # 整网 Qwen2.5 0.5B 数值门（prefill + 128 token greedy）
+pixi run test-model-avx2      # 同上，向量后端
+pixi run test-q4              # 整网 q4_0 教师强制贪心一致率
+pixi run test-memory          # 权重常驻内存门
+pixi run test-batch-forward   # 批一致性（1/2/4/8 与单请求逐 token 相同）
+pixi run test-backend-guard   # 编译期红测：拼错的后端常量必须编译失败
+pixi run test-slice           # 垂直切片门（需 1.9 GB 权重）
+```
+
+### 跑一句真文本
+
+```bash
+pixi run generate
+```
+
+```
+[greedy]  The capital of France is
+          → " Paris. It is the largest city in Europe and the second largest in the world"
+[sampled] → ": A: Paris B: not sure C: london D: BERLIN"      # 温度 1.0，seed 固定
+```
+
+两条路都说到 Paris。它们**必须**在温度趋零时逐字相等 —— 若 `run_sampled` 悄悄退化成
+argmax，"说出 Paris"照样全绿而采样路径一次都没生效过，所以那条才是这道门的关键断言。
+
+### 给账本加一条新能力
+
+新增套件后：① `scripts/run_tests.sh` 里登记（含编译参数）② 若文件在 `core/` 下，同步
+`tests/capability/test_layering.mojo` 的文件清单 ③ `pixi run ledger-sync` 刷新 `?count=`。
+
+账本里的 N/M 快照（形如 `evidence:…mojo?count=17`）由 `check-counts` 逐项核对 —— **写数字的地方只有这一个**，
+其余地方不再手写"（15/15 通过）"式的描述，因为那类描述会腐烂，而账本的职责是不腐烂。
 
 ## 规划文档
 
