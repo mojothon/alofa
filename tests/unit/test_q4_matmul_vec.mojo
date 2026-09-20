@@ -40,6 +40,7 @@ from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr
 from alofa.core.text import parse_int, read_text
 from alofa.kernels.cpu.avx2 import _matmul_q4_f32acc
+from alofa.kernels.cpu.avx2 import _matmul_q4_halves
 from alofa.kernels.cpu.avx2 import matmul_q4_f32 as matmul_q4_f32_v
 from alofa.kernels.cpu.quant import block_scale, matmul_q4_f32
 
@@ -240,7 +241,17 @@ def check_kernel_against_reference(
         var want = expect_file.unsafe_offset(out_meta[0] * 8)
         var blocks = blocks_at(blocks_file, row.block_off)
 
-        if kernel == "f32acc":
+        if kernel == "halves":
+            _matmul_q4_halves(
+                got,
+                act,
+                blocks.unsafe_bitcast[UInt8](),
+                row.rows,
+                row.cols,
+                got,
+                False,
+            )
+        elif kernel == "f32acc":
             _matmul_q4_f32acc(
                 got,
                 act,
@@ -482,6 +493,28 @@ def test_f32_accumulation_deviation_is_measured() raises:
 
     var checked = check_kernel_against_reference(
         cases, blocks_file.ptr(), act_file.ptr(), expect_file.ptr(), "f32acc", True
+    )
+    assert_true(checked == 9, "expected 9 cases, got " + String(checked))
+
+    blocks_file.keep_alive()
+    act_file.keep_alive()
+    expect_file.keep_alive()
+
+
+def test_halves_kernel_deviation_is_measured() raises:
+    """半块切分（一次 16 值）的偏差也**量出来**，不靠"应该差不多"。
+
+    它和 `test_f32_accumulation_deviation_is_measured` 一样是 f32 累加，所以预期
+    同一量级；差别只在于块内怎么切向量。把两条并排留着，是为了让"换的是切法还是
+    换的是精度"这件事在证据上分得开 —— 两件事混在一起时，变快了都不知道归谁。
+    """
+    var blocks_file = MappedFile(FIXTURE + "blocks.bin")
+    var act_file = MappedFile(FIXTURE + "act.f32")
+    var expect_file = MappedFile(FIXTURE + "out_expected.f64")
+    var cases = load_cases()
+
+    var checked = check_kernel_against_reference(
+        cases, blocks_file.ptr(), act_file.ptr(), expect_file.ptr(), "halves", True
     )
     assert_true(checked == 9, "expected 9 cases, got " + String(checked))
 

@@ -66,6 +66,9 @@ comptime Q4_BYTES = quant_bytes_per_block[QUANT_Q4_0]()
 comptime Q4_SCALE_BYTES = quant_scale_bytes[QUANT_Q4_0]()
 # 一次吃 8 个字节 = 16 个量化值 = 半块。
 comptime W_Q4 = 8
+# 半块切分：一个 q4_0 块的 16 个数据字节一次读满，低半字节对应值 0..15、高半字节
+# 对应 16..31 —— 两边各自配上 x 的一段连续区间，这就是宽度取 16 的理由。
+comptime W_Q4_HALF = 16
 
 
 def rmsnorm(
@@ -543,6 +546,75 @@ def _matmul_q4_wide[
         dst[unsafe_offset=row] = Float32(acc)
 
 
+def _matmul_q4_halves(
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+) raises AlofaError:
+    """`dst[r] = Σ_c w[r,c] · x[c]`；**按半块切**（一次 16 个值），累加 f32。
+
+    与 `_matmul_q4_wide` 的算术完全一样多，差别只在一个 q4_0 块的 16 个数据字节
+    怎么拆成向量：
+
+        本文    一次读满 16 字节 → 低半字节是第 0..15 个值、高半字节是第 16..31 个
+                值，**两边各自配上一段连续的 x**（x[0..16] 与 x[16..32]）
+        `_wide` 按 8 字节读两趟 → 四段分别配 x[0..8]、x[16..24]、x[8..16]、
+                x[24..32]，于是 nibble 的提取与转换要做四遍而不是两遍
+
+    批=1 的 matmul 每权重读一次用一次、**算术受限**（账本：q4 通路只用到它自己
+    访存地板的 10.6%），所以这里唯一能省的是**指令数** —— 没有任何访存技巧可言。
+    半块切分省掉的正是每块重复两遍的解量化指令。
+
+    ⚠️ 累加是 f32，不是默认通路的 f64（差约 1e-7 量级）。够不够格替掉默认通路，
+    取决于 `test_q4_matmul_vec.mojo` 在**真实**用例（`real13` / `down_like`）上
+    量出来的偏差 —— 在那之前它只是**被测量对象**，不该接到模型层。
+
+    `bias` 只在 `has_bias` 为真时读，约定同标量版。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q4_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
+        )
+    var blocks_per_row = cols // Q4_BLOCK
+    var low_mask = SIMD[DType.uint8, W_Q4_HALF](0x0F)
+    var eight = SIMD[DType.float32, W_Q4_HALF](8.0)
+    for row in range(rows):
+        var acc = Float64(0)
+        if has_bias:
+            acc = Float64(bias[unsafe_offset=row])
+        var s0 = SIMD[DType.float32, W_Q4_HALF](0)
+        var s1 = SIMD[DType.float32, W_Q4_HALF](0)
+        for b in range(blocks_per_row):
+            var base = (row * blocks_per_row + b) * Q4_BYTES
+            var d = block_scale(blocks, base)
+            var xb = b * Q4_BLOCK
+            var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
+            # `>> 4` 之后再与一次 0x0F：字节移位在本项目用过的两种宽度（8 / 16）上
+            # 都得是**同一个**语义，多这一次掩码是为了不把这个正确性押在编译器
+            # 怎么把 u8 移位降成 vpsrlw 上 —— 它一条指令，而装反半字节的 bug 在
+            # 差分门上长得跟"数不对"一模一样。
+            var lo = (raw & low_mask).cast[DType.float32]() - eight
+            var hi = ((raw >> 4) & low_mask).cast[DType.float32]() - eight
+            var x0 = x.unsafe_load[width=W_Q4_HALF](xb) * d
+            var x1 = x.unsafe_load[width=W_Q4_HALF](xb + W_Q4_HALF) * d
+            s0 += lo * x0
+            s1 += hi * x1
+        acc += Float64((s0 + s1).reduce_add())
+        dst[unsafe_offset=row] = Float32(acc)
+
+
 def _matmul_q4(
     dst: F32Ptr,
     x: F32Ptr,
@@ -571,8 +643,18 @@ def _matmul_q4_f32acc(
 def matmul_q4_f32(
     dst: F32Ptr, x: F32Ptr, blocks: Q4_U8, rows: Int, cols: Int
 ) raises AlofaError:
-    """`dst = W · x`，`W` 为 q4_0 块流，无偏置；向量版。"""
-    _matmul_q4(dst, x, blocks, rows, cols, dst, False)
+    """`dst = W · x`，`W` 为 q4_0 块流，无偏置；向量版。
+
+    默认走**半块切分 + f32 累加**（`_matmul_q4_halves`）：核级比按块内 `j%8` 切 f64
+    通道的那条（`_matmul_q4`）**快 1.36×**，并在 `down_proj` 4864×896 上首次比
+    `fp32/avx2` 快（1.56×，此前是慢 3.6%）—— 量化能不能带来端到端收益，就卡在
+    这个"解量化比省下的字节更贵"的算术上。付的代价是累加精度：与标量版不再逐位
+    一致，真实用例（`real13` / `down_like`）上的最大相对偏差 ~5e-8，判据 1e-5。
+
+    ⚠️ 换默认通路是**判据层**的事，不是性能层的事：偏差被
+    `test_q4_matmul_vec.mojo` 逐例量出来并打印，别拿"看着差不多"换过来。
+    """
+    _matmul_q4_halves(dst, x, blocks, rows, cols, dst, False)
 
 
 def matmul_q4_f32_bias(
