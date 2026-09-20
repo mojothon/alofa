@@ -70,16 +70,29 @@ comptime W_BYTES = COLS * INNER * 4
 comptime BYTES_PER_Q4_ROW = (INNER // Q4_BLOCK) * Q4_BYTES
 comptime Q4_BYTES_PER_REGION = COLS * BYTES_PER_Q4_ROW
 
+# q4 单独要更多份：`Q4_BYTES_PER_REGION` 只有 2.34 MB，8 份 = 19 MB 比 L3
+# （12 MB）大不到 2 倍；64 份 = 150 MB 才谈得上"≫ L3"。
+comptime Q4_REGIONS = 64
 
-async def run_linear(dst: TensorView, x: TensorView, w: TensorView):
+
+async def run_linear(d: RawPtr, x: RawPtr, w: RawPtr, cols: Int, inner: Int):
     """一片输出列上的 `linear`。
 
     ⚠️ `linear` 是 `raises` 的，而 `TaskGroup.create_task` 只收**不抛错**的协程
     （`RaisingCoroutine` 传不进去）。形状由调用方在进协程**之前**用同一次直呼验
     过，所以这里的 `except` 不是"忽略错误"，是"形状契约已经在别处守着"。
+
+    ⚠️ **协程参数只能是平凡值（指针 / 整数）**。这里原来传的是 `TensorView`，
+    实测会**静默写错地方**（参数槽在 `wait()` 之前就失效），而每片算的又是同一
+    个值，"对不对"看起来像随机的 —— 于是可能有的片压根没算，时间偏快、带宽
+    算出来超过 DRAM 上限。视图一律在协程**内**现造。
     """
     try:
-        linear(dst, x, w)
+        linear(
+            TensorView(d, shape2(1, cols), DT_FP32),
+            TensorView(x, shape2(1, inner), DT_FP32),
+            TensorView(w, shape2(cols, inner), DT_FP32),
+        )
     except err:
         _ = err
 
@@ -97,13 +110,25 @@ def ns_per_elem(ns: Float64) -> Float64:
 
 
 def bench_fp32(
-    t: Int, x: TensorView, w_raw: RawPtr, d_raw: RawPtr
+    t: Int,
+    x_raw: RawPtr,
+    w_raw: RawPtr,
+    d_raw: RawPtr,
+    ref_raw: RawPtr,
+    has_ref: Bool,
 ) raises -> Float64:
     """把 896 个输出列切成 `t` 片，在 8 份互不相交的权重上各算一趟。
 
     返回**单趟**的平均纳秒（总时间 ÷ `REGIONS`）。不取最优 —— 取最优正是上面
-    那个 80 GB/s 的来历。
+    那个 80 GB/s 的来历。**自检失败返回 -1**。
+
+    ⚠️ 自检：先把 `d` 涂成哨兵 -999（`has_ref` 时），再与 T=1 那趟的结果**精确
+    相等**比较。少算了任何一片，那几列就还是 -999，这里立刻红 —— 没有这一步，
+    "有的片压根没跑"会表现为**更快**，报出一个超过 DRAM 上限的带宽而不自知。
     """
+    var dv = f32_data(TensorView(d_raw, shape2(1, COLS), DT_FP32))
+    for c in range(COLS):
+        dv[unsafe_offset=c] = Float32(-999)
     var per = COLS // t
     var rem = COLS - per * t
     var t0 = monotonic_ns()
@@ -112,7 +137,7 @@ def bench_fp32(
         if t == 1:
             linear(
                 TensorView(d_raw, shape2(1, COLS), DT_FP32),
-                x,
+                TensorView(x_raw, shape2(1, INNER), DT_FP32),
                 TensorView(wbase, shape2(COLS, INNER), DT_FP32),
             )
         else:
@@ -120,35 +145,44 @@ def bench_fp32(
             var c0 = 0
             for k in range(t):
                 var n = per + (rem if k == t - 1 else 0)
-                # 分片视图是**栈上的局部量**：协程按值捕获（`TensorView` 是
-                # Copyable），所以这里不需要任何堆容器 —— 那正是它将来能直接
-                # 进产品代码的前提（一次 decode 有 169 次矩阵乘）。
                 tg.create_task(
                     run_linear(
-                        TensorView(d_raw.unsafe_offset(c0 * 4), shape2(1, n), DT_FP32),
-                        x,
-                        TensorView(
-                            wbase.unsafe_offset(c0 * INNER * 4),
-                            shape2(n, INNER),
-                            DT_FP32,
-                        ),
+                        d_raw.unsafe_offset(c0 * 4),
+                        x_raw,
+                        wbase.unsafe_offset(c0 * INNER * 4),
+                        n,
+                        INNER,
                     )
                 )
                 c0 += n
             tg.wait()
     var t1 = monotonic_ns()
-    var out = f32_data(TensorView(d_raw, shape2(1, COLS), DT_FP32))
     # 读一点结果：重复的计算不该被当成可消除的死代码。
-    _ = out[unsafe_offset=0]
+    _ = dv[unsafe_offset=0]
+    if not has_ref:
+        return Float64(t1 - t0) / Float64(REGIONS)
+    var rv = f32_data(TensorView(ref_raw, shape2(1, COLS), DT_FP32))
+    for c in range(COLS):
+        if dv[unsafe_offset=c] != rv[unsafe_offset=c]:
+            return -1.0
     return Float64(t1 - t0) / Float64(REGIONS)
 
 
-def bench_q4(t: Int, x: F32Ptr, blocks: Q4_U8, d: F32Ptr) raises -> Float64:
-    """同上，q4_0 通路：每行的块数是 `INNER / Q4_BLOCK`，按字节偏移切。"""
+def bench_q4(
+    t: Int, x: F32Ptr, blocks: Q4_U8, d: F32Ptr, ref_raw: RawPtr, has_ref: Bool
+) raises -> Float64:
+    """同上，q4_0 通路：每行的块数是 `INNER / Q4_BLOCK`，按字节偏移切。
+
+    ⚠️ 区域数用 `Q4_REGIONS`（64 份 = 150 MB）而不是 `REGIONS`（8 份 = 19 MB）：
+    q4 每份只有 2.34 MB，8 份加起来比 L3（12 MB）大不到 2 倍 → 后几趟有一部分
+    落在 L3 里，会报出偏快的数。fp32 那边 8 份 = 139 MB，够；q4 这边不够。
+    """
+    for c in range(COLS):
+        d[unsafe_offset=c] = Float32(-999)
     var per = COLS // t
     var rem = COLS - per * t
     var t0 = monotonic_ns()
-    for r in range(REGIONS):
+    for r in range(Q4_REGIONS):
         var bbase = blocks.unsafe_offset(r * Q4_BYTES_PER_REGION)
         if t == 1:
             matmul_q4_f32(d, x, bbase, COLS, INNER)
@@ -170,19 +204,34 @@ def bench_q4(t: Int, x: F32Ptr, blocks: Q4_U8, d: F32Ptr) raises -> Float64:
             tg.wait()
     var t1 = monotonic_ns()
     _ = d[unsafe_offset=0]
-    return Float64(t1 - t0) / Float64(REGIONS)
+    if not has_ref:
+        return Float64(t1 - t0) / Float64(Q4_REGIONS)
+    var rv = f32_data(TensorView(ref_raw, shape2(1, COLS), DT_FP32))
+    for c in range(COLS):
+        if d[unsafe_offset=c] != rv[unsafe_offset=c]:
+            return -1.0
+    return Float64(t1 - t0) / Float64(Q4_REGIONS)
 
 
 def main() raises:
     var n_w = COLS * INNER
     var q4_bytes = n_w // Q4_BLOCK * Q4_BYTES
     var arena = Arena(
-        REGIONS * n_w * 4 + INNER * 4 + COLS * 4 + REGIONS * q4_bytes + 4096
+        REGIONS * n_w * 4
+        + INNER * 4
+        + COLS * 4
+        + Q4_REGIONS * q4_bytes
+        + COLS * 4
+        + COLS * 4
+        + 4096
     )
     var w_raw = arena.alloc(REGIONS * n_w * 4)
     var x_raw = arena.alloc(INNER * 4)
     var d_raw = arena.alloc(COLS * 4)
-    var blocks = arena.alloc(REGIONS * q4_bytes)
+    var blocks = arena.alloc(Q4_REGIONS * q4_bytes)
+    # 两条通路各自的 T=1 参考结果（`bench_*` 拿它做自检）。
+    var ref_f = arena.alloc(COLS * 4)
+    var ref_q = arena.alloc(COLS * 4)
 
     var w = TensorView(w_raw, shape2(COLS, INNER), DT_FP32)
     var x = TensorView(x_raw, shape2(1, INNER), DT_FP32)
@@ -197,12 +246,15 @@ def main() raises:
     while i < INNER:
         px[unsafe_offset=i] = Float32(i % 13) - Float32(6)
         i += 1
-    for r in range(REGIONS):
-        quantize_q4_0(
-            blocks.unsafe_offset(r * Q4_BYTES_PER_REGION),
-            pw.unsafe_offset(r * n_w),
-            n_w,
-        )
+    # 只量化一份，然后**复制到 64 份不同地址**：内容相同不要紧（L3 命中看的是
+    # 物理地址，不是内容），要的是"每趟读的都是没进过缓存的地址"。
+    quantize_q4_0(blocks, pw, n_w)
+    for r in range(1, Q4_REGIONS):
+        var dst = r * Q4_BYTES_PER_REGION
+        var j = 0
+        while j < q4_bytes:
+            blocks[unsafe_offset=dst + j] = blocks[unsafe_offset=j]
+            j += 1
 
     var ts = List[Int]()
     ts.append(1)
@@ -215,8 +267,31 @@ def main() raises:
     linear(d, x, w)
     matmul_q4_f32(f32_data(d), px, blocks, COLS, INNER)
 
+    # T=1 的参考结果（`has_ref=False`：此时还没有可比的参考）。
+    _ = bench_fp32(1, x_raw, w_raw, d_raw, d_raw, False)
+    var dv = f32_data(TensorView(d_raw, shape2(1, COLS), DT_FP32))
+    var rf = f32_data(TensorView(ref_f, shape2(1, COLS), DT_FP32))
+    for c in range(COLS):
+        rf[unsafe_offset=c] = dv[unsafe_offset=c]
+    _ = bench_q4(1, px, blocks, f32_data(d), d_raw, False)
+    var rq = f32_data(TensorView(ref_q, shape2(1, COLS), DT_FP32))
+    for c in range(COLS):
+        rq[unsafe_offset=c] = dv[unsafe_offset=c]
+
     print("=== 核级：down_proj", COLS, "×", INNER, " 按输出切成 T 份 ===")
     print("fp32 每趟读", n_w * 4, "B；q4_0 每趟读", q4_bytes, "B")
+    print(
+        "权重副本：fp32",
+        REGIONS,
+        "份 =",
+        REGIONS * n_w * 4 // (1024 * 1024),
+        "MB；q4",
+        Q4_REGIONS,
+        "份 =",
+        Q4_REGIONS * q4_bytes // (1024 * 1024),
+        "MB（都要 ≫ L3 12 MB）",
+    )
+    var check_ok = True
 
     var f_lo = List[Float64]()
     var f_hi = List[Float64]()
@@ -232,8 +307,12 @@ def main() raises:
         print("-- 第", r + 1, "轮 --")
         for ti in range(len(ts)):
             var t = ts[ti]
-            var fns = bench_fp32(t, x, w_raw, d_raw)
-            var qn = bench_q4(t, px, blocks, f32_data(d))
+            var fns = bench_fp32(t, x_raw, w_raw, d_raw, ref_f, t > 1)
+            var qn = bench_q4(t, px, blocks, f32_data(d), ref_q, t > 1)
+            if fns < Float64(0) or qn < Float64(0):
+                check_ok = False
+                print("  T =", t, "  ⚠️ 自检失败：有片没算 → 这一格的数作废")
+                continue
             if r == 0 or fns < f_lo[ti]:
                 f_lo[ti] = fns
             if r == 0 or fns > f_hi[ti]:
@@ -256,6 +335,13 @@ def main() raises:
                 "ns/元素 )",
             )
 
+    if not check_ok:
+        print("")
+        print("⚠️ ⚠️ 有档位没通过自检 → 下面的数**一律不许引用**，也不许进账本。")
+        print(
+            "   最常见的成因是协程参数被写坏（那片压根没跑）→ 时间偏快、带宽算"
+            "出来能超过 DRAM 上限。"
+        )
     print("=== 区间（min…max）与相对各通路 T=1 的加速 ===")
     for ti in range(len(ts)):
         var t = ts[ti]
