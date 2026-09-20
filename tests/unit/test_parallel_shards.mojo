@@ -139,15 +139,15 @@ def test_fp32_bias_shards_match_single_pass() raises:
 def test_fp32_prefill_shards_match_single_pass() raises:
     """批大于 1 时 `dst` 是行主序，列不连续 —— 这时必须改切**行**。
 
-    `rows` 取 1/2/3/5/7/8/9/13/32/33：① 除不尽的那几档（余数那行必须被算到）；
-    ② 8/9/13/32/33 是 `avx2._gemm_tile[RB]` 的分块边界（`RB` 是 8/4/2/1，`rows`
-    跨过 8 时块怎么切都会变）；③ **33 专门跨 `PREFILL_ROWS_MEASURED`** —— 那一边
-    片数不再被压到实测档，是另一条支路。
+    `rows` 取 1/2/3/5/7/8/9/13/32/48/49：① 除不尽的那几档（余数那行必须被算到）；
+    ② 8/9/13/32/48 是 `avx2._gemm_tile[RB]` 的分块边界（`RB` 是 8/4/2/1，`rows`
+    跨过 8 时块怎么切都会变）；③ **48/49 一对专门跨 `PREFILL_ROWS_MEASURED = 48`**
+    —— 48 这侧片数被压到实测档，**49 那侧不再压**，是另一条支路。
     """
     var out = 11
     var inner = 96
     var rows_list = List[Int]()
-    for v in [1, 2, 3, 5, 7, 8, 9, 13, 32, 33]:
+    for v in [1, 2, 3, 5, 7, 8, 9, 13, 32, 48, 49]:
         rows_list.append(v)
     for ri in range(len(rows_list)):
         var rows = rows_list[ri]
@@ -188,15 +188,16 @@ def test_prefill_shards_prefers_the_measured_tier() raises:
     规矩与 `SHARDS_MEASURED` 是同一条：**量过的范围内用实测最好的 4 片**，
     **`rows` 超出量过的上界就原样返回** —— 那里没量过，改动前的样子最不坏。
     """
-    # 量过的范围内：压到 4。
+    # 量过的范围内：压到 4（48 是**换手点**：n=48 实测 4 片更好，n≥64 量不出差别）。
     assert_equal(prefill_shards(8, 8), PREFILL_SHARDS_MEASURED)
-    assert_equal(prefill_shards(16, 8), PREFILL_SHARDS_MEASURED)
     assert_equal(prefill_shards(32, 8), PREFILL_SHARDS_MEASURED)
+    assert_equal(prefill_shards(48, 8), PREFILL_SHARDS_MEASURED)
     # 调用方本来就要得更少 → 尊重调用方（它可能是显式关掉并发的）。
     assert_equal(prefill_shards(8, 2), 2)
     assert_equal(prefill_shards(8, 1), 1)
     # 超出量过的上界 → 不假装量过，原样返回。
-    assert_equal(prefill_shards(33, 8), 8)
+    assert_equal(prefill_shards(49, 8), 8)
+    assert_equal(prefill_shards(64, 8), 8)
     assert_equal(prefill_shards(128, 8), 8)
 
 

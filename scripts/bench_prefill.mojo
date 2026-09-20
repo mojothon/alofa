@@ -12,6 +12,19 @@
 所以「片数」现在是 prefill 的一个真旋钮：**片数越少，每片行数越多，复用越充分；
 片数越多，线程并行度越高**。这两个方向相反，谁是主导只能量。
 
+n = 8/16/32 那一轮已经量完：4 片最好（见账本）。这一轮问的是**更长的 prompt**：
+
+    权重被读的遍数 = 片数 × ceil(每片行数 / 8)
+
+    n = 32   1/2/4 片都是 4 遍，8 片是 8 遍   → 少片赢（实测 4 片最好）✓
+    n = 64   1/2/4/8 片**都是 8 遍**          → 遍数拉平，这时该是多线程赢？
+    n = 48   1/2 片 6 遍，4/8 片 8 遍         → 遍数甚至**不是单调的**
+
+所以最佳片数大概会在 32 与 64 之间换手。**换手点在哪儿，就是这一轮要量的**；
+换手点以内压到 4 片、以外退回调用方的 8 片，才是站得住的策略。
+
+⏱️ 长 prompt 更贵：n = 128 一趟约 1 秒，整份脚本 5 档 × 4 片数 × 4 趟 ≈ 1 分钟。
+
 口径
 ----
   * **必须 `-O2`**；每个 `(n, shards)` 预热一趟丢弃（它量的是 mmap 缺页）。
@@ -43,8 +56,9 @@ from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward
 
 comptime FIXTURE = "tests/fixtures/qwen2.5-0.5b"
 
-# prompt 长度 8 / 16 / 32；片数 1 / 2 / 4 / 8。
-comptime N_SIZES = 3
+# prompt 长度 32 / 48 / 64 / 96 / 128（32 是**锚点**：上一轮量过它 4 片最好，
+# 这一轮必须复现，否则就是机器状态变了，整轮作废）；片数 1 / 2 / 4 / 8。
+comptime N_SIZES = 5
 comptime SH_CASES = 4
 comptime MAX_TOK = 128
 comptime ROUNDS = 3
@@ -53,10 +67,14 @@ comptime ROUNDS = 3
 def n_of(c: Int) -> Int:
     """第 `c` 档 prompt 长度。"""
     if c == 0:
-        return 8
+        return 32
     if c == 1:
-        return 16
-    return 32
+        return 48
+    if c == 2:
+        return 64
+    if c == 3:
+        return 96
+    return 128
 
 
 def sh_of(s: Int) -> Int:
