@@ -42,5 +42,7 @@ tmp/
 # 测试夹具中的模型权重（1.9 GB，不入库；其余小夹具需要入库，CI 依赖它们）
 tests/fixtures/qwen2.5-0.5b/weights/tensors.f32
 
-# 例外：这条函数是量化网格的夹具，不是模型权重，CI 依赖它（曾被 *.bin 连带忽略）
+# 例外：这两处是量化网格的夹具，不是模型权重，CI 依赖它们（曾被 *.bin 连带忽略）
 !tests/fixtures/qwen2.5-0.5b/q4/blocks.bin
+# `q4vec/` 是给融合 matmul 的向量化差分门用的形状夹具（约 48 KB），理由同上。
+!tests/fixtures/qwen2.5-0.5b/q4vec/blocks.bin

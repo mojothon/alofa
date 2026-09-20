@@ -1,0 +1,9 @@
+one_block	1	32	0	1	zeros
+odd_blocks	2	96	1	6	constant
+tail5	3	160	7	15	clipped
+tail7	5	224	22	35	alternating
+tail11	7	352	57	77	dynrange
+tail17	13	544	134	221	gaussian
+const_row	3	96	355	9	clipped
+real13	13	896	364	364	real_q_w
+down_like	2	4864	728	304	gaussian
