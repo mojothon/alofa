@@ -32,8 +32,10 @@ from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, quantize_q4_0
 from alofa.model.arch.qwen import (
     BACKEND_AVX2,
     MAX_SHARDS,
+    PREFILL_SHARDS_MEASURED,
     linear_bias_k_shards,
     linear_k_shards,
+    prefill_shards,
     q4_matmul_bias_k_shards,
     q4_matmul_k_shards,
     shard_count,
@@ -137,25 +139,65 @@ def test_fp32_bias_shards_match_single_pass() raises:
 def test_fp32_prefill_shards_match_single_pass() raises:
     """批大于 1 时 `dst` 是行主序，列不连续 —— 这时必须改切**行**。
 
-    `rows` 取 7（除不尽），所以余数那行也必须被算到。
+    `rows` 取 1/2/3/5/7/8/9/13/32/33：① 除不尽的那几档（余数那行必须被算到）；
+    ② 8/9/13/32/33 是 `avx2._gemm_tile[RB]` 的分块边界（`RB` 是 8/4/2/1，`rows`
+    跨过 8 时块怎么切都会变）；③ **33 专门跨 `PREFILL_ROWS_MEASURED`** —— 那一边
+    片数不再被压到实测档，是另一条支路。
     """
-    var rows = 7
     var out = 11
     var inner = 96
-    var arena = Arena(
-        out * inner * 4 + rows * inner * 4 + rows * out * 4 * 2 + 4096
-    )
-    var w = TensorView(arena.alloc(out * inner * 4), shape2(out, inner), DT_FP32)
-    var x = TensorView(arena.alloc(rows * inner * 4), shape2(rows, inner), DT_FP32)
-    var d1 = TensorView(arena.alloc(rows * out * 4), shape2(rows, out), DT_FP32)
-    var d2 = TensorView(arena.alloc(rows * out * 4), shape2(rows, out), DT_FP32)
-    fill(w, 6)
-    fill(x, 7)
-    linear_k_shards[B](d1, x, w, 1)
-    for shards in [2, 3, 5, 8]:
-        linear_k_shards[B](d2, x, w, shards)
-        assert_true(all_equal(d1, d2), "shards=" + String(shards))
-    arena.keep_alive()
+    var rows_list = List[Int]()
+    for v in [1, 2, 3, 5, 7, 8, 9, 13, 32, 33]:
+        rows_list.append(v)
+    for ri in range(len(rows_list)):
+        var rows = rows_list[ri]
+        var arena = Arena(
+            out * inner * 4 + rows * inner * 4 + rows * out * 4 * 2 + 4096
+        )
+        var w = TensorView(
+            arena.alloc(out * inner * 4), shape2(out, inner), DT_FP32
+        )
+        var x = TensorView(
+            arena.alloc(rows * inner * 4), shape2(rows, inner), DT_FP32
+        )
+        var d1 = TensorView(
+            arena.alloc(rows * out * 4), shape2(rows, out), DT_FP32
+        )
+        var d2 = TensorView(
+            arena.alloc(rows * out * 4), shape2(rows, out), DT_FP32
+        )
+        fill(w, 6)
+        fill(x, 7)
+        linear_k_shards[B](d1, x, w, 1)
+        for shards in [2, 3, 5, 8]:
+            linear_k_shards[B](d2, x, w, shards)
+            assert_true(
+                all_equal(d1, d2),
+                "rows=" + String(rows) + " shards=" + String(shards),
+            )
+        arena.keep_alive()
+
+
+def test_prefill_shards_prefers_the_measured_tier() raises:
+    """prefill 的片数上限：**只启用量过的那一档**。
+
+    `prefill_shards()` 现在会决定一次 prefill 用几片，而它只改**并行度**、不改
+    任何一次浮点运算 —— 所以这条守的是"它把片数压到哪儿"，不是"它对不对"
+    （对不对由上一条与端到端门守）。
+
+    规矩与 `SHARDS_MEASURED` 是同一条：**量过的范围内用实测最好的 4 片**，
+    **`rows` 超出量过的上界就原样返回** —— 那里没量过，改动前的样子最不坏。
+    """
+    # 量过的范围内：压到 4。
+    assert_equal(prefill_shards(8, 8), PREFILL_SHARDS_MEASURED)
+    assert_equal(prefill_shards(16, 8), PREFILL_SHARDS_MEASURED)
+    assert_equal(prefill_shards(32, 8), PREFILL_SHARDS_MEASURED)
+    # 调用方本来就要得更少 → 尊重调用方（它可能是显式关掉并发的）。
+    assert_equal(prefill_shards(8, 2), 2)
+    assert_equal(prefill_shards(8, 1), 1)
+    # 超出量过的上界 → 不假装量过，原样返回。
+    assert_equal(prefill_shards(33, 8), 8)
+    assert_equal(prefill_shards(128, 8), 8)
 
 
 # --------------------------------------------------------------------------

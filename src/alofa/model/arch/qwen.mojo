@@ -222,6 +222,48 @@ comptime MAX_SHARDS = 16
 # 实测过的最多片数。`default_shards()` 取它作上限：只启用量过的那一档。
 comptime SHARDS_MEASURED = 8
 
+# prefill（批 > 1）实测过的最佳片数与量过的行数上界。
+#
+# 为什么 prefill 要单独一档：`prefill` 按**输出行**切片，而 `avx2._gemm` 的权重
+# 复用只在**块内**发生（`_gemm_tile[RB]`，`RB` ∈ 8/4/2/1）。于是"片数"在这里是
+# 一个真旋钮，两个方向相反：
+#
+#     片数少 → 每片行数多 → 块内复用充分 → 权重被读的遍数少
+#     片数多 → 线程并行度高 → 聚合带宽高
+#
+# 实测（`scripts/bench_prefill.mojo`，Qwen2.5-0.5B fp32 / avx2，每 token 时间，
+# 3 趟 min…max，轮外层片数内层交错，**三次运行**）：
+#
+#     n = 8    1 片 35.5–49.8 / 2 片 24.0–28.9 / 4 片 19.8–25.3 / 8 片 32.3–67.6
+#     n = 16   1 片 33.2–39.1 / 2 片 17.8–20.5 / 4 片 13.7–17.1 / 8 片 22.8–37.8
+#     n = 32   1 片 32.3–38.0 / 2 片 17.6–38.2 / 4 片 10.4–16.0 / 8 片 14.2–20.7
+#
+# → **4 片在三档上都不是最差、在 16/32 上最好**；1 片最差（并发仍然要）；
+#   8 片（默认）**在每一档上都比 4 片差**（n=32 那档区间不重合：13.37 < 14.15）。
+#   即在这个 8 核机器上，**复用比并行度更值钱**。
+#
+# ⚠️ `n > 32` **没量过** → 退回调用方给的片数（与加这个上限之前逐位相同），
+#    不假装量过。这与 `SHARDS_MEASURED` 是同一个规矩：只启用量过的那一档。
+comptime PREFILL_SHARDS_MEASURED = 4
+comptime PREFILL_ROWS_MEASURED = 32
+
+
+def prefill_shards(rows: Int, shards: Int) -> Int:
+    """prefill 这次用几片。
+
+    只在量过的行数范围内（`rows <= PREFILL_ROWS_MEASURED`）把片数压到实测最好的
+    那一档；超出就原样返回 —— 那里没量过，改动前的样子就是最不坏的选择。
+
+    ⚠️ 它只改**并行度**，不改任何一次浮点运算：每个输出各自一个累加器，切分只
+    决定"谁算哪几行"。故片数不同的 prefill 必须**逐位相等**（`bench_prefill.mojo`
+    的自检与 `tests/unit/test_parallel_shards.mojo` 都在守这条）。
+    """
+    if rows > PREFILL_ROWS_MEASURED:
+        return shards
+    if shards <= PREFILL_SHARDS_MEASURED:
+        return shards
+    return PREFILL_SHARDS_MEASURED
+
 
 def shard_count(n_out: Int, shards: Int) -> Int:
     """这次投影实际切成几片。
@@ -325,7 +367,10 @@ def linear_k_shards[backend: Int](
     var out = dst.shape.dims[1]
     var inner = x.shape.dims[1]
     var split = out if rows == 1 else rows
-    var n = shard_count(split, shards)
+    # decode（批 = 1）切输出列，片数越多聚合带宽越高；prefill 切输出行，片数
+    # 越多反而把权重读得越碎 —— 那一档实测过，见 `prefill_shards()`。
+    var want = shards if rows == 1 else prefill_shards(rows, shards)
+    var n = shard_count(split, want)
     if n <= 1:
         linear_k[backend](dst, x, w)
         return
@@ -384,7 +429,8 @@ def linear_bias_k_shards[backend: Int](
     var out = dst.shape.dims[1]
     var inner = x.shape.dims[1]
     var split = out if rows == 1 else rows
-    var n = shard_count(split, shards)
+    var want = shards if rows == 1 else prefill_shards(rows, shards)
+    var n = shard_count(split, want)
     if n <= 1:
         linear_bias_k[backend](dst, x, w, b)
         return
