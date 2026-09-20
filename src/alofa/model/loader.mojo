@@ -25,6 +25,27 @@ from alofa.core.error import (
 from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr, Shape, TensorView, f32_data
 from alofa.core.text import parse_int, read_text
+from alofa.model.safetensors import SafeTensorFile
+
+
+def _has_suffix(path: String, suffix: String) -> Bool:
+    if path.byte_length() < suffix.byte_length():
+        return False
+    var p = path.as_bytes()
+    var s = suffix.as_bytes()
+    var start = len(p) - len(s)
+    for i in range(len(s)):
+        if p[start + i] != s[i]:
+            return False
+    return True
+
+
+def _text_slice(raw: String, start: Int, end: Int) -> String:
+    var bytes = List[UInt8]()
+    var source = raw.as_bytes()
+    for i in range(start, end):
+        bytes.append(source[i])
+    return String(unsafe_from_utf8=bytes)
 
 
 def config_value(path: String, key: String) raises AlofaError -> String:
@@ -67,6 +88,30 @@ struct TensorFile(Movable):
     var counts: List[Int]
 
     def __init__(out self, dir_path: String) raises AlofaError:
+        if _has_suffix(dir_path, ".safetensors"):
+            var safe = SafeTensorFile(dir_path)
+            var n = len(safe.names)
+            self.mapped = MappedFile(dir_path)
+            self.names = safe.names.copy()
+            self.shape_text = List[String]()
+            for i in range(n):
+                var encoded = safe.shapes[i]
+                var raw_shape = encoded.as_bytes()
+                var clean = ""
+                for j in range(len(raw_shape)):
+                    if raw_shape[j] == 91 or raw_shape[j] == 93:
+                        continue
+                    if raw_shape[j] == 44:
+                        clean += "x"
+                    else:
+                        clean += _text_slice(encoded, j, j + 1)
+                self.shape_text.append(clean)
+            self.offsets = List[Int]()
+            self.counts = List[Int]()
+            for i in range(n):
+                self.offsets.append(safe.data_base + safe.begins[i])
+                self.counts.append(safe.numel(safe.names[i]))
+            return
         var index = read_text(dir_path + "/tensors.tsv")
         self.mapped = MappedFile(dir_path + "/tensors.f32")
         self.names = List[String]()

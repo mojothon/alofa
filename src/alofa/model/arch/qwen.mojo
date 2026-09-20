@@ -71,6 +71,7 @@ from alofa.kernels.cpu.scalar import (
     rope,
     swiglu,
 )
+from alofa.model.config import json_bool, json_float, json_int
 from alofa.model.loader import TensorFile, config_value
 
 comptime EMBED = "model.embed_tokens.weight"
@@ -676,18 +677,38 @@ struct QwenConfig(Movable):
     var tied_output: Bool
 
     def __init__(out self, config_path: String) raises AlofaError:
-        self.n_layers = parse_int(config_value(config_path, "n_layers"))
-        self.hidden = parse_int(config_value(config_path, "hidden"))
-        self.n_heads = parse_int(config_value(config_path, "n_heads"))
-        self.n_kv_heads = parse_int(config_value(config_path, "n_kv_heads"))
-        self.head_dim = parse_int(config_value(config_path, "head_dim"))
-        self.intermediate = parse_int(config_value(config_path, "intermediate"))
-        self.vocab = parse_int(config_value(config_path, "vocab"))
-        self.eps = Float32(parse_float64(config_value(config_path, "eps")))
-        self.rope_theta = parse_float64(config_value(config_path, "rope_theta"))
-        self.tied_output = parse_int(
-            config_value(config_path, "tie_word_embeddings")
-        ) != 0
+        var is_json = config_path.byte_length() >= 5
+        if is_json:
+            var cb = config_path.as_bytes()
+            var suffix = ".json".as_bytes()
+            var start = len(cb) - len(suffix)
+            for i in range(len(suffix)):
+                if cb[start + i] != suffix[i]:
+                    is_json = False
+        if is_json:
+            self.n_layers = json_int(config_path, "num_hidden_layers")
+            self.hidden = json_int(config_path, "hidden_size")
+            self.n_heads = json_int(config_path, "num_attention_heads")
+            self.n_kv_heads = json_int(config_path, "num_key_value_heads")
+            self.head_dim = json_int(config_path, "head_dim")
+            self.intermediate = json_int(config_path, "intermediate_size")
+            self.vocab = json_int(config_path, "vocab_size")
+            self.eps = Float32(json_float(config_path, "rms_norm_eps"))
+            self.rope_theta = json_float(config_path, "rope_theta")
+            self.tied_output = json_bool(config_path, "tie_word_embeddings")
+        else:
+            self.n_layers = parse_int(config_value(config_path, "n_layers"))
+            self.hidden = parse_int(config_value(config_path, "hidden"))
+            self.n_heads = parse_int(config_value(config_path, "n_heads"))
+            self.n_kv_heads = parse_int(config_value(config_path, "n_kv_heads"))
+            self.head_dim = parse_int(config_value(config_path, "head_dim"))
+            self.intermediate = parse_int(config_value(config_path, "intermediate"))
+            self.vocab = parse_int(config_value(config_path, "vocab"))
+            self.eps = Float32(parse_float64(config_value(config_path, "eps")))
+            self.rope_theta = parse_float64(config_value(config_path, "rope_theta"))
+            self.tied_output = parse_int(
+                config_value(config_path, "tie_word_embeddings")
+            ) != 0
         self.validate(config_path)
 
     def validate(imm self, where: String) raises AlofaError:
