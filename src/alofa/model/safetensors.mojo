@@ -1,7 +1,10 @@
 """Single-file safetensors metadata reader with a read-only mapping."""
 
+from std.memory import bitcast
+
 from alofa.core.dtype import DT_BF16, DT_FP16, DT_FP32
 from alofa.core.error import ERR_INVALID_ARGUMENT, ERR_OUT_OF_RANGE, ERR_PARSE, ERR_UNSUPPORTED, AlofaError
+from alofa.core.ffi.mem import RawPtr
 from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr, Shape, TensorView, f32_data
 from alofa.core.text import parse_int
@@ -117,11 +120,37 @@ def _array_ints(text: String) raises AlofaError -> List[Int]:
     return out^
 
 
+def bf16_to_f32(src: RawPtr, dst: F32Ptr, count: Int):
+    """Widen `count` bfloat16 values into fp32 at `dst`.
+
+    bfloat16 *is* the top sixteen bits of the fp32 with the same value, so this
+    is a shift and not arithmetic: finite, subnormal, infinite and NaN patterns
+    all widen to the fp32 that names the same number. That is the reason a
+    checkpoint ships in bf16 at all — the exponent range is fp32's — and it
+    means widening contributes no error the differential gates would have to
+    learn to tolerate.
+    """
+    var words = src.unsafe_bitcast[UInt16]()
+    for i in range(count):
+        dst[unsafe_offset=i] = bitcast[DType.float32, 1](
+            UInt32(words[unsafe_offset=i]) << 16
+        )
+
+
+def f32_copy(src: RawPtr, dst: F32Ptr, count: Int):
+    """Copy `count` fp32 values, for a payload being moved into one buffer."""
+    var words = src.unsafe_bitcast[Float32]()
+    for i in range(count):
+        dst[unsafe_offset=i] = words[unsafe_offset=i]
+
+
 struct SafeTensorFile(Movable):
     """A single safetensors file indexed by tensor name.
 
-    The first implementation accepts F32 tensors only. Other dtypes are
-    rejected explicitly until a conversion-owning backend is added.
+    The metadata reader accepts F32 and BF16 (F16 is rejected by name: it is
+    the one dtype whose widening this file does not implement). Widening itself
+    is not done here — a view has to point at memory that outlives the call,
+    and owning that memory is `TensorFile`'s job.
     """
 
     var mapped: MappedFile
@@ -160,7 +189,27 @@ struct SafeTensorFile(Movable):
                 raise AlofaError(ERR_PARSE, "unterminated safetensors tensor name", "path=" + path)
             var name = _text_slice(header, cursor + 1, name_end)
             if name == "__metadata__":
-                cursor = name_end + 1
+                # Skip the whole object, not just its name. Its contents are
+                # siblings of the tensors rather than tensors, and stopping at
+                # the name leaves `"format"` looking like one — which is how a
+                # real checkpoint failed here before this branch existed.
+                var skip = name_end + 1
+                var level = 0
+                while skip < len(raw):
+                    if raw[skip] == 123:
+                        level += 1
+                    elif raw[skip] == 125:
+                        level -= 1
+                        if level == 0:
+                            break
+                    skip += 1
+                if skip >= len(raw):
+                    raise AlofaError(
+                        ERR_PARSE,
+                        "unterminated safetensors metadata object",
+                        "path=" + path,
+                    )
+                cursor = skip + 1
                 continue
             var object_end = name_end
             var depth = 0
