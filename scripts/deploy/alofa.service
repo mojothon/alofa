@@ -1,0 +1,46 @@
+# alofa 服务的 systemd unit 模板（P3.5 部署形态）。
+#
+# 安装：
+#   cp scripts/deploy/alofa.service /etc/systemd/system/
+#   # 按机器改 Environment=（全量变量见 src/alofa/srv/config.mojo）
+#   systemctl daemon-reload && systemctl enable --now alofa
+#
+# 关键选择的理由：
+# - Environment= 而不是命令行参数：Mojo 1.0 的 sys.argv 在编译产物里是空的
+#   （srv/config.mojo 的文件头），环境变量是唯一配置通道，也正好是 systemd
+#   的原生注入方式。
+# - KillMode=control-group（默认）：systemd stop 时 SIGTERM 同时发给 master 和
+#   worker —— worker 的 SIGTERM 处理器走的是「答完在途、然后退出」的优雅路径
+#   （srv/master.mojo 的文件头），master 则被同一个信号叫醒去收尸。
+# - TimeoutStopSec 必须 > ALOFA_GRACE_MS：否则 master 还在排空，systemd 先
+#   SIGKILL 了整个组，优雅退出就白做了。
+# - Restart=on-failure：worker 运行期死亡时 master 会 fail-fast 退出（非零码），
+#   systemd 负责拉起整套 —— 进程内的监督已经证明「半套集群继续服务」更难排障。
+# - WorkingDirectory：默认权重路径是相对路径（tests/fixtures/...），换机器时
+#   用 ALOFA_WEIGHTS 指到绝对路径更稳。
+
+[Unit]
+Description=alofa OpenAI-compatible server (non-streaming, multi-worker)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/alofa
+ExecStart=/opt/alofa/bin/serve
+Environment=ALOFA_WORKERS=4
+Environment=ALOFA_HOST=0.0.0.0
+Environment=ALOFA_PORT=8000
+Environment=ALOFA_WEIGHTS=/opt/alofa/weights/qwen2.5-0.5b-hf
+Environment=ALOFA_TOKENIZER=/opt/alofa/weights/qwen2.5-0.5b/tokenizer.json
+Environment=ALOFA_MAX_TOKENS=256
+# 多 worker 下每个 worker 单分片（fork 后 asyncrt 不可用，见 serve.mojo；
+# 显式设 1 是为了让读 unit 的人知道这是个**被证实的取舍**，不是默认值漂移）。
+Environment=ALOFA_SHARDS=1
+Environment=ALOFA_GRACE_MS=120000
+Restart=on-failure
+RestartSec=2
+# > ALOFA_GRACE_MS + 余量。
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target
