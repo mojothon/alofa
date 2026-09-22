@@ -1084,9 +1084,12 @@ struct QwenForward(Movable):
         # 掉，换来的只会是"两边都说不清自己在算什么"。
         var dst_p = f32_data(dst)
         var x_p = f32_data(x)
+        # ⚠️ `dst_p` / `x_p` 是 `f32_data` 出来的**类型化**指针，`unsafe_offset` 按
+        # **元素**走，下面的行偏移**不能**带 `* 4` —— 上面那几个 fp32 分片函数里的
+        # `* 4` 是对的，因为那里的 `d0` / `x0` 是 RawPtr 偏移出来的、按**字节**走。
         for r in range(t_rows):
-            var out_row = dst_p.unsafe_offset(r * out * 4)
-            var in_row = x_p.unsafe_offset(r * cols * 4)
+            var out_row = dst_p.unsafe_offset(r * out)
+            var in_row = x_p.unsafe_offset(r * cols)
             if has_bias:
                 q4_matmul_bias_k_shards[backend](
                     out_row, in_row, blocks, out, cols, f32_data(bias), self.shards
