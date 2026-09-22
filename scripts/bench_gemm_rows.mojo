@@ -24,6 +24,11 @@
   * 辅助口径 = `rows × 17.4 MB ÷ 耗时` 这个「若每行各流一遍」的隐含带宽：
     跨 `rows` **基本恒定**且落在单线程读带宽附近 → 机制成立。
   * 效应量级 2–8× ≫ 本机噪声 ±10% → **一轮就够判定**，但结论**必须能复现**。
+  * `rows > 8` 另有一档预期（2026-09-22 扩到 16 / 32）：`_gemm` 按 8/4/2/1
+    **分块**，块内才复用，所以 `rows > 8` 时权重读 `ceil(rows / 8)` 遍 —— 每行
+    耗时应按 `ceil(rows/8) / rows` 掉（1→8 摊薄 8×，而 16→32 只剩 2×）。把 8
+    以上一并量出来，是为了让「批大于 8 还是不是同一条曲线」有数，而不是停在
+    白嫖的这一段。
 
 自检（不通过就一个数都不报）
 ----------------------------
@@ -47,7 +52,7 @@ from alofa.kernels.cpu.avx2 import linear
 # `down_proj`：896 个输出 × 4864 个输入，24 层里最大的一个投影。
 comptime COLS = 896
 comptime INNER = 4864
-comptime MAX_ROWS = 8
+comptime MAX_ROWS = 32
 
 # 权重副本份数：每趟算一份新的，8 份 = 139 MB ≫ L3（12 MB）。同块权重反复跑
 # 会让后几趟落在 L3 里 —— `bench_thread_matmul.mojo` 第一版就是这么报出
@@ -300,6 +305,8 @@ def main() raises:
     rows_list.append(2)
     rows_list.append(4)
     rows_list.append(8)
+    rows_list.append(16)
+    rows_list.append(32)
 
     var ok = True
     for ri in range(len(rows_list)):
