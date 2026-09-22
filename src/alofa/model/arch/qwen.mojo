@@ -54,6 +54,8 @@ from alofa.kernels.cpu.quant import (
 from alofa.kernels.cpu.avx2 import (
     matmul_q4_f32 as matmul_q4_f32_vec,
     matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
+    matmul_q4_f32_rows_band as matmul_q4_f32_rows_band_vec,
+    matmul_q4_f32_bias_rows_band as matmul_q4_f32_bias_rows_band_vec,
 )
 from alofa.kernels.cpu.avx2 import (
     add as add_vec,
@@ -520,6 +522,199 @@ def q4_matmul_k_shards[backend: Int](
                 cols,
                 dst,
                 False,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
+def q4_matmul_rows_k[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """按 `backend` 分发的整批 q4_0 投影（**无偏置**；一个输出行带 × 全部 token）。
+
+    它与逐 token 调 `q4_matmul_k` **逐位一致**（累加结构一行没改，只是一个块的解
+    量化被 `RB` 行共用），这条相等由 `test_q4_rows.mojo` 盯；模型层这边看的则是
+    `test_q4_greedy.mojo` 的一致率不该动（0.8691）。
+
+    ⚠️ 带偏置那条（`q/k/v`）今天还没有整批版 —— 它的累加结构与无偏置的不是同一个
+    函数，另行开门之前继续走逐 token 的老路。
+    """
+    comptime if uses_vector_backend[backend]():
+        matmul_q4_f32_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
+    else:
+        var t = 0
+        while t < n_tok:
+            matmul_q4_f32(
+                dst.unsafe_offset(t * dst_stride),
+                x.unsafe_offset(t * cols),
+                blocks,
+                rows,
+                cols,
+            )
+            t += 1
+
+
+def q4_matmul_bias_rows_k[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    dst_stride: Int,
+) raises AlofaError:
+    """按 `backend` 分发的整批 q4_0 投影（**带偏置**；Qwen2 的 q/k/v 用它）。
+
+    它与逐 token 调 `q4_matmul_bias_k` **逐位一致** —— 累加走的还是 `_matmul_q4_wide`
+    那套（f64 通道、按 `j%8` 切、`d` 折进 x、整行只归约一次），只是一个块的解量化
+    被 `RB` 行共用。
+
+    ⚠️ `RB` 由核自己定（默认 2，不是无偏置那边的 8）：这条的累加器是 4 个 f64×8，
+    每行 256 B，攒到 8 行就只有溢栈一条路 —— 理由写在 `avx2.mojo` 那个函数的注释里。
+    """
+    comptime if uses_vector_backend[backend]():
+        matmul_q4_f32_bias_rows_band_vec(dst, x, blocks, n_tok, rows, cols, bias, dst_stride)
+    else:
+        var t = 0
+        while t < n_tok:
+            matmul_q4_f32_bias(
+                dst.unsafe_offset(t * dst_stride),
+                x.unsafe_offset(t * cols),
+                blocks,
+                rows,
+                cols,
+                bias,
+            )
+            t += 1
+
+
+async def _q4_rows_shard[backend: Int](
+    d: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+):
+    """同上，但这一片拿到的是**整个 token 批**（顺序见 `q4_matmul_rows_k_shards` 的注释）。"""
+    try:
+        q4_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride)
+    except err:
+        _ = err
+
+
+async def _q4_bias_rows_shard[backend: Int](
+    d: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    dst_stride: Int,
+):
+    """带偏置的分片：同一个输出行带 × 整个 token 批。"""
+    try:
+        q4_matmul_bias_rows_k[backend](
+            d, x, blocks, n_tok, rows, cols, bias, dst_stride
+        )
+    except err:
+        _ = err
+
+
+def q4_matmul_bias_rows_k_shards[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    dst_stride: Int,
+    shards: Int,
+) raises AlofaError:
+    """同上，带偏置版：按输出行切 `shards` 片，每片做完整个 token 批。"""
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q4_matmul_bias_rows_k[backend](
+            dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+        )
+        return
+    var row_bytes = cols // Q4_BLOCK * Q4_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        tg.create_task(
+            _q4_bias_rows_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                n_tok,
+                cnt,
+                cols,
+                bias.unsafe_offset(c0),
+                dst_stride,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
+def q4_matmul_rows_k_shards[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+    shards: Int,
+) raises AlofaError:
+    """整批 q4_0 投影：先按输出行切 `shards` 片，**每片一口气做完整个 token 批**。
+
+    为什么要这个顺序（而不是「每个 token 各自再并发一遍输出切片」）：
+
+        逐 token：每个线程流 `out/shards` 行权重 × 1 个 token → 批=N 时整份权重
+                  被读 N 遍，每个字节都被买一次
+        逐行带：  每个线程流 `out/shards` 行权重 × N 个 token → 一个块解量化一次、
+                  N 行复用，也就是 `RB` 那份收益（核级保守端 2.38×，见账本）
+
+    ⚠️ `dst` 里第 `t` 个 token 的这一段起始于 `t * dst_stride`（通常 `dst_stride =
+    out`），核一次只填其中的 `rows` 个 —— 那两个步长是分开的参数，别照着"批是紧挨
+    着的"那个默认写。
+    """
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q4_matmul_rows_k[backend](dst, x, blocks, n_tok, rows, cols, dst_stride)
+        return
+    var row_bytes = cols // Q4_BLOCK * Q4_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        tg.create_task(
+            _q4_rows_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                n_tok,
+                cnt,
+                cols,
+                dst_stride,
             )
         )
         c0 += cnt
@@ -1079,23 +1274,40 @@ struct QwenForward(Movable):
             )
         var blocks = self.q4_blocks[slot]
         # 量化核做的是**矩阵乘向量**（一次给一个输出行），这里要的是一整个
-        # token 批次，于是逐行喂进去。不在核里塞二维支持，是因为核的那份契约
-        # （以及它对着的 fixture）就是一维的；为了省一个循环把两处契约一起改
-        # 掉，换来的只会是"两边都说不清自己在算什么"。
+        # token 批次。做法是把**整个批次**交给一次调用：每个输出分片一口气做完
+        # 所有 token，于是一个块的解量化按 `RB` 行复用（核级保守端 2.38×，端到端
+        # prefill 2.1–3.4×，见账本）。按有无偏置分两个核：
+        #
+        #   无偏置（down/gate/up）→ `_matmul_q4_halves_rows`（f32 半块累加，`RB=8`）
+        #   带偏置（q/k/v）       → `_matmul_q4_wide_rows`（f64 通道累加，`RB=2`）
+        #
+        # 两条都要**逐位等于**自己原来的逐 token 调用，由 `test_q4_rows.mojo` 盯。
+        #
+        # ⚠️ 下面传的 `out`（作 `dst_stride`）与核里的行偏都是**元素**数：`dst_p` /
+        # `x_p` 是 `f32_data` 出来的**类型化**指针，`unsafe_offset` 按元素走 —— 别写成
+        # `* 4`。上面那几个 fp32 分片函数里的 `* 4` 是对的，因为那里的
+        # `d0` / `x0` 是 RawPtr 偏移出来的、**按字节**走。混用会让第 1..t_rows-1 行一个
+        # 都没被写并且写到 `dst` 外面去（2026-09-22 修的就是这个，`test_q4_rows.mojo`
+        # 里留了它的常驻红测）。
         var dst_p = f32_data(dst)
         var x_p = f32_data(x)
-        # ⚠️ `dst_p` / `x_p` 是 `f32_data` 出来的**类型化**指针，`unsafe_offset` 按
-        # **元素**走，下面的行偏移**不能**带 `* 4` —— 上面那几个 fp32 分片函数里的
-        # `* 4` 是对的，因为那里的 `d0` / `x0` 是 RawPtr 偏移出来的、按**字节**走。
-        for r in range(t_rows):
-            var out_row = dst_p.unsafe_offset(r * out)
-            var in_row = x_p.unsafe_offset(r * cols)
-            if has_bias:
-                q4_matmul_bias_k_shards[backend](
-                    out_row, in_row, blocks, out, cols, f32_data(bias), self.shards
-                )
-            else:
-                q4_matmul_k_shards[backend](out_row, in_row, blocks, out, cols, self.shards)
+        if has_bias:
+            q4_matmul_bias_rows_k_shards[backend](
+                dst_p,
+                x_p,
+                blocks,
+                t_rows,
+                out,
+                cols,
+                f32_data(bias),
+                out,
+                self.shards,
+            )
+        else:
+            q4_matmul_rows_k_shards[backend](
+                dst_p, x_p, blocks, t_rows, out, cols, out, self.shards
+            )
+        return
 
     def require(imm self, name: String) raises AlofaError:
         """Fail with the parameter's name if it is not in the file."""
