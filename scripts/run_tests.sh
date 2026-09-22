@@ -67,6 +67,8 @@ SUITES=(
   # ⚠️ 真 socket 的那条端到端门（test_http_server.mojo）**不在这里**：它 fork，
   # 而 `mojo run`（JIT）下 fork 会崩编译器 —— 那条走 `pixi run test-http`。
   "tests/unit/test_http.mojo|-I src"
+  "tests/unit/test_sse.mojo|-I src"
+  "tests/unit/test_openai.mojo|-I src"
 )
 
 failed=0
