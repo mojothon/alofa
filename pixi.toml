@@ -13,6 +13,9 @@ version = "0.1.0"
 
 
 [tasks]
+# 多 worker 门：SO_REUSEPORT 三进程同端口 + 优雅退出的端到端（fork，JIT 下会
+# 崩编译器 → build 后跑，与 test-http 同理）。约 7 s，其中 6 s 是 RUN_SECONDS。
+test-workers = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_workers.mojo -o target/workers_e2e && ./target/workers_e2e"
 # 套件清单（含各自的编译参数）在 scripts/run_tests.sh 里单一维护，这里只负责串起来。
 # 单元套件需要 -I src 才能 import alofa.*；capability 下的平台探测与账本门不需要。
 # 新增基础层文件后：① 在 run_tests.sh 加一条 ② 若文件在 core/ 下，同步
