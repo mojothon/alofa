@@ -116,6 +116,50 @@ def close_fd(fd: Int32) -> Int32:
     return external_call["close", Int32](fd)
 
 
+# `fcntl` mirrors the exact argument shape flare's own `_libc` uses, because two
+# `external_call`s that disagree about one libc symbol fail to lower when both
+# modules are linked — and flare is linked wherever a socket is.
+comptime F_GETFD = 1
+comptime F_GETFL = 3
+comptime F_SETFL = 4
+comptime O_NONBLOCK = 0x800
+
+
+def set_nonblocking(fd: Int32) -> Int32:
+    """`fcntl(fd, F_SETFL, flags | O_NONBLOCK)` → 0，失败返回 -1。
+
+    reactor（`srv/loop.mojo`，roadmap 3.2）的前提是**不能在单个连接上阻塞**：
+    一 worker 一条连接时阻塞写只是"这条连接慢"，连接并到一条事件循环上之后，
+    同一个阻塞就会让**所有**连接一起等。设了 `O_NONBLOCK`，"暂时读不到 / 写不
+    进"变成 EAGAIN 交回调用方，而不是让内核替我们决定等下去 —— 于是"什么时候
+    再试"由事件循环说了算（那也是空闲超时与背压能成立的前提）。
+    """
+    var flags = external_call["fcntl", Int32](fd, Int32(F_GETFL), Int32(0))
+    if flags < 0:
+        return -1
+    return external_call["fcntl", Int32](
+        fd, Int32(F_SETFL), Int32(flags | O_NONBLOCK)
+    )
+
+
+def fd_is_open(fd: Int32) -> Bool:
+    """`fcntl(fd, F_GETFD) >= 0` — is this descriptor still open?
+
+    The caller that needs this closes the descriptor from a tiny interrupt
+    routine that cannot carry state (Mojo has no module-level mutable
+    globals); "the descriptor is gone" is the mark that routine leaves, and
+    this is how a polling loop reads it back. Callers must pick a number
+    nothing else will allocate — see the caller for why a fixed high one
+    works there.
+    """
+    return external_call["fcntl", Int32](fd, Int32(F_GETFD), Int32(0)) >= 0
+
+
+def dup_to(fd: Int32, target: Int32) -> Int32:
+    """`dup2(fd, target)` → target, or -1 on failure."""
+    return external_call["dup2", Int32](fd, target)
+
+
 def open_read(path: String) -> Int32:
     """`openat(AT_FDCWD, path, O_RDONLY)` → fd, or -1 on failure.
 
