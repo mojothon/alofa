@@ -12,6 +12,37 @@ def _text_slice(raw: String, start: Int, end: Int) -> String:
     return String(unsafe_from_utf8=bytes)
 
 
+def json_has(path: String, key: String) raises AlofaError -> Bool:
+    """Whether `key` appears as a JSON field in `path`.
+
+    Not every field is in every file: Qwen2.5's `config.json` has no
+    `head_dim`, because the reference derives it from the hidden size and the
+    head count. A reader that demanded every field would refuse the artefact it
+    exists to read, so the optional ones are asked about before they are read.
+    """
+    var raw = read_text(path).as_bytes()
+    var needle = key.as_bytes()
+    var i = 0
+    while i + len(needle) + 2 <= len(raw):
+        if raw[i] != 34:
+            i += 1
+            continue
+        var matches = True
+        for j in range(len(needle)):
+            if raw[i + 1 + j] != needle[j]:
+                matches = False
+        if matches and raw[i + 1 + len(needle)] == 34:
+            var p = i + len(needle) + 2
+            while p < len(raw) and (
+                raw[p] == 32 or raw[p] == 9 or raw[p] == 10 or raw[p] == 13
+            ):
+                p += 1
+            if p < len(raw) and raw[p] == 58:
+                return True
+        i += 1
+    return False
+
+
 def json_value(path: String, key: String) raises AlofaError -> String:
     """Return one primitive JSON value for `key`.
 
