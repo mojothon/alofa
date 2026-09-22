@@ -48,6 +48,12 @@ test-backend-guard = "bash scripts/check_bad_backend.sh"
 # 无 lm_head（绑定词表）、无 rope 表（按 rope_theta 现算），并与同一份 fp32
 # 参考对齐。不并入 test：要放宽 4.94 亿个参数，与 test-model 同级。
 test-model-dir = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_real_model_dir.mojo -o target/real_model_dir && ./target/real_model_dir"
+# HTTP 服务端到端门：**真 socket + fork**（子进程跑服务，父进程当客户端）。它钉的是
+# 服务循环的性质（keep-alive 上按顺序回答多个请求、`Connection: close` 真关、发了一半
+# 的请求只关自己那条连接而不带走进程），那些性质纯函数单测钉不住。
+# ⚠️ 不并入 test：它 fork，而 `mojo run`（JIT）下 fork 会崩编译器，所以必须 build 再跑。
+# 跑一次约 5 s：其中 5 s 是故意等的 —— 那个"发了一半"的对端要撞上接收超时才被关。
+test-http = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_http_server.mojo -o target/http_e2e && ./target/http_e2e"
 # 垂直切片：一句真文本走完 tokenizer → model → engine → sampler（真权重，一次约 40 s）。
 # 这是全链路唯一被真正执行过的接缝，见 src/alofa/cli.mojo 的文件头。
 generate = "pixi run mojo run -O0 -I src src/alofa/cli.mojo"

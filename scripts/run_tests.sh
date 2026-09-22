@@ -62,6 +62,11 @@ SUITES=(
   "tests/unit/test_batch_executor.mojo|-O0 -I src"
   "tests/unit/test_engine_core.mojo|-O0 -I src"
   "tests/unit/test_kv_room.mojo|-O0 -I src"
+  # HTTP（srv）：线格式与 OpenAI 非流式契约。两块都是纯函数，不需要权重，所以能进
+  # `pixi run test`。
+  # ⚠️ 真 socket 的那条端到端门（test_http_server.mojo）**不在这里**：它 fork，
+  # 而 `mojo run`（JIT）下 fork 会崩编译器 —— 那条走 `pixi run test-http`。
+  "tests/unit/test_http.mojo|-I src"
 )
 
 failed=0
