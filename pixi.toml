@@ -43,6 +43,11 @@ test-model-avx2 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/
 # `unknown cpu backend`。拼错的后端常量若只是静默退化成标量，整网向量门会照绿
 # —— 而它绿的原因是向量路径一次都没跑过。
 test-backend-guard = "bash scripts/check_bad_backend.sh"
+# 真实模型目录门：一个**按 Hugging Face 发布形态摆放的目录**（config.json +
+# model.safetensors + tokenizer.json），全链路只读它 —— bf16 就地放宽、
+# 无 lm_head（绑定词表）、无 rope 表（按 rope_theta 现算），并与同一份 fp32
+# 参考对齐。不并入 test：要放宽 4.94 亿个参数，与 test-model 同级。
+test-model-dir = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_real_model_dir.mojo -o target/real_model_dir && ./target/real_model_dir"
 # 垂直切片：一句真文本走完 tokenizer → model → engine → sampler（真权重，一次约 40 s）。
 # 这是全链路唯一被真正执行过的接缝，见 src/alofa/cli.mojo 的文件头。
 generate = "pixi run mojo run -O0 -I src src/alofa/cli.mojo"
