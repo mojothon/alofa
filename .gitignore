@@ -46,3 +46,11 @@ tests/fixtures/qwen2.5-0.5b/weights/tensors.f32
 !tests/fixtures/qwen2.5-0.5b/q4/blocks.bin
 # `q4vec/` 是给融合 matmul 的向量化差分门用的形状夹具（约 48 KB），理由同上。
 !tests/fixtures/qwen2.5-0.5b/q4vec/blocks.bin
+
+# 真实模型目录夹具的 provenance 写的是本机缓存路径，不入库（目录本身要入：里面
+# 有真的 config.json 和指向分词器的软链）。
+tests/fixtures/qwen2.5-0.5b-hf/SOURCE.txt
+
+# 例外：模型格式门（config.json / safetensors）的夹具是几十字节，不是模型权重，
+# 上面那条 `*.safetensors` 会连带忽略它们 → 干净克隆上该门会因缺 fixture 失败。
+!tests/fixtures/model-formats/*.safetensors
