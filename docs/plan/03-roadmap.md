@@ -100,10 +100,12 @@
 | # | 交付 | 说明 |
 |---|---|---|
 | 3.1 | 接入 `flare` 依赖（锁 0.2.0，来自 `https://prefix.dev/mojo-force`） | A7：不重复造轮子。**先只取 `runtime/` 子系统**，HTTP 层视稳定性决定用 flare 还是自建 |
-| 3.2 | `srv/loop.mojo`：reactor 线程 + **engine 独占线程**的双线程模型 | 见 `02-architecture.md` §6.1；调度决策留 reactor（保持可重放零锁），前向在独占线程 |
-| 3.3 | `srv/sse.mojo` + `srv/openai.mojo`：`/v1/chat/completions` 流式与非流式 | OpenAI 兼容是本阶段的对外契约；JSON 用 `json` 0.1.2 的编译期反射序列化 |
-| 3.4 | `srv/master.mojo`：SO_REUSEPORT 多 worker + 健康探测 + 优雅退出 | 复用 `flare.runtime.reuseport`；SIGTERM → 停止 accept → 排空 → 退出 |
-| 3.5 | 压测脚本与报告模板 | 纳入 `verify/`；**必须接受 `CUDA_VISIBLE_DEVICES`**（共享机约束） |
+| 3.2 | ✅（一半）`srv/loop.mojo`：**reactor 事件循环，一条循环 N 条连接** | 见 `02-architecture.md` §6.1 与账本 §8。**已落地**：8 条连接并发 + 「发了一半就停住」的对端不再拖住别人（旧形态停满 5 s，实测现在 0–1 ms），`pixi run test-loop`；线上入口（单进程与多 worker）已换成它，旧循环留作负向对照。⚠️ **没改「一次只生成一条」**：前向仍内联占住循环 —— 生成的并行仍只来自多 worker（**3.2b 已把前向搬到独占线程**；这句记的是 3.2 当时的状态，并解释为什么 3.2 之后仍要有一条 3.2b） |
+| 3.2b | ✅ `srv/engine_thread.mojo`：**engine 独占线程**（mailbox + `ThreadHandle`） | **已落地**：前向搬到独占线程，reactor 只做 I/O 与调度决策。`evidence:tests/unit/test_engine_thread_server.mojo`（重门 `pixi run test-engine`：真 socket + 真 fork + 真线程，内联版 `run` 是常驻负向对照）。判据是「槽位占满时，慢生成期间一条新连接仍然被接进来并立刻关掉」：探子从连上到收到 EOF，`run_threaded` 0 ms、`run` 4.5 s（对照把那 5 s 生成全等完了）。⚠️ 别拿「生成期间还有字节在走」当判据 —— 内核缓冲（实测 1.2–2.5 MB）比服务端能排队的字节（1 MiB）还大，两端一样快，门会安静地什么都不测。线上两条入口已换成 `run_threaded`。⚠️ **这一条只换来「生成不再占住这条循环」**：它起的是**一条** engine 线程，同时能生成的条数仍是 1 —— 并发生成是紧跟着的 **3.2c** |
+| 3.2c | ✅ `srv/engine_thread.mojo`：**engine 线程池**（N 条线程，每条一份 handler） | **已落地**：`engines>1` 时 N 条 engine 线程各领一份 handler（`Twinable.spawn_twin`），同时能生成 **N** 条。`evidence:tests/unit/test_engine_thread_server.mojo`（`pixi run test-engine`，三模式：threaded=1 / inline 负向 / pooled=2）。代价 **N 条 = N 份权重**（`spawn_twin` 是**重新加载**一份，还没有「共享只读权重 + 各一份 KV」那一层）→ **默认 1**，由 `ALOFA_ENGINE_THREADS`（1–16）开；多 worker 下是 `workers × engines` 份。判据换过两次：①「第二条请求什么时候被答」—— 错，**派得早但生成串行**时它也很快，那是排队不是并行；② 最后是「**两条 5 s 生成的总墙钟**」：`engines=2` **5002 ms**、`engines=1` **10002 ms**（同一条代码路径上的常驻负向对照，它不慢就证明不了门盯住了什么）。三条约束各有安排：流的**相位亲和**靠槽位→线程的黏性 `owner`（第一次派活定归属后不变）+ 单槽位单在途；同连接**按序**同上；**邮箱上界不破**靠单队列按线程过滤（每线程一队列会把一个 `MAILBOX_CAP` 变成 N 个上界）。⚠️ 真权重下 `engines=2` 是两份权重（1.98 GB × 2）；**吞吐**一个数字都没测 |
+| 3.3 | ✅ `srv/sse.mojo` + `srv/openai.mojo`：`/v1/chat/completions` 流式与非流式 | OpenAI 兼容是本阶段的对外契约。流式以 SSE 落地（无 `Content-Length`，靠关连接定界），且**文本与非流式逐字节相同**；⚠️ 未做 `stream_options.include_usage`，流式**不修并发生成**（3.2 修的是连接级并发：连接不互相挡路；生成仍串行 —— 那要 3.2b/3.2c） |
+| 3.4 | ✅ `srv/master.mojo`：SO_REUSEPORT 多 worker + 健康探测 + 优雅退出 | 复用 `flare.runtime.reuseport`；SIGTERM → 停止 accept → 排空 → 退出。`evidence:tests/unit/test_workers.mojo`（3 worker × 24 响应零错误，abnormal=0 forced=0）；⚠️ fork 后 asyncrt 不可用 → 每 worker 单分片（账本 §8）
+| 3.5 | ✅ 压测脚本与报告模板 | `scripts/stress_serve.py`（分钟级非流式口径，与 Gate P3 的 100 并发 SSE 差距显式记账）；systemd 模板 `scripts/deploy/alofa.service`
 
 ### Gate P3（**这是纯 Mojo 服务层的判据门**）
 1. **压测门**：100 并发长连接 SSE，连续运行 1 小时：零错误、零 fd 泄漏、P99 无劣化趋势。
