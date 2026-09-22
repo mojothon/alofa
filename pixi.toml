@@ -54,6 +54,10 @@ test-model-dir = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/t
 # ⚠️ 不并入 test：它 fork，而 `mojo run`（JIT）下 fork 会崩编译器，所以必须 build 再跑。
 # 跑一次约 5 s：其中 5 s 是故意等的 —— 那个"发了一半"的对端要撞上接收超时才被关。
 test-http = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_http_server.mojo -o target/http_e2e && ./target/http_e2e"
+# reactor 循环的端到端门（roadmap 3.2）：**并发连接** —— 8 条连接同时开着同时收应答，
+# 且一个"发了一半就停住"的对端不再把别的连接拖住（旧形态会停 RECV_TIMEOUT_MS 5 秒，
+# 所以这条门带一个 2 秒的时间上限）。同样 fork（JIT 下会崩编译器），所以 build 后跑。
+test-loop = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_loop_server.mojo -o target/loop_e2e && ./target/loop_e2e"
 # 垂直切片：一句真文本走完 tokenizer → model → engine → sampler（真权重，一次约 40 s）。
 # 这是全链路唯一被真正执行过的接缝，见 src/alofa/cli.mojo 的文件头。
 generate = "pixi run mojo run -O0 -I src src/alofa/cli.mojo"

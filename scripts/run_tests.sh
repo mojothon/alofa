@@ -32,6 +32,10 @@ SUITES=(
   "tests/capability/test_libc_ffi.mojo|"
   "tests/capability/test_deps.mojo|"
   "tests/capability/test_layering.mojo|-I src"
+  # reactor 能力门（P3.2）：非阻塞 accept 报 EAGAIN、poll 超时返回、跨线程 wakeup、
+  # 一个循环盯住多条连接。它 import flare，所以要 -I src 之外的环境依赖 flare
+  # （pixi 已装）；不 fork、不加载权重，因此留在 `pixi run test` 里。
+  "tests/capability/test_reactor.mojo|-I src"
   # 账本门自己也参与计数：账本里的「能力账本 CI 校验」一条的 evidence 就是它，
   # 少了它这一行就永远核验不到 —— 自证循环会缺一环。
   "tests/capability/test_ledger.mojo|"
@@ -69,6 +73,11 @@ SUITES=(
   "tests/unit/test_http.mojo|-I src"
   "tests/unit/test_sse.mojo|-I src"
   "tests/unit/test_openai.mojo|-I src"
+  # 连接机（P3.2 reactor 第一步）：入站攒字节 / 请求切分 / 出站队列上限。它没有
+  # socket，所以能逐字节钉住 —— 事件循环里最难复现的那几类错在这里是确定的。
+  # （真 socket 的那条 reactor 端到端门走 `pixi run test-loop`：它 fork。engine 独占
+  # 线程那条端到端门走 `pixi run test-engine`：它 fork + 起线程。）
+  "tests/unit/test_conn.mojo|-I src"
 )
 
 failed=0
