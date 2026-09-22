@@ -19,6 +19,7 @@ Run:
     pixi run mojo build -O2 -I src tests/unit/test_model_parity.mojo -o /tmp/mp
 """
 
+from std.math import cos, pow, sin
 from std.runtime.asyncrt import TaskGroup, parallelism_level
 
 from alofa.core.dtype import DT_FP32
@@ -27,6 +28,7 @@ from alofa.core.error import (
     ERR_OUT_OF_RANGE,
     ERR_PARSE,
     ERR_SHAPE_MISMATCH,
+    ERR_UNSUPPORTED,
     AlofaError,
 )
 from alofa.core.ffi.mem import RawPtr
@@ -71,7 +73,7 @@ from alofa.kernels.cpu.scalar import (
     rope,
     swiglu,
 )
-from alofa.model.config import json_bool, json_float, json_int
+from alofa.model.config import json_bool, json_float, json_has, json_int
 from alofa.model.loader import TensorFile, config_value
 
 comptime EMBED = "model.embed_tokens.weight"
@@ -630,6 +632,59 @@ def attention_k[backend: Int](
         attention(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
 
 
+def rope_table(
+    dst: RawPtr,
+    rows: Int,
+    head_dim: Int,
+    theta: Float64,
+    want_cos: Bool,
+) raises AlofaError:
+    """Fill a `[rows, head_dim]` rotary table from the configuration's `theta`.
+
+    A checkpoint does not contain this table — it is a function of `rope_theta`
+    and the head dimension, and the reference builds it at run time. So it is
+    derived here too: `inv_freq[i] = theta ** (-2i / head_dim)` over the first
+    half of a head, repeated across the second half, one row per position.
+
+    The frequency and the angle are kept in fp32 because that is what the
+    reference computes them in, and a table that disagreed with the reference's
+    by an fp32 epsilon at position 0 disagrees by more than an epsilon at
+    position 500. `cos` / `sin` are taken in fp64 and rounded once.
+
+    `rows` is the stream's length, not the checkpoint's `max_position_embeddings`:
+    positions beyond the table are refused by `run` before they are looked up.
+    """
+    if head_dim <= 0 or head_dim % 2 != 0:
+        raise AlofaError(
+            ERR_UNSUPPORTED,
+            "head dimension must be positive and even",
+            "head_dim=" + String(head_dim),
+        )
+    if rows <= 0:
+        raise AlofaError(
+            ERR_OUT_OF_RANGE, "rotary table needs at least one row", "rows=" + String(rows)
+        )
+    var half = head_dim // 2
+    var out = dst.unsafe_bitcast[Float32]()
+    for pos in range(rows):
+        var row = pos * head_dim
+        for i in range(half):
+            var inverse = Float32(1.0) / Float32(
+                pow(theta, Float64(2 * i) / Float64(head_dim))
+            )
+            var angle = Float32(pos) * inverse
+            var value = (
+                Float32(cos(Float64(angle)))
+                if want_cos
+                else Float32(sin(Float64(angle)))
+            )
+            # Both halves of a head carry the same value: the repetition is how
+            # the reference lays the table out, and `rope` indexes both halves
+            # rather than assuming they match (see its docstring).
+            out[unsafe_offset=row + i] = value
+            out[unsafe_offset=row + i + half] = value
+
+
 def q4_slot_count(n_layers: Int) -> Int:
     return n_layers * Q4_SLOTS_PER_LAYER
 
@@ -690,7 +745,13 @@ struct QwenConfig(Movable):
             self.hidden = json_int(config_path, "hidden_size")
             self.n_heads = json_int(config_path, "num_attention_heads")
             self.n_kv_heads = json_int(config_path, "num_key_value_heads")
-            self.head_dim = json_int(config_path, "head_dim")
+            # Qwen2.5's `config.json` has no `head_dim` — the reference derives
+            # it, and `validate` below is what catches a hidden size that the
+            # head count does not divide.
+            if json_has(config_path, "head_dim"):
+                self.head_dim = json_int(config_path, "head_dim")
+            else:
+                self.head_dim = self.hidden // self.n_heads
             self.intermediate = json_int(config_path, "intermediate_size")
             self.vocab = json_int(config_path, "vocab_size")
             self.eps = Float32(json_float(config_path, "rms_norm_eps"))
@@ -756,8 +817,15 @@ struct QwenForward(Movable):
 
     var cfg: QwenConfig
     var params: TensorFile
+    # The output projection's name. Tied embeddings (`tie_word_embeddings`)
+    # mean the checkpoint has no `lm_head.weight` — the reference reads the
+    # embedding matrix for both — so the name is resolved once, at load, and
+    # is not re-derived for every token.
+    var head: String
     var cos: TensorView
     var sin: TensorView
+    # Owns the rotary tables when the parameter file does not carry them.
+    var rope_arena: Arena
     var kv_arena: Arena
     var act_arena: Arena
     var k_store: List[RawPtr]
@@ -810,8 +878,43 @@ struct QwenForward(Movable):
         # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
         # 想退回不切就显式 `set_shards(1)` —— 那条路与分片之前逐位相同。
         self.shards = default_shards()
-        self.cos = self.params.view(COS)
-        self.sin = self.params.view(SIN)
+
+        # A checkpoint that ties its embeddings ships no `lm_head.weight`; one
+        # that does not tie them and still lacks it is a different failure, and
+        # saying which is which is the whole point of this branch.
+        if self.params.has(OUTPUT):
+            self.head = OUTPUT
+        elif self.cfg.tied_output:
+            self.head = EMBED
+        else:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "output projection is missing and embeddings are not tied",
+                "name=" + OUTPUT,
+            )
+
+        # The rotary table is a function of `rope_theta`, not a parameter, so a
+        # real checkpoint directory does not contain it. Our own exports do
+        # carry the dumped one; either is read, and only one of them is used.
+        var table_rows = max_tokens
+        var table_cols = self.cfg.head_dim
+        var derives_table = not (self.params.has(COS) and self.params.has(SIN))
+        self.rope_arena = Arena(
+            table_rows * table_cols * 2 * 4 if derives_table else 1
+        )
+        if derives_table:
+            var cos_raw = self.rope_arena.alloc(table_rows * table_cols * 4)
+            var sin_raw = self.rope_arena.alloc(table_rows * table_cols * 4)
+            rope_table(cos_raw, table_rows, table_cols, self.cfg.rope_theta, True)
+            rope_table(sin_raw, table_rows, table_cols, self.cfg.rope_theta, False)
+            var table_dims = List[Int]()
+            table_dims.append(table_rows)
+            table_dims.append(table_cols)
+            self.cos = TensorView(cos_raw, Shape(table_dims), DT_FP32)
+            self.sin = TensorView(sin_raw, Shape(table_dims), DT_FP32)
+        else:
+            self.cos = self.params.view(COS)
+            self.sin = self.params.view(SIN)
 
         var kv_dim = self.cfg.kv_dim()
         var store_bytes = max_tokens * kv_dim * 4
@@ -872,7 +975,9 @@ struct QwenForward(Movable):
         # harder to debug than one discovered before anything runs.
         self.require(EMBED)
         self.require(FINAL_NORM)
-        self.require(OUTPUT)
+        # `OUTPUT` is not required here on purpose: a tied checkpoint has no
+        # `lm_head.weight`, and `head` already names what the output projection
+        # is (`self.require(self.head)` would ask the same question twice).
         for layer in range(self.cfg.n_layers):
             var p = "model.layers." + String(layer) + "."
             self.require(p + "input_layernorm.weight")
@@ -1005,6 +1110,7 @@ struct QwenForward(Movable):
         """
         self.kv_arena.keep_alive()
         self.act_arena.keep_alive()
+        self.rope_arena.keep_alive()
         self.params.keep_alive()
 
     def reset(mut self):
@@ -1195,7 +1301,11 @@ struct QwenForward(Movable):
         var last_normed = rows_view(self.normed_ptr, 1, h)
         rmsnorm_k[backend](last_normed, last_hidden, self.params.view(FINAL_NORM), self.cfg.eps)
         var logits = rows_view(self.logits_ptr, 1, self.cfg.vocab)
-        self.project[backend](logits, last_normed, OUTPUT, Q4_NO_SLOT, logits, False)
+        # Copied out of `self` first: the projection reads the name while the
+        # call writes through `self`, and the borrow checker is right that a
+        # field cannot be both.
+        var head_name = self.head
+        self.project[backend](logits, last_normed, head_name, Q4_NO_SLOT, logits, False)
         self.kv_len = kv_len
         return f32_data(logits)
 
