@@ -66,6 +66,13 @@ test-loop = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_l
 # 并且把同一个序列在 `run`（生成在循环上）里再跑一遍当**常驻负向对照**：那里它必须
 # 等完那 1.5 秒。同样 fork（JIT 下会崩编译器），所以 build 后跑。
 test-engine = "mkdir -p target && pixi run mojo build -O0 -I src tests/unit/test_engine_thread_server.mojo -o target/engine_thread_e2e && ./target/engine_thread_e2e"
+# 单进程、非流式 HTTP 服务（真权重，绑 127.0.0.1:8000 —— 端口是常量，见
+# src/alofa/serve.mojo 的文件头写了为什么不解析命令行）。起完之后另开一个终端：
+#   curl -s localhost:8000/health
+#   curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+#     -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8}'
+# 用 -O2：加载要放宽 4.94 亿个 bf16 参数，而每个 token 的前向也在这条链路上。
+serve = "mkdir -p target && pixi run mojo build -O2 -I src src/alofa/serve.mojo -o target/serve && ./target/serve"
 # 垂直切片：一句真文本走完 tokenizer → model → engine → sampler（真权重，一次约 40 s）。
 # 这是全链路唯一被真正执行过的接缝，见 src/alofa/cli.mojo 的文件头。
 generate = "pixi run mojo run -O0 -I src src/alofa/cli.mojo"
