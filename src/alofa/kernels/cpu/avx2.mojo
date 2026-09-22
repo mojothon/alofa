@@ -20,6 +20,20 @@
 kernel"；它是否真的被编译成 VEX 编码的 `vmulpd`，取决于编译器与目标特性，本轮
 **不测、也不写进账本**。要宣称就得拿 `objdump` 数指令，没数过就不许说。
 
+**上面那段话在 2026-09-22 兑现了 —— 数过了，所以现在可以写。** 用 `objdump -d`
+数 `-O2` 编出来的产物（Mojo 1.0.0 `ed45d567`，本机 i7-9700K）：`_gemm_tile[8]` 的
+内层**确实**是 VEX 编码的 `vfmadd231pd`（真融合乘加，不是拆开的 `vmulpd` +
+`vaddpd`），而且 RB=8 的那 8 个 f64×4 累加器**留在寄存器里** —— 该函数体里
+`%rsp` 相关的 `vmovupd` 是 **0 条**。作为对照：把输出**连 `cols` 一起分块**（多个列共用一次读入的 `x`）之后，累加器
+变成 `RB×C` 个、立刻溢出，每次更新都变成"`vmovupd` 取栈 → `vfmadd231pd` → `vmovupd` 存栈"，多付两条 memory uop
+（`scripts/bench_gemm_cblock.mojo`）。每 `kk` 步的真实 uop 大约是这个账：
+9 条 load + 9 条 `vcvtps2pd` + 8 条 FMA，只推进 32 个乘加 —— **今天试过的三个杠杆
+（抬 `RB`、去掉加宽转换、列分块）没一个是便宜的**，因为它们都是拿一种资源去换
+另一种（寄存器 ↔ 缓存字节 ↔ DRAM 字节），三种都落在 ±25% 之内。
+
+⚠️ 这些数**依赖编译器版本与目标特性**，换编译器就要重新数一遍（`objdump -d` 一
+份产物），别直接抄这里的数字。
+
 为什么 q4 这条融合通路用 **8 条 f64 通道**（而不是本文件别处惯用的 4 条）
 --------------------------------------------------------------------
 `_gemm` 用 4 通道是因为它沿 `inner` 这条连续内存切通道，每条通道累加自己那一段。
@@ -675,6 +689,404 @@ def _matmul_q4_halves(
             s1 += hi * x1
         acc += Float64((s0 + s1).reduce_add())
         dst[unsafe_offset=row] = Float32(acc)
+
+
+def _matmul_q4_halves_rows[RB: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """`RB` 个 token 行**共用一次解量化**：`dst[rb, o] = Σ_c w[o,c] · x[rb, c]`。
+
+    算术与 `_matmul_q4_halves`（今天的默认向量通路）**一步一步相同**：同样按半
+    块切、同样 f32 累加、`d` 同样先折进 x、同样整行归约一次。唯一改的是 —— **一
+    个块只为 `RB` 行解量化一次**，而不是每行一遍。
+
+    为什么这一步能省：解量化那套算术（`raw` 读入、`&0x0F`、`>>4`、cast、减 8）
+    **与输入行无关**，只有后面的 x 载入、乘 `d`、两次乘加随行数增长。所以这是一
+    个改用在**算术**上的杠杆，不是挪用寄存器/缓存的那种（后者这三个今天全试过，
+    都落在 ±25% 内且方向不利，见账本）：`RB=8` 保守端 **2.38×**，趋势单调往上
+    （`scripts/bench_q4_rows.mojo`，两次运行 × 批 8/16/32 × 每档 5 轮）。
+
+    ⚠️ 布局：`dst` 里第 `rb` 行的第 `row` 个输出落在 `rb * dst_stride + row`，`x`
+    的步长固定是 `cols`。这两个都是**元素**步长 —— 这里的指针全部是类型化的，
+    `unsafe_offset` 按元素走。`dst_stride == rows` 就是紧挨着的一整批；大于
+    `rows` 时这一次算的是**一整批里的一个输出行带**（分片的走法，见 `qwen.mojo`）。
+
+    ⚠️ `RB` 调用方先行保管：本函数不会检查批是不是整好 `RB` 个，`n_tok` 不是
+    `RB` 的整数倍时要由 `matmul_q4_f32_rows` 把余下几行交给单行通路。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q4_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
+        )
+    var blocks_per_row = cols // Q4_BLOCK
+    var low_mask = SIMD[DType.uint8, W_Q4_HALF](0x0F)
+    var eight = SIMD[DType.float32, W_Q4_HALF](8.0)
+    var acc = InlineArray[Float64, RB](fill=Float64(0))
+    var s0 = InlineArray[SIMD[DType.float32, W_Q4_HALF], RB](
+        fill=SIMD[DType.float32, W_Q4_HALF](0)
+    )
+    var s1 = InlineArray[SIMD[DType.float32, W_Q4_HALF], RB](
+        fill=SIMD[DType.float32, W_Q4_HALF](0)
+    )
+
+    for row in range(rows):
+        comptime for rb in range(RB):
+            acc[rb] = Float64(0)
+            s0[rb] = SIMD[DType.float32, W_Q4_HALF](0)
+            s1[rb] = SIMD[DType.float32, W_Q4_HALF](0)
+
+        var b = 0
+        while b < blocks_per_row:
+            var base = (row * blocks_per_row + b) * Q4_BYTES
+            var d = block_scale(blocks, base)
+            var xb = b * Q4_BLOCK
+            var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
+            var lo = (raw & low_mask).cast[DType.float32]() - eight
+            var hi = ((raw >> 4) & low_mask).cast[DType.float32]() - eight
+
+            comptime for rb in range(RB):
+                var xr = rb * cols
+                s0[rb] += lo * (x.unsafe_load[width=W_Q4_HALF](xr + xb) * d)
+                s1[rb] += hi * (
+                    x.unsafe_load[width=W_Q4_HALF](xr + xb + W_Q4_HALF) * d
+                )
+            b += 1
+
+        comptime for rb in range(RB):
+            acc[rb] += Float64((s0[rb] + s1[rb]).reduce_add())
+            dst[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
+
+
+def matmul_q4_f32_rows[RB: Int = 8](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+) raises AlofaError:
+    """`dst[t, o] = Σ_c w[o,c] · x[t,c]`，`t = 0..n_tok-1`，一次性做一整批。
+
+    结果与**逐行调 `matmul_q4_f32`** 逐位一致：每行的累加结构（s0/s1 两个 f32
+    向量按块序累加、最后与 Float64 的 acc 合并）与单行通路一模一样，只是同一个块
+    的 `lo` / `hi` / `d` 被算一次、`RB` 行复用。这条相等由 `test_q4_rows.mojo`
+    盯（挑剔的形状：批不满 `RB`、以及**除不尽**的余下几行）。
+
+    `n_tok` 不是 `RB` 的整数倍时，余下 `< RB` 行走**原来的单行通路** —— 为每个余数
+    都实例化一份 `RB` 批次专门化出来的核，换不来那一点差别（`RB` 是编译期常量）。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if n_tok < RB:
+        for t in range(n_tok):
+            matmul_q4_f32(
+                dst.unsafe_offset(t * rows),
+                x.unsafe_offset(t * cols),
+                blocks,
+                rows,
+                cols,
+            )
+        return
+    var full = n_tok - n_tok % RB
+    var t = 0
+    while t < full:
+        _matmul_q4_halves_rows[RB](
+            dst.unsafe_offset(t * rows),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            rows,
+        )
+        t += RB
+    while t < n_tok:
+        matmul_q4_f32(
+            dst.unsafe_offset(t * rows),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+        )
+        t += 1
+
+
+def matmul_q4_f32_rows_band[RB: Int = 8](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """同上，但这一批在 `dst` 里**不是紧挨着的**：每行隔 `dst_stride` 个元素。
+
+    分片的那条路要走这个：一次投影按**输出行**切开并发，于是每个分片拿到的是
+    「所有 token 的这一段输出行」—— 第 `t` 个 token 的这一段起始于 `t * dst_stride`。
+    之所以让每个分片一口气吃下整个 token 批（而不是退回「分片 × 逐行」），是因为
+    后者会把复用彻底打碎：每个线程各自把自己那一段权重重流一遍。
+
+    ⚠️ `dst_stride` 必须 `>= rows`，否则相邻两个 token 的这一段会叠在一起 —— 那是
+    写坏别人的份，靠这条 `raise` 拦下来比靠差分门事后发现便宜。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if dst_stride < rows:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "the destination stride must span a whole row band",
+            "dst_stride=" + String(dst_stride) + " rows=" + String(rows),
+        )
+    var limit = n_tok - n_tok % RB if n_tok >= RB else 0
+    var t = 0
+    while t < limit:
+        _matmul_q4_halves_rows[RB](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            dst_stride,
+        )
+        t += RB
+    while t < n_tok:
+        _matmul_q4_halves_rows[1](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            dst_stride,
+        )
+        t += 1
+
+
+def _matmul_q4_wide_rows[wide: Bool, RB: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+    dst_stride: Int,
+) raises AlofaError:
+    """`RB` 个 token 行共用一次解量化；**这就是 q/k/v 那条带偏置的通路**。
+
+    算术与 `_matmul_q4_wide` **一步一步相同**（同一套按 `j%8` 切通道的布局、`d` 同样
+    折进 x、同样整行只归约一次、同样的 `wide` 选累加类型），唯一改的是一个块只为
+    `RB` 行解量化一次。
+
+    ⚠️ 它和 `_matmul_q4_halves_rows` 是**两回事**，别合并：那边（无偏置的默认通路）
+    是半块切 + f32 累加，每 RB 行要 2 个 f32×8 累加器 = 128 B；这边每 RB 行要 4 个
+    f64×8 累加器 = **256 B**。AVX2 只有 16 个 ymm（512 B），于是
+
+        RB=8 → 32 个 ymm → 必溢栈（上次抬 `_gemm_tile` 的 RB=16 就是这么慢掉 24% 的）
+
+    所以这里的 `RB` 默认是 **2**，而不是顺着那边的 8 抄过来 —— **两种累加结构的最优
+    批不是同一个数**。
+
+    ⚠️ `RB` = 2 / 4 / 8 端到端**没能量出差別**（同一份 `RB=2` 的两次运行本身就能差
+    20%，本机噪声把这个效应吃掉了；三个长度三档的数字写在账本里）。取 2 靠的是上面
+    那个**累加器预算**的理由，不是量出来的结论 —— 别把它当成已验证的最优值。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q4_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
+        )
+    var blocks_per_row = cols // Q4_BLOCK
+    var low_mask = SIMD[DType.uint8, W_Q4](0x0F)
+    var acc = InlineArray[Float64, RB](fill=Float64(0))
+
+    for row in range(rows):
+        comptime for rb in range(RB):
+            acc[rb] = Float64(0)
+            if has_bias:
+                acc[rb] = Float64(bias[unsafe_offset=row])
+
+        if wide:
+            var eight = SIMD[DType.float64, W_Q4](8.0)
+            var s0 = InlineArray[SIMD[DType.float64, W_Q4], RB](
+                fill=SIMD[DType.float64, W_Q4](0)
+            )
+            var s1 = InlineArray[SIMD[DType.float64, W_Q4], RB](
+                fill=SIMD[DType.float64, W_Q4](0)
+            )
+            var s2 = InlineArray[SIMD[DType.float64, W_Q4], RB](
+                fill=SIMD[DType.float64, W_Q4](0)
+            )
+            var s3 = InlineArray[SIMD[DType.float64, W_Q4], RB](
+                fill=SIMD[DType.float64, W_Q4](0)
+            )
+            for b in range(blocks_per_row):
+                var base = (row * blocks_per_row + b) * Q4_BYTES
+                var d = Float64(block_scale(blocks, base))
+                var xb = b * Q4_BLOCK
+                var raw0 = blocks.unsafe_load[width=W_Q4](base + Q4_SCALE_BYTES)
+                var raw1 = blocks.unsafe_load[width=W_Q4](
+                    base + Q4_SCALE_BYTES + W_Q4
+                )
+                var lo0 = (raw0 & low_mask).cast[DType.float64]() - eight
+                var hi0 = (raw0 >> 4).cast[DType.float64]() - eight
+                var lo1 = (raw1 & low_mask).cast[DType.float64]() - eight
+                var hi1 = (raw1 >> 4).cast[DType.float64]() - eight
+                comptime for rb in range(RB):
+                    var xr = rb * cols
+                    var x0 = x.unsafe_load[width=W_Q4](xr + xb).cast[
+                        DType.float64
+                    ]() * d
+                    var x1 = x.unsafe_load[width=W_Q4](xr + xb + 16).cast[
+                        DType.float64
+                    ]() * d
+                    var x2 = x.unsafe_load[width=W_Q4](xr + xb + W_Q4).cast[
+                        DType.float64
+                    ]() * d
+                    var x3 = x.unsafe_load[width=W_Q4](xr + xb + 24).cast[
+                        DType.float64
+                    ]() * d
+                    s0[rb] += lo0 * x0
+                    s1[rb] += hi0 * x1
+                    s2[rb] += lo1 * x2
+                    s3[rb] += hi1 * x3
+            comptime for rb in range(RB):
+                acc[rb] += ((s0[rb] + s1[rb]) + (s2[rb] + s3[rb])).reduce_add()
+        else:
+            var eight = SIMD[DType.float32, W_Q4](8.0)
+            var s0 = InlineArray[SIMD[DType.float32, W_Q4], RB](
+                fill=SIMD[DType.float32, W_Q4](0)
+            )
+            var s1 = InlineArray[SIMD[DType.float32, W_Q4], RB](
+                fill=SIMD[DType.float32, W_Q4](0)
+            )
+            var s2 = InlineArray[SIMD[DType.float32, W_Q4], RB](
+                fill=SIMD[DType.float32, W_Q4](0)
+            )
+            var s3 = InlineArray[SIMD[DType.float32, W_Q4], RB](
+                fill=SIMD[DType.float32, W_Q4](0)
+            )
+            for b in range(blocks_per_row):
+                var base = (row * blocks_per_row + b) * Q4_BYTES
+                var d = block_scale(blocks, base)
+                var xb = b * Q4_BLOCK
+                var raw0 = blocks.unsafe_load[width=W_Q4](base + Q4_SCALE_BYTES)
+                var raw1 = blocks.unsafe_load[width=W_Q4](
+                    base + Q4_SCALE_BYTES + W_Q4
+                )
+                var lo0 = (raw0 & low_mask).cast[DType.float32]() - eight
+                var hi0 = (raw0 >> 4).cast[DType.float32]() - eight
+                var lo1 = (raw1 & low_mask).cast[DType.float32]() - eight
+                var hi1 = (raw1 >> 4).cast[DType.float32]() - eight
+                comptime for rb in range(RB):
+                    var xr = rb * cols
+                    var x0 = x.unsafe_load[width=W_Q4](xr + xb) * d
+                    var x1 = x.unsafe_load[width=W_Q4](xr + xb + 16) * d
+                    var x2 = x.unsafe_load[width=W_Q4](xr + xb + W_Q4) * d
+                    var x3 = x.unsafe_load[width=W_Q4](xr + xb + 24) * d
+                    s0[rb] += lo0 * x0
+                    s1[rb] += hi0 * x1
+                    s2[rb] += lo1 * x2
+                    s3[rb] += hi1 * x3
+            comptime for rb in range(RB):
+                acc[rb] += Float64(
+                    ((s0[rb] + s1[rb]) + (s2[rb] + s3[rb])).reduce_add()
+                )
+
+        comptime for rb in range(RB):
+            dst[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
+
+
+def matmul_q4_f32_bias_rows_band[RB: Int = 2](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    dst_stride: Int,
+) raises AlofaError:
+    """`dst[t, o] = bias[o] + Σ_c w[o,c] · x[t,c]`，一次性做一整批；分片用它。
+
+    与**逐行调 `matmul_q4_f32_bias`** 逐位一致（威胁结构一行没改），这条相等由
+    `test_q4_rows.mojo` 盯。
+
+    ⚠️ `RB` 默认 **2** 而不是无偏置那条路的 8：这里是 f64 通道累加，每行的累加器
+    有 4 个 f64×8 = 256 B，`RB=4` 就已经把 16 个 ymm 占满（那还要给 x / lo / hi 的
+    临时值留位置），再往上只能溢栈 —— 上一次付这个学费是抬 `_gemm_tile` 的
+    `RB=16`（慢 24%），这里不重蹈。
+
+    ⚠️ **调用方负责把 `bias` 偏到这一带的起点**（`bias` 按输出行索引，而这一次的
+    `rows` 只是其中的一段）。漏偏的表现是"第一个带全对、后面的带全不对"，而且差分门
+    会把这件事说成"数不对"—— 这两个 *_bias 的 API 在这一点上比 `blocks`（核自己按
+    字节算偏移）更容易错，写测试的时候踩过一次。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if dst_stride < rows:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "the destination stride must span a whole row band",
+            "dst_stride=" + String(dst_stride) + " rows=" + String(rows),
+        )
+    var limit = n_tok - n_tok % RB if n_tok >= RB else 0
+    var t = 0
+    while t < limit:
+        _matmul_q4_wide_rows[True, RB](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            bias,
+            True,
+            dst_stride,
+        )
+        t += RB
+    while t < n_tok:
+        _matmul_q4_wide_rows[True, 1](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            bias,
+            True,
+            dst_stride,
+        )
+        t += 1
 
 
 def _matmul_q4(
