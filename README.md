@@ -43,9 +43,9 @@ README 不得出现账本里未标 `verified` 的能力；账本的分级由 `pi
 
 这些同样是事实的一部分，写在这里是为了避免"看起来已经能用"：
 
-- **只有命令行生成，没有服务层。** `pixi run generate` 能跑一句真文本（见下），但没有 HTTP / OpenAI 兼容 API、没有流式 SSE、没有并发服务。
+- **服务层：有 OpenAI 兼容 API 与 reactor 事件循环，但有几处明文边界。** HTTP + OpenAI 兼容 API（非流式 + SSE 流式）已有；入口跑 **reactor 事件循环**（一条循环 N 条连接 —— 慢客户端 / keep-alive 的空闲连接不再互相挡路，有背压队列与空闲回收），生成不在循环上（engine 线程）。⚠️ 同时能生成几条 = engine 线程数，**默认 1**（每多一条就多一份权重，`ALOFA_ENGINE_THREADS`）；无 TLS；无批调度（把多条生成合成一次前向 —— 那才是**不**多占权重的并发生成）。
 - ⚠️ 垂直切片只验 **1 条请求 / 16 个 token / scalar 后端**：不验 AVX2、不验批、不验流式输出的 UTF-8 边界，也不验生成质量。它只负责"链路通"。
-- **不能自己加载模型权重。** 模型不支持 HF `config.json` / safetensors / GGUF，权重目前来自本机导出的 fp32 裸二进制 + TSV 索引（见 `scripts/dump_model_reference.py`）。
+- **权重形态只认两种。** HF 的 `config.json` + safetensors（bf16 **就地放宽**成 fp32）可以直接读；本机导出的 fp32 裸二进制 + TSV 索引（`scripts/dump_model_reference.py`）也还在。GGUF 不支持。
 - **只有一个模型架构**（Qwen2.5 0.5B，fp32）；Llama / Mistral 未开始。
 - **量化只有 q4_0 一种格式**（q4_k / q8_0 / int8 / fp8 未开始），且整网 q4_0 的教师强制贪心一致率实测 **0.8164**，未达到自己设的 ≥0.90 质量门 → 这条在账本里按 `missing` 如实记录。
 - **没有任何性能数字。** 唯一被接受的性能基准是同机同 prompt 对比 llama.cpp，尚未做。
@@ -98,6 +98,30 @@ pixi run generate
 
 两条路都说到 Paris。它们**必须**在温度趋零时逐字相等 —— 若 `run_sampled` 悄悄退化成
 argmax，"说出 Paris"照样全绿而采样路径一次都没生效过，所以那条才是这道门的关键断言。
+
+### 跑服务（OpenAI 兼容，非流式 + SSE 流式）
+
+```bash
+pixi run serve                                      # 单进程，127.0.0.1:8000
+ALOFA_WORKERS=4 ALOFA_HOST=0.0.0.0 pixi run serve   # 4 worker，SO_REUSEPORT
+curl -s localhost:8000/health                       # 就绪探针（含边界说明）
+curl -s localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+- 配置走**环境变量**（Mojo 1.0 编译产物里 `sys.argv` 是空的），全量清单与默认值见
+  `src/alofa/srv/config.mojo`。注意 `ALOFA_MAX_TOKENS` 是**上下文窗口**（prompt+生成
+  总槽位），不是生成步数上限；`ALOFA_ENGINE_THREADS` 是同时能生成的条数（默认 1 ——
+  每多一条就多一份权重，那是线程池这条路的代价）。
+- 多 worker：master 加载一次权重后 fork，worker 靠写时复制共享（8 worker 的实际内存
+  ≈ 单进程）；**worker 内分片请保持 1** —— fork 之后 asyncrt 不可用（账本 §8 有实测）。
+- 流式：`stream=true` 走 SSE（`text/event-stream`，逐 token 一帧，以 `data: [DONE]`
+  收尾并关连接 —— 没有 `Content-Length`，长度在写的那一刻未知）。官方 `openai`
+  SDK 只改 `base_url` 即可流式对话；实测流式拼出来的文本与非流式**逐字相等**
+  （多字节字符可能跨 token，所以每步是「整段前缀解码后取新增的那一截」）。
+- 优雅退出：`SIGTERM` → 停止接新请求 → 在途答完 → 退出；systemd 部署模板见
+  `scripts/deploy/alofa.service`（`TimeoutStopSec` 要大于 `ALOFA_GRACE_MS`）。
+- 压测观测：`pixi run stress -- --url http://127.0.0.1:8000 --concurrency 8 --duration 60`
+  （QPS/分位数/错误分类/fd 与内存；本机过载数字只作同轮相对比较）。
 
 ### 给账本加一条新能力
 
