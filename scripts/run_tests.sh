@@ -46,6 +46,7 @@ SUITES=(
   # 模型格式：config.json / safetensors（含 bf16 就地放宽与 fp16 指名拒绝）。
   "tests/unit/test_model_formats.mojo|-I src"
   "tests/unit/test_tokenizer_parity.mojo|-O0 -I src"
+  "tests/unit/test_tokenizer_json.mojo|-O0 -I src"
   "tests/unit/test_layer0_parity.mojo|-I src"
   "tests/unit/test_sampler_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_parity.mojo|-O0 -I src"

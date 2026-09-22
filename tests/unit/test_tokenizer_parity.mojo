@@ -20,10 +20,14 @@ from std.testing import TestSuite, assert_equal, assert_true
 
 from alofa.tokenizer.nfc import nfc
 from alofa.tokenizer.tokenizer import Tokenizer, load_tokenizer
+from alofa.tokenizer.tokenizer_json import load_tokenizer_json
 from alofa.tokenizer.unicode import Unicode
 
 comptime FIXTURE_DIR = "tests/fixtures/qwen2.5-0.5b"
 comptime CASES_PATH = FIXTURE_DIR + "/tokenizer_cases.tsv"
+# The file Hugging Face publishes, verbatim — the same tokenizer the corpus was
+# produced with, so it is the same oracle read through a different loader.
+comptime TOKENIZER_JSON = FIXTURE_DIR + "/tokenizer.json"
 
 comptime LF = 0x0A
 comptime TAB = 0x09
@@ -101,6 +105,53 @@ def test_corpus_matches_reference_exactly() raises:
         print(result.report)
     assert_true(result.total >= MIN_CASES, "corpus is too small: " + String(result.total))
     assert_equal(result.failed, 0)
+
+
+def test_json_loader_matches_the_reference_corpus() raises:
+    """The same oracle, read from a real `tokenizer.json` instead of our TSV.
+
+    This is the one that says the ecosystem's file is loadable: the corpus was
+    produced by Hugging Face's fast tokenizer, and here it is re-encoded from
+    the artifact that tokenizer itself serializes.
+    """
+    var tokenizer = load_tokenizer_json(TOKENIZER_JSON)
+    var result = run_corpus(tokenizer)
+    if result.failed > 0:
+        print(result.report)
+    assert_true(result.total >= MIN_CASES, "corpus is too small: " + String(result.total))
+    assert_equal(result.failed, 0)
+
+
+def test_json_and_tsv_loaders_agree_on_every_token() raises:
+    """Two readers of one tokenizer must agree on all 151665 token contents.
+
+    The corpus only exercises the tokens it happens to sample; this compares the
+    whole vocabulary byte for byte, which is what catches an off-by-one in id
+    placement that no sampled case would reach.
+    """
+    var from_json = load_tokenizer_json(TOKENIZER_JSON)
+    var from_tsv = load_tokenizer(FIXTURE_DIR)
+    assert_equal(from_json.vocab.count(), from_tsv.vocab.count())
+
+    var mismatched = 0
+    var id = 0
+    while id < from_json.vocab.count():
+        var json_start = from_json.vocab.token_start(id)
+        var json_end = from_json.vocab.token_end(id)
+        var tsv_start = from_tsv.vocab.token_start(id)
+        if json_end - json_start != from_tsv.vocab.token_end(id) - tsv_start:
+            mismatched += 1
+        else:
+            var offset = 0
+            while offset < json_end - json_start:
+                if from_json.vocab.blob[json_start + offset] != from_tsv.vocab.blob[
+                    tsv_start + offset
+                ]:
+                    mismatched += 1
+                    break
+                offset += 1
+        id += 1
+    assert_equal(mismatched, 0)
 
 
 def test_round_trip_preserves_the_input() raises:
