@@ -15,8 +15,10 @@ comptime TOK_ERR_BAD_MERGES = 4
 comptime TOK_ERR_BAD_FIXTURE_LINE = 5
 comptime TOK_ERR_IO = 6
 comptime TOK_ERR_UNKNOWN_ID = 7
+comptime TOK_ERR_BAD_JSON = 8
+comptime TOK_ERR_UNSUPPORTED_TOKENIZER = 9
 
-comptime TOK_ERR_LAST = 7
+comptime TOK_ERR_LAST = 9
 
 
 def tokenizer_error_name(code: Int) -> String:
@@ -37,6 +39,10 @@ def tokenizer_error_name(code: Int) -> String:
         return "io"
     elif code == TOK_ERR_UNKNOWN_ID:
         return "unknown_id"
+    elif code == TOK_ERR_BAD_JSON:
+        return "bad_json"
+    elif code == TOK_ERR_UNSUPPORTED_TOKENIZER:
+        return "unsupported_tokenizer"
     return "unknown"
 
 

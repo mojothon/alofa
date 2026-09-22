@@ -98,7 +98,15 @@ struct Vocab(Copyable, Movable):
     def seal(mut self):
         """Index every token. Tokens are unique by construction, so probing only
         needs an empty slot rather than an equality check."""
-        var slot = 0
+        self.index_from(0)
+
+    def index_from(mut self, first: Int):
+        """Index tokens from `first` onwards; earlier ones are already indexed.
+
+        Lets a vocabulary be extended after it was sealed without re-inserting
+        every existing token.
+        """
+        var slot = first
         while slot < self.count():
             var probe = _hash_blob(self.blob, self.starts[slot], self.starts[slot + 1]) & self.mask
             while self.buckets[probe] != NO_TOKEN:
@@ -121,6 +129,32 @@ struct Vocab(Copyable, Movable):
                 var matched = True
                 while offset < length:
                     if bytes[start + offset] != self.blob[token_start + offset]:
+                        matched = False
+                        break
+                    offset += 1
+                if matched:
+                    return candidate
+            probe = (probe + 1) & self.mask
+
+    def find_bytes(imm self, imm source: List[UInt8], start: Int, end: Int) -> Int:
+        """Id of the token whose bytes equal `source[start:end]`, or `NO_TOKEN`.
+
+        The byte-list form of `find`: token contents that come out of a
+        `tokenizer.json` are held as bytes, not as a `String`, and building a
+        `String` per token just to compare bytes would copy every token twice.
+        """
+        var length = end - start
+        var probe = _hash_blob(source, start, end) & self.mask
+        while True:
+            var candidate = self.buckets[probe]
+            if candidate == NO_TOKEN:
+                return NO_TOKEN
+            var token_start = self.starts[candidate]
+            if self.starts[candidate + 1] - token_start == length:
+                var offset = 0
+                var matched = True
+                while offset < length:
+                    if source[start + offset] != self.blob[token_start + offset]:
                         matched = False
                         break
                     offset += 1
