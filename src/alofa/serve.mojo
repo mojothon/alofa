@@ -73,7 +73,7 @@ from alofa.srv.loop import Loop
 from alofa.srv.master import run_workers
 from alofa.core.memory import Arena
 from alofa.engine.core import MAX_PROMPT, EngineCore
-from alofa.engine.executor import MAX_BATCH, MAX_GEN, int_map
+from alofa.engine.executor import MAX_BATCH, MAX_GEN, NO_TOKEN, int_map
 from alofa.engine.scheduler import SchedConfig
 from alofa.srv.openai import NO_REQUEST, ChatHandler, Completion, Service
 from alofa.srv.sse import StreamToken
@@ -170,11 +170,20 @@ struct ModelService(Service, Twinable):
     #   `b_out` — 生成的 token，扁平存放：槽位 s 的第 k 个在 `s * MAX_GEN + k`
     #   `b_n` / `b_steps` — 已交出几个 / 一共要几个
     #   `b_emitted` — 已经发出去的**字节**数（增量文本靠它，理由见 `_new_text`）
+    #   `b_temp` — 这条请求的温度（贪心是 ≤ 0）
+    #   `b_rng` — 这条请求**自己的**随机源状态（`Rng.state`）
+    #
+    # ⚠️ 随机源为什么必须**每条请求一份**：批路是多条流交错推进的，一个共享的随机
+    # 源会让"这条流这一步抽到什么"取决于**别人**问了几步 —— 于是同一条 prompt 在
+    # 批里与单跑会给出不同答案，而"批调度只是换了执行顺序"这件事就不成立了。状态
+    # 存成 `UInt64` 而不是 `Rng`：平行基础类型列表，`Rng` 只在用它的那一步里现造。
     var b_req: List[Int]
     var b_out: List[Int]
     var b_n: List[Int]
     var b_steps: List[Int]
     var b_emitted: List[Int]
+    var b_temp: List[Float64]
+    var b_rng: List[UInt64]
 
     # 再造一份时要用的三个路径（`spawn_twin`）。留着它们而不是留一份
     # `ServeConfig`：配置里有 host/port 那些和"加载一份权重"无关的东西，而这里
@@ -246,11 +255,15 @@ struct ModelService(Service, Twinable):
         self.b_n = List[Int]()
         self.b_steps = List[Int]()
         self.b_emitted = List[Int]()
+        self.b_temp = List[Float64]()
+        self.b_rng = List[UInt64]()
         for i in range(MAX_BATCH):
             self.b_req.append(NO_REQUEST)
             self.b_n.append(0)
             self.b_steps.append(0)
             self.b_emitted.append(0)
+            self.b_temp.append(0.0)
+            self.b_rng.append(UInt64(0))
         for i in range(MAX_BATCH * MAX_GEN):
             self.b_out.append(0)
 
@@ -377,14 +390,17 @@ struct ModelService(Service, Twinable):
         if steps < 0:
             steps = 0
 
-        # ---- 批路：贪心，且形状装得进引擎 ----
+        # ---- 批路：贪心**与采样**都收，只要形状装得进引擎 ----
         # 三个上限都是引擎自己的（`submit` 会指名拒绝越界的，所以这里是**先**判
         # 断再决定走哪条路，而不是碰运气）：prompt ≤ `MAX_PROMPT`、新 token ≤
         # `MAX_GEN`、同时在批 ≤ `MAX_BATCH`。越界的请求不是错，只是走老路。
+        #
+        # 采样也收，是因为"选哪个 token"这一步已经不在引擎里了（`engine.decide`
+        # 只跑前向，选谁由这边按槽位答）—— 每条请求带自己的温度与自己的随机源，
+        # 所以批里的采样与单跑的采样抽的是**同一个**序列。
         var slot = self._free_slot()
         if (
             self.batch_enabled
-            and temperature <= 0.0
             and steps > 0
             and len(ids) <= MAX_PROMPT
             and steps <= MAX_GEN
@@ -403,6 +419,10 @@ struct ModelService(Service, Twinable):
             self.b_steps[slot] = steps
             self.b_n[slot] = 0
             self.b_emitted[slot] = 0
+            self.b_temp[slot] = temperature
+            # 每条请求从**同一个种子**起 —— 与老路 `self.rng = Rng(seed)` 同一个
+            # 起点，否则"批里 == 单跑"这条判据从第一步起就不可能成立。
+            self.b_rng[slot] = UInt64(self.seed)
             return
 
         # ---- 老路（采样，或装不进引擎的请求）：一次只握一条 ----
@@ -475,7 +495,11 @@ struct ModelService(Service, Twinable):
         if slot >= 0:
             if self.engine.find(request) >= 0:
                 self.engine.cancel(request)
-                self.engine.tick[BACKEND_AVX2](self.model)
+                # ⚠️ 这一拍也必须是 `_batch_tick`（按每条请求**自己的**策略选），
+                # 不能是 `engine.tick`：那个是写死贪心的，而这一拍发生在**别人**断
+                # 开的时候 —— 用它就会给批里正在采样的请求塞一个 argmax 的 token。
+                # 那不是"算错一点"，是那条流的答案从此分叉，而日志里什么都没有。
+                self._batch_tick()
             self.b_req[slot] = NO_REQUEST
             self.b_n[slot] = 0
             self.b_steps[slot] = 0
@@ -499,6 +523,65 @@ struct ModelService(Service, Twinable):
                 return i
         return -1
 
+    def _batch_tick(mut self) raises -> Int:
+        """批路走一拍：**前向交给引擎，选谁由这边决定**。
+
+        为什么不直接调 `engine.tick`：那个 tick 里的 `argmax` 是**写死**的。采样
+        要的两样东西引擎都不该持有 —— 每条请求自己的随机源（`b_rng`）与自己的历
+        史（`b_out`，采样器拿它做重复惩罚）—— 所以这一拍拆成三步：`decide`（排
+        一拍 + 跑前向）→ 逐个槽位问「谁欠一个 token、它的 logits 在哪」→ `settle`
+        （落地）。贪心那条路走的是**同一个** `decide` / `settle`，只是决策是一行
+        `argmax`，所以两条路的"一拍"不可能走偏。
+        """
+        var rows = self.engine.decide[BACKEND_AVX2](self.model)
+        var chosen = self.engine.step_choices()
+        for i in range(MAX_BATCH):
+            chosen[unsafe_offset=i] = NO_TOKEN
+        if rows > 0:
+            for i in range(MAX_BATCH):
+                if not self.engine.step_owes(i):
+                    continue
+                var req = self.engine.step_request(i)
+                var slot = self._slot_of(req)
+                if slot < 0:
+                    # 引擎在替一条这边不认得的请求跑。留 `NO_TOKEN` 会让它原地不动
+                    # —— 客户端看到的是"偶发地特别慢"，最难归因的那一种，所以宁可红。
+                    raise AlofaError(
+                        ERR_INVALID_ARGUMENT,
+                        "the engine is generating for a request this service does"
+                        + " not hold",
+                        "request=" + String(req),
+                    )
+                chosen[unsafe_offset=i] = self._batch_pick(
+                    slot, self.engine.step_logits(i)
+                )
+        self.engine.settle(chosen)
+        return rows
+
+    def _batch_pick(mut self, slot: Int, logits: F32Ptr) raises -> Int:
+        """批路给 `slot` 选这一步的 token：贪心，或按**它的**温度采样。
+
+        与老路 `_pick` 是同一个分支、同一个 `sampler`、同一份参数，唯一的结构差异
+        是**随机源**：老路一份 `self.rng`（一次一条流，无所谓），批路每条请求一份
+        （`b_rng`）—— 多条流交错推进时，一个共享的随机源会让"这条流这一步抽到什
+        么"取决于**别人**问了几步，于是同一条 prompt 在批里与单跑会给出不同答案。
+
+        ⚠️ 历史是 `b_out` 的前 `b_n` 个，与老路的 `stream_out` 对应：`sampler.build`
+        拿它做重复惩罚。少了它，批里的采样会与单跑分叉 —— 而且只在生成出重复词的
+        那一段才看得出来，是最容易被"跑一遍看着没问题"放过去的一种错。
+        """
+        if self.b_temp[slot] <= 0.0:
+            return self.model.argmax(logits)
+        var hist = List[Int]()
+        for j in range(self.b_n[slot]):
+            hist.append(self.b_out[slot * MAX_GEN + j])
+        self.params.temperature = self.b_temp[slot]
+        self.sampler.build(logits, self.vocab, self.params, List[LogitBias](), hist)
+        var rng = Rng(self.b_rng[slot])
+        var u = rng.next_uniform()
+        self.b_rng[slot] = rng.state
+        return self.sampler.pick(self.vocab, u)
+
     def _batch_next(mut self, slot: Int, request: Int) raises -> StreamToken:
         """批路走一步：引擎还没交出第 `n` 个 token 就推它，直到交出或没活干。
 
@@ -509,7 +592,7 @@ struct ModelService(Service, Twinable):
         while self.engine.n_output(request) <= want:
             if not self.engine.has_work():
                 break
-            self.engine.tick[BACKEND_AVX2](self.model)
+            self._batch_tick()
         if self.engine.n_output(request) <= want:
             # 引擎交不出更多了：这条流到终点了（也可能被抢占后没再排上 —— 无论哪
             # 一种，"给一个终点"都比"一直等"好：后者在客户端是永远等不到 `[DONE]`）。

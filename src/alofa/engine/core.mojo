@@ -54,6 +54,7 @@ from alofa.core.error import (
 
 from alofa.core.memory import Arena
 from alofa.engine.executor import (
+    F32Ptr,
     KvPageTable,
     MAX_BATCH,
     MAX_GEN,
@@ -542,6 +543,48 @@ struct EngineCore:
         self.last_rows = self.ex.plan()
         return self.last_rows
 
+    def decide[backend: Int = BACKEND_SCALAR](
+        mut self, mut model: QwenForward
+    ) raises AlofaError -> Int:
+        """Plan one step and run the forward — **without choosing anything**.
+
+        Returns the rows it ran; 0 means nothing was queued, so no slot is owed
+        an answer. After it returns, `step_owes(i)` says whether slot `i` is owed
+        a token, `step_request(i)` says whose slot it is, `step_logits(i)` is
+        where that request's logits are, and the caller writes one token per slot
+        into `step_choices()` (default `NO_TOKEN`) before calling `settle`.
+
+        Why this exists: greedy is one line (`argmax`) and it was fine for that
+        line to live inside `tick`. Sampling is not — it needs a random source
+        **per request** and that request's own history, and neither is the
+        engine's to hold: a shared source would make what a request draws depend
+        on how many steps *other* requests asked for, so the same prompt would
+        answer differently in a batch than alone. Splitting the step is what lets
+        the caller own the decision without owning the forward.
+        """
+        var rows = self.prepare()
+        if rows > 0:
+            self.ex.forward[backend](model)
+        return rows
+
+    def step_owes(self, i: Int) -> Bool:
+        """Slot `i` is owed a token this step (it is live and was served)."""
+        return self.ex.live[i] == 1 and self.ex.served[i] != 0
+
+    def step_request(self, i: Int) -> Int:
+        """Whose slot `i` is. The caller keeps its own per-request state and
+        needs this to find it."""
+        return self.ex.req[i]
+
+    def step_logits(self, i: Int) raises AlofaError -> F32Ptr:
+        """Where slot `i`'s logits are. Only meaningful when `step_owes(i)`."""
+        return self.ex.logits_of(self.ex.req[i])
+
+    def step_choices(self) -> IntPtr:
+        """The buffer `settle` reads: one token per executor slot, `NO_TOKEN`
+        for the slots that owe no answer."""
+        return self.chosen
+
     def settle(mut self, chosen: IntPtr) raises AlofaError:
         """End the step: history grows, tokens are recorded, finished released.
 
@@ -595,19 +638,20 @@ struct EngineCore:
     def tick[backend: Int = BACKEND_SCALAR](
         mut self, mut model: QwenForward
     ) raises AlofaError -> Int:
-        """One tick, model included. Returns the rows it ran."""
-        var rows = self.prepare()
+        """One **greedy** tick, model included. Returns the rows it ran.
+
+        Greedy is the case where the decision is one line, so it stays here —
+        but it now goes through `decide` / `settle` like every other policy, so
+        there is exactly one place where a step is planned and ended.
+        """
+        var rows = self.decide[backend](model)
         var chosen = self.chosen
         for i in range(MAX_BATCH):
             chosen[unsafe_offset=i] = NO_TOKEN
         if rows > 0:
-            self.ex.forward[backend](model)
             for i in range(MAX_BATCH):
-                if self.ex.live[i] != 1 or self.ex.served[i] == 0:
-                    continue
-                chosen[unsafe_offset=i] = model.argmax(
-                    self.ex.logits_of(self.ex.req[i])
-                )
+                if self.step_owes(i):
+                    chosen[unsafe_offset=i] = model.argmax(self.step_logits(i))
         self.settle(chosen)
         return rows
 
