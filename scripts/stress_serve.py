@@ -60,6 +60,7 @@ class Counter:
     def __init__(self):
         self.lock = threading.Lock()
         self.latencies = []
+        self.first_latencies = []
         self.errors = {
             "connect_failed": 0,
             "send_failed": 0,
@@ -67,11 +68,14 @@ class Counter:
             "non_200": 0,
             "bad_body": 0,
             "incomplete": 0,
+            "stream_truncated": 0,
         }
 
-    def ok(self, ms):
+    def ok(self, ms, first_ms=None):
         with self.lock:
             self.latencies.append(ms)
+            if first_ms is not None:
+                self.first_latencies.append(first_ms)
 
     def err(self, kind):
         with self.lock:
@@ -127,7 +131,7 @@ def server_snapshot(master_pid):
     }
 
 
-def one_request(host, port, body, timeout_s, counter):
+def one_request(host, port, body, timeout_s, counter, stream=False):
     """一条连接上打一个请求；错误分类后计入。"""
     t0 = time.monotonic()
     try:
@@ -144,14 +148,26 @@ def one_request(host, port, body, timeout_s, counter):
             "\r\n"
         ).encode() + body
         sock.sendall(payload)
-        # 读到 Content-Length 声明的字节数或 EOF。
+        # 非流式：读到 Content-Length 声明的字节数或 EOF。
+        # 流式（SSE）：头里**没有** Content-Length（写第一帧时长度还未知），所以
+        # 终点只能靠 `data: [DONE]` —— 那是协议规定的收尾。等 EOF 是错的：连接是
+        # keep-alive 复用的，EOF 会把"流走完了"和"连接超时被掐断"混成同一件事。
         buf = b""
         want = None
+        first_ms = None
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
+            # 首帧到达：SSE 才有这个时刻（多久吐出第一个字）。非流式只有一个响应，
+            # 没有"首字"可言。
+            if first_ms is None and b"data: " in chunk:
+                first_ms = (time.monotonic() - t0) * 1000.0
             buf += chunk
+            if stream:
+                if b"data: [DONE]" in buf:
+                    break
+                continue
             head_end = buf.find(b"\r\n\r\n")
             if want is None and head_end > 0:
                 for line in buf[:head_end].split(b"\r\n"):
@@ -168,10 +184,14 @@ def one_request(host, port, body, timeout_s, counter):
                 counter.err("non_200")
             else:
                 counter.err("incomplete")
+        elif stream and b"data: [DONE]" not in buf:
+            # 200，也发了帧，但没走到 [DONE] —— 压测里**最该盯**的一类：客户端
+            # 看到的是一条异常短的流，而不是一个错误，所以它不会出现在错误日志里。
+            counter.err("stream_truncated")
         elif b'"content":"' not in buf:
             counter.err("bad_body")
         else:
-            counter.ok(ms)
+            counter.ok(ms, first_ms)
     except socket.timeout:
         counter.err("timeout")
     except OSError:
@@ -183,9 +203,9 @@ def one_request(host, port, body, timeout_s, counter):
             pass
 
 
-def worker_loop(host, port, body, deadline, timeout_s, counter):
+def worker_loop(host, port, body, deadline, timeout_s, counter, stream=False):
     while time.monotonic() < deadline:
-        one_request(host, port, body, timeout_s, counter)
+        one_request(host, port, body, timeout_s, counter, stream)
 
 
 def main():
@@ -197,6 +217,9 @@ def main():
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--request-timeout", type=float, default=120.0)
+    ap.add_argument("--stream", action="store_true",
+                    help="打 SSE 流式请求（默认非流式）。P3 门的形态是流式的"
+                    "：长连接、每请求多帧，与非流式不是同一种压力。")
     ap.add_argument("--master-pid", type=int, default=0,
                     help="服务端 master 的 pid：观测 fd/RSS 前后差（不给就跳过）")
     ap.add_argument("--out", default="", help="把报告追加写进这个 md 文件")
@@ -209,6 +232,7 @@ def main():
         "messages": [{"role": "user", "content": args.prompt}],
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "stream": bool(args.stream),
     }).encode()
 
     loadavg = ""
@@ -226,7 +250,7 @@ def main():
     for _ in range(args.concurrency):
         th = threading.Thread(
             target=worker_loop,
-            args=(host, port, body, deadline, args.request_timeout, counter),
+            args=(host, port, body, deadline, args.request_timeout, counter, args.stream),
             daemon=True,
         )
         th.start()
@@ -246,7 +270,7 @@ def main():
     lines.append("")
     lines.append(f"- date: {datetime.date.today().isoformat()} host: {os.uname().nodename} ({os.uname().machine})")
     lines.append(f"- loadavg(1/5/15) at start: {' '.join(loadavg)} — 本机长期过载，**以下数字只能作同轮相对比较，不得当绝对吞吐外引**")
-    lines.append(f"- target: {args.url} concurrency={args.concurrency} duration={args.duration:.0f}s max_tokens={args.max_tokens} temperature={args.temperature} prompt_tokens≈{len(args.prompt.split())}")
+    lines.append(f"- target: {args.url} concurrency={args.concurrency} duration={args.duration:.0f}s max_tokens={args.max_tokens} temperature={args.temperature} stream={bool(args.stream)} prompt_tokens≈{len(args.prompt.split())}")
     if args.master_pid:
         lines.append(
             f"- server pid tree: {before['processes']} procs; "
@@ -258,6 +282,9 @@ def main():
         )
     lines.append("")
     lines.append(f"- requests ok: {n_ok}, errors: {total_err} ({counter.errors})")
+    if counter.first_latencies:
+        ttft = percentiles(counter.first_latencies)
+        lines.append(f"- TTFT(首帧) ms: p50={ttft.get('p50')} p90={ttft.get('p90')} p99={ttft.get('p99')} max={ttft.get('max')}")
     lines.append(f"- QPS: {qps:.2f} | latency ms: p50={p.get('p50')} p90={p.get('p90')} p95={p.get('p95')} p99={p.get('p99')} max={p.get('max')} (mean {round(statistics.fmean(counter.latencies),1) if counter.latencies else '-'})")
     report = "\n".join(lines)
     print(report)
