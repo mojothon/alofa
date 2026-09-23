@@ -70,7 +70,7 @@ from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import Loop
 from alofa.srv.master import run_workers
-from alofa.srv.openai import ChatHandler, Completion, Service
+from alofa.srv.openai import NO_REQUEST, ChatHandler, Completion, Service
 from alofa.srv.sse import StreamToken
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
 
@@ -99,6 +99,10 @@ struct ModelService(Service, Twinable):
     var stream_emitted: Int
     var stream_temp: Float64
     var stream_started: Bool
+    # 在途那条流的**请求号**（`NO_REQUEST` = 没有）。这一整块状态只属于它 ——
+    # `stream_next` / `stream_end` 每次都核对，号对不上就红而不是"接着给另一条流
+    # 生成"。接批调度时要换成按 request 索引的表，那时这一块就是表里的一行。
+    var stream_request: Int
 
     # 再造一份时要用的三个路径（`spawn_twin`）。留着它们而不是留一份
     # `ServeConfig`：配置里有 host/port 那些和"加载一份权重"无关的东西，而这里
@@ -141,6 +145,7 @@ struct ModelService(Service, Twinable):
         self.stream_emitted = 0
         self.stream_temp = 0.0
         self.stream_started = False
+        self.stream_request = NO_REQUEST
 
     @staticmethod
     def load(cfg: ServeConfig) raises -> ModelService:
@@ -232,13 +237,22 @@ struct ModelService(Service, Twinable):
         return Completion(text, len(ids), len(out))
 
     def stream_begin(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        request: Int,
     ) raises:
         """开始一次流式生成：**只** reset、分词与校验，不走前向。
 
         前向留在第一次 `stream_next`（惰性），因为这里是唯一还能把请求的错回成
         400 的地方 —— 响应头一旦发出去，退路就只剩下"给流一个终点"。
         """
+        # 上一条流没被收尾（对端断了 → 不一定有人通知）就先收掉它：这一整块状态
+        # 是**一整份**，不收就只是被下面覆盖掉（今天看不出来），接了批调度之后占
+        # 的是表里一个位置。
+        if self.stream_request != NO_REQUEST and self.stream_request != request:
+            self.stream_request = NO_REQUEST
         self.model.reset()
         var ids = self.tokenizer.encode(prompt)
         if len(ids) == 0:
@@ -266,13 +280,25 @@ struct ModelService(Service, Twinable):
         self.params.temperature = temperature
         self.rng = Rng(UInt64(self.seed))
         self.stream_out.clear()
+        self.stream_request = request
 
-    def stream_next(mut self) raises -> StreamToken:
+    def stream_next(mut self, request: Int) raises -> StreamToken:
         """走一步，返回这一步**新增**的文本。
 
         第一次调用才 prefill（`stream_started`），之后每次 `step` 上一步的
         token —— 与非流式那条路走的前向次数**完全相同**，所以流不改变数值结果。
         """
+        if self.stream_request != request:
+            # 号对不上 = 有人拿另一条流的号来问这一步。静默答下去就是"接着给别人
+            # 生成"，而那一边的客户端看到的是一条完全正常的流 —— 只是内容属于别人。
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "this service is already streaming another request",
+                "asked="
+                + String(request)
+                + " streaming="
+                + String(self.stream_request),
+            )
         if self.stream_count >= self.stream_steps:
             # 已经交完了还被问：仍然回答"结束"。路由可能多问一次（它才知道要了
             # 多少），重新开始或报错都会让这条流失去终点。
@@ -289,6 +315,17 @@ struct ModelService(Service, Twinable):
         self.stream_last = next_id
         self.stream_count += 1
         return StreamToken(self._new_text(), False)
+
+    def stream_end(mut self, request: Int) raises:
+        """把 `request` 占的东西还回来（**幂等**：号对不上就什么也不做）。
+
+        今天它只清掉"在途"这个标记 —— 状态本身由下一次 `stream_begin` 重设。接了批
+        调度之后这里要还的是**表里那个位置**（以及 KV 房间），那时候漏掉它就是"新
+        请求被拒"，所以这个契约先立好。
+        """
+        if self.stream_request != request:
+            return
+        self.stream_request = NO_REQUEST
 
     def _pick(mut self, logits: F32Ptr) raises -> Int:
         """从一行 logits 里取一个 id：贪心或按温度采样（与非流式同一个分支）。"""

@@ -602,7 +602,7 @@ def _answer[H: EngineHandler](
     try:
         var request = parse_request(job.raw)
         close = not request.keep_alive()
-        response = handler[].handle(request)
+        response = handler[].handle(job.slot, request)
     except err:
         # 500 不带细节进响应（内部原因属于日志），但消息要打出来 —— 一个没有原因
         # 的 500 只能靠猜。
@@ -630,7 +630,7 @@ def _stream_step[H: EngineHandler](
     """流走一步：一帧，或者一个空收尾（空收尾 = 流结束，靠关连接定界）。"""
     var frame: String
     try:
-        frame = handler[].stream_next()
+        frame = handler[].stream_next(job.slot)
     except err:
         # 前向炸了也要给这条流一个终点：少了它，客户端永远等不到 `[DONE]`。
         print("  [srv] stream aborted: " + String(err))

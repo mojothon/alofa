@@ -58,6 +58,12 @@ comptime RECV_TIMEOUT_MS = 5000
 comptime CHUNK = 4096
 comptime MAX_TOTAL_BYTES = MAX_HEADER_BYTES + MAX_BODY_BYTES
 
+# 串行那条路（`serve_with_stop`）给 handler 的 request 号。它没有槽位概念 ——
+# 一次只握着一条连接，accept 下一条之前这条已经走完了 —— 所以恒用一个号。
+# 写成常量而不是就地写 0：这个值是要被读代码的人**核对**的（"为什么是 0"），
+# 而不是一个随手填的坑位。
+comptime SOLO_REQUEST = 0
+
 
 trait Handler:
     """一个请求进、一个响应出；流式则是一次 `handle` 加若干次 `stream_next`。
@@ -65,16 +71,37 @@ trait Handler:
     服务循环不知道路由，路由不知道 socket：流式也是按这条线切的 —— handler 交
     出的是**帧的文本**（`srv/sse.mojo` 的纯函数拼的），"往 socket 上写"仍然只
     有这里做。这样流式那一半能被不需要权重的门逐字节钉住。
+
+    `request` 参数：**这条连接这一次的请求号**，由调用方（服务循环）给出，同一条
+    连接上 `handle` → `stream_next` × N → `stream_end` 必须给同一个值。Reactor 那
+    个循环给的是**连接槽位**（`[0, MAX_CONNS)`），所以两条连接天然不同号 —— 这是
+    "一条 handler 同时给多条连接生成"能成立的前提（在这之前，handler 只能靠"当前
+    只有一条流"这个**未写进类型**的假设活着，见 `ChatHandler` 里那句 ⚠️）。
+    串行的 `serve_with_stop` 一次只有一条连接，没有槽位概念，它传
+    `SOLO_REQUEST`（= 0）。
     """
 
-    def handle(mut self, req: HttpRequest) raises -> HttpResponse:
+    def handle(mut self, request: Int, req: HttpRequest) raises -> HttpResponse:
         ...
 
-    def stream_next(mut self) raises -> String:
+    def stream_next(mut self, request: Int) raises -> String:
         """流的下一帧；空串 = 流结束。
 
         只在 `handle` 返回一个 `text/event-stream` 的响应之后被调用。返回空串
         是**唯一**的正常结束方式 —— 少了它这条流就没有终点。
+        """
+        ...
+
+    def stream_end(mut self, request: Int) raises:
+        """一条流**不是**靠走完而结束（对端断了 / 连接被丢 / 服务在收尾）。
+
+        正常走完的那条路由 `stream_next` 自己收尾；这一条是给"没走完"的那条一个
+        回收的机会，所以**必须幂等**：同一个 `request` 调两次（第二次可能已经没有
+        这条流了）不能报错。
+
+        为什么要有它：不带它，"结束"就只有一条路（走完），于是每一次提前收尾都在
+        漏 —— 单条状态看不出漏（下一条 `begin` 会覆盖），按 request 索引之后漏的
+        是**表里的一个位置**，漏到一定条数就变成"新请求被拒"。
         """
         ...
 
@@ -153,7 +180,7 @@ struct Server(Movable):
                     continue
                 var response: HttpResponse
                 try:
-                    response = handler.handle(taken.request)
+                    response = handler.handle(SOLO_REQUEST, taken.request)
                 except err:
                     # 500 且不带细节进响应：内部原因属于日志，而这一版还没有日志
                     # 分级，所以只在这里打印。消息本身仍然要打出来 —— 一个没有原因的
@@ -172,7 +199,7 @@ struct Server(Movable):
                 if not taken.request.keep_alive():
                     response.close = True
                 if response.content_type == SSE_CONTENT_TYPE:
-                    write_stream(conn, handler, response.status, stop_fd)
+                    write_stream(conn, handler, response.status, stop_fd, SOLO_REQUEST)
                 else:
                     write_response(conn, response)
                 served += 1
@@ -260,7 +287,11 @@ def write_response(mut conn: TcpStream, imm res: HttpResponse) raises:
 
 
 def write_stream[H: Handler](
-    mut conn: TcpStream, mut handler: H, status: Int, stop_fd: Int32
+    mut conn: TcpStream,
+    mut handler: H,
+    status: Int,
+    stop_fd: Int32,
+    request: Int,
 ) raises:
     """写一条 SSE 流：先头，再一帧一帧，**最后关连接** —— 关连接就是这条响应
     的定界（`srv/http.mojo` 的 `serialize_stream_head` 没有 `Content-Length`）。
@@ -280,7 +311,7 @@ def write_stream[H: Handler](
             break
         var frame: String
         try:
-            frame = handler.stream_next()
+            frame = handler.stream_next(request)
         except err:
             print("  [srv] stream failed: " + String(err))
             break
@@ -291,3 +322,10 @@ def write_stream[H: Handler](
         except err:
             print("  [srv] stream aborted: " + String(err))
             break
+    # 有借有还：无论从哪条路出的循环（走完 / 停止标记 / 对端断了 / 取帧出错），
+    # 这条流都要给 handler 一次回收的机会。`stream_end` 幂等 —— 正常走完的那条
+    # 在 `stream_next` 里已经收过一次了。
+    try:
+        handler.stream_end(request)
+    except err:
+        print("  [srv] stream could not be released: " + String(err))

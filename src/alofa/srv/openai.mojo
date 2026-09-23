@@ -103,6 +103,11 @@ comptime STREAM_ROLE = 1  # 下一帧是只有 role 的首帧
 comptime STREAM_TEXT = 2  # 下一帧由 service 的下一步决定
 comptime STREAM_DONE = 3  # 下一帧是 `data: [DONE]`，之后回到 IDLE
 
+# "这条 handler 现在没有在途的流"。用 -1 是因为 0 是一个**合法**的请求号（串行
+# 那条路就用 0，见 `srv/server.mojo` 的 `SOLO_REQUEST`）—— 拿 0 当"空"就会让那条
+# 路的每一次核对都变成"碰巧对上"。
+comptime NO_REQUEST = -1
+
 
 struct Completion(Copyable, Movable):
     """一次生成的结果。`finish_reason` 不在这里 —— 它取决于"要了多少"和"给了多少"，
@@ -124,6 +129,12 @@ trait Service:
     两条路：`complete` 一次给整段；`stream_begin` + `stream_next` 一次给一步。
     流式是**迭代器式**的（不是回调）：回调要把 socket 一路传进生成循环里，那
     样"生成"和"写"就再也分不开，而分得开正是这一层能被无权重门钉住的原因。
+
+    ⚠️ **`request` 是这一层的必答题**：一次流式的三个方法都带它，同一条流的三个
+    调用必须给同一个值，不同流必须给不同的值。今天所有实现都只持**一份**流式状
+    态，所以它只被**核对**（给错了立刻报错，而不是静默答成另一条流的内容）；等到
+    实现真的按 request 索引状态（批调度），它就成了取状态的那把钥匙 —— 钥匙先配
+    好，锁后换，这样"两条流互相覆盖"这种最难查的错在换锁那天就已经不可能了。
     """
 
     def complete(
@@ -132,7 +143,11 @@ trait Service:
         ...
 
     def stream_begin(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        request: Int,
     ) raises:
         """开始一次流式生成：**只做校验与准备，不走前向**。
 
@@ -142,11 +157,20 @@ trait Service:
         """
         ...
 
-    def stream_next(mut self) raises -> StreamToken:
+    def stream_next(mut self, request: Int) raises -> StreamToken:
         """走一步，返回这一步的文本；`done=True` 表示生成结束。
 
         结束之后**继续调用**必须仍然返回 `done=True`（而不是报错或重新开始）：
         路由什么时候停由它自己决定（它同时知道要了多少），它可能会多问一次。
+        """
+        ...
+
+    def stream_end(mut self, request: Int) raises:
+        """把 `request` 这条流占的东西还回来（提前收尾那条路；走完的那条自己收）。
+
+        **必须幂等**：同一个 `request` 收两次是常态（走完时收一次，连接关掉时又
+        收一次），收一个**没这条流**的 `request` 也不许报错 —— 否则"对端断了"会
+        变成一条 500。
         """
         ...
 
@@ -733,6 +757,11 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
     var stream_max: Int
     var stream_count: Int
     var stream_phase: Int
+    # 在途那条流的**请求号**；`NO_REQUEST` = 没有在途。它跟着上面那一份状态走，
+    # 所以"这两份状态属于谁"是明写下来的：等这份 handler 一次持多条流，这里必须
+    # 变成按 request 索引的表，而到那时**不核对**的代价就是两条流互相覆盖对方的
+    # id 与计数 —— 症状只是"偶尔答错一次"。
+    var stream_request: Int
 
     def __init__(out self, var service: Self.S, model: String):
         self.service = service^
@@ -743,6 +772,7 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         self.stream_max = 0
         self.stream_count = 0
         self.stream_phase = STREAM_IDLE
+        self.stream_request = NO_REQUEST
 
     def spawn_twin(self, index: Int) raises -> Int:
         """再造一份（engine 线程池：每条线程一份，见 `srv/engine_thread.mojo`）。
@@ -761,7 +791,7 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         twin.next_id = 1 + index * ID_STRIDE
         return heap_place(twin^)
 
-    def handle(mut self, req: HttpRequest) raises -> HttpResponse:
+    def handle(mut self, request: Int, req: HttpRequest) raises -> HttpResponse:
         var path = req.path()
         if path == "/health":
             return json_response(200, health_json(self.model, MAX_MAX_TOKENS), False)
@@ -798,7 +828,7 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
             )
 
         if chat.stream:
-            return self.begin_stream(chat)
+            return self.begin_stream(chat, request)
 
         var completion = self.service.complete(
             chat.prompt, chat.max_tokens, chat.temperature
@@ -824,15 +854,24 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
             False,
         )
 
-    def begin_stream(mut self, imm chat: ChatRequest) raises -> HttpResponse:
+    def begin_stream(mut self, imm chat: ChatRequest, request: Int) raises -> HttpResponse:
         """`stream=true` 的响应：**一个头**，帧由 `stream_next` 逐条吐。
 
         为什么 `stream_begin` 在这里调、前向却不在：这一步只做校验与准备，是
         唯一还能把请求的问题回成 400 的地方（响应头还没发出去）。前向留到第一
         次 `stream_next` —— 头发出去之后除了"给流一个终点"没有别的退路。
         """
+        # 上一条流没被收尾（对端断了 → 循环那边不一定还有机会通知），这里补收。
+        # 今天漏掉它看不出来（下一条 begin 会覆盖那份状态），按 request 索引之后
+        # 漏的是**表里一个位置**，漏到一定条数就变成"新请求被拒"。
+        if self.stream_request != NO_REQUEST and self.stream_request != request:
+            self.service.stream_end(self.stream_request)
+            self.stream_phase = STREAM_IDLE
+            self.stream_request = NO_REQUEST
         try:
-            self.service.stream_begin(chat.prompt, chat.max_tokens, chat.temperature)
+            self.service.stream_begin(
+                chat.prompt, chat.max_tokens, chat.temperature, request
+            )
         except err:
             # `stream_begin` 只做校验，所以这里的错都是**请求**的错（prompt 分词
             # 为空 / 过长）—— 而不是"服务坏了"。回 400 且**不关连接**：客户端可以
@@ -852,11 +891,13 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         self.stream_max = chat.max_tokens
         self.stream_count = 0
         self.stream_phase = STREAM_ROLE
+        # 从这一刻起，这份在途状态**属于** request：后面每一帧都要拿它对得上。
+        self.stream_request = request
         # 体是空的：帧不在响应里。流式响应没有 `Content-Length`（长度未知），
         # 靠关连接定界，所以 `close=True` 是这条响应的分帧方式，不是建议。
         return HttpResponse(200, "", SSE_CONTENT_TYPE, True)
 
-    def stream_next(mut self) raises -> String:
+    def stream_next(mut self, request: Int) raises -> String:
         """流的下一帧；空串 = 流结束（服务循环据此停手）。
 
         每一条路都保证**有终点**：生成出错给一帧 `error` 再 `[DONE]`；service
@@ -865,13 +906,25 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         """
         if self.stream_phase == STREAM_IDLE:
             return ""
+        # 核对：这份 handler 一次只持**一条**流（见字段上那句 ⚠️）。号对不上必须
+        # 立刻红 —— 静默答下去就是"用另一条流的 id 和计数接着发帧"，客户端看到的
+        # 是一条完全正常的流，只是内容属于别人。
+        if self.stream_request != request:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "this handler is already serving another request",
+                "asked="
+                + String(request)
+                + " serving="
+                + String(self.stream_request),
+            )
         if self.stream_phase == STREAM_ROLE:
             self.stream_phase = STREAM_TEXT
             return sse_frame(chunk_role_json(self.stream_id, self.stream_model))
         if self.stream_phase == STREAM_TEXT:
             var token: StreamToken
             try:
-                token = self.service.stream_next()
+                token = self.service.stream_next(request)
             except err:
                 self.stream_phase = STREAM_DONE
                 return sse_frame(
@@ -892,4 +945,18 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
                 chunk_finish_json(self.stream_id, self.stream_model, finish)
             )
         self.stream_phase = STREAM_IDLE
+        # 收尾：这条流走完了，把它占的那份还回去（幂等 —— 连接关掉时还会再收一次）。
+        self.stream_end(request)
         return sse_done()
+
+    def stream_end(mut self, request: Int) raises:
+        """非正常收尾那条路（对端断了 / 服务在收尾 / 走完时自己调）。
+
+        **幂等**：号对不上（已经收过，或者根本没有这条流）就什么也不做 —— 一个
+        "对端断了"不该变成一条 500。
+        """
+        if self.stream_request != request:
+            return
+        self.service.stream_end(request)
+        self.stream_request = NO_REQUEST
+        self.stream_phase = STREAM_IDLE

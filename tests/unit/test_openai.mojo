@@ -21,6 +21,7 @@ from alofa.srv.http import SSE_CONTENT_TYPE, HttpRequest
 from alofa.srv.openai import (
     ChatHandler,
     Completion,
+    NO_REQUEST,
     Service,
     chunk_text_json,
     completion_json,
@@ -60,6 +61,9 @@ struct Stub(Service, Twinable):
     var begins: Int
     var stream_step: Int
     var stream_max: Int
+    # `request` 是不是真的穿到了这一层：替身把它记下来，门去读它。
+    var last_request: Int
+    var ends: Int
     var fail: Bool
     var refuse: Bool
 
@@ -69,6 +73,8 @@ struct Stub(Service, Twinable):
         self.begins = 0
         self.stream_step = 0
         self.stream_max = 0
+        self.last_request = NO_REQUEST
+        self.ends = 0
         self.fail = fail
         self.refuse = refuse
 
@@ -90,9 +96,14 @@ struct Stub(Service, Twinable):
         return heap_place(Stub(self.give, self.fail, self.refuse)^)
 
     def stream_begin(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        request: Int,
     ) raises:
         self.begins += 1
+        self.last_request = request
         if self.refuse:
             # 与非流式同一个错：prompt 分词为空，属于**请求**的错。
             raise AlofaError(
@@ -101,7 +112,18 @@ struct Stub(Service, Twinable):
         self.stream_max = max_tokens
         self.stream_step = 0
 
-    def stream_next(mut self) raises -> StreamToken:
+    def stream_end(mut self, request: Int) raises:
+        """幂等：号对不上就什么也不做（契约见 `srv/openai.mojo` 的 `Service`）。
+
+        替身在这里数的 `ends` 是给门看的：一条流**必须**被还回来一次，没有回收
+        路径的批调度会把"新请求被拒"留到线上才现形。
+        """
+        if self.last_request != request:
+            return
+        self.ends += 1
+        self.last_request = NO_REQUEST
+
+    def stream_next(mut self, request: Int) raises -> StreamToken:
         if self.fail:
             raise AlofaError(
                 ERR_CAPACITY, "the stream broke", "step=" + String(self.stream_step)
@@ -351,7 +373,7 @@ def test_error_json_escapes_the_message() raises:
 
 def test_handler_answers_health() raises:
     var handler = ChatHandler(Stub(), "stub-model")
-    var res = handler.handle(make_request("GET", "/health", ""))
+    var res = handler.handle(0, make_request("GET", "/health", ""))
     assert_equal(res.status, 200)
     assert_true(res.body.find("\"status\":\"ok\"") >= 0, res.body)
     assert_true(res.body.find("\"model\":\"stub-model\"") >= 0, res.body)
@@ -367,7 +389,7 @@ def test_handler_answers_health() raises:
 
 def test_handler_answers_a_completion() raises:
     var handler = ChatHandler(Stub(), "stub-model")
-    var res = handler.handle(
+    var res = handler.handle(0, 
         make_request(
             "POST",
             "/v1/chat/completions",
@@ -385,7 +407,7 @@ def test_finish_reason_is_stop_when_it_did_not_hit_the_limit() raises:
     """`finish_reason` 由"要了多少、给了多少"决定 —— 两条路都要走到，否则其中一条
     永远是没被执行过的代码。"""
     var handler = ChatHandler(Stub(1), "stub-model")
-    var res = handler.handle(
+    var res = handler.handle(0, 
         make_request(
             "POST",
             "/v1/chat/completions",
@@ -397,7 +419,7 @@ def test_finish_reason_is_stop_when_it_did_not_hit_the_limit() raises:
 
 def test_handler_lets_the_request_override_the_model_name() raises:
     var handler = ChatHandler(Stub(), "stub-model")
-    var res = handler.handle(
+    var res = handler.handle(0, 
         make_request(
             "POST",
             "/v1/chat/completions",
@@ -428,7 +450,7 @@ def collect_frames[S: Service & Deinitable & Movable & Twinable](
     """
     var out = List[String]()
     for _ in range(64):
-        var frame = handler.stream_next()
+        var frame = handler.stream_next(0)
         if frame.byte_length() == 0:
             return out^
         out.append(frame)
@@ -442,7 +464,7 @@ def test_handler_answers_a_stream_with_a_head() raises:
     见 `srv/http.mojo`）。非流式那半的帧由 `stream_next` 逐条吐，不在这里。
     """
     var handler = ChatHandler(Stub(), "stub-model")
-    var res = handler.handle(stream_request(8))
+    var res = handler.handle(0, stream_request(8))
     assert_equal(res.status, 200)
     assert_equal(res.content_type, SSE_CONTENT_TYPE)
     assert_equal(res.body, "", "a stream head must not carry a body")
@@ -461,7 +483,7 @@ def test_stream_frames_are_exact() raises:
     少一个在"能解析"这一层看不出来，但在客户端那边是"少收一帧"。
     """
     var handler = ChatHandler(Stub(3), "stub-model")
-    _ = handler.handle(stream_request(8))
+    _ = handler.handle(0, stream_request(8))
     var frames = collect_frames(handler)
     assert_equal(len(frames), 6, "role + 3 content + finish + done: " + String(len(frames)))
     assert_equal(
@@ -496,7 +518,7 @@ def test_stream_finish_reason_follows_the_same_rule() raises:
     """`finish_reason` 的两条路在流式这一侧也必须都走到：撞上上限是 `length`，
     没撞上是 `stop`（与非流式同一条规则：取决于"要了多少、给了多少"）。"""
     var limited = ChatHandler(Stub(), "stub-model")
-    _ = limited.handle(stream_request(8))
+    _ = limited.handle(0, stream_request(8))
     var hit = collect_frames(limited)
     assert_true(
         hit[len(hit) - 2].find("\"finish_reason\":\"length\"") >= 0,
@@ -504,7 +526,7 @@ def test_stream_finish_reason_follows_the_same_rule() raises:
     )
 
     var early = ChatHandler(Stub(1), "stub-model")
-    _ = early.handle(stream_request(8))
+    _ = early.handle(0, stream_request(8))
     var stopped = collect_frames(early)
     assert_equal(len(stopped), 4, "role + 1 content + finish + done")
     assert_true(
@@ -517,7 +539,7 @@ def test_stream_with_no_tokens_still_ends() raises:
     """一步都没走（prompt 就占满了窗口）也要有完整的收尾：首帧、finish、
     `[DONE]`。少任何一帧，客户端都在等一个不会来的东西。"""
     var handler = ChatHandler(Stub(0), "stub-model")
-    _ = handler.handle(stream_request(8))
+    _ = handler.handle(0, stream_request(8))
     var frames = collect_frames(handler)
     assert_equal(len(frames), 3, "role + finish + done: " + String(len(frames)))
     assert_true(frames[1].find("\"delta\":{}") >= 0, frames[1])
@@ -531,7 +553,7 @@ def test_stream_reports_the_failure_as_a_frame() raises:
     坏了"，否则这两种情况在它看来都是"收到了若干帧然后连接关了"。
     """
     var handler = ChatHandler(Stub(-1, True), "stub-model")
-    _ = handler.handle(stream_request(8))
+    _ = handler.handle(0, stream_request(8))
     var frames = collect_frames(handler)
     assert_equal(len(frames), 3, "role + error + done: " + String(len(frames)))
     assert_true(frames[1].find("\"code\":\"stream_failed\"") >= 0, frames[1])
@@ -542,12 +564,12 @@ def test_stream_begin_failure_is_400_before_any_frame() raises:
     """`stream_begin` 的错（prompt 分词为空/过长）发生在**头之前**，所以还能回
     400 —— 而且**不关连接**（客户端可以改个 prompt 重试），也不能开始一条流。"""
     var handler = ChatHandler(Stub(-1, False, True), "stub-model")
-    var res = handler.handle(stream_request(8))
+    var res = handler.handle(0, stream_request(8))
     assert_equal(res.status, 400)
     assert_equal(res.content_type, "application/json")
     assert_true(not res.close, "a refused stream must not close the connection")
     assert_equal(handler.service.begins, 1, "the request must have been checked")
-    assert_equal(handler.stream_next(), "", "a refused request must not start a stream")
+    assert_equal(handler.stream_next(0), "", "a refused request must not start a stream")
 
 
 def test_stream_chunk_escapes_the_text() raises:
@@ -564,11 +586,11 @@ def test_stream_chunk_escapes_the_text() raises:
 
 def test_handler_refuses_unknown_paths_and_methods() raises:
     var handler = ChatHandler(Stub(), "stub-model")
-    var missing = handler.handle(make_request("GET", "/nope", ""))
+    var missing = handler.handle(0, make_request("GET", "/nope", ""))
     assert_equal(missing.status, 404)
     assert_true(missing.body.find("\"code\":\"not_found\"") >= 0, missing.body)
 
-    var wrong_method = handler.handle(make_request("GET", "/v1/chat/completions", ""))
+    var wrong_method = handler.handle(0, make_request("GET", "/v1/chat/completions", ""))
     assert_equal(wrong_method.status, 405)
     assert_true(
         wrong_method.body.find("\"code\":\"method_not_allowed\"") >= 0,
@@ -579,7 +601,7 @@ def test_handler_refuses_unknown_paths_and_methods() raises:
 def test_handler_reports_a_broken_body_as_400() raises:
     """请求体的错是对端的错（400），不是服务器的错（500）。"""
     var handler = ChatHandler(Stub(), "stub-model")
-    var res = handler.handle(make_request("POST", "/v1/chat/completions", "{oops"))
+    var res = handler.handle(0, make_request("POST", "/v1/chat/completions", "{oops"))
     assert_equal(res.status, 400)
     assert_true(res.body.find("\"code\":\"invalid_body\"") >= 0, res.body)
 
@@ -644,6 +666,60 @@ def test_roles_change_the_prompt() raises:
     )
     assert_equal(as_user.prompt, chatml(turn("user", "hello")))
     assert_equal(as_assistant.prompt, chatml(turn("assistant", "hello")))
+
+
+def test_the_request_number_reaches_the_service() raises:
+    """`request` 必须一路穿到 service —— 多连接能分辨，靠的就是它这一趟。
+
+    这是"穿参数"这一步唯一的新性质：**号码被记下来了**。今天它还只被核对（一份
+    状态只能属于一条流），但它是"按 request 索引"那一步的钥匙 —— 钥匙先配好，锁
+    后换，这样换锁那天不需要同时怀疑两件事。
+    """
+    var handler = ChatHandler(Stub(), "stub-model")
+    var res = handler.handle(7, stream_request(4))
+    assert_equal(res.status, 200)
+    assert_equal(handler.service.last_request, 7)
+
+
+def test_a_stream_only_answers_to_its_own_number() raises:
+    """别人的号必须红，而不是"接着给另一条流发帧"。
+
+    负向对照正是这条门存在的理由：静默答下去，客户端收到的是一条**完全正常**的
+    流 —— id、计数、内容都属于别人，而日志里什么也看不出来（它没报错）。
+    """
+    var handler = ChatHandler(Stub(), "stub-model")
+    _ = handler.handle(7, stream_request(4))
+    var got = ""
+    try:
+        _ = handler.stream_next(8)
+    except err:
+        got = String(err)
+    assert_true(
+        is_error(got, "invalid_argument"), "别人的号必须被拒绝: " + got
+    )
+    # 自己的号照样能问：核对不是把门关死。
+    assert_true(handler.stream_next(7).byte_length() > 0, "自己的号必须能问")
+
+
+def test_a_stream_is_returned_exactly_once() raises:
+    """走完的流要还回去**一次**；再还一次、还一个没有的号，都不许报错。
+
+    负向对照：**没有**回收路径的批调度会一直占着表里的位置，表现是"新请求被拒"
+    —— 而它离真正的原因（某条连接断了）隔着一层，是最难查的那类。
+    """
+    var handler = ChatHandler(Stub(), "stub-model")
+    _ = handler.handle(7, stream_request(2))
+    var frames = 0
+    while frames < 8:
+        if handler.stream_next(7).byte_length() == 0:
+            break
+        frames += 1
+    assert_equal(handler.service.ends, 1)
+    # 幂等：连接关掉时还会再还一次，那一次不许变成一条 500。
+    handler.stream_end(7)
+    assert_equal(handler.service.ends, 1)
+    handler.stream_end(9)
+    assert_equal(handler.service.ends, 1)
 
 
 def main() raises:

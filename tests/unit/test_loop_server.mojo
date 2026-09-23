@@ -31,7 +31,7 @@ from alofa.core.ffi.posix import monotonic_ms
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import Loop
-from alofa.srv.openai import ChatHandler, Completion, Service
+from alofa.srv.openai import NO_REQUEST, ChatHandler, Completion, Service
 from alofa.srv.sse import StreamToken
 
 comptime PORT = UInt16(18124)
@@ -73,11 +73,16 @@ struct Stub(Service, Twinable):
     var give: Int
     var stream_step: Int
     var stream_max: Int
+    # `request` 是不是真的穿到了这一层：替身把它记下来，门去读它。
+    var last_request: Int
+    var ends: Int
 
     def __init__(out self, give: Int = -1):
         self.give = give
         self.stream_step = 0
         self.stream_max = 0
+        self.last_request = NO_REQUEST
+        self.ends = 0
 
     def complete(
         mut self, prompt: String, max_tokens: Int, temperature: Float64
@@ -92,12 +97,28 @@ struct Stub(Service, Twinable):
         return heap_place(Stub(self.give)^)
 
     def stream_begin(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        request: Int,
     ) raises:
         self.stream_max = max_tokens
         self.stream_step = 0
+        self.last_request = request
 
-    def stream_next(mut self) raises -> StreamToken:
+    def stream_end(mut self, request: Int) raises:
+        """幂等：号对不上就什么也不做（契约见 `srv/openai.mojo` 的 `Service`）。
+
+        替身在这里数的 `ends` 是给门看的：一条流**必须**被还回来一次，没有回收
+        路径的批调度会把"新请求被拒"留到线上才现形。
+        """
+        if self.last_request != request:
+            return
+        self.ends += 1
+        self.last_request = NO_REQUEST
+
+    def stream_next(mut self, request: Int) raises -> StreamToken:
         # 每步睡 5 ms：真模型一步几十毫秒，而"客户端中途断开"这条门要的是**服务还在
         # 流里**的时候对端消失 —— 替身瞬间交完 64 帧的话，写永远成功，这条门就变成
         # 了没测到（安静地假绿）。

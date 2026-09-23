@@ -689,10 +689,15 @@ struct Loop(Movable):
                 self.sync_interest(slot)
 
     def answer[H: Handler](mut self, mut handler: H, slot: Int, imm req: HttpRequest) raises:
-        """答一个请求：生成 → 排队（**不写**，写由 `flush` 在可写时做）。"""
+        """答一个请求：生成 → 排队（**不写**，写由 `flush` 在可写时做）。
+
+        给 handler 的 request 号就是**槽位**：两条连接不可能同号，所以 handler 那
+        边的在途状态"属于谁"是能对得上的（见 `srv/server.mojo` 里 `Handler` 的
+        文档）。
+        """
         var response: HttpResponse
         try:
-            response = handler.handle(req)
+            response = handler.handle(slot, req)
         except err:
             # 500 不带细节进响应：内部原因属于日志，而这一版还没有日志分级，所以只在
             # 这里打印。消息仍然要打出来 —— 一个没有原因的 500 只能靠猜。
@@ -739,7 +744,7 @@ struct Loop(Movable):
             return
         var frame: String
         try:
-            frame = handler.stream_next()
+            frame = handler.stream_next(slot)
         except err:
             print("  [srv] stream aborted: " + String(err))
             frame = ""
@@ -806,7 +811,15 @@ struct Loop(Movable):
 
     def drop(mut self, slot: Int):
         """关掉一条连接、把槽位还回去。中断在途的流没有后遗症（`begin_stream`
-        会把流的相位与计数全部重设）。"""
+        会把流的相位与计数全部重设）。
+
+        ⚠️ **上面这句话的前提是"service 只持一份流式状态"**，而它正在被拆掉：一旦
+        状态按 `request` 索引（`request` = 槽位，见 `Handler` 的文档），"连接被丢"
+        就必须**显式**通知 handler 释放那条 request —— 否则表里的那个位置一直占
+        着，占满的表现是"新请求被拒"，而它离真正的原因（有人断了连接）隔着一层。
+        这里没有 handler 可调用（`drop` 也被 `drop_all` / `reap` 调用），所以那一
+        步要把 handler 带进来 —— 先把这句写在这里，免得它变成"以后再说"。
+        """
         if self.live[slot] == 0:
             return
         var fd = Int32(self.streams[slot].raw_fd())
