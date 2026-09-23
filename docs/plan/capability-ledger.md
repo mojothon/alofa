@@ -998,3 +998,10 @@
   - ❌ **一处推断被证伪，改动已回退**：我一度认为是"槽位还回去得太早 —— 调度器要到下一拍才把走完的请求移出活跃集合"（服务日志里有 `the scheduler asked to decode a request that is not resident`）。据此改了 `ModelService.stream_end`（`release` 之前无条件跑一拍 `_batch_tick`），并加了一道门（连开 12 条流、每条走完就收尾）。**变异验证门不红** —— 把改动退回原样，那道门照样 PASS。所以那个推断没有证据，改动与门**都已撤销**（不留没有证据的代码与门）
   - 剩下的可疑点在 `srv/engine_thread.mojo` 的 `Mailbox`：`jobs` / `results` 两个 `List` **是有 `Mutex` 护住的**（不是忘了加锁），所以要看的是 `Job` / `Result`（`Job` 里带了请求的原始字节 `raw`）**进出队列时的所有权** —— 含 `List` 的结构体在 push/pop 之间若被拷贝而非转移，堆会被写坏，而症状正是"某次 `List` 扩容时 SIGSEGV"。**未查**
   - ⚠️ **Gate P3 仍然被它堵着**：这不是"没跑过门"，是"一跑到量就崩"
+- **2026-09-23（同日第六条）** —— **最小复现已经建起来，崩溃是「帧」推着走的，崩溃点精确到函数**
+  - **最小场景**（`/tmp/mini_curl.sh`，curl + 后台进程，不用 `stress_serve.py` —— 它服务一死就产生几十万次重连，把要量的东西淹掉）：`并发=1`（**不需要并发**）× 顺序 40 条 × `max_tokens=1`。服务在第 **26 条 / 82 帧**处哑掉，随后进程消失
+  - **帧驱动**（决定性判别，同一并发、只改每条流的帧密度）：`max_tokens=1` → 26 条 /**82 帧**；`max_tokens=8` → 8 条 /**77 帧**。请求数差 3 倍，**累计帧数几乎不变（82 / 77）**。所以它是被"每帧过一次队列"推着走的，阈值约 **80 帧**；与连接数无关（单连接顺序就能触发）
+  - **崩溃点**（gdb 跑**最小场景**，最安静的条件下复现）：`List::_realloc` ← **`Conn::enqueue`** ← `Loop::run_threaded`（reactor 线程）。`enqueue` 往 `Conn.outbound`（`List[UInt8]`）逐字节 append，**每帧一次** —— 与上面的"帧驱动"对上了
+  - **关于"修所有权还是换定长环形缓冲"的判别（已可作答）**：`Conn.enqueue` 的调用点**全在 `loop.mojo`（reactor 线程）**，engine 线程不碰 `Conn.outbound`（它把响应经 `Mailbox`（有 `Mutex`）交回来）。所以 `outbound` **不是竞争现场，是受害者** —— 堆是被别处写坏的，它只是第一个撞上的分配。**换环形缓冲不修根因**（只是把受害者从 `outbound` 挪到别处），要修的是堆损坏的**源头**
+  - 一次判别失败已记录：`ALOFA_ENGINE_THREADS=0`（想让生成回到 reactor 线程那条路，以此断定源头在不在 engine 线程侧）**服务起不来**，这个取值不被支持，**没判成**
+  - 下一步（按性价比）：`MALLOC_CHECK_=3 ./target/serve` 跑同一个最小场景 —— glibc 会在堆被写坏的**那一刻**就报错（`double free` / `invalid pointer`），比等到第 80 帧的 `realloc` 崩溃更接近源头
