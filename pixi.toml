@@ -38,6 +38,7 @@ test-batch-forward = "mkdir -p target && pixi run mojo build -O2 -I src tests/un
 # （`model.prefill`/`step`）。它要真权重，所以 build 再跑、也不并入 test。
 # 跑之前要给出权重目录（ALOFA_WEIGHTS），与 `pixi run serve` 用的是同一个变量。
 test-batch-stream = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_batch_stream.mojo -o target/batch_stream && ./target/batch_stream"
+test-conn = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_conn.mojo -o target/conn && ./target/conn"
 # CI 监视：见 scripts/ci_watch.sh —— 绑定到当前 HEAD 的运行，而不是列表第一条，
 # 否则推送刚落地的几秒里会误监视到上一次运行（往往是上一次的失败），结论相反。
 ci-watch = "scripts/ci_watch.sh"

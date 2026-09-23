@@ -283,5 +283,30 @@ def test_closing_waits_for_the_queue_to_drain() raises:
     assert_true(conn.should_close(), "once drained the connection may be closed")
 
 
+def test_a_frame_queued_behind_a_partial_write_keeps_its_place() raises:
+    """写了一半，又来一帧 —— 新字节必须接在**还没发出去的那截后面**。
+
+    这条序列是**流式独有**的：非流式一次把整段响应排进队列、一次写完，不会在"还有
+    没发出去的字节"的时候再入队一帧；流式是每帧一次，所以**每帧都走这条路**。
+
+    钉住它，是因为这里有两条容易写错的路，而它们的后果都不像 bug：把新帧从头覆盖
+    （对端收到缺开头的响应），或者把已经发出去的那截又发一遍（对端收到重复的一截，
+    JSON 还能解析，只是内容不对）。
+    """
+    var conn = Conn()
+    conn.enqueue(bytes_of_text("aaaaaaaaaa"))
+    conn.advance(4)
+    assert_equal(conn.pending_len(), 6, "only what was sent may be marked sent")
+    conn.enqueue(bytes_of_text("bbbb"))
+    assert_equal(conn.pending_len(), 10, "the new frame lands behind the unsent tail")
+    assert_equal(
+        pending_text(conn),
+        "aaaaaabbbb",
+        "the unsent tail must come first, then the new frame",
+    )
+    conn.advance(10)
+    assert_true(conn.drained(), "everything is out after the last write")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
