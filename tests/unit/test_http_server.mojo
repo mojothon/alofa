@@ -121,10 +121,10 @@ struct Stub(Service, Twinable):
         # 成功，这条门就变成了没测到（安静地假绿）。
         _ = external_call["usleep", Int32](Int32(5000))
         if self.stream_step >= self.stream_max:
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var text = "s" + String(self.stream_step)
         self.stream_step += 1
-        return StreamToken(text, False)
+        return StreamToken(text, False, False)
 
 
 def child_serve() raises:

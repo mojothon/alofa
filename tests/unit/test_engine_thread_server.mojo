@@ -220,10 +220,10 @@ struct SlowStub(Service, Twinable):
         # 连接也能被答 —— 替身瞬间交完所有帧的话，那条性质就没有被测到。
         _ = external_call["usleep", Int32](Int32(5000))
         if self.stream_step >= self.stream_max:
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var text = "s" + String(self.stream_step)
         self.stream_step += 1
-        return StreamToken(text, False)
+        return StreamToken(text, False, False)
 
 
 def child_serve(mode: Int, port: UInt16) raises:

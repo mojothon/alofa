@@ -326,6 +326,44 @@ struct EngineCore:
         _ = self.room.publish(req)
         _ = self.room.drop(req)
 
+    def is_done(self, req: Int) -> Bool:
+        """This request has finished: its transcript is written down, and the
+        slot is the only thing still being held for it."""
+        var slot = self.find(req)
+        return slot >= 0 and self.state[slot] == ST_DONE
+
+    def release(mut self, req: Int) raises AlofaError:
+        """Give the slot back. **The transcript does not survive this** — read it
+        first (`n_output` / `output`).
+
+        Why this is an explicit call and not something the engine does on its
+        own: the slot is the index into the output array, so giving it back is
+        exactly what lets the next request overwrite the transcript. Reclaiming
+        automatically would mean guessing whether the caller has read it yet,
+        and the guess fails precisely in the case that matters — a caller that
+        reads one tick later than the engine assumed.
+
+        ⚠️ Only a **finished** request may be released. Cancel a running one
+        first (`cancel`, then one tick, so the scheduler drops its accounting
+        too) — releasing it here would leave the scheduler still counting blocks
+        for a request the engine has forgotten.
+        """
+        var slot = self.find(req)
+        if slot < 0:
+            raise AlofaError(ERR_INVALID_ARGUMENT, "no such request", "")
+        if self.state[slot] != ST_DONE:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "a request that has not finished must be cancelled, not released",
+                "req=" + String(req),
+            )
+        self.ids[slot] = 0
+        self.p_len[slot] = 0
+        self.p_new[slot] = 0
+        self.fed[slot] = 0
+        self.n_out[slot] = 0
+        self.state[slot] = ST_FREE
+
     def sync_page_table(mut self, req: Int) raises AlofaError:
         """Hand the executor the blocks the room just gave this request.
 

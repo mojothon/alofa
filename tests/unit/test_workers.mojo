@@ -105,10 +105,10 @@ struct Stub(Service, Twinable):
 
     def stream_next(mut self, request: Int) raises -> StreamToken:
         if self.stream_step >= self.stream_max:
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var text = "s" + String(self.stream_step)
         self.stream_step += 1
-        return StreamToken(text, False)
+        return StreamToken(text, False, False)
 
 
 def master_child() raises:

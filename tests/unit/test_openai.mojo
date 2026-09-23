@@ -134,10 +134,10 @@ struct Stub(Service, Twinable):
         # 交完之后**继续调用仍然返回 done**：路由可能多问一次（它才知道要了
         # 多少），重新开始或报错都会让流失去终点。
         if self.stream_step >= total:
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var text = "s" + String(self.stream_step)
         self.stream_step += 1
-        return StreamToken(text, False)
+        return StreamToken(text, False, False)
 
 
 def make_request(method: String, target: String, body: String) -> HttpRequest:

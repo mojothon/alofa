@@ -189,6 +189,48 @@ def test_one_request_arrives_prefills_and_decodes() raises:
     arena.keep_alive()
 
 
+def test_a_finished_request_gives_its_slot_back() raises:
+    """A finished request must hand its slot back: the engine serves more than
+    `MAX_BATCH` requests over its life, not `MAX_BATCH` ones and then no more.
+
+    This is the negative control for the whole queueing story. If a finished
+    slot stays `ST_DONE` forever, the `(MAX_BATCH + 1)`-th request is refused
+    however long it waits — and it presents as "the server is full", not as a
+    bug. Nothing inside one batch of eight ever notices it, which is why it
+    needs a test that outlives a batch on purpose.
+    """
+    var arena = Arena(1 << 16)
+    var core = toy_core(roomy())
+    var toks = int_map(arena.alloc(256 * 8))
+
+    for req in range(MAX_BATCH):
+        core.submit(req + 1, toks, fill(toks, req + 1, 4), 2)
+    _ = drive(core, arena)
+    for req in range(MAX_BATCH):
+        assert_true(core.is_done(req + 1), "a driven request should be finished")
+        core.release(req + 1)
+
+    # The ninth request, same engine. Refusing it here is the bug.
+    core.submit(99, toks, fill(toks, 99, 4), 2)
+    _ = drive(core, arena)
+    expect_output(core, 99, 2, "the request after a full batch")
+
+    # And the other half of the contract: a request that has **not** finished
+    # must not be released. Its blocks are still counted by the scheduler, so
+    # releasing it would put the two books out by exactly one request.
+    var fresh = toy_core(roomy())
+    fresh.submit(77, toks, fill(toks, 77, 4), 2)
+    var caught = "no-error"
+    try:
+        fresh.release(77)
+    except err:
+        caught = String(err)
+    assert_true(
+        caught.find("cancelled") >= 0, "an unfinished request must be refused: " + caught
+    )
+    arena.keep_alive()
+
+
 def test_a_prompt_longer_than_a_chunk_is_fed_in_slices() raises:
     """Chunking changes when a request finishes, never what it produces."""
     var arena = Arena(1 << 16)

@@ -71,7 +71,7 @@ from alofa.srv.http import (
 )
 from alofa.srv.engine_thread import Twinable, heap_place, heap_take
 from alofa.srv.server import Handler
-from alofa.srv.sse import StreamToken, sse_done, sse_frame
+from alofa.srv.sse import StreamToken, sse_comment, sse_done, sse_frame
 from alofa.tokenizer.chat_template import render_chatml
 
 comptime DEFAULT_MAX_TOKENS = 32
@@ -930,6 +930,12 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
                 return sse_frame(
                     error_json(String(err), "server_error", "stream_failed")
                 )
+            if token.waiting:
+                # 还没轮到这条（引擎的槽位占满了，它在排队）。发一帧**注释**：客户
+                # 端忽略它，但连接与相位都还在 —— 等一等，不是结束。
+                # ⚠️ 不能返回空串：空串是"流结束"，客户端会拿到一个连 `[DONE]` 都
+                # 没有的空连接，而这正是文件头说的那种最糟的失败形态。
+                return sse_comment("waiting for a slot")
             # 上限是路由在守（它知道要了多少）：service 不说结束也不能没完。
             var hit_limit = self.stream_count[request] >= self.stream_max[request]
             if token.text.byte_length() > 0 and not token.done:

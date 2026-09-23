@@ -86,12 +86,12 @@ def test_frame_refuses_a_raw_newline() raises:
 
 
 def test_token_carries_text_and_done_separately() raises:
-    var token = StreamToken("hi", False)
+    var token = StreamToken("hi", False, False)
     assert_equal(token.text, "hi")
     assert_true(not token.done, "a token with text is not the end")
 
     # 结束的那一帧可以没有文本：两者不是一回事，所以不能用一个字段表示。
-    var last = StreamToken("", True)
+    var last = StreamToken("", True, False)
     assert_equal(last.text, "")
     assert_true(last.done, "the final token must say it is done")
 

@@ -83,29 +83,32 @@ def _batch_run(
     """
     for i in range(len(ps)):
         svc.stream_begin(ps[i], STEPS, temp, i)
+    var out = List[Int]()
+    for i in range(len(ps) * STEPS):
+        out.append(-1)
     var finished = List[Int]()
     for i in range(len(ps)):
         finished.append(0)
     var remaining = len(ps)
     var guard = 0
-    while remaining > 0 and guard < 512:
+    while remaining > 0 and guard < 4096:
         guard += 1
         for i in range(len(ps)):
             if finished[i] == 1:
                 continue
-            if svc.stream_next(i).done:
-                finished[i] = 1
-                remaining -= 1
-    var out = List[Int]()
-    for i in range(len(ps)):
-        var slot = svc._slot_of(i)
-        var n = svc.b_n[slot]
-        for k in range(STEPS):
-            if k < n:
-                out.append(svc.b_out[slot * MAX_GEN + k])
-            else:
-                out.append(-1)
-        svc.stream_end(i)
+            if not svc.stream_next(i).done:
+                continue
+            # ⚠️ 一条流走完就**立刻**把槽位还回去（真实服务里 `ChatHandler` 也是
+            # 这么做的）：槽位不释放，排在后面的请求永远进不来 —— 门会一直空转到
+            # `guard` 用尽，看起来像"排队没生效"，其实是门自己把槽位攥着。
+            var slot = svc._slot_of(i)
+            var n = svc.b_n[slot]
+            for k in range(STEPS):
+                if k < n:
+                    out[i * STEPS + k] = svc.b_out[slot * MAX_GEN + k]
+            svc.stream_end(i)
+            finished[i] = 1
+            remaining -= 1
     return out^
 
 
@@ -216,6 +219,40 @@ def test_four_identical_sampling_streams_agree() raises:
             batched[3 * STEPS + k],
             "two identical sampling streams drew differently at step=" + String(k),
         )
+
+
+def test_requests_beyond_the_batch_wait_instead_of_being_refused() raises:
+    """第 9 条之后不是"拒绝"，是**排队** —— 且排过队的答案与单跑一致。
+
+    判据分两半，缺一半这条门就不成立：
+    * **不被拒绝**：10 条请求一起推进（引擎只有 `MAX_BATCH` = 8 个槽位），全部跑
+      完、每条都给满 `STEPS` 个 token。以前第 9 条收到的是 `capacity`（"this
+      service runs one sampling stream at a time"），客户端只能自己重试。
+    * **确实排过队**：`svc.waited` 必须 ≥ 2。少了这一半，"10 条都跑完了"也可能只
+      是"恰好没人超额" —— 门会在逻辑上变绿而一个字节也没验到。
+    """
+    var svc = ModelService.load(ServeConfig.from_env())
+    var ps = List[String]()
+    for i in range(10):
+        if i % 2 == 0:
+            ps.append(PROMPT_A)
+        else:
+            ps.append(PROMPT_C)
+    svc.batch_enabled = True
+    var batched = _batch_run(svc, ps, TEMP)
+    for i in range(10):
+        for k in range(STEPS):
+            assert_true(
+                batched[i * STEPS + k] >= 0,
+                "第 "
+                + String(i)
+                + " 条没有跑完（被拒了？）step="
+                + String(k),
+            )
+    assert_true(svc.waited >= 2, "应该有请求排过队，waited=" + String(svc.waited))
+    svc.batch_enabled = False
+    var solo = _solo_all(svc, ps, TEMP)
+    _compare(batched, solo, "queued")
 
 
 def test_the_two_paths_really_are_two_paths() raises:

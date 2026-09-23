@@ -69,7 +69,7 @@ from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
 from alofa.srv.config import ServeConfig
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
-from alofa.srv.loop import Loop
+from alofa.srv.loop import MAX_CONNS, Loop
 from alofa.srv.master import run_workers
 from alofa.core.memory import Arena
 from alofa.engine.core import MAX_PROMPT, EngineCore
@@ -185,6 +185,21 @@ struct ModelService(Service, Twinable):
     var b_temp: List[Float64]
     var b_rng: List[UInt64]
 
+    # 等待队列：槽位满了的请求**排在这里**，而不是被拒绝。
+    # 它是"只 append + 一个头指针"的：条目一旦被放进批表就不再回看，`w_head` 追上
+    # 队尾时整表清空（那时队列是空的）。不这么做就需要列表的删除操作，而"删中间
+    # 一项"正是这类定长簿记里最容易写错的地方。
+    #   `w_req` — 在给谁等（`NO_REQUEST` = 已经划掉，比如对端断了）
+    #   `w_prompt` / `w_steps` / `w_temp` — 轮到它时重新 submit 要的东西
+    var w_req: List[Int]
+    var w_prompt: List[String]
+    var w_steps: List[Int]
+    var w_temp: List[Float64]
+    var w_head: Int
+    # 一共让多少条请求排过队。它是**给门读**的：门要能说"这里确实排过队"，否则
+    # "没有被拒绝"可能只是"恰好没人超额"。
+    var waited: Int
+
     # 再造一份时要用的三个路径（`spawn_twin`）。留着它们而不是留一份
     # `ServeConfig`：配置里有 host/port 那些和"加载一份权重"无关的东西，而这里
     # 要的只是"从哪儿加载"。
@@ -257,6 +272,12 @@ struct ModelService(Service, Twinable):
         self.b_emitted = List[Int]()
         self.b_temp = List[Float64]()
         self.b_rng = List[UInt64]()
+        self.w_req = List[Int]()
+        self.w_prompt = List[String]()
+        self.w_steps = List[Int]()
+        self.w_temp = List[Float64]()
+        self.w_head = 0
+        self.waited = 0
         for i in range(MAX_BATCH):
             self.b_req.append(NO_REQUEST)
             self.b_n.append(0)
@@ -404,26 +425,15 @@ struct ModelService(Service, Twinable):
             and steps > 0
             and len(ids) <= MAX_PROMPT
             and steps <= MAX_GEN
-            and slot >= 0
         ):
-            var arena = Arena(MAX_PROMPT * 8 + 64)
-            var toks = int_map(arena.alloc(MAX_PROMPT * 8))
-            for i in range(len(ids)):
-                toks[unsafe_offset=i] = ids[i]
-            self.engine.submit(request, toks, len(ids), steps)
-            # ⚠️ `Arena` 在**指针最后一次使用处**就析构（这是它的设计），所以这行不
-            # 写，`toks` 在 `submit` 内部读到的是已经释放的内存 —— 实测表现是
-            # `stream_begin` 段错误，而不是"算错了"。
-            arena.keep_alive()
-            self.b_req[slot] = request
-            self.b_steps[slot] = steps
-            self.b_n[slot] = 0
-            self.b_emitted[slot] = 0
-            self.b_temp[slot] = temperature
-            # 每条请求从**同一个种子**起 —— 与老路 `self.rng = Rng(seed)` 同一个
-            # 起点，否则"批里 == 单跑"这条判据从第一步起就不可能成立。
-            self.b_rng[slot] = UInt64(self.seed)
-            return
+            if slot >= 0:
+                self._submit(slot, request, ids, steps, temperature)
+                return
+            # 槽位满了 → **排队**而不是拒绝（为什么是排队、以及它为什么必须有上
+            # 界，写在 `_enqueue` 上）。队列也满了才落到老路去 —— 那里会指名拒绝
+            # （`capacity`），那是有上界的拒绝，不是无上界的排队。
+            if self._enqueue(request, prompt, steps, temperature):
+                return
 
         # ---- 老路（采样，或装不进引擎的请求）：一次只握一条 ----
         # 第二条采样流**指名拒绝**而不是悄悄串行：串行的话客户端看到的是"偶发地
@@ -453,6 +463,14 @@ struct ModelService(Service, Twinable):
         第一次调用才 prefill（`stream_started`），之后每次 `step` 上一步的
         token —— 与非流式那条路走的前向次数**完全相同**，所以流不改变数值结果。
         """
+        # 有空位就先把排队的放进来：槽位是在别人走完的那一刻空出来的，而"轮到谁"
+        # 不该由调用方记着 —— 否则排在第 9 位的那条要等有人恰好问它，才知道自己
+        # 已经能进了。
+        self._admit()
+        if self._waiting_of(request) >= 0:
+            # 还在等：它排着队，可引擎里没有它的位置。这一帧**必须**说"在等"而不
+            # 是"结束" —— 后者会让客户端拿到一个连 `[DONE]` 都没有的空连接。
+            return StreamToken("", False, True)
         var slot = self._slot_of(request)
         if slot >= 0:
             return self._batch_next(slot, request)
@@ -470,7 +488,7 @@ struct ModelService(Service, Twinable):
         if self.stream_count >= self.stream_steps:
             # 已经交完了还被问：仍然回答"结束"。路由可能多问一次（它才知道要了
             # 多少），重新开始或报错都会让这条流失去终点。
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var next_id = 0
         if not self.stream_started:
             var logits = self.model.prefill[BACKEND_AVX2](self.stream_ids)
@@ -482,7 +500,7 @@ struct ModelService(Service, Twinable):
         self.stream_out.append(next_id)
         self.stream_last = next_id
         self.stream_count += 1
-        return StreamToken(self._new_text(), False)
+        return StreamToken(self._new_text(), False, False)
 
     def stream_end(mut self, request: Int) raises:
         """把 `request` 占的东西还回来（**幂等**：号对不上就什么也不做）。
@@ -494,23 +512,148 @@ struct ModelService(Service, Twinable):
         var slot = self._slot_of(request)
         if slot >= 0:
             if self.engine.find(request) >= 0:
-                self.engine.cancel(request)
-                # ⚠️ 这一拍也必须是 `_batch_tick`（按每条请求**自己的**策略选），
-                # 不能是 `engine.tick`：那个是写死贪心的，而这一拍发生在**别人**断
-                # 开的时候 —— 用它就会给批里正在采样的请求塞一个 argmax 的 token。
-                # 那不是"算错一点"，是那条流的答案从此分叉，而日志里什么都没有。
-                self._batch_tick()
+                if not self.engine.is_done(request):
+                    self.engine.cancel(request)
+                    # ⚠️ 这一拍也必须是 `_batch_tick`（按每条请求**自己的**策略选），
+                    # 不能是 `engine.tick`：那个是写死贪心的，而这一拍发生在**别人**
+                    # 断开的时候 —— 用它就会给批里正在采样的请求塞一个 argmax 的
+                    # token。那不是"算错一点"，是那条流的答案从此分叉，而日志里什么
+                    # 都没有。
+                    self._batch_tick()
+                # ⚠️ 槽位要**显式**还回去：引擎那边"走完"只是 `ST_DONE`，它自己不
+                # 回收（槽位是输出数组的下标，什么时候能复用只有调用方知道）。少了
+                # 这一步，这台服务一辈子只能服务 `MAX_BATCH` 条请求 —— 第 9 条无论
+                # 什么时候来，收到的都是 "the engine is full"。
+                self.engine.release(request)
             self.b_req[slot] = NO_REQUEST
             self.b_n[slot] = 0
             self.b_steps[slot] = 0
             self.b_emitted[slot] = 0
+            # 让出一个槽位之后**立刻**把排队的接进来：等待的那条流正在等的正是这
+            # 一刻，放到下一次 `stream_next` 才接就等于让它多等一轮轮询。
+            self._admit()
+            return
+        # 它也可能还在**队列**里（还没等到槽位，对端就断了）：划掉它，不然它会占
+        # 着一个位置，直到被 admit 到一条已经不存在的连接上。
+        if self._cancel_wait(request):
+            self._admit()
             return
         if self.stream_request != request:
             return
         self.stream_request = NO_REQUEST
 
+    def _submit(
+        mut self,
+        slot: Int,
+        request: Int,
+        imm ids: List[Int],
+        steps: Int,
+        temperature: Float64,
+    ) raises:
+        """把一条请求放进批表的 `slot`（编码已经做好，这里只 submit + 记状态）。"""
+        var arena = Arena(MAX_PROMPT * 8 + 64)
+        var toks = int_map(arena.alloc(MAX_PROMPT * 8))
+        for i in range(len(ids)):
+            toks[unsafe_offset=i] = ids[i]
+        self.engine.submit(request, toks, len(ids), steps)
+        # ⚠️ `Arena` 在**指针最后一次使用处**就析构（这是它的设计），所以这行不
+        # 写，`toks` 在 `submit` 内部读到的是已经释放的内存 —— 实测表现是
+        # `stream_begin` 段错误，而不是"算错了"。
+        arena.keep_alive()
+        self.b_req[slot] = request
+        self.b_steps[slot] = steps
+        self.b_n[slot] = 0
+        self.b_emitted[slot] = 0
+        self.b_temp[slot] = temperature
+        # 每条请求从**同一个种子**起 —— 与老路 `self.rng = Rng(seed)` 同一个
+        # 起点，否则"批里 == 单跑"这条判据从第一步起就不可能成立。
+        self.b_rng[slot] = UInt64(self.seed)
+
+    def _enqueue(
+        mut self, request: Int, prompt: String, steps: Int, temperature: Float64
+    ) -> Bool:
+        """排到队尾。返回 False = 队列也满了（那时调用方才真的拒绝）。
+
+        为什么是**排队**而不是拒绝：引擎的槽位数是形状决定的（`MAX_BATCH` = 8），
+        而放宽它不兑换吞吐（实测 `rows` 8 / 16 / 32 的每行耗时重合 —— 见账本），
+        所以"第 9 条并发"本来就不该靠加槽位解决，它该等。
+
+        ⚠️ 排队必须**有上界**，否则"排队"就是把 OOM 推迟到半夜：一条连接最多一条
+        在途流，所以队长的上界就是连接数 —— 这不是估的，是数的。
+        """
+        if len(self.w_req) - self.w_head >= MAX_CONNS:
+            return False
+        self.w_req.append(request)
+        self.w_prompt.append(prompt)
+        self.w_steps.append(steps)
+        self.w_temp.append(temperature)
+        self.waited += 1
+        return True
+
+    def _waiting_of(self, request: Int) -> Int:
+        """`request` 在等待队列里的下标（-1 = 它没在等）。"""
+        for i in range(self.w_head, len(self.w_req)):
+            if self.w_req[i] == request:
+                return i
+        return -1
+
+    def _cancel_wait(mut self, request: Int) -> Bool:
+        """把还在排队的 `request` 划掉（对端断了）。划掉而不是删除：这条队列只
+        append，`_admit` 会跳过划掉的条目。"""
+        var i = self._waiting_of(request)
+        if i < 0:
+            return False
+        self.w_req[i] = NO_REQUEST
+        return True
+
+    def _admit(mut self) raises:
+        """有几个空位就放几条进来，队首优先（先来的先服务）。"""
+        while self.w_head < len(self.w_req):
+            if self.w_req[self.w_head] == NO_REQUEST:
+                self.w_head += 1
+                continue
+            var slot = self._free_slot()
+            if slot < 0:
+                break
+            var request = self.w_req[self.w_head]
+            # 轮到它才编码：队列里存的是 prompt。`ids` 只在 submit 那一刻有用，
+            # 提前编好就得把一批不定长的表一直挂在这里。
+            var ids = self.tokenizer.encode(self.w_prompt[self.w_head])
+            # ⚠️ **批表有空位 ≠ 引擎有空位**：一条流走完时，批表这边立刻空了，而
+            # 引擎那个槽位要到**下一拍**才是 `ST_FREE`。所以这里必须接住"满了"：
+            # 队首**不动**，下一轮再来 —— 这本来就是排队该有的样子（"轮到我时再
+            # 试"），而不是"我保证现在一定进得去"。
+            try:
+                self._submit(
+                    slot,
+                    request,
+                    ids,
+                    self.w_steps[self.w_head],
+                    self.w_temp[self.w_head],
+                )
+            except err:
+                # 只吞"满了"这一件事：别的错（形状、重复 id）吞了就是把它变成
+                # 一场永远等不到的排队。
+                if String(err).find("capacity") < 0:
+                    raise err
+                # ⚠️ 空转一拍，否则这个队永远排不到头：引擎把槽位从"走完"收回
+                # 是**在一拍里**做的，而所有活跃请求都走完之后就没人再拍了 —— 于
+                # 是槽位一直停在"走完"，下一轮问还是"满了"。这一拍与 `stream_end`
+                # 里那一拍是同一个理由（引擎的状态机只在一拍里前进）。
+                self._batch_tick()
+                break
+            self.w_head += 1
+        if self.w_head >= len(self.w_req):
+            # 队尾已经追平：整表清空、头指针归零。不清的话这个只 append 的列表会
+            # 一直涨，涨到上界就再也放不进新的 —— 而它其实早就空了。
+            self.w_req.clear()
+            self.w_prompt.clear()
+            self.w_steps.clear()
+            self.w_temp.clear()
+            self.w_head = 0
+
     def _free_slot(self) -> Int:
-        """批表里第一个空位（-1 = 满了）。满了不是错 —— 请求会走老路。"""
+        """批表里第一个空位（-1 = 满了）。满了不是错 —— 请求会排队。"""
         for i in range(MAX_BATCH):
             if self.b_req[i] == NO_REQUEST:
                 return i
@@ -596,7 +739,7 @@ struct ModelService(Service, Twinable):
         if self.engine.n_output(request) <= want:
             # 引擎交不出更多了：这条流到终点了（也可能被抢占后没再排上 —— 无论哪
             # 一种，"给一个终点"都比"一直等"好：后者在客户端是永远等不到 `[DONE]`）。
-            return StreamToken("", True)
+            return StreamToken("", True, False)
         var arena = Arena(MAX_GEN * 8 + 64)
         var dest = int_map(arena.alloc(MAX_GEN * 8))
         var n = self.engine.output(request, dest)
@@ -605,7 +748,7 @@ struct ModelService(Service, Twinable):
         arena.keep_alive()  # 同上：指针用完之前 arena 不许析构
         var text = self._batch_text(slot, n)
         self.b_n[slot] = want + 1
-        return StreamToken(text, self.b_n[slot] >= self.b_steps[slot])
+        return StreamToken(text, self.b_n[slot] >= self.b_steps[slot], False)
 
     def _batch_text(mut self, slot: Int, n: Int) raises -> String:
         """批路这一步新增的文本 —— 与 `_new_text` **同一个**算法（整段前缀解码减去

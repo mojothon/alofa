@@ -38,14 +38,23 @@ struct StreamToken(Copyable, Movable):
     产出文本，或者一步都没走）。`done` 与 `text` 分开，是因为"这一步有没有
     文本"和"生成是不是结束了"是不同的两件事 —— 合成一个字段就得用空串去
     表示"结束"，于是"生成了一个空文本的 token"没法表达。
+
+    `waiting=True` 表示**还没轮到这一条**：它已经排上队了，但引擎里的槽位全
+    占着，所以它这一步**还没有**增量 —— 这与"结束了"和"产出了一个空文本的
+    token"是第三件事，混进前两个里就会变成：要么把等待当成结束（客户端拿到
+    一个没有 `[DONE]` 的空连接），要么把等待当成空 token（一路空转到有人
+    让出槽位）。它必须单独是一个字段，因为**这三种状态在客户端看来完全不
+    同**。
     """
 
     var text: String
     var done: Bool
+    var waiting: Bool
 
-    def __init__(out self, text: String, done: Bool):
+    def __init__(out self, text: String, done: Bool, waiting: Bool):
         self.text = text
         self.done = done
+        self.waiting = waiting
 
 
 def sse_frame(imm json: String) raises -> String:
@@ -61,6 +70,25 @@ def sse_frame(imm json: String) raises -> String:
             "json=" + json,
         )
     return "data: " + json + CRLF + CRLF
+
+
+def sse_comment(imm text: String) raises -> String:
+    """一帧**注释**：客户端必须忽略它，但它仍然是一帧。
+
+    它是"这条流还活着，只是这一步没有内容"的表达。服务循环只把**空串**当作
+    流结束，所以等待不能靠空串说 —— 那样会被当成结束，客户端拿到一个连
+    `[DONE]` 都没有的空连接。注释帧是 SSE 协议里专门留给"什么都不说"的那一格：
+    有它，等待就既不是结束也不是空转。
+
+    ⚠️ 与 `sse_frame` 同一个约束：注释行不能含裸 `CR`/`LF`。
+    """
+    if text.find("\n") >= 0 or text.find("\r") >= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "an SSE comment must not carry a raw newline",
+            "text=" + text,
+        )
+    return ": " + text + CRLF + CRLF
 
 
 def sse_done() raises -> String:
