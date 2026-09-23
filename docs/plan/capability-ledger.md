@@ -1073,3 +1073,7 @@
   - → **实质进展**：ASan 有 redzone，堆越界写是**必报**的。零报错 ⇒ **崩溃不是堆越界写**（也基本排除了 UAF）
   - → **新假设：未初始化读**。它最吻合"-O0 不崩 / -O1 -O2 崩"—— `-O0` 下栈槽与寄存器恰好是 0，`-O1`+ 是垃圾；一个垃圾长度/指针传给分配器，就崩在 `List::_realloc` 或 AsyncRT 的分配里，而崩溃点看起来随机。这也解释了为什么读代码找不到"写坏堆的人"：**根本没有人写坏，是有人读到了没写过的东西**
   - 下一步：查 `mojo build --sanitize memory`（MSan）是否可用；或人工找"可能未初始化就被读"的字段 —— 重点看引擎/服务层那些"先声明、后填"的 `var`（`serve.mojo` 与 `engine/core.mojo`）
+- **2026-09-23（同日第十八条）** —— **MSan 不可用；转 TSan**
+  - `mojo build --sanitize` 只接受 `address` 或 `thread`（报错原文：`invalid sanitizer 'memory', expected one of: address or thread`）→ **没有 MSan**，未初始化读没法靠 sanitizer 直接抓
+  - → 转 `--sanitize thread`（TSan）。理由：虽然"双重推进"已被证伪，但 reactor 与 engine 线程**确实并存**，且默认配置下 0 号 engine 线程用的是调用方那一份 handler（`engine_thread.mojo:560` 注释明写）→ **共享是真实存在的**，值得让 TSan 直接测，而不是继续推理
+  - 备用（若 TSan 也无收获）：① 人工找"先声明后填、可能在填之前被读"的 `var`（`serve.mojo` / `engine/core.mojo`）；② `-O2` + gdb 在崩溃点打印关键状态（当初方案 1 用 -O0 跑、没崩，所以没打成；该用 -O2 跑）
