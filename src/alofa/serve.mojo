@@ -52,6 +52,7 @@ roadmap 3.2b），循环只做 I/O；同时能生成几条 = `ALOFA_ENGINE_THREA
 """
 
 from std.collections import List
+from std.os import getenv
 
 from flare.net import IpAddr, SocketAddr
 
@@ -88,6 +89,19 @@ comptime BATCH_BLOCK = 16
 comptime BATCH_CAP_BLOCKS = 256
 comptime BATCH_WATERMARK = 900
 comptime BATCH_MAX_WAIT = 8
+
+
+def batch_default() -> Bool:
+    """批路的默认开关：`ALOFA_BATCH=0` 关掉，其余（含没设）都是开。
+
+    只认 `0`/非 `0` 两个态，不解析其它值 —— 一个"关批调度"的开关不需要三态，
+    多出来的态只是多一种写错的方式（写错就退到默认，也就是开着，而那是**安全**
+    的那一侧：开着若有问题，门会先红）。
+    """
+    var raw = getenv("ALOFA_BATCH", "")
+    if raw.byte_length() == 0:
+        return True
+    return raw != "0"
 
 
 struct ModelService(Service, Twinable):
@@ -137,6 +151,16 @@ struct ModelService(Service, Twinable):
     # 生成"。它服务的是下面那条**单流老路**（采样，或装不进引擎的请求）；
     # 批路的状态在 `b_*` 那几张表里。
     var stream_request: Int
+
+    # 批路的开关。**默认开**。
+    #
+    # ⚠️ 这个开关不是给运维的旋钮，是给**门**留的：同一条 prompt 要能分别走两条
+    # 路（一批 N 条 vs 一条一条跑），才对得上"逐 token 相等"那笔账 —— 没它，两条
+    # 路只能各自跑，差异会被"反正 prompt 不一样"永远盖住。
+    #
+    # 关掉它（`ALOFA_BATCH=0`）就是退回批调度之前那条路：一条一条跑。所以它也
+    # 是"批调度出问题时"的退路 —— 明着慢，而不是静默变慢。
+    var batch_enabled: Bool
 
     # 批调度（P2 已 verified 的那条执行器）：一次前向推进**多条**请求。
     var engine: EngineCore
@@ -194,6 +218,7 @@ struct ModelService(Service, Twinable):
         self.stream_temp = 0.0
         self.stream_started = False
         self.stream_request = NO_REQUEST
+        self.batch_enabled = batch_default()
         # 批路：形状参数全部来自**这份权重**（不从配置里再抄一遍 —— 抄错了会静默
         # 算错，而从同一个 cfg 读出来的是同一份真值）。
         self.engine = EngineCore(
@@ -358,7 +383,8 @@ struct ModelService(Service, Twinable):
         # `MAX_GEN`、同时在批 ≤ `MAX_BATCH`。越界的请求不是错，只是走老路。
         var slot = self._free_slot()
         if (
-            temperature <= 0.0
+            self.batch_enabled
+            and temperature <= 0.0
             and steps > 0
             and len(ids) <= MAX_PROMPT
             and steps <= MAX_GEN

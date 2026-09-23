@@ -33,6 +33,11 @@ test = "bash scripts/run_tests.sh && pixi run check-ledger"
 # 逐 token 相同（greedy，所以一个 token 不同就是一个不同）。它跑的是真实的 0.5B
 # 权重，所以要 build 再跑，也因此没有并入 test —— 与 test-model / test-q4 同理。
 test-batch-forward = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_batch_forward.mojo -o target/batch_forward && ./target/batch_forward"
+# 服务层那条批一致性门：与 test-batch-forward 同一个判据（一批 N 条 vs 一条一条跑，
+# 逐 token 相同），但比的是**服务层那两条路** —— 批路（`EngineCore`）与单流老路
+# （`model.prefill`/`step`）。它要真权重，所以 build 再跑、也不并入 test。
+# 跑之前要给出权重目录（ALOFA_WEIGHTS），与 `pixi run serve` 用的是同一个变量。
+test-batch-stream = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_batch_stream.mojo -o target/batch_stream && ./target/batch_stream"
 # CI 监视：见 scripts/ci_watch.sh —— 绑定到当前 HEAD 的运行，而不是列表第一条，
 # 否则推送刚落地的几秒里会误监视到上一次运行（往往是上一次的失败），结论相反。
 ci-watch = "scripts/ci_watch.sh"
