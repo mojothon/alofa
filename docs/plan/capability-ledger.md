@@ -1057,3 +1057,7 @@
   - ✅ `srv/sse.mojo` **排除**：全文件无 `unsafe` / `InlineArray` / `capacity=` —— 帧构造是纯字符串拼接
   - **已排除汇总**：RSS 无泄漏 · `Conn` 的 `sent`/`clear()`（有门且变异验证会红）· `pending_view` 零拷贝（拷贝版仍崩）· `chunk_text_json`（纯拼接）· `escape_json` · `sse.mojo` · reactor 的 `dispatch` 不碰引擎 · "双重推进"（已证伪，实际只有 reactor 推进）
   - **还没查**（流式每帧走）：① `ChatHandler.stream_next` 对 `stream_phase` / `stream_count` 等**按下标写**（有 `_check_request`，但要核对它比的是不是这些数组的上界）；② `service.stream_next`（引擎侧取 token 那一段）
+- **2026-09-23（同日第十五条）** —— **逐处排除（二）**
+  - ✅ `stream_next` 的按 `request` 下标写**排除**：`MAX_CONNS = MAX_STREAMS = 128`（两者相等，槽位号不会越出流数组），且 `_check_request`（`openai.mojo:980`）比的是 `MAX_STREAMS` —— 正确的那个上界
+  - ✅ `_new_text` / `bytes_to_text` **排除**（**曾是最像的候选**）：`_new_text` 每帧把整段前缀重新解码，`full` 是**局部变量**，再用 `bytes_to_text(full, sent, len(full))` 取增量 —— 若那是零拷贝视图，返回的就是指向一个已死局部变量的 String（悬垂，且与"-O0 不崩 / -O1 -O2 崩"完美吻合）。查了：`bytes_to_text`（`srv/http.mojo:57`）是**纯拷贝**（新建 List + `append` + `String(unsafe_from_utf8=out)` 消费它），不悬垂
+  - **下一个候选**：`tokenizer.decode`（`_new_text` 每帧调它）—— 流式每帧唯一还没看过的一大块
