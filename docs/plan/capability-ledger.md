@@ -1039,3 +1039,9 @@
   - 与全部观测吻合：**每帧驱动**（每帧一次 `dispatch` + 一次 `progress`）、**崩溃点随机落点**（竞争窗口随机，所以一会儿 `chunk_text_json` 的 `String::_add`、一会儿 `Conn::enqueue` 的 `List::_realloc` —— 两处都是碰分配器的受害者）、**`-O0` 不崩而 `-O1/-O2` 崩**（优化下的重排/缓存放大竞争后果）、**非流式不崩**（非流式不走 `progress` 的流分支，也没有每帧的 `JOB_STREAM_STEP`）、**单连接也崩**（不需要多连接，reactor + 1 条 engine 线程就够）
   - ✅ 排除项（都已验证过）：RSS 无泄漏；`Conn` 的 `sent`/`clear()` 状态机正确（有门，且变异验证会红）；`pending_view` 零拷贝视图不是根因（改拷贝版照样崩）；`chunk_text_json` 是纯 `String` 拼接，自己写不出界；reactor 的 `dispatch` 不碰引擎
   - ⚠️ **还没修**：这是架构级决定（生成到底该在哪条线程上），三条路需定夺：① `progress` 推进前也看 `inflight`（让 engine 线程独占那一帧）；② 干掉 `dispatch` 里的 `JOB_STREAM_STEP`（若生成本就该在 reactor 同步跑）；③ 让 `step_stream` 只取结果、不触发生成
+- **2026-09-23（同日第十二条）** —— **engine 线程那条路确认了：默认配置下它与 reactor 共用同一份 handler**
+  - `_run_job`：`JOB_STREAM_STEP` → `_stream_step(handler, job)`（engine 线程跑一帧）
+  - ⚠️ 而 `engine_thread.mojo:560` 的注释明写 —— **0 号线程用的是调用方那一份 handler**（"它归调用方管，而调用方的生命周期本来就盖到 join 之后"）。默认 `ALOFA_ENGINE_THREADS=1` → 只有 0 号 → **engine 线程 #0 与 reactor 共用同一份 handler/service，无锁**
+  - 所以上一条的假设成立，但机制要修正一层：不是"所有 engine 线程都共享"，而是**默认的单线程配置下恰好 0 号复用了调用方那份**（1 号起才是 `spawn_twin` 的副本）
+  - **设计意图有据**：`_answer` 的注释写着"流式只交头，帧由 `_stream_step` 一帧一帧给" → 帧本该**只**由 engine 线程给。reactor 侧 `progress` → `step_stream`（注释"一次一条流，handler 的流状态只有一份"）是早于 engine 线程的旧路径 —— 两条并存 = **双重推进**
+  - → 修复应走③（reactor 不再触发生成，只把 engine 交回的字节发出去）。**动手前先确认 reactor 已有"把 `Result` 的字节排进发送队列"的路径**，否则摘掉 `step_stream` 的生成调用等于断流
