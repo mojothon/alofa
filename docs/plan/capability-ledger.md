@@ -1052,3 +1052,8 @@
   - ⚠️ 顺带发现一个真问题：`engine_thread.mojo` 的 `JOB_STREAM_STEP` / `_stream_step` 很可能是**没接上的死路径**（`loop.mojo:397` 那句"接下来由 `dispatch` 一帧一次往返地喂它"与实际不符）。留着它会误导下一个人 —— 它已经误导了我一次。要么接上，要么删掉
   - 改动已 `git checkout` 还原，服务恢复（改前 40 条能过若干条，改后 1 条就停）
   - 回到原点：现在是**单线程**内的 UB（`-O0` 不崩、`-O1`/`-O2` 崩、崩溃点随机落、每帧驱动）。该找的是"每帧一次的**越界写**"，不是竞争
+- **2026-09-23（同日第十四条）** —— **逐处排除（一）**
+  - ✅ `escape_json`（`openai.mojo:583`）**排除**：每帧对每个 token 都跑，是最像"固定缓冲写爆"的地方。但它全程 `List.append`（自动扩容），`capacity=len(raw)+8` 是初始容量不是上界 —— 全 `\u00XX` 转义会超出它，靠 `append` 扩容兜住。末尾 `String(unsafe_from_utf8=out)` 消费 `List`（有所有权），不是零拷贝。无裸写
+  - ✅ `srv/sse.mojo` **排除**：全文件无 `unsafe` / `InlineArray` / `capacity=` —— 帧构造是纯字符串拼接
+  - **已排除汇总**：RSS 无泄漏 · `Conn` 的 `sent`/`clear()`（有门且变异验证会红）· `pending_view` 零拷贝（拷贝版仍崩）· `chunk_text_json`（纯拼接）· `escape_json` · `sse.mojo` · reactor 的 `dispatch` 不碰引擎 · "双重推进"（已证伪，实际只有 reactor 推进）
+  - **还没查**（流式每帧走）：① `ChatHandler.stream_next` 对 `stream_phase` / `stream_count` 等**按下标写**（有 `_check_request`，但要核对它比的是不是这些数组的上界）；② `service.stream_next`（引擎侧取 token 那一段）
