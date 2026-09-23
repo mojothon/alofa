@@ -847,7 +847,15 @@ struct BatchExecutor:
             tail_normed, tail, model.params.view(FINAL_NORM), self.eps
         )
         var logits = rows_view(self.raw_of(14), served, self.vocab)
-        model.project[backend](logits, tail_normed, OUTPUT, Q4_NO_SLOT, logits, False)
+        # ⚠️ 用 `model.head` 而不是常量 `OUTPUT`（= `"lm_head.weight"`）：绑定词表的
+        # 检查点**没有** `lm_head.weight`（`QwenForward` 在构造时就选好了该用哪个名
+        # 字 —— `tied_output` 时回落到 embedding）。按常量查的话，这类检查点上批路
+        # 的第一步就报 "entry is not in the file [name=lm_head.weight]"，而老路是
+        # 好的 —— 症状看着像"批调度不能用"，其实是这一行没有跟上模型层。
+        # 名字先拷到局部：`model` 要被 `project` 可变借用，而 `model.head` 是它的
+        # 字段，两个借用同时存在编译不过（先把值拷出来是这里唯一干净的做法）。
+        var head = model.head
+        model.project[backend](logits, tail_normed, head, Q4_NO_SLOT, logits, False)
         return served
 
     def logits_of(self, request: Int) raises AlofaError -> F32Ptr:

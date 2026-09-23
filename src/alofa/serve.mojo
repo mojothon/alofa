@@ -70,13 +70,46 @@ from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import Loop
 from alofa.srv.master import run_workers
+from alofa.core.memory import Arena
+from alofa.engine.core import MAX_PROMPT, EngineCore
+from alofa.engine.executor import MAX_BATCH, MAX_GEN, int_map
+from alofa.engine.scheduler import SchedConfig
 from alofa.srv.openai import NO_REQUEST, ChatHandler, Completion, Service
 from alofa.srv.sse import StreamToken
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
 
 
+# 批调度这一侧的配置。⚠️ `capacity_blocks` 是**故意的小**：一块是 16 个 token 的
+# K/V，1024 块在 0.5B 上是几百 MB；而引擎同一时刻最多 `MAX_BATCH`(= 8) 条、每条最多
+# `MAX_PROMPT` + `MAX_GEN` = 160 个 token —— 80 块就够，给 256 块是三倍余量（前缀
+# 缓存也记在这本账上）。
+comptime BATCH_ROWS = 64
+comptime BATCH_BLOCK = 16
+comptime BATCH_CAP_BLOCKS = 256
+comptime BATCH_WATERMARK = 900
+comptime BATCH_MAX_WAIT = 8
+
+
 struct ModelService(Service, Twinable):
-    """一次加载、多次请求：每次 complete 都从干净状态开始。"""
+    """一次加载、多次请求：每次 complete 都从干净状态开始。
+
+    流式有**两条**路（这不是偷懒，是两条路的形状不同）：
+
+    * **批路**（`EngineCore`）：一次前向推进多条请求，是 p99 那条收益的来源。它只
+      收"装得进引擎"的请求 —— prompt ≤ `MAX_PROMPT`(= 128)、要的新 token ≤
+      `MAX_GEN`(= 32)、同一时刻 ≤ `MAX_BATCH`(= 8) 条，而且**目前只收贪心**
+      （`temperature <= 0`）。
+    * **单流老路**（`model.prefill` / `model.step`）：形状越界或带温度的请求走它。
+      它一次只握一条（第二条会被指名拒绝，而不是静默串行）。
+
+    ⚠️ **默认 `temperature` 是 1.0**（`srv/openai.mojo`），所以**默认请求走的是老
+    路** —— 批调度今天只覆盖显式要贪心的客户端。这条不是疏漏，是"采样批化"还没
+    被逐 token 验过（验过之后才会把它也搬上批路）；它写在这里，也该写进能力账本。
+
+    两条路**可以同时**有流在跑：批路的 K/V 在引擎自己的池里，老路的在 model 里，
+    而 `QwenForward` 没有跨调用的位置状态（`t` 是每次前向的局部变量），所以交错
+    调用同一份权重是安全的 —— 这也是它们能共用一份权重的原因。
+    """
 
     var model: QwenForward
     var tokenizer: Tokenizer
@@ -101,8 +134,23 @@ struct ModelService(Service, Twinable):
     var stream_started: Bool
     # 在途那条流的**请求号**（`NO_REQUEST` = 没有）。这一整块状态只属于它 ——
     # `stream_next` / `stream_end` 每次都核对，号对不上就红而不是"接着给另一条流
-    # 生成"。接批调度时要换成按 request 索引的表，那时这一块就是表里的一行。
+    # 生成"。它服务的是下面那条**单流老路**（采样，或装不进引擎的请求）；
+    # 批路的状态在 `b_*` 那几张表里。
     var stream_request: Int
+
+    # 批调度（P2 已 verified 的那条执行器）：一次前向推进**多条**请求。
+    var engine: EngineCore
+    # 批路每条流的状态，**按槽位**索引（不是按 request 号 —— 引擎自己只有
+    # `MAX_BATCH` 个槽位，`find` 是线性查找）。
+    #   `b_req` — 这个槽位在给谁生成（`NO_REQUEST` = 空着）
+    #   `b_out` — 生成的 token，扁平存放：槽位 s 的第 k 个在 `s * MAX_GEN + k`
+    #   `b_n` / `b_steps` — 已交出几个 / 一共要几个
+    #   `b_emitted` — 已经发出去的**字节**数（增量文本靠它，理由见 `_new_text`）
+    var b_req: List[Int]
+    var b_out: List[Int]
+    var b_n: List[Int]
+    var b_steps: List[Int]
+    var b_emitted: List[Int]
 
     # 再造一份时要用的三个路径（`spawn_twin`）。留着它们而不是留一份
     # `ServeConfig`：配置里有 host/port 那些和"加载一份权重"无关的东西，而这里
@@ -146,6 +194,40 @@ struct ModelService(Service, Twinable):
         self.stream_temp = 0.0
         self.stream_started = False
         self.stream_request = NO_REQUEST
+        # 批路：形状参数全部来自**这份权重**（不从配置里再抄一遍 —— 抄错了会静默
+        # 算错，而从同一个 cfg 读出来的是同一份真值）。
+        self.engine = EngineCore(
+            SchedConfig(
+                BATCH_ROWS,
+                BATCH_ROWS,
+                BATCH_BLOCK,
+                BATCH_CAP_BLOCKS,
+                BATCH_WATERMARK,
+                BATCH_MAX_WAIT,
+            ),
+            self.model.cfg.hidden,
+            self.model.cfg.intermediate,
+            self.model.cfg.kv_dim(),
+            self.model.cfg.n_layers,
+            self.model.cfg.n_heads,
+            self.model.cfg.n_kv_heads,
+            self.model.cfg.head_dim,
+            self.model.cfg.vocab,
+            self.model.cfg.eps,
+            self.max_tokens,
+        )
+        self.b_req = List[Int]()
+        self.b_out = List[Int]()
+        self.b_n = List[Int]()
+        self.b_steps = List[Int]()
+        self.b_emitted = List[Int]()
+        for i in range(MAX_BATCH):
+            self.b_req.append(NO_REQUEST)
+            self.b_n.append(0)
+            self.b_steps.append(0)
+            self.b_emitted.append(0)
+        for i in range(MAX_BATCH * MAX_GEN):
+            self.b_out.append(0)
 
     @staticmethod
     def load(cfg: ServeConfig) raises -> ModelService:
@@ -253,7 +335,6 @@ struct ModelService(Service, Twinable):
         # 的是表里一个位置。
         if self.stream_request != NO_REQUEST and self.stream_request != request:
             self.stream_request = NO_REQUEST
-        self.model.reset()
         var ids = self.tokenizer.encode(prompt)
         if len(ids) == 0:
             raise AlofaError(
@@ -270,6 +351,44 @@ struct ModelService(Service, Twinable):
         var steps = min(max_tokens, self.max_tokens - len(ids))
         if steps < 0:
             steps = 0
+
+        # ---- 批路：贪心，且形状装得进引擎 ----
+        # 三个上限都是引擎自己的（`submit` 会指名拒绝越界的，所以这里是**先**判
+        # 断再决定走哪条路，而不是碰运气）：prompt ≤ `MAX_PROMPT`、新 token ≤
+        # `MAX_GEN`、同时在批 ≤ `MAX_BATCH`。越界的请求不是错，只是走老路。
+        var slot = self._free_slot()
+        if (
+            temperature <= 0.0
+            and steps > 0
+            and len(ids) <= MAX_PROMPT
+            and steps <= MAX_GEN
+            and slot >= 0
+        ):
+            var arena = Arena(MAX_PROMPT * 8 + 64)
+            var toks = int_map(arena.alloc(MAX_PROMPT * 8))
+            for i in range(len(ids)):
+                toks[unsafe_offset=i] = ids[i]
+            self.engine.submit(request, toks, len(ids), steps)
+            # ⚠️ `Arena` 在**指针最后一次使用处**就析构（这是它的设计），所以这行不
+            # 写，`toks` 在 `submit` 内部读到的是已经释放的内存 —— 实测表现是
+            # `stream_begin` 段错误，而不是"算错了"。
+            arena.keep_alive()
+            self.b_req[slot] = request
+            self.b_steps[slot] = steps
+            self.b_n[slot] = 0
+            self.b_emitted[slot] = 0
+            return
+
+        # ---- 老路（采样，或装不进引擎的请求）：一次只握一条 ----
+        # 第二条采样流**指名拒绝**而不是悄悄串行：串行的话客户端看到的是"偶发地
+        # 特别慢"，而那是最难归因的一种慢。
+        if self.stream_request != NO_REQUEST and self.stream_request != request:
+            raise AlofaError(
+                ERR_CAPACITY,
+                "this service runs one sampling stream at a time",
+                "streaming=" + String(self.stream_request),
+            )
+        self.model.reset()
         self.stream_ids = ids^
         self.stream_steps = steps
         self.stream_count = 0
@@ -288,6 +407,9 @@ struct ModelService(Service, Twinable):
         第一次调用才 prefill（`stream_started`），之后每次 `step` 上一步的
         token —— 与非流式那条路走的前向次数**完全相同**，所以流不改变数值结果。
         """
+        var slot = self._slot_of(request)
+        if slot >= 0:
+            return self._batch_next(slot, request)
         if self.stream_request != request:
             # 号对不上 = 有人拿另一条流的号来问这一步。静默答下去就是"接着给别人
             # 生成"，而那一边的客户端看到的是一条完全正常的流 —— 只是内容属于别人。
@@ -319,13 +441,81 @@ struct ModelService(Service, Twinable):
     def stream_end(mut self, request: Int) raises:
         """把 `request` 占的东西还回来（**幂等**：号对不上就什么也不做）。
 
-        今天它只清掉"在途"这个标记 —— 状态本身由下一次 `stream_begin` 重设。接了批
-        调度之后这里要还的是**表里那个位置**（以及 KV 房间），那时候漏掉它就是"新
-        请求被拒"，所以这个契约先立好。
+        批路要还的是引擎里那个**槽位**：`cancel` 只是把取消排进下一拍，所以这里
+        必须再跑一拍让它落地 —— 少了那一拍，槽位一直占着，第 `MAX_BATCH` + 1 条
+        请求会收到 "the engine is full"，而真正的原因（某条连接断了）在别处。
         """
+        var slot = self._slot_of(request)
+        if slot >= 0:
+            if self.engine.find(request) >= 0:
+                self.engine.cancel(request)
+                self.engine.tick[BACKEND_AVX2](self.model)
+            self.b_req[slot] = NO_REQUEST
+            self.b_n[slot] = 0
+            self.b_steps[slot] = 0
+            self.b_emitted[slot] = 0
+            return
         if self.stream_request != request:
             return
         self.stream_request = NO_REQUEST
+
+    def _free_slot(self) -> Int:
+        """批表里第一个空位（-1 = 满了）。满了不是错 —— 请求会走老路。"""
+        for i in range(MAX_BATCH):
+            if self.b_req[i] == NO_REQUEST:
+                return i
+        return -1
+
+    def _slot_of(self, request: Int) -> Int:
+        """`request` 在批表里的槽位（-1 = 它不在批路上）。"""
+        for i in range(MAX_BATCH):
+            if self.b_req[i] == request:
+                return i
+        return -1
+
+    def _batch_next(mut self, slot: Int, request: Int) raises -> StreamToken:
+        """批路走一步：引擎还没交出第 `n` 个 token 就推它，直到交出或没活干。
+
+        一次 `tick` 推进**所有**在批里的请求 —— 这正是批调度的收益所在：八条流的
+        第 k 个 token 是同一次前向算出来的。
+        """
+        var want = self.b_n[slot]
+        while self.engine.n_output(request) <= want:
+            if not self.engine.has_work():
+                break
+            self.engine.tick[BACKEND_AVX2](self.model)
+        if self.engine.n_output(request) <= want:
+            # 引擎交不出更多了：这条流到终点了（也可能被抢占后没再排上 —— 无论哪
+            # 一种，"给一个终点"都比"一直等"好：后者在客户端是永远等不到 `[DONE]`）。
+            return StreamToken("", True)
+        var arena = Arena(MAX_GEN * 8 + 64)
+        var dest = int_map(arena.alloc(MAX_GEN * 8))
+        var n = self.engine.output(request, dest)
+        for i in range(n):
+            self.b_out[slot * MAX_GEN + i] = dest[unsafe_offset=i]
+        arena.keep_alive()  # 同上：指针用完之前 arena 不许析构
+        var text = self._batch_text(slot, n)
+        self.b_n[slot] = want + 1
+        return StreamToken(text, self.b_n[slot] >= self.b_steps[slot])
+
+    def _batch_text(mut self, slot: Int, n: Int) raises -> String:
+        """批路这一步新增的文本 —— 与 `_new_text` **同一个**算法（整段前缀解码减去
+        已经发出去的字节），只是源头是批表那一段。
+
+        两边必须同一个算法：不一样的话，流式拼出来的文本会**不等于**非流式那份，
+        而"多字节字符被切成两半"正是它要防的。
+        """
+        var ids = List[Int]()
+        for i in range(n):
+            ids.append(self.b_out[slot * MAX_GEN + i])
+        var full = bytes_of_text(self.tokenizer.decode(ids))
+        var sent = self.b_emitted[slot]
+        if sent > len(full):
+            # 不该发生（前缀只会变长）。真发生了就从头对齐，而不是带着一个错的
+            # 偏移量继续 —— 那个偏移会让后面每一帧都错。
+            sent = 0
+        self.b_emitted[slot] = len(full)
+        return bytes_to_text(full, sent, len(full))
 
     def _pick(mut self, logits: F32Ptr) raises -> Int:
         """从一行 logits 里取一个 id：贪心或按温度采样（与非流式同一个分支）。"""

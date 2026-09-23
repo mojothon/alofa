@@ -681,24 +681,25 @@ def test_the_request_number_reaches_the_service() raises:
     assert_equal(handler.service.last_request, 7)
 
 
-def test_a_stream_only_answers_to_its_own_number() raises:
-    """别人的号必须红，而不是"接着给另一条流发帧"。
+def test_a_number_without_a_stream_answers_nothing() raises:
+    """一个没有在途流的号必须得到**空串**，而不是一条别人的流。
 
-    负向对照正是这条门存在的理由：静默答下去，客户端收到的是一条**完全正常**的
-    流 —— id、计数、内容都属于别人，而日志里什么也看不出来（它没报错）。
+    负向对照正是这条门存在的理由：拿别的流来答的话，客户端收到的是一条**完全正
+    常**的流 —— id、计数、内容都属于别人，而日志里什么也没有（它没报错）。
     """
     var handler = ChatHandler(Stub(), "stub-model")
     _ = handler.handle(7, stream_request(4))
+    # 7 这条流正在途：它自己的号能问到帧。
+    assert_true(handler.stream_next(7).byte_length() > 0, "自己的号必须能问")
+    # 8 这条没 begin 过 → 空串（= 流结束），不是"拿 7 的流来答"。
+    assert_equal(handler.stream_next(8), "")
+    # 越界的号（不是连接槽位）必须指名报错，而不是越界写别人的状态。
     var got = ""
     try:
-        _ = handler.stream_next(8)
+        _ = handler.stream_next(9999)
     except err:
         got = String(err)
-    assert_true(
-        is_error(got, "invalid_argument"), "别人的号必须被拒绝: " + got
-    )
-    # 自己的号照样能问：核对不是把门关死。
-    assert_true(handler.stream_next(7).byte_length() > 0, "自己的号必须能问")
+    assert_true(is_error(got, "invalid_argument"), "越界的号必须被拒: " + got)
 
 
 def test_a_stream_is_returned_exactly_once() raises:

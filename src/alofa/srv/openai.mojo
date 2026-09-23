@@ -108,6 +108,12 @@ comptime STREAM_DONE = 3  # 下一帧是 `data: [DONE]`，之后回到 IDLE
 # 路的每一次核对都变成"碰巧对上"。
 comptime NO_REQUEST = -1
 
+# 一份 handler 同时能握多少条流。`request` 是**连接槽位**，所以这个数与
+# `srv/loop.mojo` 的 `MAX_CONNS` 同值 —— 没 import 它是为了让路由层不必依赖循环层
+# （依赖是单向的：循环用路由，路由不认识循环）；两个常量会不会漂由 `_check_request`
+# 兜着：越界的号是**指名报错**，不是越界写。
+comptime MAX_STREAMS = 128
+
 
 struct Completion(Copyable, Movable):
     """一次生成的结果。`finish_reason` 不在这里 —— 它取决于"要了多少"和"给了多少"，
@@ -748,31 +754,33 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
     var service: Self.S
     var model: String
     var next_id: Int
-    # 一次流式请求的在途状态。**一份 handler 一次只处理一条**连接（engine 线程池里
-    # 是"每条线程一份 handler"，所以每条线程一次一条流），所以不需要按连接分开存
-    # —— 这个前提是明写的：等哪天一份 handler 同时持有多条流，这里必须改成按连接
-    # 索引，而那时改不动的代价是"两条流互相覆盖对方的 id"。
-    var stream_id: String
-    var stream_model: String
-    var stream_max: Int
-    var stream_count: Int
-    var stream_phase: Int
-    # 在途那条流的**请求号**；`NO_REQUEST` = 没有在途。它跟着上面那一份状态走，
-    # 所以"这两份状态属于谁"是明写下来的：等这份 handler 一次持多条流，这里必须
-    # 变成按 request 索引的表，而到那时**不核对**的代价就是两条流互相覆盖对方的
-    # id 与计数 —— 症状只是"偶尔答错一次"。
-    var stream_request: Int
+    # 流式在途状态，**按 request 索引**（request = 连接槽位）。
+    #
+    # 为什么必须是表而不是一份：批调度要"一份 handler 同时握多条流"（一条 engine
+    # 线程一次前向推进多条），而单份状态的表现是——第二条流的 `begin` 把第一条的
+    # 号顶掉，第一条的下一帧于是"没有这条流"，客户端拿到一个连 `[DONE]` 都没有的
+    # 空连接。这不是理论风险：它是接批调度时实测到的第一个现象。
+    var stream_phase: List[Int]
+    var stream_count: List[Int]
+    var stream_max: List[Int]
+    var stream_id: List[String]
+    var stream_model: List[String]
 
     def __init__(out self, var service: Self.S, model: String):
         self.service = service^
         self.model = model
         self.next_id = 1
-        self.stream_id = ""
-        self.stream_model = ""
-        self.stream_max = 0
-        self.stream_count = 0
-        self.stream_phase = STREAM_IDLE
-        self.stream_request = NO_REQUEST
+        self.stream_phase = List[Int]()
+        self.stream_count = List[Int]()
+        self.stream_max = List[Int]()
+        self.stream_id = List[String]()
+        self.stream_model = List[String]()
+        for i in range(MAX_STREAMS):
+            self.stream_phase.append(STREAM_IDLE)
+            self.stream_count.append(0)
+            self.stream_max.append(0)
+            self.stream_id.append("")
+            self.stream_model.append("")
 
     def spawn_twin(self, index: Int) raises -> Int:
         """再造一份（engine 线程池：每条线程一份，见 `srv/engine_thread.mojo`）。
@@ -860,14 +868,14 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         为什么 `stream_begin` 在这里调、前向却不在：这一步只做校验与准备，是
         唯一还能把请求的问题回成 400 的地方（响应头还没发出去）。前向留到第一
         次 `stream_next` —— 头发出去之后除了"给流一个终点"没有别的退路。
+
+        状态按 `request` 索引，所以多条流可以同时在这一份 handler 上开着。
         """
-        # 上一条流没被收尾（对端断了 → 循环那边不一定还有机会通知），这里补收。
-        # 今天漏掉它看不出来（下一条 begin 会覆盖那份状态），按 request 索引之后
-        # 漏的是**表里一个位置**，漏到一定条数就变成"新请求被拒"。
-        if self.stream_request != NO_REQUEST and self.stream_request != request:
-            self.service.stream_end(self.stream_request)
-            self.stream_phase = STREAM_IDLE
-            self.stream_request = NO_REQUEST
+        self._check_request(request)
+        # 这个号上如果还挂着一条没走完的流（对端断了 → 循环那边不一定通知到），
+        # 先把它收掉：漏掉它占的是表里一个位置，占满了就是"新请求被拒"。
+        if self.stream_phase[request] != STREAM_IDLE:
+            self.stream_end(request)
         try:
             self.service.stream_begin(
                 chat.prompt, chat.max_tokens, chat.temperature, request
@@ -885,14 +893,12 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         var model = self.model
         if chat.model.byte_length() > 0:
             model = chat.model
-        self.stream_model = model
-        self.stream_id = "chatcmpl-" + String(self.next_id)
+        self.stream_model[request] = model
+        self.stream_id[request] = "chatcmpl-" + String(self.next_id)
         self.next_id += 1
-        self.stream_max = chat.max_tokens
-        self.stream_count = 0
-        self.stream_phase = STREAM_ROLE
-        # 从这一刻起，这份在途状态**属于** request：后面每一帧都要拿它对得上。
-        self.stream_request = request
+        self.stream_max[request] = chat.max_tokens
+        self.stream_count[request] = 0
+        self.stream_phase[request] = STREAM_ROLE
         # 体是空的：帧不在响应里。流式响应没有 `Content-Length`（长度未知），
         # 靠关连接定界，所以 `close=True` 是这条响应的分帧方式，不是建议。
         return HttpResponse(200, "", SSE_CONTENT_TYPE, True)
@@ -904,59 +910,73 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         交了空文本却不说结束，也当作结束 —— 否则一条流会一直问下去，而客户端
         那边就表现为"永远等不到 `[DONE]`"（见文件头：这是最糟的失败形态）。
         """
-        if self.stream_phase == STREAM_IDLE:
+        self._check_request(request)
+        var phase = self.stream_phase[request]
+        if phase == STREAM_IDLE:
+            # 这个号上**没有**流。返回空串而不是"答一条别人的流"：后者在客户端看来
+            # 是一条完全正常的流，只是 id 与内容属于别人，而日志里什么也没有。
             return ""
-        # 核对：这份 handler 一次只持**一条**流（见字段上那句 ⚠️）。号对不上必须
-        # 立刻红 —— 静默答下去就是"用另一条流的 id 和计数接着发帧"，客户端看到的
-        # 是一条完全正常的流，只是内容属于别人。
-        if self.stream_request != request:
-            raise AlofaError(
-                ERR_INVALID_ARGUMENT,
-                "this handler is already serving another request",
-                "asked="
-                + String(request)
-                + " serving="
-                + String(self.stream_request),
+        if phase == STREAM_ROLE:
+            self.stream_phase[request] = STREAM_TEXT
+            return sse_frame(
+                chunk_role_json(self.stream_id[request], self.stream_model[request])
             )
-        if self.stream_phase == STREAM_ROLE:
-            self.stream_phase = STREAM_TEXT
-            return sse_frame(chunk_role_json(self.stream_id, self.stream_model))
-        if self.stream_phase == STREAM_TEXT:
+        if phase == STREAM_TEXT:
             var token: StreamToken
             try:
                 token = self.service.stream_next(request)
             except err:
-                self.stream_phase = STREAM_DONE
+                self.stream_phase[request] = STREAM_DONE
                 return sse_frame(
                     error_json(String(err), "server_error", "stream_failed")
                 )
             # 上限是路由在守（它知道要了多少）：service 不说结束也不能没完。
-            var hit_limit = self.stream_count >= self.stream_max
+            var hit_limit = self.stream_count[request] >= self.stream_max[request]
             if token.text.byte_length() > 0 and not token.done:
-                self.stream_count += 1
+                self.stream_count[request] += 1
                 return sse_frame(
-                    chunk_text_json(self.stream_id, self.stream_model, token.text)
+                    chunk_text_json(
+                        self.stream_id[request],
+                        self.stream_model[request],
+                        token.text,
+                    )
                 )
             var finish = "stop"
             if hit_limit:
                 finish = "length"
-            self.stream_phase = STREAM_DONE
+            self.stream_phase[request] = STREAM_DONE
             return sse_frame(
-                chunk_finish_json(self.stream_id, self.stream_model, finish)
+                chunk_finish_json(
+                    self.stream_id[request], self.stream_model[request], finish
+                )
             )
-        self.stream_phase = STREAM_IDLE
         # 收尾：这条流走完了，把它占的那份还回去（幂等 —— 连接关掉时还会再收一次）。
+        # ⚠️ 顺序：不能先设 `STREAM_IDLE` 再调 `stream_end` —— 后者用相位判断"这个
+        # 号上还有没有流"，先清成 IDLE 它会认为"已经收过了"而直接返回，于是
+        # service 那一份从来没被还回去。
         self.stream_end(request)
         return sse_done()
 
     def stream_end(mut self, request: Int) raises:
         """非正常收尾那条路（对端断了 / 服务在收尾 / 走完时自己调）。
 
-        **幂等**：号对不上（已经收过，或者根本没有这条流）就什么也不做 —— 一个
+        **幂等**：这个号上没有流（已经收过，或者根本没开始）就什么也不做 —— 一个
         "对端断了"不该变成一条 500。
         """
-        if self.stream_request != request:
+        if request < 0 or request >= MAX_STREAMS:
+            return
+        if self.stream_phase[request] == STREAM_IDLE:
             return
         self.service.stream_end(request)
-        self.stream_request = NO_REQUEST
-        self.stream_phase = STREAM_IDLE
+        self.stream_phase[request] = STREAM_IDLE
+        self.stream_count[request] = 0
+
+    def _check_request(self, request: Int) raises:
+        """`request` 是**连接槽位**：越界就是调用方错了，指名报错而不是越界写。"""
+        if request < 0 or request >= MAX_STREAMS:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "the request number is not a connection slot",
+                "request=" + String(request),
+            )
+
