@@ -1061,3 +1061,8 @@
   - ✅ `stream_next` 的按 `request` 下标写**排除**：`MAX_CONNS = MAX_STREAMS = 128`（两者相等，槽位号不会越出流数组），且 `_check_request`（`openai.mojo:980`）比的是 `MAX_STREAMS` —— 正确的那个上界
   - ✅ `_new_text` / `bytes_to_text` **排除**（**曾是最像的候选**）：`_new_text` 每帧把整段前缀重新解码，`full` 是**局部变量**，再用 `bytes_to_text(full, sent, len(full))` 取增量 —— 若那是零拷贝视图，返回的就是指向一个已死局部变量的 String（悬垂，且与"-O0 不崩 / -O1 -O2 崩"完美吻合）。查了：`bytes_to_text`（`srv/http.mojo:57`）是**纯拷贝**（新建 List + `append` + `String(unsafe_from_utf8=out)` 消费它），不悬垂
   - **下一个候选**：`tokenizer.decode`（`_new_text` 每帧调它）—— 流式每帧唯一还没看过的一大块
+- **2026-09-23（同日第十六条）** —— **逐处排除（三）：`tokenizer.decode` 排除；每帧路径已全部排除，该换工具了**
+  - `decode`（`tokenizer/tokenizer.mojo:156`）：id 有边界检查（`id >= self.vocab.count()` → raise）；三段全是 `List.append` + `String(unsafe_from_utf8=...)` 消费 List —— 无裸写、无零拷贝视图
+  - 唯一可疑点：`utf8_decode_at(raw, index)` 对不完整 UTF-8 可能读 `index+1/+2` 而不检查（**读**越界）。但那是读，我们要找的是"谁**写**坏了堆"；读越界的后果是解出错误码点，而写进 `text` 仍是 `append`（安全）
+  - ⚠️ **流式每帧路径上的候选至此全部排除**：`escape_json`、`sse.mojo`、`stream_next` 的下标写、`_new_text`/`bytes_to_text`（悬垂）、`pending_view`（零拷贝视图）、`chunk_text_json`、`Conn` 的 `sent`/`clear()`、`tokenizer.decode`。加上 RSS 无泄漏、`dispatch` 不碰引擎、"双重推进"已证伪
+  - → **继续读代码的收益已经很低**，剩下两条路：① 引擎侧（`service.stream_next` → 引擎 step / KV 房间），但非流式也走引擎却不崩，所以要找的是**流式特有的引擎用法差异**；② **换工具**：用 ASan / valgrind 直接抓"谁写坏了堆"（`-O0` 二进制 + valgrind；或查 `mojo build` 是否支持 sanitizer）。② 比继续猜快得多
