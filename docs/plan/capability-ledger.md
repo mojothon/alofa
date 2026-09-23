@@ -1077,3 +1077,7 @@
   - `mojo build --sanitize` 只接受 `address` 或 `thread`（报错原文：`invalid sanitizer 'memory', expected one of: address or thread`）→ **没有 MSan**，未初始化读没法靠 sanitizer 直接抓
   - → 转 `--sanitize thread`（TSan）。理由：虽然"双重推进"已被证伪，但 reactor 与 engine 线程**确实并存**，且默认配置下 0 号 engine 线程用的是调用方那一份 handler（`engine_thread.mojo:560` 注释明写）→ **共享是真实存在的**，值得让 TSan 直接测，而不是继续推理
   - 备用（若 TSan 也无收获）：① 人工找"先声明后填、可能在填之前被读"的 `var`（`serve.mojo` / `engine/core.mojo`）；② `-O2` + gdb 在崩溃点打印关键状态（当初方案 1 用 -O0 跑、没崩，所以没打成；该用 -O2 跑）
+- **2026-09-23（同日第十九条）** —— **TSan 链接失败；sanitizer 路线盘点到此为止**
+  - `--sanitize thread` 编译通过但**链接失败**：`collect2: error: ld returned 1 exit status` → `failed to link executable`。环境里有 ASan 运行时、没有 TSan 运行时；装它要 sudo（无密码，装不了）
+  - **工具盘点**：ASan ✅（跑通，80 条 / 240 帧**零报错** ⇒ 排除了堆越界写与 UAF）· MSan ❌（`mojo build` 只支持 `address`/`thread`）· TSan ❌（链接失败）· valgrind ❌（未安装，装要 sudo）· gdb ✅（可用）
+  - → 下一步二选一：① **`-O2` + gdb 在崩溃点打印状态** —— 当初方案 1 是用 `-O0` 跑的、没崩所以没打成；换成 `-O2` 二进制就能打到。它能直接回答"崩溃那一刻我们的状态是好的还是坏的"，最便宜（现成二进制 + gdb，不用重编）· ② 人工查"先声明后填、可能在填之前被读"的 `var`（`serve.mojo` / `engine/core.mojo`）
