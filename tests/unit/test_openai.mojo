@@ -25,9 +25,16 @@ from alofa.srv.openai import (
     chunk_text_json,
     completion_json,
     error_json,
+    escape_json,
     parse_chat_request,
 )
 from alofa.srv.sse import StreamToken, sse_frame
+from alofa.tokenizer.chat_template import (
+    GENERATION_PROMPT,
+    IM_END,
+    IM_START,
+    QWEN25_DEFAULT_SYSTEM,
+)
 
 
 def is_error(imm text: String, imm name: String) -> Bool:
@@ -126,7 +133,7 @@ def test_request_fields() raises:
         + "\"max_tokens\":8,\"temperature\":0.5}"
     )
     assert_equal(chat.model, "qwen")
-    assert_equal(chat.prompt, "hi")
+    assert_equal(chat.prompt, chatml(turn("user", "hi")))
     assert_equal(chat.max_tokens, 8)
     assert_equal(chat.temperature, Float64(0.5))
     assert_true(not chat.stream, "stream must default to false")
@@ -142,17 +149,51 @@ def test_defaults_when_the_request_omits_them() raises:
     assert_equal(chat.temperature, Float64(1.0))
 
 
-def test_messages_are_joined_in_order() raises:
-    """多条消息按出现顺序用换行拼起来。
+def chatml(imm body: String) -> String:
+    """没有首条 system 时的标准形状：模板自带那句 + 这一段 body + 补笔。
 
-    还没有 chat template（见 `srv/openai.mojo` 的文件头），所以这里钉的是"顺序与
-    内容都保留" —— 顺序反了的 bug 在多轮对话里表现为"答上一句的问题"。
+    期望是**在这座 Note 里手拼的**（不是再调一次 `render_chatml`）—— 调回渲染器比
+    的话，这扇门就只是在跟自己对答案。渲染器那侧求真是在
+    `tests/unit/test_chat_template.mojo`，它比的是 transformers 导出来的夹具。
+    """
+    return (
+        IM_START
+        + "system\n"
+        + QWEN25_DEFAULT_SYSTEM
+        + IM_END
+        + "\n"
+        + body
+        + GENERATION_PROMPT
+    )
+
+
+def turn(imm role: String, imm content: String) -> String:
+    """一条非首条的消息段。"""
+    return IM_START + role + "\n" + content + IM_END + "\n"
+
+
+def test_messages_are_rendered_with_roles() raises:
+    """首条 `system` 进 system 段，`user` 按序各占一段 —— 角色**参与**了。
+
+    上一版的期望是 `"a\\nb\\nc"`（按顺序拼起来），那时角色被读掉不参与。这条钉的是
+    "同一份输入现在会长成什么样"，以及那条最容易被写错的判据：首条 system **不在**
+    循环里重复出现。
     """
     var chat = parse_chat_request(
         "{\"messages\":[{\"role\":\"system\",\"content\":\"a\"},"
         + "{\"role\":\"user\",\"content\":\"b\"},{\"role\":\"user\",\"content\":\"c\"}]}"
     )
-    assert_equal(chat.prompt, "a\nb\nc")
+    var expected = (
+        IM_START
+        + "system\n"
+        + "a"
+        + IM_END
+        + "\n"
+        + turn("user", "b")
+        + turn("user", "c")
+        + GENERATION_PROMPT
+    )
+    assert_equal(chat.prompt, expected)
 
 
 def test_unknown_keys_are_skipped() raises:
@@ -167,7 +208,10 @@ def test_unknown_keys_are_skipped() raises:
         + "\"max_tokens\":4}"
     )
     assert_equal(chat.max_tokens, 4)
-    assert_equal(chat.prompt, "hi")
+    # prompt 现在是渲染过的一段 ChatML（不是 "hi" 本身），而对不对的答案在
+    # `test_chat_template.mojo` 那边的夹具里；这里只保证辅助 key 被跳过了之后
+    # **`messages` 照旧被读到了**。
+    assert_equal(chat.prompt, chatml(turn("user", "hi")))
 
 
 def test_escapes_and_unicode() raises:
@@ -179,7 +223,9 @@ def test_escapes_and_unicode() raises:
     var chat = parse_chat_request(
         "{\"messages\":[{\"role\":\"user\",\"content\":\"a\\\"b\\\\c\\nd\\u00e9\"}]}"
     )
-    assert_equal(chat.prompt, "a\"b\\c\ndé")
+    # 转义要还原成真的字节 —— 只是现在它还被包在 ChatML 里。这条照样是负向对照：
+    # 原样保留 `\u00e9` 的实现出来的仍然是一段合法的 JSON/prompt，但 token 全变了。
+    assert_equal(chat.prompt, chatml(turn("user", "a\"b\\c\ndé")))
 
 
 def test_surrogate_half_is_refused() raises:
@@ -311,7 +357,12 @@ def test_handler_answers_health() raises:
     assert_true(res.body.find("\"model\":\"stub-model\"") >= 0, res.body)
     # "还没有 chat template"这件事必须能被不读源码的人看见。
     assert_true(res.body.find("\"streaming\":true") >= 0, res.body)
-    assert_true(res.body.find("no chat template yet") >= 0, res.body)
+    # "它有 chat template 了、但那只是一个族群的渲染器"这件事，也必須能被不读源码
+    # 的人看见 —— 所以 `PROMPT_NOTE` 里同时写着两件事。
+    assert_true(res.body.find("roles") >= 0, res.body)
+    assert_true(
+        res.body.find("not a template engine") >= 0, res.body
+    )
 
 
 def test_handler_answers_a_completion() raises:
@@ -324,7 +375,7 @@ def test_handler_answers_a_completion() raises:
         )
     )
     assert_equal(res.status, 200)
-    assert_true(res.body.find("\"content\":\"S:hi\"") >= 0, res.body)
+    assert_true(res.body.find(escape_json("S:" + chatml(turn("user", "hi")))) >= 0, res.body)
     # 替身要多少给多少 → 撞上了上限 → `length`，不是 `stop`。
     assert_true(res.body.find("\"finish_reason\":\"length\"") >= 0, res.body)
     assert_true(res.body.find("\"id\":\"chatcmpl-1\"") >= 0, res.body)
@@ -531,6 +582,68 @@ def test_handler_reports_a_broken_body_as_400() raises:
     var res = handler.handle(make_request("POST", "/v1/chat/completions", "{oops"))
     assert_equal(res.status, 400)
     assert_true(res.body.find("\"code\":\"invalid_body\"") >= 0, res.body)
+
+
+def test_a_message_without_a_role_is_refused() raises:
+    """缺 `role` 不许被当成"无角色的消息"照样渲染 —— 那正是这次修掉的 bug。
+
+    所以回的是 `invalid_argument`（对端的错），而不是 500：请求写错了要对端知道。
+    """
+    var got = ""
+    try:
+        _ = parse_chat_request("{\"messages\":[{\"content\":\"hi\"}]}")
+    except err:
+        got = String(err)
+    assert_true(is_error(got, "invalid_argument"), "no role must be refused: " + got)
+
+
+def test_an_unknown_role_is_refused() raises:
+    """`tool` 这类角色不许被拼成 `<|im_start|>tool\n...`。
+
+    它在模板里走的完全是另一段（`<tool_response>`，包在 `<|im_start|>user` 里），
+    拼错了不会有错 —— 只会让模型把一段工具输出当成人话读，安静地答得不一样。
+    """
+    var got = ""
+    try:
+        _ = parse_chat_request(
+            "{\"messages\":[{\"role\":\"tool\",\"content\":\"hi\"}]}"
+        )
+    except err:
+        got = String(err)
+    assert_true(is_error(got, "invalid_argument"), "unknown role: " + got)
+
+
+def test_a_message_without_content_is_refused() raises:
+    """只有 `role` 的消息不许被静默丢掉 —— 上一版正是这么做的（`has_content` 为假
+    就整条跳过），那样一条消息会消失得毫无痕迹，而 prompt 看起来照样正常。"""
+    var got = ""
+    try:
+        _ = parse_chat_request("{\"messages\":[{\"role\":\"user\"}]}")
+    except err:
+        got = String(err)
+    assert_true(
+        is_error(got, "invalid_argument"), "no content must be refused: " + got
+    )
+
+
+def test_roles_change_the_prompt() raises:
+    """同一段文字换个角色，prompt 必须不一样 —— 否则"角色参与了"只是一句注释。
+
+    这条同时是前面那些"按序拼"的负向对照：若还停在拼 content 的老路上，两条请求会
+    出一模一样的 prompt。
+    """
+    var as_user = parse_chat_request(
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"
+    )
+    var as_assistant = parse_chat_request(
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hello\"}]}"
+    )
+    assert_true(
+        as_user.prompt != as_assistant.prompt,
+        "the same text under another role must not give the same prompt",
+    )
+    assert_equal(as_user.prompt, chatml(turn("user", "hello")))
+    assert_equal(as_assistant.prompt, chatml(turn("assistant", "hello")))
 
 
 def main() raises:

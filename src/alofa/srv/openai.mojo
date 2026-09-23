@@ -27,12 +27,29 @@ JSON 为什么自己扫
 - 数字里的指数（`1e-5`）：指名拒绝，因为 `parse_float64` 不收指数（见
   `core/text.mojo`），而"不收"必须显式说出来。
 
+`role` 是怎么变成 prompt 的
+--------------------------
+`messages` 不再"按出现顺序用换行拼起来"了 —— 那是上一版的做法，角色（`role`）被读
+掉但不参与，多轮对话与系统提示的语义是错的。现在交给 `alofa.tokenizer.chat_template`
+的 `render_chatml`：**先吐一段 system**（首条是 `system` 就用它的 content，否则用模板
+自带那句），随后每条 `user` / `assistant` 各吐一段 ChatML，最后补一小段
+`<|im_start|>assistant\n` 把笔交给模型。
+
+模板怎么说这件事，不由本文件决定 —— 它由 Hugging Face 那份 `chat_template` 说，答案是
+`scripts/dump_chat_template.py` 用 transformers 自己那个 Jinja 引擎导出来的夹具
+（`tests/fixtures/qwen2.5-0.5b/chat_template.tsv`），守着它的是
+`tests/unit/test_chat_template.mojo`：**逐字节比文本、逐个比 token id**。
+
+因此这里对 `role` 的态度是**要么认识，要么拒绝**：缺 `role`、缺 `content`、角色不认得，
+一律 `invalid_request_error` —— 把一个契约错误拼成一段"看起来正常"的 prompt，比报错糟
+得多，它会让模型照常回答一个它没听懂的问题。
+
 还没有的东西
 ------------
-**没有 chat template。** `messages` 的内容按出现顺序用换行拼起来当 prompt，角色
-（`role`）被读掉但不参与 —— 真正的 chat template（`chat_template.mojo`）还没做，在
-这之前假装角色起了作用是更糟的那种假。这一点写在响应之外：见文件末尾的
-`PROMPT_NOTE`（会随 `/health` 一起返回）。
+只有 **Qwen ChatML 这一族**（没有 tools / tool_calls 的那一段），而且它不是从
+`tokenizer.json` 里读出来的模板 —— 本仓库的夹具不带 `chat_template` 字段。做成真正的
+Jinja 子集是 roadmap 的正文，那一步之前这里是"一个族群的渲染器"，不是模板引擎。这一
+句写在响应里：见 `PROMPT_NOTE`（会随 `/health` 一起返回）。
 """
 
 from std.collections import List
@@ -55,13 +72,17 @@ from alofa.srv.http import (
 from alofa.srv.engine_thread import Twinable, heap_place, heap_take
 from alofa.srv.server import Handler
 from alofa.srv.sse import StreamToken, sse_done, sse_frame
+from alofa.tokenizer.chat_template import render_chatml
 
 comptime DEFAULT_MAX_TOKENS = 32
 comptime DEFAULT_TEMPERATURE = Float64(1.0)
 comptime MAX_MESSAGES = 64
 comptime MAX_MAX_TOKENS = 256
 
-comptime PROMPT_NOTE = "messages are joined with newlines; there is no chat template yet"
+comptime PROMPT_NOTE = (
+    "messages are rendered with the Qwen2.5 chat template (ChatML) so that roles"
+    " take part; it is one family's renderer, not a template engine"
+)
 
 # `created` 字段：OpenAI 要求它是秒级时间戳，而 Mojo 1.0 的 stdlib 里没有墙上时钟
 # （`core/ffi` 只有单调时钟）。填 0 而不是编一个：编出来的时间戳会让"这个响应是
@@ -353,8 +374,18 @@ def _skip_value(imm raw: List[UInt8], mut at: Int) raises:
         at += 1
 
 
-def _read_messages(imm raw: List[UInt8], mut at: Int, mut sink: List[String]) raises:
-    """读 `messages` 数组，把每条消息的 `content` 按序收进 `sink`。"""
+def _read_messages(
+    imm raw: List[UInt8],
+    mut at: Int,
+    mut roles: List[String],
+    mut contents: List[String],
+) raises:
+    """读 `messages` 数组，把每条消息的 `role` 与 `content` 平行收进两张表。
+
+    `role` 是**必填**：渲染器要靠它决定这一条说的是哪一段 ChatML，缺了它就只剩
+    "按顺序拼"那条老路。同理 `content` 缺了也不许静默跳过 —— 上一版正是这么做的
+    （`has_content` 为假就整条丢掉），那样一条只有角色的消息会消失得毫无痕迹。
+    """
     _expect(raw, at, 91)  # '['
     _skip_ws(raw, at)
     if at < len(raw) and raw[at] == 93:  # ']'
@@ -364,7 +395,9 @@ def _read_messages(imm raw: List[UInt8], mut at: Int, mut sink: List[String]) ra
         _skip_ws(raw, at)
         _expect(raw, at, 123)  # '{'
         var content = List[UInt8]()
+        var role = List[UInt8]()
         var has_content = False
+        var has_role = False
         while True:
             _skip_ws(raw, at)
             var key = List[UInt8]()
@@ -376,8 +409,10 @@ def _read_messages(imm raw: List[UInt8], mut at: Int, mut sink: List[String]) ra
             if name == "content":
                 _read_string(raw, at, content)
                 has_content = True
+            elif name == "role":
+                _read_string(raw, at, role)
+                has_role = True
             else:
-                # `role` 也走这里：这一版没有 chat template（见文件头）。
                 _skip_value(raw, at)
             _skip_ws(raw, at)
             if at >= len(raw):
@@ -391,14 +426,26 @@ def _read_messages(imm raw: List[UInt8], mut at: Int, mut sink: List[String]) ra
             raise AlofaError(
                 ERR_PARSE, "unexpected byte inside a message", "at=" + String(at)
             )
-        if has_content:
-            if len(sink) >= MAX_MESSAGES:
-                raise AlofaError(
-                    ERR_CAPACITY,
-                    "too many messages in one request",
-                    "n=" + String(len(sink)),
-                )
-            sink.append(String(unsafe_from_utf8=content))
+        if not has_role:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "a message has no role, and roles decide the prompt",
+                "at=" + String(at),
+            )
+        if not has_content:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "a message has no content",
+                "at=" + String(at),
+            )
+        if len(roles) >= MAX_MESSAGES:
+            raise AlofaError(
+                ERR_CAPACITY,
+                "too many messages in one request",
+                "n=" + String(len(roles)),
+            )
+        roles.append(String(unsafe_from_utf8=role^))
+        contents.append(String(unsafe_from_utf8=content^))
         _skip_ws(raw, at)
         if at >= len(raw):
             raise AlofaError(ERR_PARSE, "the JSON body ends inside messages", "")
@@ -421,7 +468,8 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
     _expect(raw, at, 123)  # '{'
 
     var request = ChatRequest()
-    var messages = List[String]()
+    var roles = List[String]()
+    var contents = List[String]()
 
     while True:
         _skip_ws(raw, at)
@@ -441,7 +489,7 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
             _read_string(raw, at, value)
             request.model = String(unsafe_from_utf8=value)
         elif name == "messages":
-            _read_messages(raw, at, messages)
+            _read_messages(raw, at, roles, contents)
         elif name == "max_tokens":
             var digits = List[UInt8]()
             _read_number_text(raw, at, digits)
@@ -473,7 +521,7 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
             ERR_PARSE, "trailing bytes after the JSON object", "at=" + String(at)
         )
 
-    if len(messages) == 0:
+    if len(roles) == 0:
         raise AlofaError(
             ERR_INVALID_ARGUMENT, "the request carries no message content", ""
         )
@@ -496,12 +544,9 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
             "value=" + String(request.temperature),
         )
 
-    var prompt = ""
-    for i in range(len(messages)):
-        if i > 0:
-            prompt += "\n"
-        prompt += messages[i]
-    request.prompt = prompt
+    # prompt 的形状交给渲染器（见文件头「`role` 是怎么变成 prompt 的」）。这里不再
+    # 自己拼：任何一种拼法都是对模板的一次私下解读，而正确答案是导出来的夹具。
+    request.prompt = render_chatml(roles, contents)
     return request^
 
 
