@@ -1066,3 +1066,10 @@
   - 唯一可疑点：`utf8_decode_at(raw, index)` 对不完整 UTF-8 可能读 `index+1/+2` 而不检查（**读**越界）。但那是读，我们要找的是"谁**写**坏了堆"；读越界的后果是解出错误码点，而写进 `text` 仍是 `append`（安全）
   - ⚠️ **流式每帧路径上的候选至此全部排除**：`escape_json`、`sse.mojo`、`stream_next` 的下标写、`_new_text`/`bytes_to_text`（悬垂）、`pending_view`（零拷贝视图）、`chunk_text_json`、`Conn` 的 `sent`/`clear()`、`tokenizer.decode`。加上 RSS 无泄漏、`dispatch` 不碰引擎、"双重推进"已证伪
   - → **继续读代码的收益已经很低**，剩下两条路：① 引擎侧（`service.stream_next` → 引擎 step / KV 房间），但非流式也走引擎却不崩，所以要找的是**流式特有的引擎用法差异**；② **换工具**：用 ASan / valgrind 直接抓"谁写坏了堆"（`-O0` 二进制 + valgrind；或查 `mojo build` 是否支持 sanitizer）。② 比继续猜快得多
+- **2026-09-23（同日第十七条）** —— **换工具：ASan 跑通了但零报错 ⇒ 崩溃不是堆越界写；新假设 = 未初始化读**
+  - 工具：`mojo build` 支持 `--sanitize`（帮助里明写 "Dynamically link the address sanitizer runtime"）。编了 `-O1 -g --sanitize address` 版（`target/serve_asan`，约 255 秒）
+  - ⚠️ 坑（下次直接用）：开箱即 abort 在**加载模型**阶段 —— 栈是 `List::_annotate_new` ← `List(capacity=N)` ← `SafeTensorFile.__init__`，报 `bad parameters to __sanitizer_annotate_contiguous_container`。这是 **Mojo 标准库与 ASan 的容器标注不兼容**，与流式无关。**解法：`ASAN_OPTIONS=detect_container_overflow=0`，不用重编**
+  - 结果：流式 **80 条 / 240 帧全部通过，ASan 零报错**（同一份代码在 `-O1` 无 ASan 时 6 条就崩）
+  - → **实质进展**：ASan 有 redzone，堆越界写是**必报**的。零报错 ⇒ **崩溃不是堆越界写**（也基本排除了 UAF）
+  - → **新假设：未初始化读**。它最吻合"-O0 不崩 / -O1 -O2 崩"—— `-O0` 下栈槽与寄存器恰好是 0，`-O1`+ 是垃圾；一个垃圾长度/指针传给分配器，就崩在 `List::_realloc` 或 AsyncRT 的分配里，而崩溃点看起来随机。这也解释了为什么读代码找不到"写坏堆的人"：**根本没有人写坏，是有人读到了没写过的东西**
+  - 下一步：查 `mojo build --sanitize memory`（MSan）是否可用；或人工找"可能未初始化就被读"的字段 —— 重点看引擎/服务层那些"先声明、后填"的 `var`（`serve.mojo` 与 `engine/core.mojo`）
