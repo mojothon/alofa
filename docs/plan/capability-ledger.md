@@ -1030,3 +1030,12 @@
   - **优化档**：`-O0` 不崩（40 条 / 120 帧全过）、**`-O1` 也崩**（6 条 / 18 帧）、`-O2` 崩（14 条 / 46 帧）。所以不是某个 `-O2` 特有 pass 的锅，是**一开优化就崩** —— 这反而更像我们能修的东西（我们的 UB 在优化下暴露），而不是编译器 bug
   - **`pending_view` 排除**：把它从"指向 `outbound` 内部缓冲的零拷贝视图"改成"先拷进 `scratch` 再给出去"（签名一起改成 `origin_of(self.scratch)`），`-O2` 下**照样崩**（7 条 / 24 帧；第二轮 14 条 / 42 帧）。实验改动已还原，零拷贝设计保持不变
   - 下一步：**查 `chunk_text_json`**。它是最早那次 gdb 栈里明确出现过的帧（`String::_add` ← `chunk_text_json` ← `ChatHandler::stream_next`），而且**每帧都走** —— 比继续猜别处更有依据。另一条栈是 `Conn::enqueue` ← `List::_realloc` ← Mojo 运行时，两个栈不同说明崩溃点是**随机落点**（堆损坏的典型表现），所以别再追"崩溃在哪一行"，要追"谁写坏了堆"
+- **2026-09-23（同日第十一条）** —— **流式崩溃的根因假设：同一条流被两条线程同时推进（高置信度，尚未修）**
+  - 证据链（都是代码，不是猜）：
+    1. `Loop.progress`（reactor 主循环）：有流在途 → `step_stream` → `handler.stream_next(slot)` → 里面 `self.service.stream_next(request)` = **生成一步**，即**生成跑在 reactor 线程**
+    2. `Loop.dispatch` 同时把 `JOB_STREAM_STEP`（每帧一帧）塞进 mailbox → **engine 线程也推进同一条流的帧**
+    3. `dispatch` 推进前有 `if self.inflight[slot] == 1: continue`（一帧在途就不再派）；而 **`progress` → `step_stream` 完全没有这个检查**
+  - → engine 线程正在推进 slot 那一帧（`inflight=1`）的同时，reactor 也在推进它：**两条线程同时对同一条流做一步生成**。共享的是 handler 的流状态（`stream_phase[slot]` / `stream_count` / `stream_id`…，作者在 `progress` 的注释里自己写了"handler 的流状态只有一份"）和引擎 —— 都没有锁
+  - 与全部观测吻合：**每帧驱动**（每帧一次 `dispatch` + 一次 `progress`）、**崩溃点随机落点**（竞争窗口随机，所以一会儿 `chunk_text_json` 的 `String::_add`、一会儿 `Conn::enqueue` 的 `List::_realloc` —— 两处都是碰分配器的受害者）、**`-O0` 不崩而 `-O1/-O2` 崩**（优化下的重排/缓存放大竞争后果）、**非流式不崩**（非流式不走 `progress` 的流分支，也没有每帧的 `JOB_STREAM_STEP`）、**单连接也崩**（不需要多连接，reactor + 1 条 engine 线程就够）
+  - ✅ 排除项（都已验证过）：RSS 无泄漏；`Conn` 的 `sent`/`clear()` 状态机正确（有门，且变异验证会红）；`pending_view` 零拷贝视图不是根因（改拷贝版照样崩）；`chunk_text_json` 是纯 `String` 拼接，自己写不出界；reactor 的 `dispatch` 不碰引擎
+  - ⚠️ **还没修**：这是架构级决定（生成到底该在哪条线程上），三条路需定夺：① `progress` 推进前也看 `inflight`（让 engine 线程独占那一帧）；② 干掉 `dispatch` 里的 `JOB_STREAM_STEP`（若生成本就该在 reactor 同步跑）；③ 让 `step_stream` 只取结果、不触发生成
