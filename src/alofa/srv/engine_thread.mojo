@@ -181,12 +181,23 @@ def opaque_of(imm addr: Int) -> OpaquePtr:
     return OpaquePtr(unsafe_from_address=addr)
 
 
+# 过邮箱的那两样东西自带的**自证**：一个魔数（放在结构体的**第一个**字段 —— 被前一块
+# 写穿时它先坏）加一份"内层 List 有多长"的副本（长度对不上 = `List` 那三个字被踩了）。
+#
+# 为什么要有它：实测踩踏的表现是"几十条之后在别处随机发作"（`Job.slot` 变成一个堆地址、
+# 请求行开头乱码、随机 abort）。那种失败没法归因 —— 它离真凶太远。有了自证，被踩的那
+# 一次会在**过邮箱的那一刻**变红，而且能分出"进邮箱之前就坏了"与"在邮箱里坏的"。
+comptime JOB_MAGIC = 0xA10FA001
+comptime RES_MAGIC = 0xA10FA002
+
+
 struct Job(Movable):
     """一件派给 engine 的事。
 
     `slot` 与 `gen` 一起才认得一条连接：号会复用，gen 不会。
     """
 
+    var magic: Int
     var slot: Int
     var gen: Int
     var kind: Int
@@ -202,23 +213,73 @@ struct Job(Movable):
     # 一次**（`parse_request` 只做切分与拷贝，一次几百字节，而它本来就要跑一次
     # 前向），换来的是"跨线程只过一种形状的东西"。
     var raw: List[UInt8]
+    var n_raw: Int
 
     def __init__(out self, slot: Int, gen: Int, kind: Int, thread: Int):
+        self.magic = JOB_MAGIC
         self.slot = slot
         self.gen = gen
         self.kind = kind
         self.thread = thread
         self.raw = List[UInt8]()
+        self.n_raw = 0
 
     def __init__(
         out self, slot: Int, gen: Int, kind: Int, thread: Int, var raw: List[UInt8]
     ):
         """带上请求的那一个（`JOB_REQUEST`）。"""
+        self.magic = JOB_MAGIC
         self.slot = slot
         self.gen = gen
         self.kind = kind
         self.thread = thread
         self.raw = raw^
+        self.n_raw = len(self.raw)
+
+    def intact(self) -> Bool:
+        """自己还像一件活吗（过邮箱**前后**都该为真）。
+
+        `JOB_REQUEST` 还要看**内容的头一个字节**：HTTP 方法就是那几个大写字母
+        （POST/GET/OPTIONS…）。长度对而内容坏是最需要盯住的一种 —— 实测那条
+        `[line=p?!/chat/completions HTTP/1.1]` 正是这个形状：**尾巴是好的、开头是
+        乱码**，长度一点没变。只看长度会把它漏掉。
+        """
+        if self.magic != JOB_MAGIC:
+            return False
+        if self.slot < 0 or self.kind < JOB_REQUEST or self.kind > JOB_STREAM_END:
+            return False
+        if self.thread < 0 or len(self.raw) != self.n_raw:
+            return False
+        if self.kind == JOB_REQUEST and self.n_raw > 0:
+            var head = self.raw[0]
+            if head < 65 or head > 90:  # 'A'..'Z'
+                return False
+        return True
+
+    def dump(self) -> String:
+        var head = "head="
+        var i = 0
+        while i < 8 and i < len(self.raw):
+            head += String(Int(self.raw[i])) + ","
+            i += 1
+        return (
+            "magic="
+            + String(self.magic)
+            + " slot="
+            + String(self.slot)
+            + " gen="
+            + String(self.gen)
+            + " kind="
+            + String(self.kind)
+            + " thread="
+            + String(self.thread)
+            + " raw="
+            + String(len(self.raw))
+            + "/"
+            + String(self.n_raw)
+            + " "
+            + head
+        )
 
 
 struct Result(Movable):
@@ -229,18 +290,22 @@ struct Result(Movable):
     错了。
     """
 
+    var magic: Int
     var slot: Int
     var gen: Int
     var kind: Int
     var close: Bool
     var bytes: List[UInt8]
+    var n_bytes: Int
 
     def __init__(out self):
+        self.magic = RES_MAGIC
         self.slot = -1
         self.gen = -1
         self.kind = RES_DONE
         self.close = False
         self.bytes = List[UInt8]()
+        self.n_bytes = 0
 
     def __init__(
         out self,
@@ -250,11 +315,39 @@ struct Result(Movable):
         close: Bool,
         var bytes: List[UInt8],
     ):
+        self.magic = RES_MAGIC
         self.slot = slot
         self.gen = gen
         self.kind = kind
         self.close = close
         self.bytes = bytes^
+        self.n_bytes = len(self.bytes)
+
+    def intact(self) -> Bool:
+        """自己还像一截应答吗（过邮箱**前后**都该为真）。"""
+        return (
+            self.magic == RES_MAGIC
+            and self.slot >= -1
+            and self.kind >= RES_BYTES
+            and self.kind <= RES_STREAM_HEAD
+            and len(self.bytes) == self.n_bytes
+        )
+
+    def dump(self) -> String:
+        return (
+            "magic="
+            + String(self.magic)
+            + " slot="
+            + String(self.slot)
+            + " gen="
+            + String(self.gen)
+            + " kind="
+            + String(self.kind)
+            + " bytes="
+            + String(len(self.bytes))
+            + "/"
+            + String(self.n_bytes)
+        )
 
 
 struct Mailbox(Movable):
@@ -320,6 +413,9 @@ struct Mailbox(Movable):
         return room
 
     def push_job(mut self, var job: Job) raises -> Bool:
+        # 进邮箱**之前**先自证：这里就坏 = 踩它的在循环那一侧（构造它的地方到这儿之间）。
+        if not job.intact():
+            print("  [srv] a job was already damaged before the mailbox: " + job.dump())
         self.mutex.lock()
         if len(self.jobs) >= MAILBOX_CAP:
             self.mutex.unlock()
@@ -348,6 +444,10 @@ struct Mailbox(Movable):
                 job = self.jobs.pop(i)
                 self.jobs_taken += 1
                 self.mutex.unlock()
+                # 出邮箱**之后**再自证：进来时是好的、出去时坏了 = 踩它的在邮箱里
+                # （`List` 的搬运、或者别处这次写穿到这儿）。
+                if not job.intact():
+                    print("  [srv] a job was damaged in the mailbox: " + job.dump())
                 return True
             i += 1
         self.mutex.unlock()
@@ -356,6 +456,11 @@ struct Mailbox(Movable):
     # ── 结果方向（engine → 循环） ──────────────────────────────────────────
 
     def push_result(mut self, var res: Result) raises:
+        if not res.intact():
+            print(
+                "  [srv] a result was already damaged before the mailbox: "
+                + res.dump()
+            )
         self.mutex.lock()
         self.results.append(res^)
         self.results_pushed += 1
@@ -386,6 +491,8 @@ struct Mailbox(Movable):
         res = self.results.pop(0)
         self.results_taken += 1
         self.mutex.unlock()
+        if not res.intact():
+            print("  [srv] a result was damaged in the mailbox: " + res.dump())
         return True
 
     # ── 在途与停止 ────────────────────────────────────────────────────────
