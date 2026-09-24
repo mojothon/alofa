@@ -380,6 +380,16 @@ struct Mailbox(Movable):
         self.mutex = Mutex()
         self.jobs = List[Job]()
         self.results = List[Result]()
+        # 一次把容量留到上界，**让这两个 `List` 永不扩容**：扩容要把每个元素搬到新
+        # 缓冲上，而元素是带一块自有 `List` 的 `Job`/`Result` —— 不搬就没有那次机会。
+        #
+        # ⚠️ 它是**被量过才留下来的**，不是顺手：这里原本是为了治那个 UAF（活躺在邮箱
+        # 里的时候字节被踩），假设是"扩容时旧缓冲上那份已被挪走的元素又被析构了一次，
+        # 于是把新元素正在用的缓冲还了回去"。实测**否掉**：留够容量之后自证照红（20 条
+        # 里 5 次），服务仍旧死。留着它只因为"热路径上不 realloc"本身成立，而这条否掉
+        # 的记录比那点分配更值钱 —— 下一个人不必再猜一遍。
+        self.jobs.reserve(MAILBOX_CAP)
+        self.results.reserve(MAILBOX_CAP)
         self.stop = False
         self.threads = 0
         self.jobs_pushed = 0
