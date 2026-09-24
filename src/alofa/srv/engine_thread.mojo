@@ -145,6 +145,14 @@ def heap_take[T: Movable](raw: Int) raises -> T:
 #   engine 不知道对端收得动收不动，而循环知道（它握着发送队列）。
 comptime JOB_REQUEST = 0
 comptime JOB_STREAM_STEP = 1
+# - `JOB_STREAM_END`：一条流**没走完**就结束了（对端断了 / 连接被丢），让 engine 把它
+#   那一份收掉（`Handler.stream_end`，幂等）。
+#
+#   为什么它是**一件事**而不是循环直接调 handler：handler 归 engine 线程独占（见
+#   `EngineBox` 的注释），循环这一侧从头到尾碰不得 —— 从循环调一次 `stream_end`
+#   等于把"每条线程一份相位"这件事撕开一个口子，而症状会是"偶尔答错一帧"那种最难
+#   归因的失败。派一件活过去，收尾仍然发生在持有相位的那条线程上。
+comptime JOB_STREAM_END = 2
 
 # 一个 result 是"engine 交回来的字节"。
 # - `RES_BYTES`：排进这条连接的发送队列，这条请求**还没答完**（流的一帧）。
@@ -676,7 +684,25 @@ def _run_job[H: EngineHandler](
     """跑一件活，交回一截字节。这一层不许抛（见 `_engine_entry`）。"""
     if job.kind == JOB_STREAM_STEP:
         return _stream_step[H](handler, job^)
+    if job.kind == JOB_STREAM_END:
+        return _stream_end[H](handler, job^)
     return _answer[H](handler, job^)
+
+
+def _stream_end[H: EngineHandler](
+    handler: Pointer[H, MutUntrackedOrigin], var job: Job
+) -> Result:
+    """把一条**没走完**的流在 engine 这一侧收掉。
+
+    交回的那一截不会被任何人收到（连接已经不在了，`collect` 靠 `gen` 对不上把它丢
+    掉）—— 它存在的唯一理由是**记账**：循环派了活就要等到应答，`inflight` 才有机会
+    归零。少了这一截，槽位上的"还有一件事在途"永远是真的。
+    """
+    try:
+        handler[].stream_end(job.slot)
+    except err:
+        print("  [srv] a stream could not be released: " + String(err))
+    return Result(job.slot, job.gen, RES_DONE, True, List[UInt8]())
 
 
 def _answer[H: EngineHandler](

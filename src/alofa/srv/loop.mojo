@@ -72,6 +72,7 @@ from alofa.srv.conn import (
 from alofa.srv.engine_thread import (
     JOB_REQUEST,
     JOB_STREAM_STEP,
+    JOB_STREAM_END,
     RES_BYTES,
     RES_DONE,
     RES_STREAM_HEAD,
@@ -165,6 +166,15 @@ struct Loop(Movable):
     var next_engine: Int
     # 诊断用：这个槽位已经报过一次"卡住"了吗（0 = 还没报）。只上诊断，不参与判定。
     var stall_seen: List[Int]
+    # 这个槽位上有一条**没走完**的流等着 engine 去收尾（`JOB_STREAM_END`）：
+    # `-1` = 没有，`>= 0` = 该交给第几条 engine 线程。记线程号而不是记"有/没有"，
+    # 是因为 `drop` 会把 `owner` 清成 -1 —— 不在这里留住它，收尾就不知道该派给谁
+    # （派错线程 = 从一条没有那条相位的线程上收一条不存在的流）。
+    #
+    # 为什么是"登记一个待办"而不是 `drop` 时直接派：`drop` 也被 `reap` / `drop_all` 调，
+    # 那些地方手上没有邮箱；而真正能派活的是 `dispatch`。分开之后"连接被丢"与"通知
+    # engine"各在自己的位置上，`drop` 也不必为了派活把 `Handler` 的类型参数拖进来。
+    var release_pending: List[Int]
 
     def __init__(out self, var listener: TcpListener) raises:
         self.listener = listener^
@@ -181,6 +191,7 @@ struct Loop(Movable):
         self.inflight = List[Int]()
         self.owner = List[Int]()
         self.stall_seen = List[Int]()
+        self.release_pending = List[Int]()
         self.engines = 1
         self.next_engine = 0
 
@@ -379,6 +390,9 @@ struct Loop(Movable):
                 print("  [srv] a result could not be taken: " + String(err))
                 return
             self.inflight[slot] = 0
+            # 这一件回来了 ⇒ 槽位上不再有"在途的收尾"（见 `dispatch` 里派
+            # `JOB_STREAM_END` 那一段：待办要等回执才清）。
+            self.release_pending[slot] = -1
             if res.gen != self.gen[slot] or self.live[slot] == 0:
                 # 槽位换过主人：这个结果属于**上一条**连接。发给这一条，就是那种
                 # "偶发的响应内容不对"，而且只在客户端恰好中途断开时出现。
@@ -440,6 +454,24 @@ struct Loop(Movable):
         **再派新请求**。一起做而不是二选一，是因为 `engines > 1` 时"一条流在跑"不
         再意味着"别的槽位只能等着" —— 流占的是它自己那条线程。
         """
+        # 0) 先派"收尾"（连接被丢时 engine 那一份还没还回去）。它排在喂帧**之前**：
+        #    一个已经没有客户端的槽位不该继续占着引擎侧的请求号 —— 而喂帧是让活
+        #    下去，收尾是让活停下来，后者先走才不会把号越占越满。
+        for slot in range(len(self.live)):
+            var thread = self.release_pending[slot]
+            if thread < 0 or self.inflight[slot] == 1:
+                continue
+            var closing = Job(slot, self.gen[slot], JOB_STREAM_END, thread)
+            try:
+                # ⚠️ 派出去**先不消待办**：`stream_end` 是按请求号（= 槽位）找流的，这件
+                # 活还在飞的时候把槽位给新连接，engine 收掉的就会是**新**那条流（更
+                # 糟的是重复释放）。待办要等 `collect` 看见回执才清 —— 那时才真的收完。
+                if box.mailbox.push_job(closing^):
+                    self.inflight[slot] = 1
+                # 邮箱满了就留着下一轮再派：这是一件"迟早要办"的事，不是"现在必须
+                # 办完"的事，而丢掉它就等于把引擎侧那个位置漏掉。
+            except err:
+                print("  [srv] a stream release could not be queued: " + String(err))
         # 1) 在途的流：每条一帧（归它的那条线程）。
         for slot in range(len(self.live)):
             if self.live[slot] == 0 or self.streaming[slot] != 1:
@@ -532,6 +564,8 @@ struct Loop(Movable):
         """
         var now = monotonic_ms()
         for slot in range(len(self.live)):
+            # 没有主人的槽位不看：它可能正在等 engine 收尾（`release_pending`），那个
+            # 在途是有意为之，不是卡住。
             if self.live[slot] == 0 or self.stall_seen[slot] >= 4:
                 continue
             if self.inflight[slot] != 1 and self.streaming[slot] != 1:
@@ -649,39 +683,58 @@ struct Loop(Movable):
 
     def has_room(self) -> Bool:
         """还有槽位吗。判据在**移动之前**问 —— 移动之后 `conn` 与槽位里的那份是同一
-        个 fd，再"关掉它"就变成关两次（中间这个号可能已经被别人拿走了）。"""
+        个 fd，再"关掉它"就变成关两次（中间这个号可能已经被别人拿走了）。
+
+        ⚠️ **等着收尾的槽位不算空位**：那条流在 engine 那边还没还回去，把槽位给新
+        连接会让 `stream_end` 收到新那条流上（见 `adopt`）。宁可拒一条新连接，也不
+        能把一条正在跑的流收掉。
+        """
         if len(self.live) < MAX_CONNS:
             return True
         for slot in range(len(self.live)):
-            if self.live[slot] == 0:
+            if self.live[slot] == 0 and self.release_pending[slot] < 0:
                 return True
         return False
 
     def adopt(mut self, var conn: TcpStream, fd: Int32) raises -> Int:
-        """把一条新连接放进一个槽位（调用方已经确认有空位）。"""
+        """把一条新连接放进一个槽位（调用方已经确认有空位）。
+
+        ⚠️ **等着收尾的槽位不给新连接**（`release_pending`）：那份收尾还在 engine 那边
+        排队或已经在飞，而 `stream_end` 是按请求号（= 槽位）找流的 —— 这时候把槽位给
+        新连接，被收掉的就是**新**那条流。宁可让这条连接去别的槽位（都没有就让
+        `has_room` 把它拒掉）。
+        """
+        var target = -1
         for slot in range(len(self.live)):
-            if self.live[slot] == 0:
-                self.streams[slot] = conn^
-                var fresh = Conn()
-                self.conns[slot] = fresh^
-                self.live[slot] = 1
-                self.interest[slot] = INTEREST_READ
-                self.inflight[slot] = 0
-                self.streaming[slot] = 0
-                self.owner[slot] = -1
-                # ⚠️ 代号**不动**：换主人正是靠它自增来标记的（见 `drop`）。
-                try:
-                    self.reactor.register(
-                        fd, UInt64(CONN_TOKEN_BASE + slot), INTEREST_READ
-                    )
-                except err:
-                    # 注册不上（EEXIST = 上一条连接的注册没摘干净，EBADF = fd 已经关了）
-                    # 只该带走这一条连接。让它冒出去 = 一次 `epoll_ctl` 失败就让整个服
-                    # 务没了 —— 而"一个倒霉的客户端不该带走所有人"正是这条循环的理由。
-                    print("  [srv] a connection could not be registered: " + String(err))
-                    self.drop(slot)
-                    return -1
-                return slot
+            if self.live[slot] == 0 and self.release_pending[slot] < 0:
+                target = slot
+                break
+        if target >= 0:
+            var slot = target
+            self.streams[slot] = conn^
+            var fresh = Conn()
+            self.conns[slot] = fresh^
+            self.live[slot] = 1
+            self.interest[slot] = INTEREST_READ
+            self.inflight[slot] = 0
+            self.streaming[slot] = 0
+            self.owner[slot] = -1
+            # 上一条连接的收尾**不再等**：这条槽位现在归新连接，而 `stream_end`
+            # 是按请求号（= 槽位）找流的 —— 再派一次就会收掉**新**那条流。
+            self.release_pending[slot] = -1
+            # ⚠️ 代号**不动**：换主人正是靠它自增来标记的（见 `drop`）。
+            try:
+                self.reactor.register(
+                    fd, UInt64(CONN_TOKEN_BASE + slot), INTEREST_READ
+                )
+            except err:
+                # 注册不上（EEXIST = 上一条连接的注册没摘干净，EBADF = fd 已经关了）
+                # 只该带走这一条连接。让它冒出去 = 一次 `epoll_ctl` 失败就让整个服
+                # 务没了 —— 而"一个倒霉的客户端不该带走所有人"正是这条循环的理由。
+                print("  [srv] a connection could not be registered: " + String(err))
+                self.drop(slot)
+                return -1
+            return slot
         if len(self.live) >= MAX_CONNS:
             return -1
         var fresh = Conn()
@@ -695,6 +748,7 @@ struct Loop(Movable):
         self.streaming.append(0)
         self.owner.append(-1)
         self.stall_seen.append(0)
+        self.release_pending.append(-1)
         try:
             self.reactor.register(
                 fd, UInt64(CONN_TOKEN_BASE + len(self.live) - 1), INTEREST_READ
@@ -919,15 +973,15 @@ struct Loop(Movable):
             self.drop(slot)
 
     def drop(mut self, slot: Int):
-        """关掉一条连接、把槽位还回去。中断在途的流没有后遗症（`begin_stream`
-        会把流的相位与计数全部重设）。
+        """关掉一条连接、把槽位还回去。
 
-        ⚠️ **上面这句话的前提是"service 只持一份流式状态"**，而它正在被拆掉：一旦
-        状态按 `request` 索引（`request` = 槽位，见 `Handler` 的文档），"连接被丢"
-        就必须**显式**通知 handler 释放那条 request —— 否则表里的那个位置一直占
-        着，占满的表现是"新请求被拒"，而它离真正的原因（有人断了连接）隔着一层。
-        这里没有 handler 可调用（`drop` 也被 `drop_all` / `reap` 调用），所以那一
-        步要把 handler 带进来 —— 先把这句写在这里，免得它变成"以后再说"。
+        一条**没走完**的流在这里被登记成待收尾（`release_pending`），由 `dispatch`
+        派一件 `JOB_STREAM_END` 给 engine：状态是按 `request`（= 槽位）索引的，不显式
+        交还，那个位置就一直占着 —— 占满的表现是"新请求被拒"，而它离真正的原因
+        （有人断了连接）隔着一层。
+
+        ⚠️ 这里**不能**直接调 handler：handler 归 engine 线程独占（`EngineBox` 的注
+        释），从循环这一侧调一次，等于给"每条线程一份相位"撕开一个口子。
         """
         if self.live[slot] == 0:
             return
@@ -945,6 +999,11 @@ struct Loop(Movable):
         self.gen[slot] += 1
         self.inflight[slot] = 0
         # 流跟着连接一起没了（在途的那一帧回来时对不上代号，会被 `collect` 丢掉）。
+        # ⚠️ 但**engine 那一份还在**：登记待收尾，交给 `dispatch` 派 `JOB_STREAM_END`。
+        # 只有"确实有一条流、且它已经有归属"才登记 —— 没有归属说明它还没派出去过，
+        # engine 那边本来就没有东西要收。
+        if self.streaming[slot] == 1 and self.owner[slot] >= 0:
+            self.release_pending[slot] = self.owner[slot]
         self.streaming[slot] = 0
         # 归属也作废：下一个主人重新轮转（留着旧的会让"每条线程各几条"慢慢失衡）。
         self.owner[slot] = -1
