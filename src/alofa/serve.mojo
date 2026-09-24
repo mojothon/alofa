@@ -59,6 +59,7 @@ from flare.net import IpAddr, SocketAddr
 from alofa.core.error import (
     ERR_CAPACITY,
     ERR_INVALID_ARGUMENT,
+    ERR_STALLED,
     AlofaError,
 )
 from alofa.core.rng import Rng
@@ -89,6 +90,16 @@ comptime BATCH_BLOCK = 16
 comptime BATCH_CAP_BLOCKS = 256
 comptime BATCH_WATERMARK = 900
 comptime BATCH_MAX_WAIT = 8
+# 一条流最多推引擎多少拍还没等到下一个 token，就算**卡住**（`ERR_STALLED`）。
+#
+# 为什么必须有上界：那个循环原来只有两个出口 —— 引擎交出 token，或 `has_work()`
+# 变假。两条都不成立时（无调试信息的 -O2 下实测就会），客户端一个字节都收不到，
+# 而服务端还在算：从外面看是"服务活着、请求卡死"，分不清是死循环还是还在排队。
+# 有了上界，"等不到"变成一帧**指名错误**，卡在哪条请求上一眼看得见。
+#
+# 为什么是 256：正常每 token 一拍（批满时加上 prefill 分块也不过十几拍），256 是
+# 一个数量级的余量 —— 上界只用来兜住"永远不前进"，不该在正常的排队等待时先跳出来。
+comptime MAX_PROGRESS_TICKS = 256
 
 
 def batch_default() -> Bool:
@@ -732,10 +743,26 @@ struct ModelService(Service, Twinable):
         第 k 个 token 是同一次前向算出来的。
         """
         var want = self.b_n[slot]
+        var spins = 0
         while self.engine.n_output(request) <= want:
             if not self.engine.has_work():
                 break
             self._batch_tick()
+            spins += 1
+            if spins >= MAX_PROGRESS_TICKS:
+                # 指名拒绝而不是继续等：等到天荒地老在客户端就是"永远没有
+                # `[DONE]`"，而那是最难归因的一种失败。报出来至少知道卡在哪条
+                # 请求、要的是第几个 token。
+                raise AlofaError(
+                    ERR_STALLED,
+                    "the engine stopped making progress on this request",
+                    "req="
+                    + String(request)
+                    + " want="
+                    + String(want)
+                    + " ticks="
+                    + String(spins),
+                )
         if self.engine.n_output(request) <= want:
             # 引擎交不出更多了：这条流到终点了（也可能被抢占后没再排上 —— 无论哪
             # 一种，"给一个终点"都比"一直等"好：后者在客户端是永远等不到 `[DONE]`）。

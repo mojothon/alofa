@@ -35,8 +35,12 @@ comptime ERR_SHAPE_MISMATCH = 9
 comptime ERR_NOT_INITIALIZED = 10
 comptime ERR_DOUBLE_FREE = 11
 comptime ERR_PARSE = 12
+# 引擎**还在干活，但这条请求不再前进**：循环推它 N 拍，`n_output` 一个数都没多。
+# 它与 `ERR_CAPACITY` 是两件事：后者是"装不下"（池/批次的空间不够），这里是"装得
+# 下却在原地转"。分开之后，"等不到 token"不再只能表现为客户端永远收不到字节。
+comptime ERR_STALLED = 13
 
-comptime ERR_LAST = 12
+comptime ERR_LAST = 13
 
 
 def error_name(code: Int) -> String:
@@ -73,6 +77,8 @@ def error_name(code: Int) -> String:
         return "double_free"
     elif code == ERR_PARSE:
         return "parse"
+    elif code == ERR_STALLED:
+        return "stalled"
     return "unknown"
 
 
