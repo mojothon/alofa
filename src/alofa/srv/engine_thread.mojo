@@ -265,6 +265,15 @@ struct Mailbox(Movable):
     # 你不知道哪条线程先跑起来）。它借邮箱这把锁 —— 认领只发生一次，不值得再开
     # 一把。
     var threads: Int
+    # 诊断计数：四个数一起看，才能分开"活没被 engine 取走"（pushed > taken）与
+    # "取走之后结果丢了"（pushed == taken）。只在卡住时读，不进热路径的判定。
+    var jobs_pushed: Int
+    var jobs_taken: Int
+    var results_pushed: Int
+    var results_taken: Int
+    var engine_busy: Int
+    var engine_polls: Int
+    var engine_runs: Int
 
     def __init__(out self) raises:
         self.mutex = Mutex()
@@ -272,6 +281,16 @@ struct Mailbox(Movable):
         self.results = List[Result]()
         self.stop = False
         self.threads = 0
+        self.jobs_pushed = 0
+        self.jobs_taken = 0
+        self.results_pushed = 0
+        self.results_taken = 0
+        # engine 自己在干什么：`busy=1` = 正在 `_run_job` 里（卡在这里 = 引擎不动了）；
+        # `polls` = 空转问活的次数（在涨 = 线程活着且闲着）；`runs` = 干完的件数。
+        # 这三个数放在这里，是因为只有它们能把"`take` 走了却没结果"分成两半。
+        self.engine_busy = 0
+        self.engine_polls = 0
+        self.engine_runs = 0
 
     def claim_thread(mut self) raises -> Int:
         """领一个 engine 编号（0, 1, 2 …）。第一条起来的线程不一定是第一条 spawn
@@ -298,6 +317,7 @@ struct Mailbox(Movable):
             self.mutex.unlock()
             return False
         self.jobs.append(job^)
+        self.jobs_pushed += 1
         self.mutex.unlock()
         return True
 
@@ -318,6 +338,7 @@ struct Mailbox(Movable):
         while i < len(self.jobs):
             if self.jobs[i].thread == thread:
                 job = self.jobs.pop(i)
+                self.jobs_taken += 1
                 self.mutex.unlock()
                 return True
             i += 1
@@ -329,6 +350,7 @@ struct Mailbox(Movable):
     def push_result(mut self, var res: Result) raises:
         self.mutex.lock()
         self.results.append(res^)
+        self.results_pushed += 1
         self.mutex.unlock()
 
     def first_result(mut self, mut slot: Int, mut gen: Int) raises -> Bool:
@@ -354,6 +376,7 @@ struct Mailbox(Movable):
             self.mutex.unlock()
             return False
         res = self.results.pop(0)
+        self.results_taken += 1
         self.mutex.unlock()
         return True
 
@@ -369,6 +392,36 @@ struct Mailbox(Movable):
         var n = len(self.jobs) + len(self.results)
         self.mutex.unlock()
         return n
+
+    def read_counters(
+        mut self,
+        mut jpush: Int,
+        mut jtake: Int,
+        mut rpush: Int,
+        mut rtake: Int,
+        mut busy: Int,
+        mut polls: Int,
+        mut runs: Int,
+    ) raises:
+        """七个诊断数**在锁内**一次读完。
+
+        为什么非要这一层：这七个字段都是**跨线程**的（engine 线程写、循环读），直接
+        读字段不只是"数可能不对"—— `-O2` 在这一侧看不到任何写，于是它把那次读提到
+        循环外，之后每一轮都拿到同一个陈旧值。实测正是这样把 `busy=1` 钉在打印里，
+        让人误以为 engine 卡在 `_run_job` 里（其实它在空转，`polls` 一直在涨）。
+
+        七个一起读还有一个理由：分开读会拿到**不同时刻**的切片，而这几个数是要互相
+        对账的（`jtake` 比 `rpush` 多出来的那件就是丢的那件）。
+        """
+        self.mutex.lock()
+        jpush = self.jobs_pushed
+        jtake = self.jobs_taken
+        rpush = self.results_pushed
+        rtake = self.results_taken
+        busy = self.engine_busy
+        polls = self.engine_polls
+        runs = self.engine_runs
+        self.mutex.unlock()
 
     def set_stop(mut self) raises:
         self.mutex.lock()
@@ -541,13 +594,27 @@ def _engine_main[H: EngineHandler](
         except err:
             print("  [srv] the mailbox could not be read: " + String(err))
         if got:
-            var res = _run_job[H](handler, job^)
+            box[].mailbox.engine_busy = 1
+            # 默认值就是"失败"那一截（关连接）：上行会覆盖它。先备好再跑，是因为
+            # "可能没初始化"在这条线程上的后果是一次未定义行为，不是一条编译警告。
+            var res = Result(job.slot, job.gen, RES_DONE, True, List[UInt8]())
+            try:
+                res = _run_job[H](handler, job^)
+            except err:
+                # ⚠️ **一件取走的活必须有应答**。少了这一截，循环那边 `inflight` 永远
+                # 是 1，而邮箱里一件都没有 —— 那是一条挂到天亮的请求，且没有任何报错
+                # （实测：16 件活只交回 15 截，多出来的那条就是这么没的；同时 `busy`
+                # 卡在 1、`runs` 冻结）。炸也要给客户端一个终点。
+                print("  [srv] a job could not be run: " + String(err))
             try:
                 box[].mailbox.push_result(res^)
             except err:
                 print("  [srv] a result could not be queued: " + String(err))
+            box[].mailbox.engine_busy = 0
+            box[].mailbox.engine_runs += 1
             _wake[H](box)
             continue
+        box[].mailbox.engine_polls += 1
         # 停不停是**唯一**的退出条件（`while True` 没有别的出口）。连"该退出了吗"都问
         # 不出来的时候，退是唯一不会更坏的选择 —— 继续跑下去只会让 `join` 挂住。
         try:

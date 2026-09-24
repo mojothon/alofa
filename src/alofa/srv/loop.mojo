@@ -163,6 +163,8 @@ struct Loop(Movable):
     # engine 线程数（`run_threaded` 的 `engines`）与"下一个派给谁"的游标。
     var engines: Int
     var next_engine: Int
+    # 诊断用：这个槽位已经报过一次"卡住"了吗（0 = 还没报）。只上诊断，不参与判定。
+    var stall_seen: List[Int]
 
     def __init__(out self, var listener: TcpListener) raises:
         self.listener = listener^
@@ -178,6 +180,7 @@ struct Loop(Movable):
         self.gen = List[Int]()
         self.inflight = List[Int]()
         self.owner = List[Int]()
+        self.stall_seen = List[Int]()
         self.engines = 1
         self.next_engine = 0
 
@@ -300,6 +303,7 @@ struct Loop(Movable):
             if max_requests > 0:
                 budget = max_requests - self.served - box.mailbox.pending()
             self.dispatch[H](box, budget)
+            self.guard_stalls[H](box)
             self.sync_all()
             self.reap()
         box.stop()
@@ -509,6 +513,93 @@ struct Loop(Movable):
             self.inflight[slot] = 1
             budget -= 1
 
+    def guard_stalls[H: EngineHandler](mut self, mut box: EngineBox) raises:
+        """一个槽位"在途"却不再前进：先打几帧状态（隔 1 s，最多 4 帧），然后收掉它。
+
+        只在**已经卡住**时才执行（热路径只多一次扫槽位），所以它不会像"每次派活都打
+        印"那样把时序改掉 —— 那正是这次排查踩过的坑：加两行常规打印，现象就消失了。
+
+        **收掉的三条判据必须同时成立**（少一条就会误杀）：
+        - 这个槽位记着活（`inflight` 或 `streaming`）；
+        - 超过 6 s 没等到结果（4 帧、每帧隔 1 s，最后一帧才动手）；
+        - **邮箱里没有待办的活**（`pending()` 在锁内看）。这一条把"引擎正在算"排除
+          在外 —— 还在算的那条不能收，否则 40× 慢（见记忆）会变成真的失败。
+
+        为什么非收不可：卡住时实测邮箱是空的、engine 在空转，循环却一直以为有一帧在
+        途 ⇒ 不会再派帧；而 `reap` 会跳过 `streaming=1` 的槽位，空闲超时也收不到它。
+        两边都不收，客户端就只能挂到超时 —— SSE 没有 `Content-Length`，只能靠关连接
+        定界，于是"流其实吐完了"也照样挂。
+        """
+        var now = monotonic_ms()
+        for slot in range(len(self.live)):
+            if self.live[slot] == 0 or self.stall_seen[slot] >= 4:
+                continue
+            if self.inflight[slot] != 1 and self.streaming[slot] != 1:
+                continue
+            # 隔 1 s 再打一帧：只看一帧分不清"engine 还活着但在原地转"与"已经死了"。
+            if now - self.last_seen[slot] <= 3000 + 1000 * self.stall_seen[slot]:
+                continue
+            self.stall_seen[slot] += 1
+            # 诊断数必须**在锁内**读（见 `Mailbox.read_counters`）：直接读跨线程字段，
+            # `-O2` 会把那次读提到循环外，于是每一帧都拿到同一个陈旧值 —— 那样打出来的
+            # 数字不是"当时的状态"，只会把排查带偏。
+            var jpush = 0
+            var jtake = 0
+            var rpush = 0
+            var rtake = 0
+            var busy = 0
+            var polls = 0
+            var runs = 0
+            try:
+                box.mailbox.read_counters(
+                    jpush, jtake, rpush, rtake, busy, polls, runs
+                )
+            except err:
+                print("  [srv] the engine counters could not be read: " + String(err))
+            print(
+                "  [dbg] stalled slot="
+                + String(slot)
+                + " gen="
+                + String(self.gen[slot])
+                + " owner="
+                + String(self.owner[slot])
+                + " inflight="
+                + String(self.inflight[slot])
+                + " streaming="
+                + String(self.streaming[slot])
+                + " pending="
+                + String(self.conns[slot].pending_len())
+                + " mailbox="
+                + String(box.mailbox.pending())
+                + " jpush="
+                + String(jpush)
+                + " jtake="
+                + String(jtake)
+                + " rpush="
+                + String(rpush)
+                + " rtake="
+                + String(rtake)
+                + " busy="
+                + String(busy)
+                + " polls="
+                + String(polls)
+                + " runs="
+                + String(runs)
+                + " n="
+                + String(self.stall_seen[slot])
+            )
+            if self.stall_seen[slot] == 4:
+                # 最后一帧之后收掉它：清掉"还在等它"的标记 → 写完就关（`reap` 见到
+                # `closing` 且队列空就丢槽位）。客户端看到的是"流没走到 `[DONE]` 就断
+                # 了" —— 断言该看的是"没有请求能挂死"，不是"每条都必须走完"。
+                #
+                # ⚠️ 差一步：这里**没有**调 handler 的 `stream_end`（`EngineBox` 的约定
+                # 是"循环不碰 handler"），所以引擎那一侧的请求号/槽位还占着。按 `drop`
+                # 那条 TODO，把 handler 带进来才能连这一步一起收干净。
+                self.inflight[slot] = 0
+                self.streaming[slot] = 0
+                self.conns[slot].close_when_drained()
+
     def sync_all(mut self) raises:
         """把所有连接的 interest 改成它现在真的用得上的（背压的落点）。"""
         for slot in range(len(self.live)):
@@ -552,6 +643,8 @@ struct Loop(Movable):
                 conn.close()
                 continue
             var slot = self.adopt(conn^, fd)
+            if slot < 0:
+                continue  # 登记不上（`adopt` 已经把它关掉并打过招呼了）
             self.last_seen[slot] = monotonic_ms()
 
     def has_room(self) -> Bool:
@@ -577,7 +670,17 @@ struct Loop(Movable):
                 self.streaming[slot] = 0
                 self.owner[slot] = -1
                 # ⚠️ 代号**不动**：换主人正是靠它自增来标记的（见 `drop`）。
-                self.reactor.register(fd, UInt64(CONN_TOKEN_BASE + slot), INTEREST_READ)
+                try:
+                    self.reactor.register(
+                        fd, UInt64(CONN_TOKEN_BASE + slot), INTEREST_READ
+                    )
+                except err:
+                    # 注册不上（EEXIST = 上一条连接的注册没摘干净，EBADF = fd 已经关了）
+                    # 只该带走这一条连接。让它冒出去 = 一次 `epoll_ctl` 失败就让整个服
+                    # 务没了 —— 而"一个倒霉的客户端不该带走所有人"正是这条循环的理由。
+                    print("  [srv] a connection could not be registered: " + String(err))
+                    self.drop(slot)
+                    return -1
                 return slot
         if len(self.live) >= MAX_CONNS:
             return -1
@@ -591,9 +694,15 @@ struct Loop(Movable):
         self.inflight.append(0)
         self.streaming.append(0)
         self.owner.append(-1)
-        self.reactor.register(
-            fd, UInt64(CONN_TOKEN_BASE + len(self.live) - 1), INTEREST_READ
-        )
+        self.stall_seen.append(0)
+        try:
+            self.reactor.register(
+                fd, UInt64(CONN_TOKEN_BASE + len(self.live) - 1), INTEREST_READ
+            )
+        except err:
+            print("  [srv] a connection could not be registered: " + String(err))
+            self.drop(len(self.live) - 1)
+            return -1
         return len(self.live) - 1
 
     def read_ready(mut self, slot: Int) raises:
