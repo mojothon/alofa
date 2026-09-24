@@ -393,6 +393,31 @@ struct Mailbox(Movable):
         self.mutex.unlock()
         return n
 
+    def begin_job(mut self) raises:
+        """记"我进 `_run_job` 了"。
+
+        ⚠️ **写也必须在锁内**：只读加锁是不够的 —— 读侧拿到的是"别的线程写的普通字段"，
+        而这类写不保证对读侧可见（`-O2` 还会把读侧的读提到循环外，见 `read_counters`）。
+        `busy` 罩着整段生成，锁不能抱那么久，所以拆成一头一尾两次很短的加锁更新。
+        """
+        self.mutex.lock()
+        self.engine_busy = 1
+        self.mutex.unlock()
+
+    def end_job(mut self) raises:
+        """记"这一件干完了"。`busy` 归零与 `runs` 自增**在同一个临界区**里：分开写会
+        让读侧看见"不忙但没干完"（或反过来）的切片，而这两个数正是要对账的。"""
+        self.mutex.lock()
+        self.engine_busy = 0
+        self.engine_runs += 1
+        self.mutex.unlock()
+
+    def tick_poll(mut self) raises:
+        """记一次空转轮询（同样要加锁，理由见 `begin_job`）。"""
+        self.mutex.lock()
+        self.engine_polls += 1
+        self.mutex.unlock()
+
     def read_counters(
         mut self,
         mut jpush: Int,
@@ -594,27 +619,39 @@ def _engine_main[H: EngineHandler](
         except err:
             print("  [srv] the mailbox could not be read: " + String(err))
         if got:
-            box[].mailbox.engine_busy = 1
+            try:
+                box[].mailbox.begin_job()
+            except err:
+                print("  [srv] the engine counters could not be written: " + String(err))
             # 默认值就是"失败"那一截（关连接）：上行会覆盖它。先备好再跑，是因为
             # "可能没初始化"在这条线程上的后果是一次未定义行为，不是一条编译警告。
             var res = Result(job.slot, job.gen, RES_DONE, True, List[UInt8]())
             try:
                 res = _run_job[H](handler, job^)
             except err:
-                # ⚠️ **一件取走的活必须有应答**。少了这一截，循环那边 `inflight` 永远
-                # 是 1，而邮箱里一件都没有 —— 那是一条挂到天亮的请求，且没有任何报错
-                # （实测：16 件活只交回 15 截，多出来的那条就是这么没的；同时 `busy`
-                # 卡在 1、`runs` 冻结）。炸也要给客户端一个终点。
+                # ⚠️ **一件取走的活必须有应答**。少了这一截，循环那边 `inflight` 永远是
+                # 1，而邮箱里一件都没有 —— 那是一条挂到天亮的请求，且没有任何报错：循环
+                # 不会再派帧，`reap` 又跳过 `streaming=1` 的槽位，空闲超时也收不到它。
+                # 炸也要给客户端一个终点。
+                #
+                # （这句曾经引过一组"实测数字"：16 件活只交回 15 截、`busy` 卡在 1。那组
+                # 数字是**未加锁读**造出来的假象 —— 计数改成锁内读之后四数是对平的。不
+                # 变量本身照样成立，但"它已经被实测证实"这句话不成立。）
                 print("  [srv] a job could not be run: " + String(err))
             try:
                 box[].mailbox.push_result(res^)
             except err:
                 print("  [srv] a result could not be queued: " + String(err))
-            box[].mailbox.engine_busy = 0
-            box[].mailbox.engine_runs += 1
+            try:
+                box[].mailbox.end_job()
+            except err:
+                print("  [srv] the engine counters could not be written: " + String(err))
             _wake[H](box)
             continue
-        box[].mailbox.engine_polls += 1
+        try:
+            box[].mailbox.tick_poll()
+        except err:
+            print("  [srv] the engine counters could not be written: " + String(err))
         # 停不停是**唯一**的退出条件（`while True` 没有别的出口）。连"该退出了吗"都问
         # 不出来的时候，退是唯一不会更坏的选择 —— 继续跑下去只会让 `join` 挂住。
         try:
