@@ -486,7 +486,9 @@ struct Scheduler:
         if max_new <= 0:
             raise AlofaError(ERR_INVALID_ARGUMENT, "max_new must be positive")
         if self.find(req) >= 0:
-            raise AlofaError(ERR_INVALID_ARGUMENT, "duplicate request id")
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "duplicate request id (scheduler)"
+            )
         var need = blocks_for(prompt_len, self.cfg.block_size)
         if need > self.cfg.capacity_blocks:
             raise AlofaError(ERR_CAPACITY, "prompt does not fit in the kv pool")

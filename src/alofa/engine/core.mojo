@@ -278,7 +278,9 @@ struct EngineCore:
                 ERR_CAPACITY, "max_new is more than the engine records", ""
             )
         if self.find(req) >= 0:
-            raise AlofaError(ERR_INVALID_ARGUMENT, "duplicate request id", "")
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "duplicate request id (engine)", ""
+            )
         var slot = -1
         for i in range(MAX_BATCH):
             if self.state[i] == ST_FREE:
@@ -357,6 +359,32 @@ struct EngineCore:
                 "a request that has not finished must be cancelled, not released",
                 "req=" + String(req),
             )
+        # ⚠️ The scheduler's copy does not come back with this call unless it is
+        # asked. A request that completes inside `settle` — rather than by
+        # hitting `max_new` in the decode loop, which releases it there — is only
+        # *reported* to the scheduler on the following tick (`self.report`, handed
+        # over in `prepare`). Until that tick the scheduler still holds the id, so
+        # a caller that releases and then reuses the number is refused with
+        # "duplicate request id (scheduler)". The serial server loop reuses the
+        # same number for every request (`SOLO_REQUEST` = 0), which is why the
+        # second request on a service is the one that fails.
+        #
+        # `to_cache=True` is right for a request that reached `ST_DONE`: its
+        # sequence was published, so the blocks change owner instead of coming
+        # back to the pool.
+        var sslot = self.sched.find(req)
+        if sslot >= 0:
+            self.sched.release(sslot, True)
+        # It is accounted for right now, so take it out of the pending report:
+        # that list is consumed a tick later, by which time the number may belong
+        # to a different request — and releasing *that* one would silently end a
+        # generation nobody asked to end.
+        var kept = 0
+        for i in range(self.n_report):
+            if self.report[i] != req:
+                self.report[kept] = self.report[i]
+                kept += 1
+        self.n_report = kept
         self.ids[slot] = 0
         self.p_len[slot] = 0
         self.p_new[slot] = 0

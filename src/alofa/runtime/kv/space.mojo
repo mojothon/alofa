@@ -176,7 +176,9 @@ struct KvSpace:
         if n <= 0 or n > MAX_SEQ_TOKENS:
             raise AlofaError(ERR_INVALID_ARGUMENT, "bad token count")
         if self.find_request(req) >= 0:
-            raise AlofaError(ERR_INVALID_ARGUMENT, "duplicate request id")
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "duplicate request id (kv room)"
+            )
         var slot = self.free_slot()
         var bs = self.pool.block_size
         var res = OpResult()
