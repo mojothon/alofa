@@ -175,6 +175,13 @@ struct Loop(Movable):
     # 那些地方手上没有邮箱；而真正能派活的是 `dispatch`。分开之后"连接被丢"与"通知
     # engine"各在自己的位置上，`drop` 也不必为了派活把 `Handler` 的类型参数拖进来。
     var release_pending: List[Int]
+    # 那份待办**已经派出去了吗**（`JOB_STREAM_END` 进邮箱 = 1）。
+    #
+    # 为什么要有它：待办必须等**它自己**的回执才清，而 `collect` 收到的一截应答分不
+    # 出是"那件活的"还是"收尾的" —— 于是原来它对**每一截**应答都清一次待办，结果
+    # 是：断开时那件在途的活一回来就把待办抹了，`JOB_STREAM_END` 从此再也没人派，
+    # engine 那边那个号一直占着（占满的表现是"新请求被拒"，而真正的原因在别处）。
+    var release_sent: List[Int]
 
     def __init__(out self, var listener: TcpListener) raises:
         self.listener = listener^
@@ -192,6 +199,7 @@ struct Loop(Movable):
         self.owner = List[Int]()
         self.stall_seen = List[Int]()
         self.release_pending = List[Int]()
+        self.release_sent = List[Int]()
         self.engines = 1
         self.next_engine = 0
 
@@ -393,9 +401,15 @@ struct Loop(Movable):
                 print("  [srv] a result could not be taken: " + String(err))
                 return
             self.inflight[slot] = 0
-            # 这一件回来了 ⇒ 槽位上不再有"在途的收尾"（见 `dispatch` 里派
-            # `JOB_STREAM_END` 那一段：待办要等回执才清）。
-            self.release_pending[slot] = -1
+            # 待办只认**它自己**的回执：这一截是 `JOB_STREAM_END` 的答案才清。
+            #
+            # 对每一截应答都清（原来的写法）等于把待办提前抹掉：断开时那件在途的活
+            # 一回来就把待办清了，于是 `JOB_STREAM_END` 从此没人派 —— engine 那边那个
+            # 请求号一直占着（占满的表现是"新请求被拒"，而原因在别处），而槽位还被
+            # `has_room` 当成空位。
+            if self.release_sent[slot] == 1:
+                self.release_pending[slot] = -1
+                self.release_sent[slot] = 0
             if res.gen != self.gen[slot] or self.live[slot] == 0:
                 # 槽位换过主人：这个结果属于**上一条**连接。发给这一条，就是那种
                 # "偶发的响应内容不对"，而且只在客户端恰好中途断开时出现。
@@ -471,6 +485,9 @@ struct Loop(Movable):
                 # 糟的是重复释放）。待办要等 `collect` 看见回执才清 —— 那时才真的收完。
                 if box.mailbox.push_job(closing^):
                     self.inflight[slot] = 1
+                    # 派出去了：从现在起回来的那一截应答**才是**这份待办的回执
+                    # （`collect` 据此清它，见 `release_sent`）。
+                    self.release_sent[slot] = 1
                 # 邮箱满了就留着下一轮再派：这是一件"迟早要办"的事，不是"现在必须
                 # 办完"的事，而丢掉它就等于把引擎侧那个位置漏掉。
             except err:
@@ -756,6 +773,7 @@ struct Loop(Movable):
             # 上一条连接的收尾**不再等**：这条槽位现在归新连接，而 `stream_end`
             # 是按请求号（= 槽位）找流的 —— 再派一次就会收掉**新**那条流。
             self.release_pending[slot] = -1
+            self.release_sent[slot] = 0
             # ⚠️ 代号**不动**：换主人正是靠它自增来标记的（见 `drop`）。
             try:
                 self.reactor.register(
@@ -783,6 +801,7 @@ struct Loop(Movable):
         self.owner.append(-1)
         self.stall_seen.append(0)
         self.release_pending.append(-1)
+        self.release_sent.append(0)
         try:
             self.reactor.register(
                 fd, UInt64(CONN_TOKEN_BASE + len(self.live) - 1), INTEREST_READ
@@ -1036,8 +1055,22 @@ struct Loop(Movable):
         # ⚠️ 但**engine 那一份还在**：登记待收尾，交给 `dispatch` 派 `JOB_STREAM_END`。
         # 只有"确实有一条流、且它已经有归属"才登记 —— 没有归属说明它还没派出去过，
         # engine 那边本来就没有东西要收。
-        if self.streaming[slot] == 1 and self.owner[slot] >= 0:
+        # ⚠️ 判据是"**engine 那边还占着这个号**"，不是"这条连接上开着一条流"。
+        #
+        # 一件活还在飞（或还排在邮箱里）的时候 `streaming` 可能还是 0 —— 流头都还没
+        # 回来。那种情况下不登记，槽位下一轮就能被新连接拿走（它只避 `release_pending`），
+        # 而新请求用的**是同一个请求号**（`handle(job.slot, …)`，请求号 = 槽位）⇒ 两件
+        # 活共用一个号：engine 那侧的状态被第二个覆盖、被第一个释放。实测那次堆踩穿
+        # （`Job.raw` 的 `magic`/长度全对、头 8 字节变成别人的堆地址，最后 abort 在
+        # `Conn::enqueue` 的 realloc 上）只有客户端中途断开时才出现，形状正对这一条。
+        #
+        # `stream_end` 是幂等的（"号对不上就什么也不做"），所以给一个其实没有流的号
+        # 派这一件是安全的 —— 宁可多派一次，也不能漏。
+        if (
+            self.streaming[slot] == 1 or self.inflight[slot] == 1
+        ) and self.owner[slot] >= 0:
             self.release_pending[slot] = self.owner[slot]
+            self.release_sent[slot] = 0
         self.streaming[slot] = 0
         # 归属也作废：下一个主人重新轮转（留着旧的会让"每条线程各几条"慢慢失衡）。
         self.owner[slot] = -1
