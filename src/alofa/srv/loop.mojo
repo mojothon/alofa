@@ -1050,6 +1050,10 @@ struct Loop(Movable):
         self.last_seen[slot] = monotonic_ms()
         # 换主人：代号自增。在途的结果回来时对不上代号 → 丢掉（它属于上一条连接）。
         self.gen[slot] += 1
+        # ⚠️ 判据必须在 `inflight` 清零**之前**取出来：清零之后再问"它在途吗"，答案永远
+        # 是"不在" —— 那样非流式请求被中途断开时就登记不上待收尾，engine 那一份相位一直
+        # 占着这个号（等到同槽的下一条请求撞上来，两条活的相位叠在一起）。
+        var was_inflight = self.inflight[slot]
         self.inflight[slot] = 0
         # 流跟着连接一起没了（在途的那一帧回来时对不上代号，会被 `collect` 丢掉）。
         # ⚠️ 但**engine 那一份还在**：登记待收尾，交给 `dispatch` 派 `JOB_STREAM_END`。
@@ -1067,7 +1071,7 @@ struct Loop(Movable):
         # `stream_end` 是幂等的（"号对不上就什么也不做"），所以给一个其实没有流的号
         # 派这一件是安全的 —— 宁可多派一次，也不能漏。
         if (
-            self.streaming[slot] == 1 or self.inflight[slot] == 1
+            self.streaming[slot] == 1 or was_inflight == 1
         ) and self.owner[slot] >= 0:
             self.release_pending[slot] = self.owner[slot]
             self.release_sent[slot] = 0
