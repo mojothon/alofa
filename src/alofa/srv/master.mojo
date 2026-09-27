@@ -147,6 +147,9 @@ def worker_main[H: EngineHandler](
     **fork 之后**才起的（`srv/engine_thread.mojo` 的 `spawn_engines`），所以这里
     不存在"fork 带着线程"的问题；而 `engines > 1` 时每条线程各一份权重（见
     `run_workers` 那段警告）。
+
+    ⚠️ **`engines == 0` = 生成就在这条循环上**（`Loop.run`，不过线程）—— 与
+    `serve.mojo` 那条单进程的路同一个开关、同一个语义。默认值见 `ServeConfig`。
     """
     # 父进程（master）死了也别当孤儿：内核会替我们补一发 SIGTERM，走进
     # 下面的优雅路径而不是漂着。
@@ -160,9 +163,13 @@ def worker_main[H: EngineHandler](
     # 一个 worker 现在跑的是一条 reactor 循环（`srv/loop.mojo`）**加 `engines` 条
     # engine 线程**（`srv/engine_thread.mojo`）：它同时挂着多条连接，而且一次前向
     # 不再把别的连接的读写一起按住 —— "一个慢客户端 = 一个 worker 下线"不再成立。
-    # 同时能生成的条数 = `engines`（默认 1）。
+    # 同时能生成的条数 = `engines`（= 0 时生成就在这条循环上，见函数头）。
     var loop = Loop.adopt_listener(listener^)
-    var served = loop.run_threaded(handler, max_requests, STOP_FD, engines)
+    var served = 0
+    if engines == 0:
+        served = loop.run(handler, max_requests, STOP_FD)
+    else:
+        served = loop.run_threaded(handler, max_requests, STOP_FD, engines)
     print(
         "  [worker " + String(external_call["getpid", Int32]()) + "] served "
         + String(served) + " requests"

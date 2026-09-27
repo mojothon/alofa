@@ -888,13 +888,25 @@ def main() raises:
         # 这个限制到此为止 —— 慢客户端、流水线、keep-alive 的空闲连接都不再互相挡
         # 路；生成仍然是一条一条来（见 loop 文件头）。监听只在单进程这条路上开：
         # 多 worker 时 master 不监听，每个 worker fork 之后自己 bind。
-        # 生成在**另一条线程**上（`srv/engine_thread.mojo`）：这条循环上只剩 I/O，
-        # 一次前向不再把别的连接的读写一起按住。`run`（生成就在这条循环上）保留着
-        # —— 它是这条性质唯一的负向对照（`pixi run test-engine` 两种都跑）。
+        # 两条路都在，选哪条看 `cfg.engine_threads`：
+        #
+        # - `0`（**默认**）= `Loop.run`：生成就在这条循环上，不过线程、不碰邮箱。
+        # - `>=1` = `Loop.run_threaded`：生成在 `engines` 条 engine 线程上
+        #   （`srv/engine_thread.mojo`），这条循环上只剩 I/O，一次前向不再把别的连接的
+        #   读写一起按住（roadmap 3.2b/3.2c）。
+        #
+        # ⚠️ **为什么默认不是 1**：实测（2026-09-25）线程那条路会把请求搞坏 —— 同一份
+        # 二进制上 8 条几乎每条挂到超时，而走 `run` 是 8/8 全过、~1 s、零报错。性质还没
+        # 修好，而"能用的服务"与"并发生成"是两件事，不该让前者等后者。`run` 保留着另一
+        # 半用途：它是那条性质唯一的负向对照（`pixi run test-engine` 两种都跑）。
         var loop = Loop.bind_addr(addr)
         print("  listening on " + cfg.host + ":" + String(Int(cfg.port)))
-        var served = loop.run_threaded(
-            handler, cfg.max_requests, Int32(-1), cfg.engine_threads
-        )
+        var served = 0
+        if cfg.engine_threads == 0:
+            served = loop.run(handler, cfg.max_requests, Int32(-1))
+        else:
+            served = loop.run_threaded(
+                handler, cfg.max_requests, Int32(-1), cfg.engine_threads
+            )
         print("  served " + String(served) + " requests")
         loop.close()

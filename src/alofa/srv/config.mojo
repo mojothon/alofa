@@ -71,7 +71,12 @@ struct ServeConfig(Movable):
     # 0 = 无限答；>0 = 每个 worker 答满这个数就退出（门用）。
     var max_requests: Int
     # 每个 worker（单进程时就是那一个进程）里 **engine 线程的条数** = 同时能生成的
-    # 条数（roadmap 3.2c）。默认 1 = 只有一条 engine 线程（3.2b 的行为）。
+    # 条数（roadmap 3.2c）。
+    #
+    # ⚠️ **默认是 0 = 生成就在这条循环上**（`Loop.run`，不过线程、不用邮箱），
+    # **不是** 1 条 engine 线程。为什么：走线程那条路会把请求搞坏 —— 实测（2026-09-25）
+    # 同一份二进制上 8 条几乎每条挂到超时，而 `run` 是 8/8 全过、~1 s、零报错。性质
+    # 还没修好，而"能用的服务"不该等它。要并发生成就把它设成 1（或更多），代价见下。
     #
     # ⚠️ **N 条 = N 份权重**：`handler.spawn_twin` 是重新加载一份（现在还没有"共享
     # 只读权重"那一层），所以把它调大之前先算内存。想并发又想让权重真的共享，加
@@ -103,5 +108,7 @@ struct ServeConfig(Movable):
             run_seconds=env_int("ALOFA_RUN_SECONDS", 0, 0, 86_400),
             grace_ms=env_int("ALOFA_GRACE_MS", 120_000, 1, 3_600_000),
             max_requests=env_int("ALOFA_MAX_REQUESTS", 0, 0, 2_000_000_000),
-            engine_threads=env_int("ALOFA_ENGINE_THREADS", 1, 1, 16),
+            # 0 = 串行（生成在循环上）；>=1 = 那么多条 engine 线程（见字段上的注释：
+            # 那条路现在会把请求搞坏，所以默认取 0）。
+            engine_threads=env_int("ALOFA_ENGINE_THREADS", 0, 0, 16),
         )
