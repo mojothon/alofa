@@ -301,8 +301,11 @@ struct Loop(Movable):
         while max_requests <= 0 or self.served < max_requests:
             if stop_requested(stop_fd):
                 break
+            # ⚠️ 超时归零的判据是"还有字节没发出去"，**不是** `busy()`：后者把"有流在跑"
+            # 也算进去，而线程这条路上帧是 engine 产的、它产完会叫醒我们 —— 为此死转只会
+            # 白烧一个核（实测 utime +68/秒）。见 `has_pending_writes`。
             var timeout = POLL_IDLE_MS
-            if self.busy():
+            if self.has_pending_writes():
                 timeout = 0
             var events = List[Event]()
             var got = self.reactor.poll(timeout, events)
@@ -661,6 +664,20 @@ struct Loop(Movable):
         """这轮 poll 该立刻返回吗（有字节要写、或有流在途）。"""
         if self.streaming_slot() >= 0:
             return True
+        return self.has_pending_writes()
+
+    def has_pending_writes(self) -> Bool:
+        """有还没发出去的字节吗。**只看发送队列，不看有没有流在跑**。
+
+        为什么拆出这一条：线程那条路上"有流在跑"**不能**再让 poll 超时归零 —— 帧是
+        engine 线程产出来的，它产完会 `_wake` 把这条循环叫醒（`_wake` 的注释里那句
+        "叫不醒就每帧晚 50 ms"说的正是这件事）。照旧归零的话，整条流期间这条循环都在
+        死转：实测主线程 `state=R`、utime **+68/秒**（≈ 烧掉 0.7 个核），而 engine 那边
+        在睡 —— 一个核在为一个"没有活要干"的循环转。
+
+        真正需要立刻返回的只有一种情况：手上还有字节没发出去（`flush` 要靠 writable
+        事件，而事件只有 poll 才拿得到）。
+        """
         for slot in range(len(self.live)):
             if self.live[slot] == 1 and self.conns[slot].pending_len() > 0:
                 return True
