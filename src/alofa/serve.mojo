@@ -368,7 +368,11 @@ struct ModelService(Service, Twinable):
             steps = 0
         var out = List[Int]()
         var rng = Rng(UInt64(self.seed))
-        var sampler = Sampler(self.vocab, MAX_SEQ_TOKENS)
+        # ⚠️ 采样器**复用 `self.sampler` 那一份**，不在这里现造一个：`Sampler` 的构造
+        # 会按 `vocab` 建一块 arena（`vocab*16 + vocab*8 + …`，0.5B 上是 **3.65 MB**），
+        # 每请求建毁一次等于每请求一次几 MB 的申请+释放。`build` 每一步都按 logits 全量
+        # 重建分布，不留上一步的东西 —— 批路本来就是这么用 `self.sampler` 的。
+        var n_vocab = self.vocab
         var params = SampleParams()
         params.temperature = temperature
 
@@ -378,10 +382,8 @@ struct ModelService(Service, Twinable):
             if temperature <= 0.0:
                 next_id = self.model.argmax(logits)
             else:
-                sampler.build(
-                    logits, self.vocab, params, List[LogitBias](), out
-                )
-                next_id = sampler.pick(self.vocab, rng.next_uniform())
+                self.sampler.build(logits, n_vocab, params, List[LogitBias](), out)
+                next_id = self.sampler.pick(n_vocab, rng.next_uniform())
             out.append(next_id)
             if t + 1 < steps:
                 logits = self.model.step[BACKEND_AVX2](next_id)
