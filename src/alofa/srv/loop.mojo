@@ -510,6 +510,23 @@ struct Loop(Movable):
             if self.conns[slot].backpressure():
                 self.sync_interest(slot)
                 continue
+            # ⚠️ **先把字节留在连接的缓冲里，等确认邮箱有位置再取**。
+            #
+            # 反过来（先 `take_with_raw` 再 `push_job`）会静默丢请求：那份字节一旦被
+            # 从入站缓冲上切下来，就交给了一个 `Job`；`push_job` 说"满了"的时候，那个
+            # `Job` 连同字节一起被销毁 —— 请求从此消失，客户端挂到超时，而服务端一行
+            # 报错都没有。原来那句"满了就留着下一轮再派"是不成立的：字节已经没了，
+            # 没有下一轮。
+            #
+            # 循环开头那次 `has_room()` 不够：这一轮里排在前面的槽位已经占了位置。
+            var room_now = False
+            try:
+                room_now = box.mailbox.has_room()
+            except err:
+                print("  [srv] the mailbox could not be checked: " + String(err))
+                return
+            if not room_now:
+                return
             # 请求要过线程，过的是**原始字节**而不是 `HttpRequest`：后者带着入站缓冲
             # 的借用关系，挪不进邮箱（见 `srv/conn.mojo` 的 `take_with_raw`）。
             var raw = List[UInt8]()
