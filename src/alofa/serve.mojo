@@ -44,9 +44,11 @@ UTF-8，`decode` 会把它丢掉 —— 那样流式拼出来的文本会**不�
 ------
 `llama.cpp` 的 server。差异：一个 worker 一条 reactor 循环（`srv/loop.mojo`），
 上面同时挂着多条连接（旧形态是「一个 worker 同时只处理一条连接」，多 worker 只修
-进程数、修不了单 worker 的串行）。生成**不在**这条循环上（`srv/engine_thread.mojo`，
-roadmap 3.2b），循环只做 I/O；同时能生成几条 = `ALOFA_ENGINE_THREADS`（默认 1 —— 每
-多一条就多一份权重，那是 3.2c 明文写下的代价）。兼容
+进程数、修不了单 worker 的串行）。生成默认**就在这条循环上**（`ALOFA_ENGINE_THREADS=0`
+= 串行，一次生成占住这条循环直到它结束）。`>=1` 才把生成搬到 `srv/engine_thread.mojo`
+的 engine 线程上（roadmap 3.2b → 3.2c），同时能生成几条 = 那个数（每多一条就多一份权
+重，那是 3.2c 明文写下的代价）—— ⚠️ **那条路是实验的**：真模型 + 客户端中途断开会把
+请求搞坏（堆被踩，见账本 §8），所以它不默认开。兼容
 面是 OpenAI 的 `/v1/chat/completions`：不改代码、只改 `base_url` 就能用官方 SDK
 打到它。
 """
@@ -323,8 +325,8 @@ struct ModelService(Service, Twinable):
 
         ⚠️ **一份 = 一份权重**：这里是**重新加载**（`QwenForward` 从权重文件再来一
         次），不是"共享只读权重 + 各自一份 KV"。所以 `ALOFA_ENGINE_THREADS=N` 的
-        内存是 N 份权重 —— 这个代价写在 `srv/engine_thread.mojo` 的文件头与
-        `config.mojo` 的启动打印里，不是疏漏。共享那一层要动到 model（把"只读的
+        内存是 N 份权重 —— 这个代价写在 `srv/engine_thread.mojo` 的文件头，启动时
+        也会跟着实验警示一起打出来，不是疏漏。共享那一层要动到 model（把"只读的
         权重"和"每条流的状态"分开），那是下一件事。
 
         分片数跟着原型走（多 worker 下它是 1，见 `main` 里那段 fork 的说明）。
@@ -849,15 +851,26 @@ def main() raises:
         # 单进程不受影响（没有 fork）。
         service.model.shards = 1
     print("  model loaded: " + cfg.model_name + " (vocab " + String(service.vocab) + ")")
-    if cfg.engine_threads > 1:
-        # 这条打印不是装饰：`engines` 条的代价是 **N 份权重**（`spawn_twin` 是重新
-        # 加载一份），而"为什么内存翻了几倍"在 ps 里看不出来 —— 它只显示一个进程。
+    if cfg.engine_threads >= 1:
+        # ⚠️ 这是**警示**不是装饰：engine 线程路已知会在"真模型 + 客户端中途断开"
+        # 时把请求搞坏（`Job` 的缓冲被别人 free —— 那次排查的硬事实在账本 §8），所以
+        # 默认不开（`ALOFA_ENGINE_THREADS=0` = 生成就在循环上）。把它打开的人必须
+        # **当场**看见，而不是等它把请求搞坏之后才知道。
+        var extra = ""
+        if cfg.engine_threads > 1:
+            # 多一条就多**一份权重**（`spawn_twin` 是重新加载一份），而"为什么内存翻
+            # 了几倍"在 ps 里看不出来 —— 它只显示一个进程。
+            extra = (
+                "; each one reloads the weights: "
+                + String(cfg.engine_threads)
+                + " copies of them"
+            )
         print(
-            "  engine threads: "
+            "  [warn] engine threads: "
             + String(cfg.engine_threads)
-            + " per worker (each one reloads the weights: "
-            + String(cfg.engine_threads)
-            + " copies of them)"
+            + " (EXPERIMENTAL — a client leaving mid-generation is known to"
+            + " corrupt the heap; the supported path is ALOFA_ENGINE_THREADS=0)"
+            + extra
         )
 
     var addr = SocketAddr(IpAddr.parse(cfg.host), cfg.port)
