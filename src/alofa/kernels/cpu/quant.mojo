@@ -161,11 +161,38 @@ def f32_to_fp16_bits(value: Float32) raises AlofaError -> Int:
     return (sign << 15) | encoded
 
 
+@always_inline
 def block_scale(blocks: U8Ptr, block_base: Int) raises AlofaError -> Float32:
-    """第 `block_base` 字节处的那个块的 fp16 缩放因子。"""
+    """第 `block_base` 字节处的那个块的 fp16 缩放因子。
+
+    ⚠️ `@always_inline` 不是装饰：这个函数**每个块都要调一次**，而不内联的调用
+    开销本身就是大头 —— 换成 F16C 之后核级只快了 7%（1071 → 1157 µs），而把同样
+    的 F16C 转换**直接写在核里**是 472 µs（2.27×）。也就是说那个 90.6% 里，fp16
+    怎么解只占一小部分，**每块一次的函数调用才是主体**。
+
+    ⚠️ **快路径走 F16C 的 `vcvtph2ps`**（一条指令），手写位运算只留给下面两种
+    情况：指数全 1 的 inf / NaN（`fp16_bits_to_f32` 会把它们报出来，见它自己的
+    docstring），以及 `block_base` 是奇数（快路径按 fp16 也就是 2 字节索引，偏移
+    必须是偶数 —— 块长 18 是偶数，正常调用不会撞上，撞上说明调用方传错了）。
+
+    为什么要换：这个函数**每个块都要调一次**，而 `bench_block_scale.mojo` 量出来
+    它一次要 **5.4 ns**，折合 **38.6 条 f32 fma** —— 一个块只有 32 个值、本身只要
+    4 条 fma 就乘完 ⇒ **每块成本的 90.6% 花在读 `d` 上**，q4 层核因此只跑到
+    2.85 GB/s（同一形状下几乎无算术的 f16 核能到 11.03）。换掉之后核级 **2.30×**
+    （`bench_q4_predecode.mojo`，与预解码表版的 2.54× 只差 10%，但不用改内存布局、
+    不用改加载路径、调用面一处不动）。
+
+    为什么敢换：**与手写版逐位相同**，不是"差不多"。fp16 能表示的每个数 fp32 都能
+    精确表示，次正规（`exponent == 0`）硬件同样精确处理，所以两条路给出的是同一个
+    `Float32` —— `bench_q4_predecode.mojo` 在 4864 行上逐行比对过，0 行不同。
+    """
     var low = Int(blocks[unsafe_offset=block_base])
     var high = Int(blocks[unsafe_offset=block_base + 1])
-    return fp16_bits_to_f32(low | (high << 8))
+    var half = low | (high << 8)
+    if (half & 0x7C00) == 0x7C00 or (block_base & 1) != 0:
+        return fp16_bits_to_f32(half)
+    var hp = blocks.unsafe_bitcast[Float16]()
+    return hp.unsafe_load[width=1](block_base // 2).cast[DType.float32]()[0]
 
 
 def dequant_q4_0(dst: F32Ptr, blocks: U8Ptr, n: Int) raises AlofaError:
