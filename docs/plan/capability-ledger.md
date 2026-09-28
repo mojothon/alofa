@@ -1204,3 +1204,29 @@
   - ⚠️ 边界：`bench_head_split` 那次的绝对值（88.18 ms）比 `bench_vs` 同档（49.4 ms）慢
     **1.6×**（本机当时更忙）⇒ 上面只用它的**占比**；拿 `bench_vs` 的绝对值配上这个占比，
     层那半约 39.7 ms 读 201 MB ⇒ **5.1 GB/s**，对照输出投影 17 GB/s、fp32 层 14 GB/s。
+- **2026-09-28（同日·整数点积那条路：探通了，但只值 1.07× ⇒ 收手，不接线）**
+  - **通路发现（可复用）**：Mojo 1.0 里 `llvm_intrinsic` **不在 `sys`**，在 **`std.sys`**
+    （`from std.sys import llvm_intrinsic`）；写 `from sys import ...` 报"unable to locate
+    module 'sys'"，写 `std.intrinsics` 也找不到。另一条 `__mlir_op.\`llvm.intr...\`` 走不
+    通（报 `unrealized_conversion_cast` —— Mojo 的 `SIMD` 不是 LLVM vector，要转换）。
+  - **能叫到的**：`llvm.x86.avx2.pmadd.wd`（`vpmaddwd`：16 个 int16 乘加 → 8 个 int32），
+    数值已验（(3,4) → 24）。⚠️ **`vpmaddubsw` 拿不到**：`avx2.pmaddubsw` /
+    `avx2.pmaddubs.w` / `avx2.pmaddub.sw` / `avx2.pmadd.ubsw` / `avx2.pmaddubsw.256` /
+    `ssse3.pmaddubsw` 六种拼法本机全都"could not find LLVM intrinsic"。而 llama.cpp 的
+    q4_0 **正是靠它**（无 VNNI 时用符号技巧 `ax=|x|`、`sy=sign(x)·y` 再走 `maddubs`）
+    ⇒ 拿不到它，是本方案与 llama.cpp 之间**最实在的一处差距**。
+  - **实测**（新脚本 `scripts/bench_q4_int8.mojo`，真形状 `down_proj` 4864×896，avx2，
+    参照物是未量化 fp32 权重 × fp32 激活、fp64 累加，**独立另写**）：
+    - 现在的 f32 解量化核：**2.28 GB/s**，相对 L2 **6.39%**
+    - 整数点积（`pmadd.wd`）：**2.44 GB/s（1.07×）**，相对 L2 **6.40%**
+    - 同上 + 激活预 widen 成 int16：**2.09 GB/s（0.96×，更慢）**
+  - **精度站得住**：整数点积 6.40% 与 f32 核 6.39% 几乎相同 ⇒ 整数路径数学正确，误差
+    只来自 q4 量化本身（合成权重取均匀分布，q4 误差本就是最大的一档；真实权重近正态）。
+    参照 `test-q8-head` 那条门的 0.77% —— 那是词表输出投影，量级不同，不直接比。
+  - **为什么只有 7%**：`pmadd.wd` 要 int16 输入 ⇒ 每块多付 4 条 `vpmovsxbw` 的 widen，
+    把"一条指令 16 个乘加"的收益吃掉了。llama.cpp 直接吃 int8，没有这 4 条。试过把激活
+    **预先** widen（省 2 条）⇒ 反而 0.96×：省下的指令抵不过激活体积翻倍带来的 L1 压力。
+  - ⇒ **收手**：7% 配不上"改 q4 主通路"的风险（168 次投影的调用面 + 新精度门）。
+    ⚠️ **记一个坑**：**`SIMD.cast` 是数值转换，不是位重解释** —— 补码字节（200 = −56）
+    被 `cast[DType.int8]()` **饱和成 +127**，激活的负值全废，第一版就是这个 bug
+    （相对 L2 **240%**）。修法是按 `Int8` 取指针，`unsafe_load` 即得符号扩展。
