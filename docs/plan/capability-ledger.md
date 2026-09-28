@@ -256,7 +256,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 可在本机跑通的端到端服务 | `missing` | P1–P3 的目标 |
-| 与 llama.cpp 的同机同 prompt 对比 | `verified` | **唯一被接受的性能参考基准** —— **2026-09-28 首次做成口径对齐**（上次 2026-09-18 那次三条边界没对齐，故一直没接受）<br>`evidence:scripts/bench_vs_llamacpp.mojo`（alofa 侧，`mojo build -O2 -I src`；**prefill 与 decode 分开报**、打印 token id 供对账）<br>**对齐项**：同机（i7-9700K 8C AVX2，非共享机）· 同模型（Qwen2.5-0.5B-Instruct）· **同 prompt（两边 tokenizer 逐 id 相同：`[785,6722,315,9625,374]`，5 token）** · 同生成 32 token · greedy · 权重同源（HF → f32 GGUF → `llama-quantize` 出 q4_0）<br>**decode tok/s —— fp32 档**：alofa `5.83…7.92`（shards=8）/ `3.95…5.22`（shards=1） vs llama.cpp `5.51…5.52`（`-t 1`）⇒ **alofa 是 llama.cpp 的 1.06…1.43×**<br>**decode tok/s —— q4_0 档**：alofa `13.83…15.37`（shards=8）/ `6.65…6.80`（shards=1） vs llama.cpp `25.60 ± 1.18`（`-t 1`）⇒ **alofa 是 llama.cpp 的 0.54…0.60×**<br>⚠️ **边界（不可省略）**：① **本机长期过载**（本轮 runq 2–17）⇒ 绝对值只作**同机同轮**相对比较，不可跨机；② llama.cpp 在本机 **`-t 8` 反而慢于 `-t 1`**（fp32 `1.54…3.34` vs `5.52`；q4_0 `14.71 ± 6.88` vs `25.60`，且 `-t 8` 抖动大）⇒ **主口径取 `-t 1`**，这是本机环境的观测，不是 llama.cpp 的普遍结论；③ alofa 的 q4 是**加载期量化**（缩放按 MSE 选），llama.cpp 的 q4_0 由 `llama-quantize` 从**同一个** f32 GGUF 转出 —— 块布局相同、**缩放选法不同** ⇒ **速度可比、质量不可比**（alofa 整网 q4 一致率仍 `missing`，实测 0.8691）；④ prefill 只有 5 token，粒度太粗（alofa fp32 `195…457 ms`，同档抖动 2.3×）⇒ **只报不判**；⑤ llama.cpp 侧用 `llama-bench -p 5 -n 32 -r 5`，它的 prompt 是**随机 5 token**而非这段文本（已用 `llama-tokenize` 证两边 id 一致，prefill 时间只与长度/形状有关，故可比） |
+| 与 llama.cpp 的同机同 prompt 对比 | `verified` | **唯一被接受的性能参考基准** —— **2026-09-28 首次做成口径对齐**（上次 2026-09-18 那次三条边界没对齐，故一直没接受）<br>`evidence:scripts/bench_vs_llamacpp.mojo`（alofa 侧，`mojo build -O2 -I src`；**prefill 与 decode 分开报**、打印 token id 供对账）<br>**对齐项**：同机（i7-9700K 8C AVX2，非共享机）· 同模型（Qwen2.5-0.5B-Instruct）· **同 prompt（两边 tokenizer 逐 id 相同：`[785,6722,315,9625,374]`，5 token）** · 同生成 32 token · greedy · 权重同源（HF → f32 GGUF → `llama-quantize` 出 q4_0）<br>**decode tok/s —— fp32 档**：alofa `5.83…7.92`（shards=8）/ `3.95…5.22`（shards=1） vs llama.cpp `5.51…5.52`（`-t 1`）⇒ **alofa 是 llama.cpp 的 1.06…1.43×**<br>**decode tok/s —— q4_0 档**：alofa `13.83…15.37`（shards=8）/ `6.65…6.80`（shards=1） vs llama.cpp `25.60 ± 1.18`（`-t 1`）⇒ **alofa 是 llama.cpp 的 0.54…0.60×**<br>⚠️ **这个 0.54…0.60× 不可读成"q4 内核差"** —— **同流量对照**（当日变更日志）：把 llama.cpp 的**输出/嵌入张量也拖回 F32**（层仍 q4_0），它从 `25.60` 掉到 **`13.44 ± 0.82`**，与 alofa 的 `13.83…15.37` **几乎重合** ⇒ **相同流量下 alofa 反而 `1.03…1.14×` 快**；差距 100% 来自**输出投影的存储精度**（alofa `lm_head` 是独立 fp32 副本 = 544 MB；llama.cpp 因 tied embedding 只存一份且压成 **Q8_0** ≈165 MB ⇒ 每 token 流量 655 MB vs 276 MB）<br>⚠️ **边界（不可省略）**：① **本机长期过载**（本轮 runq 2–17）⇒ 绝对值只作**同机同轮**相对比较，不可跨机；② llama.cpp 在本机 **`-t 8` 反而慢于 `-t 1`**（fp32 `1.54…3.34` vs `5.52`；q4_0 `14.71 ± 6.88` vs `25.60`，且 `-t 8` 抖动大）⇒ **主口径取 `-t 1`**，这是本机环境的观测，不是 llama.cpp 的普遍结论；③ alofa 的 q4 是**加载期量化**（缩放按 MSE 选），llama.cpp 的 q4_0 由 `llama-quantize` 从**同一个** f32 GGUF 转出 —— 块布局相同、**缩放选法不同** ⇒ **速度可比、质量不可比**（alofa 整网 q4 一致率仍 `missing`，实测 0.8691）；④ prefill 只有 5 token，粒度太粗（alofa fp32 `195…457 ms`，同档抖动 2.3×）⇒ **只报不判**；⑤ llama.cpp 侧用 `llama-bench -p 5 -n 32 -r 5`，它的 prompt 是**随机 5 token**而非这段文本（已用 `llama-tokenize` 证两边 id 一致，prefill 时间只与长度/形状有关，故可比） |
 | "比 vLLM / MAX 更快" | ❌ **不做此声明** | 缺少公平比较条件（vLLM/MAX 在 A100 上的数字来自不同栈与环境） |
 | GPU **正确性**结论 | ✅ **可做** | A100 验证机已打通（§1.2），CUDA kernel 可与标量后端做逐值差分 |
 | GPU **性能**数字 | ⚠️ **有条件可做** | 必须：① 在 A100 机测得 ② **报 roofline 利用率而非裸 tok/s** ③ 标注"共享环境"与其他卡占用 ④ 记录驱动/CUDA 版本 |
@@ -1104,3 +1104,31 @@
     - q4 一致性旁证：alofa q4 档生成的文本与 fp32 档**不同**（"…largest city in Europe. It is also…" vs "…largest city in Europe and the second largest…"）—— 与账本里"整网 q4 一致率实测 0.8691、未达 0.90 门"是同一件事的两个观测面。
   - **结论（决定下一个杠杆）**：**fp32 档已打平甚至略超**（llama.cpp 的 f32 权重在本机还吃不到 `CPU_REPACK`，它的优化重心不在这一档）；**差距集中在 q4_0 档** —— llama.cpp 的 q4_0 相对它自己的 fp32 提速 **4.64×**（5.52 → 25.60 tok/s），alofa 只做到 **1.94×**（7.92 → 15.37）。⇒ 下一个性能杠杆是 **q4 内核**（repack / gemv），**不是** fp32 gemm（后者已到天花板，见「性能」一节）。
   - **未做**：批（batch > 1）档、更长 prompt 档、`-t 8` 异常的机理（怀疑 ggml 线程 barrier 在过载下被放大，**未证**）、A100 机同口径复现。
+- **2026-09-28（同日·对照实验：q4 档差距的归因）** —— **差距不在 q4 内核，在输出投影的存储精度**
+  - **做法**：**不碰 alofa 一行代码**，只在 llama.cpp 侧做**单变量对照** —— 层恒为 q4_0，只改
+    `--token-embedding-type`。⚠️ 两个前提：① Qwen2.5-0.5B 是 **tied embedding**，GGUF 里
+    **没有** `output.weight`（输出投影用的就是 `token_embd.weight`）；② `llama-quantize` 的
+    选项必须放在**位置参数之前**（放后面会被当成 `nthread`，报 `invalid nthread … (stoi)`）。
+  - **实测**（`llama-bench -t 1 -p 5 -n 32 -r 5`，tg32，层恒 q4_0）：
+    - 嵌入/输出 **Q8_0**（默认，336 MB）：**25.60 ± 1.18**
+    - 嵌入/输出 **F16**（452 MB）：**17.77 ± 1.32**
+    - 嵌入/输出 **F32**（712 MB）：**13.44 ± 0.82**
+    - 全 F32 参考（1.84 GB）：5.52
+  - **结论**：alofa 的 q4 档 `13.83…15.37` 与 llama.cpp「输出投影也拖回 F32」的 `13.44`
+    **几乎重合** ⇒ **同流量下 alofa 反而 `1.03…1.14×` 快**。所以 §11 那个 `0.54…0.60×`
+    **不是** q4 内核的水平，而是**输出投影字节数**的差：alofa 的 `lm_head` 是独立的 fp32
+    副本（544 MB），llama.cpp 因 tied 只存一份且压成 Q8_0（≈165 MB）⇒ 每 token 流量
+    **655 MB vs 276 MB**。
+  - **为什么 alofa 的 lm_head 没量化**（`qwen.mojo` 的 `enable_q4` 注释，本轮之前量过）：
+    连同它压成 **q4_0**，教师强制贪心一致率从 0.8691 掉到 **0.77** —— 词表那 151936 个
+    logits 谁最大全看这一步，4 bit 在这儿省 76 MB 不值。**但 8 bit 是另一回事**：q8_0 的
+    相对 L2 约 **0.4%**（q4_0 是 10.3%），精度损失比"掉到 0.77"小一个量级。
+  - **下一个杠杆（已量化，未实现）**：把 `lm_head` 存成 **q8_0**（≈145 MB）而非 fp32
+    （544 MB）⇒ 流量 655 → 256 MB。按 llama.cpp 同一对照的经验（流量降 2.1× 实拿 **1.90×**，
+    效率约 90%），alofa q4 档预期 `15.37 → 约 29 tok/s`，**越过** llama.cpp 当前的 25.60；
+    fp32 档同样受益（1432 → 1033 MB）。
+  - **实现成本（未做）**：仓库**还没有 q8_0 通路**（`core/dtype.mojo` 只有枚举，无 kernel）
+    ⇒ 要新写量化步 + dequant 融合 matmul（标量 / avx2）+ 接进 `lm_head` + 零容差门与常驻
+    负向对照。q8_0 的 dequant 与 q4_0 同性质（8 bit 值 × fp16 scale，两者都精确）⇒ **可零容差**。
+  - **未做 / 已否**：f16 方案（llama.cpp 实测只 **+32%**，不如 q8_0 的 **+90%**）；q8_0 用在
+    embed 上（decode 只读一行，无收益；prefill 才有）。
