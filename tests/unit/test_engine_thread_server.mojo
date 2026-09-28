@@ -50,7 +50,7 @@ socket 的缓冲实测能吃下 **1.2–2.5 MB**（自动调优，随发送速�
 `engines`）：`engines=1` 那一次必须串行（≈ 10 秒）。没有它，"两条 5 秒的生成 5 秒
 答完"可能只是"第二条根本没生成"。
 
-另外两条（都是这一版才有可能会错的）
+另外三条（都是这一版才有可能会错的）
 ------------------------------------
 - **逐字节一致**：三种模式下同一个请求的响应必须**逐字节相等**。生成搬到别的线程
   上，最容易漂的是流的分帧与收尾（一段一段交回来，和一次交回来，形状必须一样）。
@@ -60,6 +60,10 @@ socket 的缓冲实测能吃下 **1.2–2.5 MB**（自动调优，随发送速�
 - **槽位不串味**：一条连接在生成期间断开，它的应答**不许**发给接下来复用这个槽位的
   连接。这个错只在"客户端恰好中途断开"时出现，所以必须专门造一次 —— 而且要让新连接
   **确实复用那个槽位**（所以这一小段之前先把别的连接全关掉，只剩那一条空位）。
+- **客户端反复中途断开之后，服务还得能答**：`drop` 那条路径上出过的毛病（服务整个
+  崩掉，或者还活着但已经哑了）**只在客户端恰好中途离开时才现形**，平时怎么跑都看不
+  出来 ⇒ 必须专门造几次（`run_scenario` 第 9 步，三种模式各跑一遍）。判据是"断开之后
+  那条探活**有应答、而且答的是它自己的**"，不是"进程还在" —— 哑掉的时候进程照样在。
 
 为什么不在 `pixi run test` 里
 ------------------------------
@@ -67,7 +71,7 @@ socket 的缓冲实测能吃下 **1.2–2.5 MB**（自动调优，随发送速�
 `pixi run test-engine`。
 
 替身 `SlowStub` 不带权重：这一层与模型无关。它唯一的额外能力是"prompt 里有 `slow`
-就睡 1.5 秒" —— 那是一个不需要权重就能造出来的"生成"。
+就睡 `SLOW_MS`" —— 那是一个不需要权重就能造出来的"生成"。
 """
 
 from std.collections import List
@@ -97,8 +101,13 @@ comptime READ_CHUNK = 4096
 # `run_threaded` 下它的结果因为"槽位换过主人"被丢掉（`served` 不增），`run` 下它照答
 # （`served` 增）。数得刚刚好的话，其中一种模式会在最后一条请求之前就退出并把连接全
 # 关掉 —— 症状是"最后一条请求连接被重置"。收尾靠 `kill_child`，不靠这个数。
-# slowA(1) + plain(1) + stream(1) + slowmark(可能 1) + second(1) ≤ 5。
-comptime WANT_REQUESTS = 8
+# slowA(1) + plain(1) + stream(1) + slowmark(可能 1) + second(1) + 收尾那段"中途
+# 断开" `ROBUST_DISCONNECTS` 条（断开的那条在 `run_threaded` 下不一定计入 `served`，
+# 所以这里只能给宽，不能算准）+ 断开后的探活(1) ≤ 9。
+comptime WANT_REQUESTS = 16
+# 收尾那一段要断几次。`3` 是"能看出不是偶发"的最小那个数；再往上加，这个门会慢到
+# 没人愿意跑（每条都要占满一次 `SLOW_MS` 的生成）。
+comptime ROBUST_DISCONNECTS = 3
 # 替身"生成"一次的时长。它要**明显长于**一次往返，也要**明显长于**本机过载带来的
 # 抖动 —— 5 秒是这两个下界之间离两边都远的那个数（两个判据分别在它的两侧，间隔以
 # 秒计，本机 ±10% 的噪声吞不掉）。
@@ -547,6 +556,51 @@ def run_scenario(mode: Int, port: UInt16) raises -> List[String]:
     )
     next.close()
 
+    # 9) 客户端**反复中途断开**之后，服务必须还能正常应答。
+    #
+    # 为什么必须有这一段（它盯的是"连接被丢时会发生什么"）：`drop` 那条路径上出过的
+    # 毛病是服务**整个崩掉**或**哑掉** —— 而它只在"客户端恰好中途离开"时才现形，
+    # 平时怎么跑都看不出来。断开**必须发生在生成进行中**：派出去就断，测的是"还没开
+    # 始生成"，那是另一条性质（替身睡 `SLOW_MS`，这里等 `DISPATCH_WAIT_MS` 再断 ⇒
+    # 一定断在生成中间）。
+    #
+    # ⚠️ 判据是"探活这条**有应答且是它自己的**"，不是"进程还活着"：服务哑掉的时候
+    # 进程照样在（实测踩过：只看进程活着，以为修好了，一量字节数才发现全是 0）。
+    for i in range(ROBUST_DISCONNECTS):
+        var leaving = connect(port)
+        send_text(
+            leaving, post_request(chat_body("slowD" + String(i), 1, False), False)
+        )
+        _ = external_call["usleep", Int32](Int32(DISPATCH_WAIT_MS * 1000))
+        leaving.close()
+        _ = external_call["usleep", Int32](Int32(100000))
+    var after_began = monotonic_ms()
+    var after = connect(port)
+    var after_buf = List[UInt8]()
+    send_text(after, post_request(chat_body("after", 1, False), False))
+    var after_got = await_responses(after, after_buf, 1)
+    # 打印出来**只为留证据**：探活要等在那 `ROBUST_DISCONNECTS` 次生成后面（替身每条
+    # 睡 `SLOW_MS`），所以它该是十几秒。它要是接近 0，说明那些断开**没落在生成中**
+    # （派早了），这一段就什么都没测 —— 那样这个门会安静地假绿。
+    # ⚠️ 因此**不**给它断言下界：哪天实现了"客户端走了就取消生成"，探活本就该变快，
+    # 那是对的优化，不该被这个门判红。
+    print(
+        "  [gate] after "
+        + String(ROBUST_DISCONNECTS)
+        + " clients left mid-generation: probe_ms="
+        + String(monotonic_ms() - after_began)
+        + " bytes="
+        + String(len(after_buf))
+    )
+    assert_true(
+        len(after_got) >= 1,
+        "the server stopped answering after "
+        + String(ROBUST_DISCONNECTS)
+        + " clients left mid-generation",
+    )
+    assert_true(answered_with(after_got[0], "after"), after_got[0])
+    after.close()
+
     var out = List[String]()
     out.append(plain[0])
     out.append(streamed)
@@ -670,6 +724,7 @@ def main() raises:
         "PASS engine thread: the loop still accepts while a generation runs"
         + " (control case waits for the generation), two generations run at the"
         + " same time with 2 engines (control case serializes at 1), answers are"
-        + " byte-identical across all three loops, and a departed client's answer"
-        + " is not delivered to the next one"
+        + " byte-identical across all three loops, a departed client's answer"
+        + " is not delivered to the next one, and it still answers after clients"
+        + " leave mid-generation"
     )
