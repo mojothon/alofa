@@ -47,6 +47,9 @@ ci-watch = "scripts/ci_watch.sh"
 # 并入 test —— 它仍然由 scripts/dump_model_reference.py --full 的本地产物驱动。
 test-model = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_model_parity.mojo -o target/model_parity && ./target/model_parity"
 test-q4 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q4_greedy.mojo -o target/q4_greedy && ./target/q4_greedy"
+# q8_0 输出投影接进整网之后的端到端质量门（教师强制贪心一致率）。同样不并入
+# test：要加载 2 GB 导出并把 24 层压一遍 q4_0，数分钟。
+test-q8-head = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q8_head_greedy.mojo -o target/q8_head_greedy && ./target/q8_head_greedy"
 test-memory = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_memory_gate.mojo -o target/memory_gate && ./target/memory_gate"
 # 整网**向量后端**门：与 test-model 同一批 prompt、同一段 fp32 参考、同一条
 # cos 判据，只把后端参数换成 BACKEND_AVX2。同样不并入 test（2GB 权重 + 数分钟）。

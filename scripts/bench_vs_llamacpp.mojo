@@ -53,7 +53,10 @@ comptime ROUNDS = 3
 # 两档：1 = 不切（单线程语义），8 = 本机核数。
 comptime ARMS = 2
 # 两档权重：fp32 与 q4_0（加载期量化）。
-comptime KINDS = 2
+# 三档：fp32 / q4_0 / **q4_0 + q8_0 输出投影**。第三档是这轮要看的那档 —— 它只改
+# 输出投影的宽度（544 MB → 165 MB），24 层与 q4_0 档逐位相同，于是两档之差就是
+# "这一个张量的流量"值多少钱。
+comptime KINDS = 3
 
 
 def shard_of(i: Int) -> Int:
@@ -157,9 +160,14 @@ def main() raises:
     for kind in range(KINDS):
         var kind_s = String("fp32")
         var use_q4 = False
+        var use_q8_head = False
         if kind == 1:
             kind_s = "q4_0"
             use_q4 = True
+        elif kind == 2:
+            kind_s = "q4_0+q8_head"
+            use_q4 = True
+            use_q8_head = True
 
         print("")
         print("   ---- 权重档：" + kind_s + " ----")
@@ -172,6 +180,14 @@ def main() raises:
             print("   q4_enabled=true（推理确实走量化通路）")
         else:
             print("   q4_enabled=false")
+        if use_q8_head:
+            var tq = monotonic_ns()
+            model.enable_q8_output()
+            print(
+                "   q8_head_enabled=true（输出投影走 q8_0 通路），量化耗时 "
+                + String((monotonic_ns() - tq) // 1000000)
+                + " ms"
+            )
         print("   权重加载（含量化）: " + String(load_ms) + " ms")
 
         # 预热：两档各跑一遍丢弃（量的是 mmap 缺页，不是计算）。

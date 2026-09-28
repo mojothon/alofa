@@ -35,6 +35,7 @@ from std.testing import TestSuite, assert_true
 from alofa.core.memory import Arena
 from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr
+from alofa.kernels.cpu.avx2 import matmul_q8_f32_vec
 from alofa.kernels.cpu.quant import (
     U8Ptr,
     block_scale,
@@ -287,11 +288,11 @@ def test_relative_l2_is_under_one_percent() raises:
     arena.keep_alive()
 
 
-def test_matmul_matches_the_reference() raises:
-    """融合 matmul 必须等于"解量化后的权重 × 真实激活"（fp64 累加）。
+def _check_matmul_against_reference[vector: Bool]() raises:
+    """融合 matmul 与 fp64 参考的比对，`vector` 选走哪条实现。
 
-    期望值用**解量化后**的权重算，所以判据只盯累加顺序 —— 量化误差（0.54%）不
-    在这条门的射程内，它在上一条门里。
+    期望值用**解量化后**的权重算 ⇒ 判据只盯**累加结构**：量化误差（0.54%）不在这
+    条门的射程内，它在相对 L2 那条门里。
     """
     var blocks_file = MappedFile(FIXTURE + "blocks.bin")
     var act_file = MappedFile(FIXTURE + "act.f32")
@@ -302,8 +303,12 @@ def test_matmul_matches_the_reference() raises:
 
     var arena = Arena(ROWS * 4 + 64)
     var got = arena.alloc(ROWS * 4).unsafe_bitcast[Float32]()
-    matmul_q8_f32(got, act, blocks, ROWS, COLS)
+    comptime if vector:
+        matmul_q8_f32_vec(got, act, blocks, ROWS, COLS)
+    else:
+        matmul_q8_f32(got, act, blocks, ROWS, COLS)
 
+    var worst = Float64(0)
     for r in range(ROWS):
         var refv = want[unsafe_offset=r]
         var mag = refv if refv >= Float64(0) else -refv
@@ -312,14 +317,38 @@ def test_matmul_matches_the_reference() raises:
         var diff = Float64(got[unsafe_offset=r]) - refv
         if diff < Float64(0):
             diff = -diff
+        if diff > worst:
+            worst = diff
         assert_true(
             diff <= REL_TOL * mag,
             "第 " + String(r) + " 行偏离参考（差 " + String(diff) + "）",
         )
+    print("观测：融合 matmul 与 fp64 参考的最大绝对差 = " + String(worst))
     blocks_file.keep_alive()
     act_file.keep_alive()
     expect_file.keep_alive()
     arena.keep_alive()
+
+
+def test_matmul_matches_the_reference() raises:
+    """标量版融合 matmul 必须等于"解量化后的权重 × 真实激活"（f64 累加）。"""
+    _check_matmul_against_reference[False]()
+
+
+def test_matmul_vector_backend_matches_the_reference() raises:
+    """向量版融合 matmul 对**同一个** fp64 参考，判据同样是 1e-5。
+
+    为什么单开一条而不是让上面那条也跑向量版：两条实现的累加结构**不同**（f32 通道
+    + 行末归约 vs f64 一路累加），它们互相之间**不逐位相等** —— 那不是 bug，是换通
+    路要付的精度，q4 那条向量通路也是同一个规矩。所以两边各自对着**同一个** fp64
+    参考比，谁都不许越 1e-5。
+
+    ⚠️ 这条存在的直接理由：输出投影接进模型之后，标量版让端到端**变慢**（q4_0 档
+    `shards=8` 从 9.62…12.08 掉到 7.12…9.36 tok/s）—— 136M 次乘加压在标量上，省下的
+    379 MB/token 流量全被吃了回去。向量版就是为了让那份流量真正兑现，而它必须先证
+    明自己算得对。
+    """
+    _check_matmul_against_reference[True]()
 
 
 def main() raises:
