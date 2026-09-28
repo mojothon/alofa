@@ -47,6 +47,7 @@ from std.math import exp, sqrt
 
 from alofa.core.dtype import (
     QUANT_Q4_0,
+    QUANT_Q8_0,
     quant_block_size,
     quant_bytes_per_block,
     quant_scale_bytes,
@@ -1136,3 +1137,112 @@ def matmul_q4_f32_bias(
 ) raises AlofaError:
     """`dst = W · x + bias`，向量版；Qwen2 的 q/k/v 投影都带偏置。"""
     _matmul_q4(dst, x, blocks, rows, cols, bias, True)
+
+
+# ---------------------------------------------------------------------------
+# q8_0
+# ---------------------------------------------------------------------------
+# 为什么必须有它（2026-09-28 量出来的理由，不是"顺手也做个向量版"）：把输出投影
+# 压成 q8_0 之后，端到端**反而变慢** —— q4_0 档 `shards=8` 是 9.62…12.08 tok/s，
+# 接上标量 q8 之后掉到 7.12…9.36。原因不是"量化没用"，而是**标量实现自己成了瓶
+# 颈**：fp32 那条通路是 AVX2 + 分片，q8 这边却让它一个字节一个字节地算，省下的
+# 379 MB/token 流量被 136M 次标量乘加吃了回去。
+#
+# 这也顺带说明一件事：账本里"批=1 恒 memory 受限 ⇒ 减少每权重字节 ≠ 提速"那句
+# 话，**前提是计算足够快**。量化省的字节只有在解量化不比它贵时才兑现。
+
+comptime Q8_BLOCK = quant_block_size[QUANT_Q8_0]()
+comptime Q8_BYTES = quant_bytes_per_block[QUANT_Q8_0]()
+comptime Q8_SCALE_BYTES = quant_scale_bytes[QUANT_Q8_0]()
+comptime Q8_U8 = Pointer[UInt8, MutUntrackedOrigin]
+# 一个块 32 个值，8 个一组 ⇒ 4 组，没有尾巴。
+comptime W_Q8 = 8
+
+
+def _matmul_q8_vec(
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q8_U8,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+) raises AlofaError:
+    """`dst[r] = Σ_c w[r,c] · x[c]`，`w` 为 q8_0 块流，一次 8 个值。
+
+    一个 q8_0 块是 34 字节：2 字节 fp16 缩放 + 32 个**有符号**字节 ⇒ 正好 4 条
+    8 宽向量，**没有尾巴**（32 是 8 的整数倍，且不随模型变 —— 与 q4 那个"块布局固
+    定给的余数"是同一类 luck，这里更干净）。
+
+    **`d` 折进 x**，与 `_matmul_q4_halves` 同一招：整块共享一个缩放，乘到 x 上一
+    次做 8 个，比每个权重各乘一次省一半乘法。累加走 f32 通道、行末归约一次。
+
+    ⚠️ **符号扩展交给 load 的类型**，不手写"读 u8 再判 ≥128 减 256"：把指针按
+    `Int8` 读，补码的解释就成了类型的一部分。q8_0 存的是补码（不是 q4_0 那种"无
+    符号 nibble 减 8"），这一步错了整块负权重会跳到 +128 那侧 —— 而且**看起来仍然
+    像权重**，只有零容差的差分门抓得住。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q8_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q8_BLOCK),
+        )
+    var blocks_per_row = cols // Q8_BLOCK
+    var sblocks = blocks.unsafe_bitcast[Int8]()
+    for row in range(rows):
+        var acc = Float64(0)
+        if has_bias:
+            acc = Float64(bias[unsafe_offset=row])
+        var s0 = SIMD[DType.float32, W_Q8](0)
+        var s1 = SIMD[DType.float32, W_Q8](0)
+        var s2 = SIMD[DType.float32, W_Q8](0)
+        var s3 = SIMD[DType.float32, W_Q8](0)
+        for b in range(blocks_per_row):
+            var base = (row * blocks_per_row + b) * Q8_BYTES
+            var d = block_scale(blocks, base)
+            var dv = SIMD[DType.float32, W_Q8](d)
+            var xb = b * Q8_BLOCK
+            var q0 = sblocks.unsafe_load[width=W_Q8](base + Q8_SCALE_BYTES)
+            var q1 = sblocks.unsafe_load[width=W_Q8](base + Q8_SCALE_BYTES + W_Q8)
+            var q2 = sblocks.unsafe_load[width=W_Q8](base + Q8_SCALE_BYTES + 2 * W_Q8)
+            var q3 = sblocks.unsafe_load[width=W_Q8](base + Q8_SCALE_BYTES + 3 * W_Q8)
+            var v0 = q0.cast[DType.float32]()
+            var v1 = q1.cast[DType.float32]()
+            var v2 = q2.cast[DType.float32]()
+            var v3 = q3.cast[DType.float32]()
+            var x0 = x.unsafe_load[width=W_Q8](xb) * dv
+            var x1 = x.unsafe_load[width=W_Q8](xb + W_Q8) * dv
+            var x2 = x.unsafe_load[width=W_Q8](xb + 2 * W_Q8) * dv
+            var x3 = x.unsafe_load[width=W_Q8](xb + 3 * W_Q8) * dv
+            s0 = v0.fma(x0, s0)
+            s1 = v1.fma(x1, s1)
+            s2 = v2.fma(x2, s2)
+            s3 = v3.fma(x3, s3)
+        acc += Float64((s0 + s1 + s2 + s3).reduce_add())
+        dst[unsafe_offset=row] = Float32(acc)
+
+
+def matmul_q8_f32_vec(
+    dst: F32Ptr, x: F32Ptr, blocks: Q8_U8, rows: Int, cols: Int
+) raises AlofaError:
+    """`dst = W · x`，`W` 为 q8_0 块流，无偏置（输出投影就是这种）；向量版。
+
+    ⚠️ 累加是 f32 通道 + 行末归约，与标量版的 f64 累加**不再逐位一致** —— 判据是
+    `1e-5 × max(1,|ref|)`（fp64 期望），与 q4 那条向量通路同一个规矩。够不够格由
+    `test_q8_parity.mojo` 量：它把两条实现对着**同一个** fp64 参考比。
+    """
+    _matmul_q8_vec(dst, x, blocks, rows, cols, dst, False)
+
+
+def matmul_q8_f32_bias_vec(
+    dst: F32Ptr, x: F32Ptr, blocks: Q8_U8, rows: Int, cols: Int, bias: F32Ptr
+) raises AlofaError:
+    """`dst = W · x + bias`，q8_0 块流；向量版。"""
+    _matmul_q8_vec(dst, x, blocks, rows, cols, bias, True)

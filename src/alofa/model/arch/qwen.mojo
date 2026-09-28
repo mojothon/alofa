@@ -46,9 +46,14 @@ from alofa.core.text import parse_float64, parse_int
 from alofa.kernels.cpu.quant import (
     Q4_BLOCK,
     Q4_BYTES,
+    Q8_BLOCK,
+    Q8_BYTES,
+    dequant_q8_0,
     matmul_q4_f32,
     matmul_q4_f32_bias,
+    matmul_q8_f32,
     quantize_q4_0,
+    quantize_q8_0,
 )
 
 from alofa.kernels.cpu.avx2 import (
@@ -56,6 +61,7 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
     matmul_q4_f32_rows_band as matmul_q4_f32_rows_band_vec,
     matmul_q4_f32_bias_rows_band as matmul_q4_f32_bias_rows_band_vec,
+    matmul_q8_f32_vec,
 )
 from alofa.kernels.cpu.avx2 import (
     add as add_vec,
@@ -522,6 +528,69 @@ def q4_matmul_k_shards[backend: Int](
                 cols,
                 dst,
                 False,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
+def q8_matmul_k[backend: Int](
+    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int
+) raises AlofaError:
+    """按 `backend` 分发的 q8_0 投影（无偏置 —— 输出投影没有偏置项）。
+
+    ⚠️ 向量版与标量版**不再逐位一致**（f32 通道累加 vs f64 累加），判据是
+    `1e-5 × max(1,|ref|)`，与 q4 那条向量通路同一个规矩；这条相等由
+    `test_q8_parity.mojo` 对着**同一个** fp64 参考量。
+    """
+    comptime if uses_vector_backend[backend]():
+        matmul_q8_f32_vec(dst, x, blocks.unsafe_bitcast[UInt8](), rows, cols)
+    else:
+        matmul_q8_f32(dst, x, blocks.unsafe_bitcast[UInt8](), rows, cols)
+
+
+async def _q8_shard[backend: Int](
+    d: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int
+):
+    """同上，q8_0 通路：一片输出行，配上它在块流里那一段。"""
+    try:
+        q8_matmul_k[backend](d, x, blocks, rows, cols)
+    except err:
+        _ = err
+
+
+def q8_matmul_k_shards[backend: Int](
+    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int, shards: Int
+) raises AlofaError:
+    """输出投影的 q8_0 通路：按输出行切 `shards` 片并发。
+
+    与 `q4_matmul_k_shards` 同一套切法（按**输出行**切，每片做完自己那些行）。
+    为什么它也必须能分片：输出投影是 151936 × 896，一次 decode 就是它**一整遍**
+    —— 这是整个模型里最大的单次读（q8 后 165 MB，fp32 时 544 MB）。fp32 通路是
+    靠 `linear_k_shards` 把这份带宽摊到 `shards` 个线程上才跑到 13.83…15.37
+    tok/s 的；量化通路不分片，等于先自断一条腿再去比谁跑得快。
+
+    ⚠️ 分片数沿用实例的 `self.shards`（与 fp32 通路**同一个**数），这样两档的比
+    较才是在比"权重宽了几倍"，而不是在比"谁开的线程多"。
+    """
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q8_matmul_k[backend](dst, x, blocks, rows, cols)
+        return
+    var row_bytes = cols // Q8_BLOCK * Q8_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        tg.create_task(
+            _q8_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                cnt,
+                cols,
             )
         )
         c0 += cnt
@@ -1046,6 +1115,19 @@ struct QwenForward(Movable):
     var q4_arena: Arena
     var q4_blocks: List[RawPtr]
     var q4_enabled: Bool
+    # 输出投影（`self.head`）的 q8_0 块流，单独一条通路。
+    #
+    # 与 q4 分开不是因为实现麻烦，而是**理由**不同，也就不该共用一个开关：q4 压
+    # 的是 24 层的七个投影（省 1.31 GB 的流量），q8 压的是输出投影这**一个**张
+    # 量 —— 而它**不能**跟着压到 4 bit（量过：教师强制贪心一致率 0.8691 → 0.77，
+    # 省下的 76 MB 不值），8 bit 是它在质量上还站得住的最窄一档（相对 L2
+    # 0.5359%，q4_0 是 10.3%，见 `test_q8_parity.mojo`）。
+    #
+    # ⚠️ tied embedding 时 `self.head` 指向的就是 `embed_tokens` 那份字节 ⇒ 启用
+    # 这条通路后，**embedding 查表也得从块流里解**，不是只改 matmul 一侧。
+    var q8_arena: Arena
+    var q8_blocks: List[RawPtr]
+    var q8_enabled: Bool
     # 一次投影切成几片并发跑。1 = 不切（与加这个字段之前完全同一条代码路径）；
     # 默认是核数（上限 8），见 `default_shards()`。
     # 它是**实例**的属性而不是方法的参数：一次前向里有 169 次投影，让调用方每
@@ -1150,6 +1232,12 @@ struct QwenForward(Movable):
         # 层崩，那时已经跑了二十几层。
         self.q4_enabled = False
         self.q4_blocks = List[RawPtr]()
+        # q8 那条通路默认**关**：它的块流要占 165 MB，而"要不要为省流量付这份钱"
+        # 得由调用方说了算（与 `set_shards` 同一个道理）。`enable_q8_output()`
+        # 里才按实际张量大小开 arena，这里给 1 字节只是为了让字段有个值。
+        self.q8_enabled = False
+        self.q8_blocks = List[RawPtr]()
+        self.q8_arena = Arena(1)
         var q4_bytes = 0
         for layer in range(self.cfg.n_layers):
             for slot in range(Q4_SLOTS_PER_LAYER):
@@ -1227,6 +1315,35 @@ struct QwenForward(Movable):
         var blocks = self.q4_arena.alloc(n // Q4_BLOCK * Q4_BYTES)
         quantize_q4_0(blocks, self.params.ptr(name), n)
         self.q4_blocks.append(blocks)
+
+    def enable_q8_output(mut self) raises AlofaError:
+        """把输出投影压成 q8_0，之后的输出投影走量化通路。
+
+        ⚠️ **tied embedding 时这份字节是共用的**（`self.head` 解析出来就是
+        `embed_tokens`）⇒ `run` 里的 embedding 查表**也必须**改读块流。只改
+        matmul 那一侧的话，prefill 会把 q8 的字节当 fp32 解释，得到一堆量级在
+        1e38 的"权重"—— 而且**只在 prefill 上错**，decode 看起来完全正常。
+
+        ⚠️ fp32 原始权重**仍然映射着**，与 `enable_q4` 同一个取舍：这条通路省的是
+        **每 token 的读流量**（544 MB → 165 MB），不是常驻内存；要省内存得先丢掉
+        原始映射，那是加载器的事，本轮没做。
+        """
+        if self.q8_enabled:
+            return
+        var head_name = self.head
+        var n = self.params.numel(head_name)
+        if n % Q8_BLOCK != 0:
+            raise AlofaError(
+                ERR_SHAPE_MISMATCH,
+                "a quantised matrix must be a whole number of blocks",
+                "name=" + head_name + " numel=" + String(n),
+            )
+        var total = n // Q8_BLOCK * Q8_BYTES
+        self.q8_arena = Arena(total + 64)
+        var blocks = self.q8_arena.alloc(total)
+        quantize_q8_0(blocks, self.params.ptr(head_name), n)
+        self.q8_blocks.append(blocks)
+        self.q8_enabled = True
 
     def project[backend: Int = BACKEND_SCALAR](
         mut self,
@@ -1399,6 +1516,19 @@ struct QwenForward(Movable):
             )
         var pe = f32_data(embed)
         var ph = f32_data(hidden)
+        # q8_0 那条通路把**输出投影**压了，而 tied embedding 时输出投影就是这份
+        # embedding 字节 ⇒ 这里的查表也得跟着改读块流，否则会把 q8 的字节当 fp32
+        # 解释（错的量级，不是错的精度）。一行正好是 `h` 个连续值 = `h/32` 个块，
+        # 所以第 `token` 行的字节起点是 `token * row_bytes`。
+        var q8_row_bytes = 0
+        if self.q8_enabled:
+            if h % Q8_BLOCK != 0:
+                raise AlofaError(
+                    ERR_SHAPE_MISMATCH,
+                    "a q8 embedding row must be a whole number of blocks",
+                    "h=" + String(h) + " block=" + String(Q8_BLOCK),
+                )
+            q8_row_bytes = h // Q8_BLOCK * Q8_BYTES
         for i in range(t):
             var token = new_ids[i]
             if token < 0 or token >= self.cfg.vocab:
@@ -1407,6 +1537,15 @@ struct QwenForward(Movable):
                     "token id is outside the vocabulary",
                     "id=" + String(token),
                 )
+            if self.q8_enabled:
+                dequant_q8_0(
+                    ph.unsafe_offset(i * h),
+                    self.q8_blocks[0]
+                    .unsafe_offset(token * q8_row_bytes)
+                    .unsafe_bitcast[UInt8](),
+                    h,
+                )
+                continue
             var src = token * h
             var dst = i * h
             for j in range(h):
@@ -1520,7 +1659,22 @@ struct QwenForward(Movable):
         # call writes through `self`, and the borrow checker is right that a
         # field cannot be both.
         var head_name = self.head
-        self.project[backend](logits, last_normed, head_name, Q4_NO_SLOT, logits, False)
+        if self.q8_enabled:
+            # 151936 × 896：一次 decode 里最大的单次读。q8_0 把它从 544 MB 降到
+            # 165 MB —— 这是 alofa 的 q4 档追上 llama.cpp 的那一步（同流量对照：
+            # 把 llama.cpp 的输出投影也拖回 fp32，它从 25.60 掉到 13.44，正落在
+            # alofa 的 13.83…15.37 上）。分片数沿用 `self.shards`，与 fp32 通路
+            # 同一个数 —— 两档比较要比的是权重宽度，不是谁开的线程多。
+            q8_matmul_k_shards[backend](
+                f32_data(logits),
+                f32_data(last_normed),
+                self.q8_blocks[0],
+                self.cfg.vocab,
+                h,
+                self.shards,
+            )
+        else:
+            self.project[backend](logits, last_normed, head_name, Q4_NO_SLOT, logits, False)
         self.kv_len = kv_len
         return f32_data(logits)
 
