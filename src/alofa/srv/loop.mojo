@@ -591,8 +591,10 @@ struct Loop(Movable):
         **收掉的三条判据必须同时成立**（少一条就会误杀）：
         - 这个槽位记着活（`inflight` 或 `streaming`）；
         - 超过 6 s 没等到结果（4 帧、每帧隔 1 s，最后一帧才动手）；
-        - **邮箱里没有待办的活**（`pending()` 在锁内看）。这一条把"引擎正在算"排除
-          在外 —— 还在算的那条不能收，否则 40× 慢（见记忆）会变成真的失败。
+        - **引擎这边没有活**：`busy`（引擎正卡在一件活里）为 0 **且** `pending()`
+          （邮箱里还压着待办的）为 0，都在锁内看。这一条把"引擎正在算"与"这条只是排
+          在别人后面"一起排除在外 —— 还在算的那条不能收，否则 40× 慢（见记忆）会变成
+          真的失败；排队的同样不能收，否则 `engines=1` 时第二条生成会被砍。
 
         为什么非收不可：卡住时实测邮箱是空的、engine 在空转，循环却一直以为有一帧在
         途 ⇒ 不会再派帧；而 `reap` 会跳过 `streaming=1` 的槽位，空闲超时也收不到它。
@@ -607,10 +609,6 @@ struct Loop(Movable):
                 continue
             if self.inflight[slot] != 1 and self.streaming[slot] != 1:
                 continue
-            # 隔 1 s 再打一帧：只看一帧分不清"engine 还活着但在原地转"与"已经死了"。
-            if now - self.last_seen[slot] <= 3000 + 1000 * self.stall_seen[slot]:
-                continue
-            self.stall_seen[slot] += 1
             # 诊断数必须**在锁内**读（见 `Mailbox.read_counters`）：直接读跨线程字段，
             # `-O2` 会把那次读提到循环外，于是每一帧都拿到同一个陈旧值 —— 那样打出来的
             # 数字不是"当时的状态"，只会把排查带偏。
@@ -627,6 +625,19 @@ struct Loop(Movable):
                 )
             except err:
                 print("  [srv] the engine counters could not be read: " + String(err))
+            # ⚠️ **引擎正在一件活里、或邮箱里还压着活 ⇒ 这一条只是排在别人后面，不是卡
+            # 住**。少了这一条，`engines=1` 时第二条生成会被误杀：它从派出去那一刻起就
+            # "在途"，而第一条要跑满一整次生成（实测 5 s 那条把 6 s 的判据顶掉了）。
+            #
+            # 边界（诚实写下来）：这样一条**卡在 `handle` 里永远不出来**的活就收不掉了
+            # —— 从外面看它和"正在算"没有区别。宁可留这个洞，也不能把排队中的活砍了：
+            # 后者是**必现**的，前者是要引擎自己坏掉才出现。
+            if busy != 0 or box.mailbox.pending() > 0:
+                continue
+            # 隔 1 s 再打一帧：只看一帧分不清"engine 还活着但在原地转"与"已经死了"。
+            if now - self.last_seen[slot] <= 3000 + 1000 * self.stall_seen[slot]:
+                continue
+            self.stall_seen[slot] += 1
             print(
                 "  [dbg] stalled slot="
                 + String(slot)
