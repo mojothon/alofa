@@ -409,6 +409,19 @@ def send_text(mut conn: TcpStream, imm text: String) raises:
     assert_equal(sent, text.byte_length(), "the write was short")
 
 
+def answered_with(imm response: String, imm marker: String) -> Bool:
+    """这条应答是不是**这条请求**的（替身回的是 `"S:" + prompt`）。
+
+    ⚠️ 为什么不能直接找 `"S:" + marker`：替身收到的 `prompt` 到那一层已经是**渲染过的
+    chat template**（`S:<|im_start|>system\nYou are Qwen…<|im_start|>user\nslowA<|im_end|>…`），
+    所以 `"S:slowA"` **不是**它的子串 —— 那个标记只在"替身原样收到裸 content"时才成立，
+    而 chat 路径本来就该渲染模板。判据因此拆成两半：替身的前缀 `S:`（应答确实出自替身）
+    + 这条请求独有的内容 `marker`（本场景里只属于它）⇒ 盯的性质没变，只是不再依赖模板
+    的形状 —— 哪天模板换了内容，这条门不会因此变绿。
+    """
+    return response.find("S:") >= 0 and response.find(marker) >= 0
+
+
 def run_scenario(mode: Int, port: UInt16) raises -> List[String]:
     """跑一遍同一个序列，返回"逐字节一致"那两条要用的响应文本。
 
@@ -465,7 +478,7 @@ def run_scenario(mode: Int, port: UInt16) raises -> List[String]:
     var slow_got = await_responses(slow_conn, slow_buf, 1)
     var slow_ms = monotonic_ms() - began
     assert_true(len(slow_got) >= 1, "the slow request was never answered")
-    assert_true(slow_got[0].find("S:slowA") >= 0, slow_got[0])
+    assert_true(answered_with(slow_got[0], "slowA"), slow_got[0])
     assert_true(
         slow_ms >= PROBE_SLOW_MS,
         "the slow request came back in " + String(slow_ms) + "ms — it did not generate",
@@ -524,7 +537,7 @@ def run_scenario(mode: Int, port: UInt16) raises -> List[String]:
     var next_got = await_responses(next, next_buf, 1)
     assert_true(len(next_got) >= 1, "the second client was never answered")
     assert_true(
-        next_got[0].find("S:second") >= 0,
+        answered_with(next_got[0], "second"),
         "the second client did not get its own answer: " + next_got[0],
     )
     assert_true(
@@ -570,8 +583,8 @@ def run_concurrency(mode: Int, port: UInt16) raises -> Int:
         ms = monotonic_ms() - began
         assert_true(len(got_a) >= 1, "the first slow request was never answered")
         assert_true(len(got_b) >= 1, "the second slow request was never answered")
-        assert_true(got_a[0].find("S:slowX") >= 0, got_a[0])
-        assert_true(got_b[0].find("S:slowY") >= 0, got_b[0])
+        assert_true(answered_with(got_a[0], "slowX"), got_a[0])
+        assert_true(answered_with(got_b[0], "slowY"), got_b[0])
     except e:
         err = String(e)
     kill_child(pid)
