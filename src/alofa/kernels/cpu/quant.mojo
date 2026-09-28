@@ -48,6 +48,7 @@ Run:
 
 from alofa.core.dtype import (
     QUANT_Q4_0,
+    QUANT_Q8_0,
     quant_block_size,
     quant_bytes_per_block,
     quant_scale_bytes,
@@ -361,3 +362,191 @@ def matmul_q4_f32_bias(
 ) raises AlofaError:
     """`dst = W · x + bias`；Qwen2 的 q/k/v 投影都带偏置。"""
     _matmul_q4(dst, x, blocks, rows, cols, bias, True)
+
+
+# ---------------------------------------------------------------------------
+# q8_0
+# ---------------------------------------------------------------------------
+# GGML q8_0：一个块 32 个值、34 字节 —— [0:2] fp16 缩放 d（小端），其后 32 个字
+# 节各装一个**有符号** 8 位量化值，还原 `v = q · d`。
+#
+# 为什么在已有 q4_0 之后还要它（2026-09-28 的量出来的理由，不是偏好）：同机同
+# prompt 与 llama.cpp 对比时，alofa 的 q4_0 档只有对方的 0.54…0.60×，而**同流量
+# 对照**（把 llama.cpp 的输出/嵌入张量也拖回 F32，它从 25.60 掉到 13.44，与
+# alofa 的 13.83…15.37 重合）证明差距全在**输出投影的存储宽度** —— alofa 的
+# `lm_head` 是独立 fp32 副本（544 MB），llama.cpp 因 tied embedding 只存一份且压
+# 成 Q8_0（≈165 MB）。输出投影**不能**压到 q4_0（实测一致率 0.8691 → 0.77），
+# 8 bit 是它在质量上还站得住的最窄一档。
+
+comptime Q8_BLOCK = quant_block_size[QUANT_Q8_0]()
+comptime Q8_BYTES = quant_bytes_per_block[QUANT_Q8_0]()
+comptime Q8_SCALE_BYTES = quant_scale_bytes[QUANT_Q8_0]()
+
+
+def _int8_from_byte(byte: Int) -> Int:
+    """字节 → 有符号 8 位值（补码）。
+
+    q8_0 存的是**有符号**码，这与 q4_0 的"无符号 nibble 减 8"不同：少这一步
+    符号扩展，所有负权重会整体跳到 +128 那侧，零容差的 `dequant` 门立刻红。
+    """
+    var v = byte
+    if v >= 128:
+        v = v - 256
+    return v
+
+
+def dequant_q8_0(dst: F32Ptr, blocks: U8Ptr, n: Int) raises AlofaError:
+    """把 `n` 个 q8_0 量化值还原成 fp32。`n` 必须是 32 的倍数。
+
+    与 q4_0 同一条理由，这一层**可以**零容差：8 位码与 fp16 缩放都是精确的
+    （fp16 → fp32 是精确转换），于是"差一个 ulp"不是舍入，是**读错了字节**。
+    """
+    if n <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT, "element count must be positive", "n=" + String(n)
+        )
+    if n % Q8_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "element count must be a whole number of blocks",
+            "n=" + String(n) + " block=" + String(Q8_BLOCK),
+        )
+    var n_blocks = n // Q8_BLOCK
+    for b in range(n_blocks):
+        var base = b * Q8_BYTES
+        var d = block_scale(blocks, base)
+        for j in range(Q8_BLOCK):
+            var q = _int8_from_byte(
+                Int(blocks[unsafe_offset=base + Q8_SCALE_BYTES + j])
+            )
+            dst[unsafe_offset=b * Q8_BLOCK + j] = Float32(q) * d
+
+
+def _quantise_one_q8(value: Float32, d: Float32) -> Int:
+    """`clamp(round(value / d), -128, 127)`，取整取最近、并列取偶。"""
+    var scaled = value / d
+    var floor_value = Float32(Int(scaled))
+    if floor_value > scaled:
+        floor_value -= Float32(1)
+    var below = Int(floor_value)
+    var fraction = scaled - floor_value
+    var rounded = below
+    if fraction > Float32(0.5):
+        rounded = below + 1
+    elif fraction == Float32(0.5):
+        # 恰好半个台阶：取偶数那一侧。
+        rounded = below if (below % 2 == 0) else below + 1
+    if rounded < -128:
+        return -128
+    if rounded > 127:
+        return 127
+    return rounded
+
+
+def quantize_q8_0(blocks: U8Ptr, src: F32Ptr, n: Int) raises AlofaError:
+    """把 `n` 个 fp32 压成 q8_0 块流（每 32 个值 34 字节）。
+
+    朴素 q8_0：`amax = 块内 |x| 的最大值`；`d = amax / 127`（让最大值够到 +127）；
+    `q = clamp(round(x / d), -128, 127)`。
+
+    ⚠️ 这里**没有**照 q4_0 那样按 MSE 修 d：q8 有 256 级台阶，相对 L2 约 0.4%
+    （q4_0 是 10.3%），台阶细到"往哪儿挪"这件事本身已无收益可榨 —— 账本里
+    "每块一个 scale 的自由度已经榨干"说的正是这个尺度效应。
+
+    两个容易写错的地方，与 q4_0 同源：
+    - **量化用的 d 是 fp32 的 d**，存进块里的才是 fp16 的那个（先用 fp16 的 d
+      去除，量化结果会整体偏大）；
+    - `round` 取**最近、并列取偶**（IEEE 默认），截断会让每个值平均偏小半个台阶。
+    """
+    if n <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT, "element count must be positive", "n=" + String(n)
+        )
+    if n % Q8_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "element count must be a whole number of blocks",
+            "n=" + String(n) + " block=" + String(Q8_BLOCK),
+        )
+    var n_blocks = n // Q8_BLOCK
+    for b in range(n_blocks):
+        var start = b * Q8_BLOCK
+        var amax = Float32(0)
+        for j in range(Q8_BLOCK):
+            var v = src[unsafe_offset=start + j]
+            var a = v if v >= Float32(0) else -v
+            if a > amax:
+                amax = a
+        var d = Float32(0)
+        if amax != Float32(0):
+            d = amax / Float32(127)
+        var half = f32_to_fp16_bits(d)
+        var base = b * Q8_BYTES
+        blocks[unsafe_offset=base] = UInt8(half & 0xFF)
+        blocks[unsafe_offset=base + 1] = UInt8((half >> 8) & 0xFF)
+        for j in range(Q8_BLOCK):
+            var q = 0
+            if d != Float32(0):
+                q = _quantise_one_q8(src[unsafe_offset=start + j], d)
+            blocks[unsafe_offset=base + Q8_SCALE_BYTES + j] = UInt8(q & 0xFF)
+
+
+def _matmul_q8(
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: U8Ptr,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+) raises AlofaError:
+    """`dst[r] = Σ_c w[r,c] · x[c]`，`w` 以 q8_0 块流给出，行主序 `[rows, cols]`。
+
+    与 `_matmul_q4` 同一条约定：解量化发生在内层寄存器里，**不物化**解量化后的
+    权重 —— "融合"本身就是要被检验的那件事。累加走 `Float64`，理由与标量 gemm
+    相同（点积有抵消，f32 累加能吃掉判据）。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q8_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q8_BLOCK),
+        )
+    var blocks_per_row = cols // Q8_BLOCK
+    for row in range(rows):
+        var acc = Float64(0)
+        if has_bias:
+            acc = Float64(bias[unsafe_offset=row])
+        var row_block = row * blocks_per_row
+        for b in range(blocks_per_row):
+            var base = (row_block + b) * Q8_BYTES
+            var d = block_scale(blocks, base)
+            var x_base = b * Q8_BLOCK
+            for j in range(Q8_BLOCK):
+                var w = Float32(
+                    _int8_from_byte(
+                        Int(blocks[unsafe_offset=base + Q8_SCALE_BYTES + j])
+                    )
+                ) * d
+                acc += Float64(w) * Float64(x[unsafe_offset=x_base + j])
+        dst[unsafe_offset=row] = Float32(acc)
+
+
+def matmul_q8_f32(
+    dst: F32Ptr, x: F32Ptr, blocks: U8Ptr, rows: Int, cols: Int
+) raises AlofaError:
+    """`dst = W · x`，`W` 为 q8_0 块流，无偏置（输出投影就是这种）。"""
+    _matmul_q8(dst, x, blocks, rows, cols, dst, False)
+
+
+def matmul_q8_f32_bias(
+    dst: F32Ptr, x: F32Ptr, blocks: U8Ptr, rows: Int, cols: Int, bias: F32Ptr
+) raises AlofaError:
+    """`dst = W · x + bias`。"""
+    _matmul_q8(dst, x, blocks, rows, cols, bias, True)

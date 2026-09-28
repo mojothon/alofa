@@ -55,6 +55,7 @@ SUITES=(
   "tests/unit/test_layer0_parity.mojo|-I src"
   "tests/unit/test_sampler_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_parity.mojo|-O0 -I src"
+  "tests/unit/test_q8_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_matmul_vec.mojo|-O0 -I src"
   "tests/unit/test_q4_rows.mojo|-O0 -I src"
   "tests/unit/test_parallel_shards.mojo|-O2 -I src"
