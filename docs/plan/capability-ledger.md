@@ -256,7 +256,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 可在本机跑通的端到端服务 | `missing` | P1–P3 的目标 |
-| 与 llama.cpp 的同机同 prompt 对比 | `missing` | **唯一被接受的性能参考基准** |
+| 与 llama.cpp 的同机同 prompt 对比 | `verified` | **唯一被接受的性能参考基准** —— **2026-09-28 首次做成口径对齐**（上次 2026-09-18 那次三条边界没对齐，故一直没接受）<br>`evidence:scripts/bench_vs_llamacpp.mojo`（alofa 侧，`mojo build -O2 -I src`；**prefill 与 decode 分开报**、打印 token id 供对账）<br>**对齐项**：同机（i7-9700K 8C AVX2，非共享机）· 同模型（Qwen2.5-0.5B-Instruct）· **同 prompt（两边 tokenizer 逐 id 相同：`[785,6722,315,9625,374]`，5 token）** · 同生成 32 token · greedy · 权重同源（HF → f32 GGUF → `llama-quantize` 出 q4_0）<br>**decode tok/s —— fp32 档**：alofa `5.83…7.92`（shards=8）/ `3.95…5.22`（shards=1） vs llama.cpp `5.51…5.52`（`-t 1`）⇒ **alofa 是 llama.cpp 的 1.06…1.43×**<br>**decode tok/s —— q4_0 档**：alofa `13.83…15.37`（shards=8）/ `6.65…6.80`（shards=1） vs llama.cpp `25.60 ± 1.18`（`-t 1`）⇒ **alofa 是 llama.cpp 的 0.54…0.60×**<br>⚠️ **边界（不可省略）**：① **本机长期过载**（本轮 runq 2–17）⇒ 绝对值只作**同机同轮**相对比较，不可跨机；② llama.cpp 在本机 **`-t 8` 反而慢于 `-t 1`**（fp32 `1.54…3.34` vs `5.52`；q4_0 `14.71 ± 6.88` vs `25.60`，且 `-t 8` 抖动大）⇒ **主口径取 `-t 1`**，这是本机环境的观测，不是 llama.cpp 的普遍结论；③ alofa 的 q4 是**加载期量化**（缩放按 MSE 选），llama.cpp 的 q4_0 由 `llama-quantize` 从**同一个** f32 GGUF 转出 —— 块布局相同、**缩放选法不同** ⇒ **速度可比、质量不可比**（alofa 整网 q4 一致率仍 `missing`，实测 0.8691）；④ prefill 只有 5 token，粒度太粗（alofa fp32 `195…457 ms`，同档抖动 2.3×）⇒ **只报不判**；⑤ llama.cpp 侧用 `llama-bench -p 5 -n 32 -r 5`，它的 prompt 是**随机 5 token**而非这段文本（已用 `llama-tokenize` 证两边 id 一致，prefill 时间只与长度/形状有关，故可比） |
 | "比 vLLM / MAX 更快" | ❌ **不做此声明** | 缺少公平比较条件（vLLM/MAX 在 A100 上的数字来自不同栈与环境） |
 | GPU **正确性**结论 | ✅ **可做** | A100 验证机已打通（§1.2），CUDA kernel 可与标量后端做逐值差分 |
 | GPU **性能**数字 | ⚠️ **有条件可做** | 必须：① 在 A100 机测得 ② **报 roofline 利用率而非裸 tok/s** ③ 标注"共享环境"与其他卡占用 ④ 记录驱动/CUDA 版本 |
@@ -1088,3 +1088,19 @@
   - 两类最像的解释：① **未初始化读**（ASan 抓不到，它只管越界）② **栈上越界写 / 栈对象的悬垂引用**（`-g` 改变栈帧布局 → 恰好写不到要害）
   - 🔎 **新候选（强）**：`src/alofa/engine/scheduler.mojo` 有一批 `InlineArray[Int, MAX_BATCH]`（`MAX_BATCH=8`；203–207、287 行等）—— 定长**栈**数组。写入越过 `MAX_BATCH` 就是栈越界写；且 `InlineArray` 是**值类型**，结构体被按值拷贝/移动后其地址即失效 → 悬垂。两者都与"-g 改变栈布局就不崩"高度吻合
   - 下一步：查 scheduler 里对这些数组的**每一次写入**有没有与 `MAX_BATCH` 对齐的边界检查；以及 scheduler 对象是否被**按值拷贝**过（拷贝后结构体内的 `InlineArray` 地址失效，而外部若仍持有旧地址就是悬垂）
+- **2026-09-28（同日·基准）** —— **「与 llama.cpp 的同机同 prompt 对比」首次做成口径对齐**（§11 那一行 `missing` → `verified`）
+  - **为什么上一次（2026-09-18）不算**：三条边界没对齐 —— alofa 报**含 prefill** 的墙钟而 llama.cpp 是纯 decode；两边 prompt token 数不同（5 vs 13，当时没对账 tokenizer）；跑在 A100 **共享机**上。这次三条逐条解决。
+  - **踩到的坑（下一个做基准的人直接抄）**：
+    - ① ⚠️ **llama.cpp 的 CMake 默认不开 AVX2**（`build/CMakeCache.txt` 里 `GGML_AVX2:BOOL=OFF` / `GGML_AVX:BOOL=OFF`）⇒ 按默认编出来的二进制跑的是**基线实现**，实测 `tg128 = 1.88 tok/s`，照它写会得出"alofa 快 3×"的**假结论**。必须显式 `-DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON` 重编。
+    - ② **别用 anaconda 的工具链**：`which cmake` 是 anaconda 的，编到 `ggml.c` 报 `PR_SET_PTRACER undeclared`（它定义在 `linux/prctl.h`，glibc 的 `sys/prctl.h` 不含），anaconda 的 libstdc++ 还报 `timespec_get has not been declared`。改用 `env -i PATH=/usr/bin:… CC=/usr/bin/gcc CXX=/usr/bin/g++` 并补 `-DCMAKE_C_FLAGS=-DPR_SET_PTRACER=0x59616d61`。
+    - ③ **`llama-cli` 不打印 perf 行，且默认是交互模式**（生成完挂在那儿等输入 ⇒ 看着像卡死，实测 5 min 无输出、sys 时间虚高）。改用 **`llama-bench`**（`-p 5 -n 32 -r 5`，分别报 `pp5` / `tg32`）；若非用 cli 不可要加 `-st`（单轮退出）。
+    - ④ **权重同源**：HF 缓存 → `convert_hf_to_gguf.py --outtype f32`（1.98 GB / 290 tensors）→ `llama-quantize … Q4_0`（336 MB）。alofa 侧用**同一份** fp32 fixture（它的 q4 是加载期量化，不需要另备 q4 权重）。
+  - **对账（可比的前提）**：`llama-tokenize` 对同一段文本给出 `[785, 6722, 315, 9625, 374]`，与 alofa 的 `tok.encode` **逐 id 相同**、无 BOS 差异 ⇒ "5 vs 13" 那条边界消失。
+  - **新脚本** `scripts/bench_vs_llamacpp.mojo`：prefill 单独占返回 List 的第 0 格（llama-bench 的 `pp` / `tg` 就是分开的，混在一起会让 tok/s 随生成长度漂移）；两档 shards（1 / 8）交错；两档权重（fp32 / q4_0）；打印 id 与生成文本供对账。⚠️ Mojo 1.0 **一个函数只允许一个 `out` 参数**，所以两个输出塞进一条 List 返回。
+  - **实测（本机 i7-9700K 8C AVX2，prompt 5 token，生成 32 token，greedy）**：
+    - fp32 decode：alofa `5.83…7.92`（shards=8）/ `3.95…5.22`（shards=1） vs llama.cpp `5.51…5.52`（`-t 1`）⇒ **1.06…1.43×**
+    - q4_0 decode：alofa `13.83…15.37`（shards=8）/ `6.65…6.80`（shards=1） vs llama.cpp `25.60 ± 1.18`（`-t 1`）⇒ **0.54…0.60×**
+    - ⚠️ llama.cpp `-t 8` 在本机**反而更慢且抖**（fp32 `1.54…3.34`、q4_0 `14.71 ± 6.88`）⇒ 主口径取 `-t 1`；本机本轮 runq 2–17，**过载是这台机器的常态**，绝对值不可跨机比较。
+    - q4 一致性旁证：alofa q4 档生成的文本与 fp32 档**不同**（"…largest city in Europe. It is also…" vs "…largest city in Europe and the second largest…"）—— 与账本里"整网 q4 一致率实测 0.8691、未达 0.90 门"是同一件事的两个观测面。
+  - **结论（决定下一个杠杆）**：**fp32 档已打平甚至略超**（llama.cpp 的 f32 权重在本机还吃不到 `CPU_REPACK`，它的优化重心不在这一档）；**差距集中在 q4_0 档** —— llama.cpp 的 q4_0 相对它自己的 fp32 提速 **4.64×**（5.52 → 25.60 tok/s），alofa 只做到 **1.94×**（7.92 → 15.37）。⇒ 下一个性能杠杆是 **q4 内核**（repack / gemv），**不是** fp32 gemm（后者已到天花板，见「性能」一节）。
+  - **未做**：批（batch > 1）档、更长 prompt 档、`-t 8` 异常的机理（怀疑 ggml 线程 barrier 在过载下被放大，**未证**）、A100 机同口径复现。
