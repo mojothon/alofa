@@ -1203,7 +1203,6 @@ def _matmul_q4_mub(
         # 超出栈缓冲上限 ⇒ 退回默认通路。**不**在这里悄悄改结果。
         _matmul_q4_halves(dst, x, blocks, rows, cols, bias, has_bias)
         return
-
     var xq_buf = InlineArray[Int8, MUB_MAX_COLS](fill=Int8(0))
     var sumx_buf = InlineArray[Int32, MUB_MAX_BLOCKS * W_Q4](fill=Int32(0))
     var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
@@ -1285,6 +1284,255 @@ def matmul_q4_mub_bias(
 ) raises AlofaError:
     """同上，带偏置（Qwen2 的 q/k/v 投影）。"""
     _matmul_q4_mub(dst, x, blocks, rows, cols, bias, True)
+
+
+# ---------------------------------------------------------------------------
+# 行复用通路的 `vpmaddubsw` 版（`prefill` 与 `decode` 都走这条）
+# ---------------------------------------------------------------------------
+# 为什么必须单做一份：模型层 `project` 走的是 `q4_matmul_rows_k` / `_bias_rows_k`（行
+# 带），**不是** `q4_matmul_k` —— 只把开关挂在后者上，端到端一个周期都不会进 mub
+# （2026-09-29 实测：bench 二进制 `vpmaddubsw` 0 条、追踪 0 行，"无增益"是假象）。
+#
+# 指令账（每块）：默认 f32 行带 = 共享解量化 ~27 条 + 每行 6 条；本函数 = 共享 ~5 条
+# + 每行 ~9 条 ⇒ **RB=1（decode）33 vs 14**，**RB=2 是 39 vs 23**，RB=8 大致打平。
+# 所以 `RB` 默认 **2**（不是无偏置那条路的 8）：行组越大，省下的解量化被摊得越薄。
+comptime MUB_ROWS_MAX_XQ = 16384
+comptime MUB_ROWS_MAX_SUMS = MUB_ROWS_MAX_XQ // Q4_BLOCK
+
+
+def _matmul_q4_mub_rows[RB: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+    dst_stride: Int,
+) raises AlofaError:
+    """`RB` 个 token 行**共用一次解量化**的 `vpmaddubsw` 版。
+
+    与 `_matmul_q4_halves_rows[RB]` 的差别只有内层：那一条把 nibble 展开成 f32 再乘
+    加，这里把 nibble 直接喂 `vpmaddubsw`，`−8` 那一项用 `Σx` 补回（见下）。
+
+    ⚠️ **整批共用一个激活量化步长** `sx`（取 `RB` 行里绝对值的最大值）：每行各自一
+    个步长要多一次广播（每块每行一条 port 5 指令），而同一批 token 的激活幅度本来
+    就在同一量级。代价是**幅度小的那几行相对误差更大** —— 这也是"多一层激活量化"
+    那笔账的一部分，不是免费的。
+
+    ⚠️ `Σx` 按 **(行, 块)** 存**标量** `i32`（不是单行版那种"仅 lane 0 非零"的向
+    量）：8 个 lane 各加 `−Σx`，`reduce_add` 之后合计正好 `−8·Σx`。向量版要 8 倍缓冲，
+    行组一多就顶到栈上限。
+
+    ⚠️ 缓冲上限 `MUB_ROWS_MAX_XQ`（16 KB）：`RB * cols` 超出就**退回默认行带通路**
+    —— 不静默给错结果，也不许靠"恰好没超"活着。`RB=2` 时 `cols` 可到 8192，本项目
+    最大 inner 是 `down_proj` 的 4864。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q4_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
+        )
+    if RB * cols > MUB_ROWS_MAX_XQ:
+        if has_bias:
+            _matmul_q4_wide_rows[True, RB](
+                dst, x, blocks, rows, cols, bias, has_bias, dst_stride
+            )
+        else:
+            _matmul_q4_halves_rows[RB](dst, x, blocks, rows, cols, dst_stride)
+        return
+    var nb = cols // Q4_BLOCK
+    var xq_buf = InlineArray[Int8, MUB_ROWS_MAX_XQ](fill=Int8(0))
+    var sumx_buf = InlineArray[Int32, MUB_ROWS_MAX_SUMS](fill=Int32(0))
+    var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
+    var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
+
+    var xmax = Float32(0)
+    comptime for rb in range(RB):
+        for i in range(cols):
+            var v = x[unsafe_offset=rb * cols + i]
+            if v < Float32(0):
+                v = -v
+            if v > xmax:
+                xmax = v
+    var sx = xmax / Float32(127.0)
+    if sx == Float32(0):
+        sx = Float32(1)
+
+    comptime for rb in range(RB):
+        for i in range(cols):
+            var qv = Int(x[unsafe_offset=rb * cols + i] / sx)
+            if qv > 127:
+                qv = 127
+            if qv < -128:
+                qv = -128
+            xqp[unsafe_offset=rb * cols + i] = Int8(qv)
+
+    comptime for rb in range(RB):
+        for b in range(nb):
+            var s = Int(0)
+            for j in range(Q4_BLOCK):
+                s += Int(xqp[unsafe_offset=rb * cols + b * Q4_BLOCK + j])
+            sump[unsafe_offset=rb * nb + b] = Int32(-s)
+
+    var low_mask = SIMD[DType.uint8, W_Q4_HALF](0x0F)
+    var four = SIMD[DType.uint8, W_Q4_HALF](4)
+    var ones = SIMD[DType.int16, W_Q4_HALF](1)
+    var acc8 = InlineArray[SIMD[DType.float32, W_Q4], RB](
+        fill=SIMD[DType.float32, W_Q4](0)
+    )
+    var acc = InlineArray[Float64, RB](fill=Float64(0))
+
+    for row in range(rows):
+        comptime for rb in range(RB):
+            acc8[rb] = SIMD[DType.float32, W_Q4](0)
+            acc[rb] = Float64(bias[unsafe_offset=row]) if has_bias else Float64(0)
+
+        var b = 0
+        while b < nb:
+            var base = (row * nb + b) * Q4_BYTES
+            var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
+            var lo = raw & low_mask
+            var hi = (raw >> four) & low_mask
+            var w32 = lo.join(hi)
+            var d = block_scale(blocks, base)
+            var dsx = SIMD[DType.float32, W_Q4](d * sx)
+            comptime for rb in range(RB):
+                var x32 = xqp.unsafe_load[width=2 * W_Q4_HALF](
+                    rb * cols + b * Q4_BLOCK
+                )
+                var p = llvm_intrinsic[MUBSW, SIMD[DType.int16, W_Q4_HALF]](
+                    w32, x32
+                )
+                var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, W_Q4]](p, ones)
+                var c = SIMD[DType.float32, W_Q4](
+                    Float32(sump[unsafe_offset=rb * nb + b])
+                )
+                acc8[rb] = (q.cast[DType.float32]() + c) * dsx + acc8[rb]
+            b += 1
+
+        comptime for rb in range(RB):
+            acc[rb] += Float64(acc8[rb].reduce_add())
+            dst[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
+
+
+def matmul_q4_mub_rows_band[RB: Int = 2](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """整批无偏置的 `vpmaddubsw` 行带投影；切法与 `matmul_q4_f32_rows_band` 一致。
+
+    ⚠️ 与默认通路**不是逐位一致**（多一层激活量化），所以只能由 `ALOFA_Q4_MUB=1`
+    打开，默认不走。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if dst_stride < rows:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "the destination stride must span a whole row band",
+            "dst_stride=" + String(dst_stride) + " rows=" + String(rows),
+        )
+    var limit = n_tok - n_tok % RB if n_tok >= RB else 0
+    var t = 0
+    while t < limit:
+        _matmul_q4_mub_rows[RB](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            dst,
+            False,
+            dst_stride,
+        )
+        t += RB
+    while t < n_tok:
+        _matmul_q4_mub_rows[1](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            dst,
+            False,
+            dst_stride,
+        )
+        t += 1
+
+
+def matmul_q4_mub_bias_rows_band[RB: Int = 2](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    dst_stride: Int,
+) raises AlofaError:
+    """整批**带偏置**的 `vpmaddubsw` 行带投影（Qwen2 的 q/k/v）。
+
+    ⚠️ 默认通路在这里是 **f64 通道累加**（`_matmul_q4_wide_rows`），本函数改成 f32
+    八个通道累加、行末才并 —— 这是它与默认通路在数值上的**第二处**差别（第一处是
+    激活量化），不是逐位一致。
+
+    ⚠️ **`bias` 须由调用方偏到本带起点**（与默认通路同一个坑）。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if dst_stride < rows:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "the destination stride must span a whole row band",
+            "dst_stride=" + String(dst_stride) + " rows=" + String(rows),
+        )
+    var limit = n_tok - n_tok % RB if n_tok >= RB else 0
+    var t = 0
+    while t < limit:
+        _matmul_q4_mub_rows[RB](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            bias,
+            True,
+            dst_stride,
+        )
+        t += RB
+    while t < n_tok:
+        _matmul_q4_mub_rows[1](
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            bias,
+            True,
+            dst_stride,
+        )
+        t += 1
 
 
 # ---------------------------------------------------------------------------
