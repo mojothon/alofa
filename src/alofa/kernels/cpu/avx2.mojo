@@ -1323,7 +1323,15 @@ comptime MUB_ROW_ACC_TARGET = 8
 # 相邻两轮 `gate` 393657 ↔ 581050 ns），`RU=8` vs `16` 那种 ≲10% 的差**量不出来**。有了
 # 这个参数，探针能在同一个二进制里实例化多档、交错计时 + 轮换出场顺序，把系统漂移变成
 # 两臂共有（`scripts/bench_q4_rows_ru.mojo`）。
-def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0](
+# ⚠️ `SX_I32` 是同类旋钮：`1` = `−8·Σx` 那一项在 **int32 域** 补回（`vpaddd`，1 周期）
+# 而不是先转 f32 再加（`vaddps`，4 周期）⇒ 依赖链 22 → ~18，`objdump` 数得到 `RU=8` 两臂
+# `vaddps` 29 → 20、`vpaddd` 0 → 9。数值**逐位相同**（`q` 与 `Σx` 都是整数、|q + Σx| < 2^24
+# ⇒ 两条路在 f32 里都精确，探针实测 896/896 · 4864/4864 · 128/128）。
+# ⚠️ **2026-09-30 判不了，故不采用**：同进程配对（256 MB 冲刷 + 每轮每臂 best-of-5、9 轮）
+# 逐轮 `Σx f32/int32` 是 `q/o 0.931…1.098`、`gate 0.815…1.073`、`k/v 0.882…1.461`，三组**都
+# 跨 1.0**（中位 ≈1.00）。读法：`RU=8` 给出 8 条独立累加链之后，**链长已经不是瓶颈**（真瓶颈
+# 是每行块 38.4 条指令里那 23% 的栈存取），再短 4 个周期换不到时间。生产路径不传 ⇒ 走 f32 那条。
+def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1480,12 +1488,24 @@ def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0](
                     var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, W_Q4]](
                         p, ones
                     )
-                    var c = SIMD[DType.float32, W_Q4](
-                        Float32(sump[unsafe_offset=rb * nb + b])
-                    )
-                    acc8u[rb * RU + u] = (
-                        (q.cast[DType.float32]() + c) * dsx + acc8u[rb * RU + u]
-                    )
+                    comptime if SX_I32 == 1:
+                        # `−8·Σx` 在 **int32 域** 补回：`vpaddd`（1 周期）替掉一次
+                        # `vaddps`（4 周期），依赖链 22 → ~18。⚠️ 数值**逐位相同** ——
+                        # `q` 与 `Σx` 都是整数且 |q + Σx| < 2^24 ⇒ 两条路在 f32 里都精确。
+                        var qc = q + SIMD[DType.int32, W_Q4](
+                            sump[unsafe_offset=rb * nb + b]
+                        )
+                        acc8u[rb * RU + u] = (
+                            qc.cast[DType.float32]() * dsx + acc8u[rb * RU + u]
+                        )
+                    else:
+                        var c = SIMD[DType.float32, W_Q4](
+                            Float32(sump[unsafe_offset=rb * nb + b])
+                        )
+                        acc8u[rb * RU + u] = (
+                            (q.cast[DType.float32]() + c) * dsx
+                            + acc8u[rb * RU + u]
+                        )
             b += 1
 
         comptime for rb in range(RB):
@@ -1521,10 +1541,16 @@ def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0](
                     w32, x32
                 )
                 var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, W_Q4]](p, ones)
-                var c = SIMD[DType.float32, W_Q4](
-                    Float32(sump[unsafe_offset=rb * nb + b])
-                )
-                acc8[rb] = (q.cast[DType.float32]() + c) * dsx + acc8[rb]
+                comptime if SX_I32 == 1:
+                    var qc = q + SIMD[DType.int32, W_Q4](
+                        sump[unsafe_offset=rb * nb + b]
+                    )
+                    acc8[rb] = qc.cast[DType.float32]() * dsx + acc8[rb]
+                else:
+                    var c = SIMD[DType.float32, W_Q4](
+                        Float32(sump[unsafe_offset=rb * nb + b])
+                    )
+                    acc8[rb] = (q.cast[DType.float32]() + c) * dsx + acc8[rb]
             b += 1
 
         comptime for rb in range(RB):
