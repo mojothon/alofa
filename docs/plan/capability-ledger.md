@@ -1317,3 +1317,15 @@
       **已验过它不是不会失败的门**：把 mub 换成 f32 再跑，两条"确实在算"全红（3 passed / 2 failed）。
   - ⇒ **翻默认**：`vpmaddubsw` 成为 AVX2 下的 q4 通路（`ALOFA_Q4_MUB=0` 退回 f32 展开）。
     原 `scripts/verify_q4_mub_greedy.mojo` 删除 —— 它"不是门、不登记"的定位已被上面的门取代。
+  - ⚠️ **翻默认当天就发现它让 shards=8 慢 30%**（同轮、用 fp32 档归一化：mub 3.39× vs
+    无 mub 4.85×，而 shards=1 是 +20%）。成因是**每次调用的固定税**：三个 scratch 缓冲用
+    `fill=0` 构造 ⇒ 每次调用清 16 KB + 2 KB + 2 KB，与本次真正要读的权重流量无关；shards
+    切分后每次调用只做 1/8 的输出行，**同一笔税被放大 8 倍**。改成 `uninitialized=True`
+    （三个缓冲都是先写后读；单行核的 `Σx` 只有 lane 0 有意义，改用整向量 store 写满 8 lane）
+    ⇒ shards=8 回到**齐平**（3.85× vs 3.87×），shards=1 的 +20% 保住。
+    ⚠️ 记忆里"Mojo 1.0 没有未初始化构造"是**错的**：`unsafe_uninitialized=True` 不存在，
+    `uninitialized=True` 存在且能编。
+  - ⚠️ 本轮绝对吞吐被机器负载压低（runq 8–20）⇒ **只做同轮比较**，跨轮绝对数字不可比。
+  - 已有重门里**唯一能看见这条通路的是 `test-q8-head`**（它两个后端都跑且开 q4）：翻默认后
+    4/4 过（AVX2 档 plain 0.8672 / q8_0 0.8652，差 0.002 ≪ 0.03 容忍）。
+    ⚠️ `test-batch-forward` 与 `test-model-avx2` 都是 **fp32**，**看不见**这条通路。
