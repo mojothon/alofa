@@ -1311,6 +1311,10 @@ def matmul_q4_mub_bias(
 # 逐 (行, 块) 缩放后每块每行多一次 `d·s` 的广播：RB=1 与共用步长持平，RB=2 多一条。
 comptime MUB_ROWS_MAX_XQ = 16384
 comptime MUB_ROWS_MAX_SUMS = MUB_ROWS_MAX_XQ // Q4_BLOCK
+# 一次解量化喂几个**输出行**（2026-09-29 加）：见下面 `_matmul_q4_mub_rows` 的注释。
+# 这里存的是**累加器组数的预算**，不是行数 —— 实际行数 `RU = 预算 // RB`，这样
+# `RB=1`（decode）用 8 行一组、`RB=2`（prefill）用 4 行一组，寄存器占用恒定。
+comptime MUB_ROW_ACC_TARGET = 8
 
 
 def _matmul_q4_mub_rows[RB: Int](
@@ -1414,7 +1418,76 @@ def _matmul_q4_mub_rows[RB: Int](
     )
     var acc = InlineArray[Float64, RB](fill=Float64(0))
 
-    for row in range(rows):
+    # ⚠️ **输出行按 `RU` 个一组走**：一块权重解量化一次，喂给 `RU` 个输出行。
+    # 能这么做是因为 `x32` / `Σx` / `scp` 都只取决于 `(rb, b)`，**与输出行无关** ——
+    # 多行共用它们不花任何额外算术，只多 `RU-1` 组寄存器。
+    # 为什么要这么做（2026-09-29 实测，见账本变更日志）：核级每 (行,块) 要 ~17 个周期、
+    # IPC≈0.85 —— 卡在**只有 2 条独立累加链**（编译器把行循环展开成 2）上，既不是
+    # 算术峰值（`vpmaddubsw` 只用到 3%）也不是 DRAM（权重放在 L3 里也只快 4%）。
+    # `RU` 组给出 `RU` 条独立链 + `RU` 份在飞访存。
+    # ⚠️ 每个输出行的**累加顺序一个字节都没动**（仍是 `b = 0…nb-1`、行末 `reduce_add`）
+    # ⇒ 与改前**逐位一致**，不需要重定任何判据基线。
+    # ⚠️ `RU` 随 `RB` 反向缩：**累加器组数恒定**（`RB * RU ≈ MUB_ROW_ACC_TARGET`），
+    # 免得 `RB=2`（prefill）时 `8 × 2 = 16` 组把寄存器压到溢出。
+    comptime RU = MUB_ROW_ACC_TARGET // RB if RB <= MUB_ROW_ACC_TARGET else 1
+    var acc8u = InlineArray[SIMD[DType.float32, W_Q4], RB * RU](
+        fill=SIMD[DType.float32, W_Q4](0)
+    )
+    var accu = InlineArray[Float64, RB * RU](fill=Float64(0))
+
+    var row = 0
+    while row + RU <= rows:
+        comptime for rb in range(RB):
+            comptime for u in range(RU):
+                acc8u[rb * RU + u] = SIMD[DType.float32, W_Q4](0)
+                accu[rb * RU + u] = (
+                    Float64(bias[unsafe_offset=row + u])
+                    if has_bias
+                    else Float64(0)
+                )
+
+        var b = 0
+        while b < nb:
+            comptime for u in range(RU):
+                var base = ((row + u) * nb + b) * Q4_BYTES
+                var raw = blocks.unsafe_load[width=W_Q4_HALF](
+                    base + Q4_SCALE_BYTES
+                )
+                var lo = raw & low_mask
+                var hi = (raw >> four) & low_mask
+                var w32 = lo.join(hi)
+                var d = block_scale(blocks, base)
+                comptime for rb in range(RB):
+                    var dsx = SIMD[DType.float32, W_Q4](
+                        d * scp[unsafe_offset=rb * nb + b]
+                    )
+                    var x32 = xqp.unsafe_load[width=2 * W_Q4_HALF](
+                        rb * cols + b * Q4_BLOCK
+                    )
+                    var p = llvm_intrinsic[MUBSW, SIMD[DType.int16, W_Q4_HALF]](
+                        w32, x32
+                    )
+                    var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, W_Q4]](
+                        p, ones
+                    )
+                    var c = SIMD[DType.float32, W_Q4](
+                        Float32(sump[unsafe_offset=rb * nb + b])
+                    )
+                    acc8u[rb * RU + u] = (
+                        (q.cast[DType.float32]() + c) * dsx + acc8u[rb * RU + u]
+                    )
+            b += 1
+
+        comptime for rb in range(RB):
+            comptime for u in range(RU):
+                accu[rb * RU + u] += Float64(acc8u[rb * RU + u].reduce_add())
+                dst[unsafe_offset=rb * dst_stride + row + u] = Float32(
+                    accu[rb * RU + u]
+                )
+        row += RU
+
+    # 尾巴：`rows` 不是 `RU` 的整数倍时逐行走（同一套算术，只是没有多行共用）。
+    while row < rows:
         comptime for rb in range(RB):
             acc8[rb] = SIMD[DType.float32, W_Q4](0)
             acc[rb] = Float64(bias[unsafe_offset=row]) if has_bias else Float64(0)
@@ -1447,6 +1520,7 @@ def _matmul_q4_mub_rows[RB: Int](
         comptime for rb in range(RB):
             acc[rb] += Float64(acc8[rb].reduce_add())
             dst[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
+        row += 1
 
 
 def matmul_q4_mub_rows_band[RB: Int = 2](
