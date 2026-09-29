@@ -58,6 +58,11 @@ SUITES=(
   "tests/unit/test_q8_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_matmul_vec.mojo|-O0 -I src"
   "tests/unit/test_q4_rows.mojo|-O0 -I src"
+  # `vpmaddubsw` 行带通路的核级差分门：贴着默认 f32 行带（相对 L2 ≤ 1%）+ 两条通路
+  # **不许逐位相同**（"开关没接到"就长这样）+ 守卫区。不要权重，所以留在 `pixi run
+  # test` 里 —— 整网那条（test-q4-mub）要 2 GB 权重，红的时候分不清是核错还是没接上，
+  # 这个门先把那两种死法钉住。
+  "tests/unit/test_q4_mub_rows.mojo|-O0 -I src"
   "tests/unit/test_parallel_shards.mojo|-O2 -I src"
   "tests/unit/test_gemm_batch_layout.mojo|-O0 -I src"
   "tests/unit/test_avx2_parity.mojo|-I src"
