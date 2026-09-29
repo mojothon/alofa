@@ -62,6 +62,8 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
     matmul_q4_f32_rows_band as matmul_q4_f32_rows_band_vec,
     matmul_q4_f32_bias_rows_band as matmul_q4_f32_bias_rows_band_vec,
+    matmul_q4_mub_rows_band as matmul_q4_mub_rows_band_vec,
+    matmul_q4_mub_bias_rows_band as matmul_q4_mub_bias_rows_band_vec,
     matmul_q4_mub as matmul_q4_mub_vec,
     matmul_q4_mub_bias as matmul_q4_mub_bias_vec,
     matmul_q8_f32_vec,
@@ -641,7 +643,10 @@ def q4_matmul_rows_k[backend: Int](
     函数，另行开门之前继续走逐 token 的老路。
     """
     comptime if uses_vector_backend[backend]():
-        matmul_q4_f32_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
+        if q4_mub_enabled():
+            matmul_q4_mub_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
+        else:
+            matmul_q4_f32_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
     else:
         var t = 0
         while t < n_tok:
@@ -675,7 +680,14 @@ def q4_matmul_bias_rows_k[backend: Int](
     每行 256 B，攒到 8 行就只有溢栈一条路 —— 理由写在 `avx2.mojo` 那个函数的注释里。
     """
     comptime if uses_vector_backend[backend]():
-        matmul_q4_f32_bias_rows_band_vec(dst, x, blocks, n_tok, rows, cols, bias, dst_stride)
+        if q4_mub_enabled():
+            matmul_q4_mub_bias_rows_band_vec(
+                dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+            )
+        else:
+            matmul_q4_f32_bias_rows_band_vec(
+                dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+            )
     else:
         var t = 0
         while t < n_tok:

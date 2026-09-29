@@ -40,7 +40,7 @@ memory 受限，所以这里量的是"alofa 今天的水平"，不是它的天�
 
 from alofa.core.ffi import monotonic_ns
 from alofa.core.text import parse_int, read_text
-from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward
+from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
 from alofa.tokenizer import Tokenizer, load_tokenizer
 
 comptime FIXTURE = "tests/fixtures/qwen2.5-0.5b"
@@ -143,6 +143,11 @@ def main() raises:
     print("")
     print("== alofa：与 llama.cpp 同机同 prompt 对齐的端到端计时 ==")
     print("   backend avx2 / greedy / prefill 与 decode 分开报 / fp32 与 q4 两档")
+    # 跑什么通路必须打印出来：开关没生效时数字会和默认档一模一样，光看 tok/s 分不出来。
+    print(
+        "   q4 通路："
+        + ("vpmaddubsw（ALOFA_Q4_MUB=1）" if q4_mub_enabled() else "默认 f32 展开")
+    )
 
     var tok = load_tokenizer(FIXTURE)
 
