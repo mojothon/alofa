@@ -1203,9 +1203,12 @@ def _matmul_q4_mub(
         # 超出栈缓冲上限 ⇒ 退回默认通路。**不**在这里悄悄改结果。
         _matmul_q4_halves(dst, x, blocks, rows, cols, bias, has_bias)
         return
-    var xq_buf = InlineArray[Int8, MUB_MAX_COLS](fill=Int8(0))
-    var sumx_buf = InlineArray[Int32, MUB_MAX_BLOCKS * W_Q4](fill=Int32(0))
-    var scale_buf = InlineArray[Float32, MUB_MAX_BLOCKS](fill=Float32(0))
+    # 同样**不清零**（理由见行带版那条注释）：`xq` 覆盖整个 `cols`、缩放覆盖 `nb`；
+    # `Σx` 只写 lane 0，所以下面用**整向量** store 把其余 7 个 lane 一并写成 0，
+    # 不能靠清零来兜 —— 清零是每次调用的固定税，行带版正是被它拖垮的。
+    var xq_buf = InlineArray[Int8, MUB_MAX_COLS](uninitialized=True)
+    var sumx_buf = InlineArray[Int32, MUB_MAX_BLOCKS * W_Q4](uninitialized=True)
+    var scale_buf = InlineArray[Float32, MUB_MAX_BLOCKS](uninitialized=True)
     var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
     var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
     var scp = scale_buf.unsafe_ptr().unsafe_bitcast[Float32]()
@@ -1238,8 +1241,11 @@ def _matmul_q4_mub(
             xqp[unsafe_offset=xb + j] = Int8(qv)
             s += qv
         # Σx 做成"仅 lane 0 非零"的向量：`vpmaddubsw` 送进去的是未减 8 的 nibble，
-        # `−8` 这一项只能这样在整数域补回来（放在整数域 ⇒ 不添浮点误差）。
-        sump[unsafe_offset=b * W_Q4] = Int32(-8 * s)
+        # `−8` 这一项只能这样在整数域补回来（放在整数域 ⇒ 不添浮点误差）。整向量
+        # store 一次写满 8 个 lane，其余 7 个是 0 —— 不清零也保证它们有定义。
+        var sv = SIMD[DType.int32, W_Q4](0)
+        sv[0] = Int32(-8 * s)
+        sump.unsafe_store[width=W_Q4](b * W_Q4, sv)
 
     # --- 点积：每块一条 `vpmaddubsw`，**块内不求和** ---
     #
@@ -1357,9 +1363,14 @@ def _matmul_q4_mub_rows[RB: Int](
             _matmul_q4_halves_rows[RB](dst, x, blocks, rows, cols, dst_stride)
         return
     var nb = cols // Q4_BLOCK
-    var xq_buf = InlineArray[Int8, MUB_ROWS_MAX_XQ](fill=Int8(0))
-    var sumx_buf = InlineArray[Int32, MUB_ROWS_MAX_SUMS](fill=Int32(0))
-    var scale_buf = InlineArray[Float32, MUB_ROWS_MAX_SUMS](fill=Float32(0))
+    # ⚠️ **不清零**（`uninitialized=True`）：下面三个缓冲都是**先写后读** —— `xq` 覆盖
+    # `RB*cols`、`Σx` 与缩放覆盖 `RB*nb`，点积循环只读这些下标。清零在这里不是"保险"，
+    # 是**每次调用的固定税**：16 KB 的 store 与本次真正要读的权重流量无关，shards=8
+    # 时每次调用只做 1/8 的输出行，这笔税就被放大 8 倍（实测 shards=8 端到端慢
+    # 20–25%，shards=1 反而快）⇒ 2026-09-29 改掉。
+    var xq_buf = InlineArray[Int8, MUB_ROWS_MAX_XQ](uninitialized=True)
+    var sumx_buf = InlineArray[Int32, MUB_ROWS_MAX_SUMS](uninitialized=True)
+    var scale_buf = InlineArray[Float32, MUB_ROWS_MAX_SUMS](uninitialized=True)
     var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
     var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
     var scp = scale_buf.unsafe_ptr().unsafe_bitcast[Float32]()
