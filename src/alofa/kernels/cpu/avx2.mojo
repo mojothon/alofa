@@ -1153,7 +1153,7 @@ def matmul_q4_f32_bias(
 # ⚠️ **代价不是累加顺序，是多一层量化。** `vpmaddubsw` 的第一操作数按 **u8** 解释，
 # 于是送进去的必须是**未减 8** 的 nibble（`−8` 只能在整数域用 `−8·Σx` 补回来）；
 # 第二操作数按 **i8** 解释 ⇒ **激活必须先量化成 int8**。相对默认通路多出约
-# **0.75% 相对 L2**。够不够格替掉默认通路是**判据层**的事（`test-q4` 的 greedy
+# **0.35% 相对 L2**（逐块缩放后；共用步长那版是 0.75%）。够不够格替掉默认通路是**判据层**的事（`test-q4` 的 greedy
 # 一致率）；在此之前它只由 `ALOFA_Q4_MUB=1` 打开，默认通路一个字节都不动。
 # ---------------------------------------------------------------------------
 
@@ -1205,35 +1205,40 @@ def _matmul_q4_mub(
         return
     var xq_buf = InlineArray[Int8, MUB_MAX_COLS](fill=Int8(0))
     var sumx_buf = InlineArray[Int32, MUB_MAX_BLOCKS * W_Q4](fill=Int32(0))
+    var scale_buf = InlineArray[Float32, MUB_MAX_BLOCKS](fill=Float32(0))
     var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
     var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
+    var scp = scale_buf.unsafe_ptr().unsafe_bitcast[Float32]()
 
-    var xmax = Float32(0)
-    for i in range(cols):
-        var v = x[unsafe_offset=i]
-        if v < Float32(0):
-            v = -v
-        if v > xmax:
-            xmax = v
-    var sx = xmax / Float32(127.0)
-    if sx == Float32(0):
-        sx = Float32(1)
-
-    for i in range(cols):
-        var qv = Int(x[unsafe_offset=i] / sx)
-        if qv > 127:
-            qv = 127
-        if qv < -128:
-            qv = -128
-        xqp[unsafe_offset=i] = Int8(qv)
-
-    # 每段的 Σx，做成"仅 lane 0 非零"的向量：`vpmaddubsw` 送进去的是未减 8 的
-    # nibble，`−8` 这一项只能这样在整数域补回来（放在整数域 ⇒ 不添浮点误差）。
+    # 逐**块**缩放（每 32 个激活一个步长，与行带版同一个口径）。两趟走同一块：一趟求
+    # `amax`，一趟量化并顺手把 `Σx` 累加出来 —— 顺便带走，等于不额外花钱。
     var nb = cols // Q4_BLOCK
     for b in range(nb):
+        var xb = b * Q4_BLOCK
+        var amax = Float32(0)
+        for j in range(Q4_BLOCK):
+            var v = x[unsafe_offset=xb + j]
+            if v < Float32(0):
+                v = -v
+            if v > amax:
+                amax = v
+        var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+        scp[unsafe_offset=b] = amax / Float32(127.0)
         var s = Int(0)
         for j in range(Q4_BLOCK):
-            s += Int(xqp[unsafe_offset=b * Q4_BLOCK + j])
+            var t = x[unsafe_offset=xb + j] * inv
+            # 四舍五入：截断会带 0.5 LSB 的**系统性**偏差
+            var qv = (
+                Int(t + Float32(0.5)) if t >= Float32(0) else Int(t - Float32(0.5))
+            )
+            if qv > 127:
+                qv = 127
+            if qv < -128:
+                qv = -128
+            xqp[unsafe_offset=xb + j] = Int8(qv)
+            s += qv
+        # Σx 做成"仅 lane 0 非零"的向量：`vpmaddubsw` 送进去的是未减 8 的 nibble，
+        # `−8` 这一项只能这样在整数域补回来（放在整数域 ⇒ 不添浮点误差）。
         sump[unsafe_offset=b * W_Q4] = Int32(-8 * s)
 
     # --- 点积：每块一条 `vpmaddubsw`，**块内不求和** ---
@@ -1261,7 +1266,7 @@ def _matmul_q4_mub(
             var sh = sump.unsafe_load[width=W_Q4](b * W_Q4)
             var d = block_scale(blocks, base)
             acc8 = (q + sh).cast[DType.float32]() * SIMD[DType.float32, W_Q4](
-                d * sx
+                d * scp[unsafe_offset=b]
             ) + acc8
         acc += Float64(acc8.reduce_add())
         dst[unsafe_offset=row] = Float32(acc)
@@ -1272,7 +1277,8 @@ def matmul_q4_mub(
 ) raises AlofaError:
     """可选通路（**默认不启用**）：激活量化成 int8 + `vpmaddubsw` 整数点积。
 
-    核级比默认通路快约 1.87×，但**多一层激活量化**（相对 L2 约 0.75%）。
+    核级比默认通路快约 1.87×，但**多一层激活量化**：逐块缩放之后相对 L2 约 **0.35%**
+    （共用步长那版是 0.75%，差的那部分把整网一致率从 0.8672 压到 0.8184）。
     ⚠️ 够不够格替掉默认通路由 `test-q4` 的 greedy 一致率判 —— 在那之前它只由
     `ALOFA_Q4_MUB=1` 打开。
     """
@@ -1296,6 +1302,7 @@ def matmul_q4_mub_bias(
 # 指令账（每块）：默认 f32 行带 = 共享解量化 ~27 条 + 每行 6 条；本函数 = 共享 ~5 条
 # + 每行 ~9 条 ⇒ **RB=1（decode）33 vs 14**，**RB=2 是 39 vs 23**，RB=8 大致打平。
 # 所以 `RB` 默认 **2**（不是无偏置那条路的 8）：行组越大，省下的解量化被摊得越薄。
+# 逐 (行, 块) 缩放后每块每行多一次 `d·s` 的广播：RB=1 与共用步长持平，RB=2 多一条。
 comptime MUB_ROWS_MAX_XQ = 16384
 comptime MUB_ROWS_MAX_SUMS = MUB_ROWS_MAX_XQ // Q4_BLOCK
 
@@ -1315,10 +1322,11 @@ def _matmul_q4_mub_rows[RB: Int](
     与 `_matmul_q4_halves_rows[RB]` 的差别只有内层：那一条把 nibble 展开成 f32 再乘
     加，这里把 nibble 直接喂 `vpmaddubsw`，`−8` 那一项用 `Σx` 补回（见下）。
 
-    ⚠️ **整批共用一个激活量化步长** `sx`（取 `RB` 行里绝对值的最大值）：每行各自一
-    个步长要多一次广播（每块每行一条 port 5 指令），而同一批 token 的激活幅度本来
-    就在同一量级。代价是**幅度小的那几行相对误差更大** —— 这也是"多一层激活量化"
-    那笔账的一部分，不是免费的。
+    ⚠️ 激活按 **(行, 块)** 缩放：每 32 个激活一个步长，就是 llama.cpp q8_0 激活的口径。
+    **不要退回整批一个 `sx`** —— 那样幅度小的行要按幅度大的行定标，核级相对 L2 从
+    0.1% 量级涨到 0.75%（各行幅度差 20× 时 1.00%），而整网一致率从 0.8691 掉到 0.8184，
+    直接过不了 0.85 那条线。⚠️ **"每行一个步长"那一档不用单独留**：内层每块每行都要
+    一次 `d·s` 广播，逐行与逐块**成本完全相同**，而逐行仍被整行最大值支配 ⇒ 被严格支配。
 
     ⚠️ `Σx` 按 **(行, 块)** 存**标量** `i32`（不是单行版那种"仅 lane 0 非零"的向
     量）：8 个 lane 各加 `−Σx`，`reduce_add` 之后合计正好 `−8·Σx`。向量版要 8 倍缓冲，
@@ -1351,36 +1359,41 @@ def _matmul_q4_mub_rows[RB: Int](
     var nb = cols // Q4_BLOCK
     var xq_buf = InlineArray[Int8, MUB_ROWS_MAX_XQ](fill=Int8(0))
     var sumx_buf = InlineArray[Int32, MUB_ROWS_MAX_SUMS](fill=Int32(0))
+    var scale_buf = InlineArray[Float32, MUB_ROWS_MAX_SUMS](fill=Float32(0))
     var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
     var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
+    var scp = scale_buf.unsafe_ptr().unsafe_bitcast[Float32]()
 
-    var xmax = Float32(0)
-    comptime for rb in range(RB):
-        for i in range(cols):
-            var v = x[unsafe_offset=rb * cols + i]
-            if v < Float32(0):
-                v = -v
-            if v > xmax:
-                xmax = v
-    var sx = xmax / Float32(127.0)
-    if sx == Float32(0):
-        sx = Float32(1)
-
-    comptime for rb in range(RB):
-        for i in range(cols):
-            var qv = Int(x[unsafe_offset=rb * cols + i] / sx)
-            if qv > 127:
-                qv = 127
-            if qv < -128:
-                qv = -128
-            xqp[unsafe_offset=rb * cols + i] = Int8(qv)
-
+    # 两趟走同一个块（32 个 f32 = 128 B，留在 L1）：一趟求 `amax`，一趟量化并顺手把
+    # `Σx` 累加出来 —— 逐块缩放要的就是这个 `amax`，顺路带走 `Σx` 等于不额外花钱。
     comptime for rb in range(RB):
         for b in range(nb):
-            var s = Int(0)
+            var xb = rb * cols + b * Q4_BLOCK
+            var amax = Float32(0)
             for j in range(Q4_BLOCK):
-                s += Int(xqp[unsafe_offset=rb * cols + b * Q4_BLOCK + j])
-            sump[unsafe_offset=rb * nb + b] = Int32(-s)
+                var v = x[unsafe_offset=xb + j]
+                if v < Float32(0):
+                    v = -v
+                if v > amax:
+                    amax = v
+            var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+            scp[unsafe_offset=rb * nb + b] = amax / Float32(127.0)
+            var sx = Int(0)
+            for j in range(Q4_BLOCK):
+                var t = x[unsafe_offset=xb + j] * inv
+                # 四舍五入：截断会带 0.5 LSB 的**系统性**偏差（不只是抖动）
+                var qv = (
+                    Int(t + Float32(0.5))
+                    if t >= Float32(0)
+                    else Int(t - Float32(0.5))
+                )
+                if qv > 127:
+                    qv = 127
+                if qv < -128:
+                    qv = -128
+                xqp[unsafe_offset=xb + j] = Int8(qv)
+                sx += qv
+            sump[unsafe_offset=rb * nb + b] = Int32(-sx)
 
     var low_mask = SIMD[DType.uint8, W_Q4_HALF](0x0F)
     var four = SIMD[DType.uint8, W_Q4_HALF](4)
@@ -1403,8 +1416,10 @@ def _matmul_q4_mub_rows[RB: Int](
             var hi = (raw >> four) & low_mask
             var w32 = lo.join(hi)
             var d = block_scale(blocks, base)
-            var dsx = SIMD[DType.float32, W_Q4](d * sx)
             comptime for rb in range(RB):
+                var dsx = SIMD[DType.float32, W_Q4](
+                    d * scp[unsafe_offset=rb * nb + b]
+                )
                 var x32 = xqp.unsafe_load[width=2 * W_Q4_HALF](
                     rb * cols + b * Q4_BLOCK
                 )
