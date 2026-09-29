@@ -47,6 +47,11 @@ ci-watch = "scripts/ci_watch.sh"
 # 并入 test —— 它仍然由 scripts/dump_model_reference.py --full 的本地产物驱动。
 test-model = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_model_parity.mojo -o target/model_parity && ./target/model_parity"
 test-q4 = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q4_greedy.mojo -o target/q4_greedy && ./target/q4_greedy"
+# `vpmaddubsw` 那条通路的整网质量门：与 test-q4 同一份 fixture、同一套教师强制贪心、
+# 同一组下限（0.75 / 0.85），但后端换成 `BACKEND_AVX2` —— 标量后端下这条通路一个
+# 周期都不会执行，少了这个门，它绿不绿没人知道（2026-09-29 之前就是这样）。
+# 同样不并入 test（2 GB 权重 + 数分钟）。
+test-q4-mub = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q4_mub_greedy.mojo -o target/q4_mub_greedy && ./target/q4_mub_greedy"
 # q8_0 输出投影接进整网之后的端到端质量门（教师强制贪心一致率）。同样不并入
 # test：要加载 2 GB 导出并把 24 层压一遍 q4_0，数分钟。
 test-q8-head = "mkdir -p target && pixi run mojo build -O2 -I src tests/unit/test_q8_head_greedy.mojo -o target/q8_head_greedy && ./target/q8_head_greedy"
