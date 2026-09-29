@@ -44,6 +44,7 @@ q4 的块是 **32 个值 / 18 字节**，一个 nibble 不是一个通道宽度�
 """
 
 from std.math import exp, sqrt
+from std.sys import llvm_intrinsic
 
 from alofa.core.dtype import (
     QUANT_Q4_0,
@@ -1137,6 +1138,153 @@ def matmul_q4_f32_bias(
 ) raises AlofaError:
     """`dst = W · x + bias`，向量版；Qwen2 的 q/k/v 投影都带偏置。"""
     _matmul_q4(dst, x, blocks, rows, cols, bias, True)
+
+
+# ---------------------------------------------------------------------------
+# 可选通路：`vpmaddubsw` 整数点积（**默认不启用**）
+#
+# 2026-09-29 探出来的（`scripts/bench_q4_mub.mojo`）：`_matmul_q4_halves` 的热循环
+# 是 24 条/块，其中 **16 条在把 nibble 展开成 f32**（`vpmovzxbd` + `vcvtdq2ps`，两条都
+# 走 **port 5**、每 cycle 1 条），**只有 4 条在真乘加** ⇒ 每块约 13 cycle 里有 8 个卡在
+# port 5。`vpmaddubsw`（u8 × i8 → i16，一条吃掉 16 对乘加）走的是乘加端口，绕得开。
+#
+# 实测（`down_proj` 4864×896，同场）：生产核 518 µs、本通路 **277 µs（1.87×）**。
+#
+# ⚠️ **代价不是累加顺序，是多一层量化。** `vpmaddubsw` 的第一操作数按 **u8** 解释，
+# 于是送进去的必须是**未减 8** 的 nibble（`−8` 只能在整数域用 `−8·Σx` 补回来）；
+# 第二操作数按 **i8** 解释 ⇒ **激活必须先量化成 int8**。相对默认通路多出约
+# **0.75% 相对 L2**。够不够格替掉默认通路是**判据层**的事（`test-q4` 的 greedy
+# 一致率）；在此之前它只由 `ALOFA_Q4_MUB=1` 打开，默认通路一个字节都不动。
+# ---------------------------------------------------------------------------
+
+comptime MUBSW = "llvm.x86.avx2.pmadd.ub.sw"
+comptime MADDWD = "llvm.x86.avx2.pmadd.wd"
+
+# 激活量化缓冲放在**栈上**（热路径分配会付 malloc，而 `Arena` 还会打日志）。
+# 本项目的最大 inner 是 `down_proj` 的 4864；超出上限就**退回默认通路** ——
+# 不静默给错结果，也不许靠"恰好没超"活着。
+comptime MUB_MAX_COLS = 8192
+comptime MUB_MAX_BLOCKS = MUB_MAX_COLS // Q4_BLOCK
+
+comptime I8Ptr = Pointer[Int8, MutUntrackedOrigin]
+comptime I32Ptr = Pointer[Int32, MutUntrackedOrigin]
+
+
+def _matmul_q4_mub(
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q4_U8,
+    rows: Int,
+    cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
+) raises AlofaError:
+    """先把激活量化成 int8（顺带算出每段的 `Σx`），再走 `vpmaddubsw` 点积。
+
+    **量化与点积写在同一个函数里**，两个理由：一是量化缓冲在**栈**上
+    （`InlineArray`），它的指针带着 `origin_of(buf)`，而本模块的指针契约一律是
+    `MutUntrackedOrigin` —— 跨函数传就得擦 origin，热路径为这件事多一层间接不值；
+    二是写在一起才能保证量化只做**一次**（`cols` 个值）而不是每行一遍：矩阵是
+    `rows × cols`，4864 行共用同一份 int8 激活。
+    """
+    if rows <= 0 or cols <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "matrix dimensions must be positive",
+            "rows=" + String(rows) + " cols=" + String(cols),
+        )
+    if cols % Q4_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
+        )
+    if cols > MUB_MAX_COLS:
+        # 超出栈缓冲上限 ⇒ 退回默认通路。**不**在这里悄悄改结果。
+        _matmul_q4_halves(dst, x, blocks, rows, cols, bias, has_bias)
+        return
+
+    var xq_buf = InlineArray[Int8, MUB_MAX_COLS](fill=Int8(0))
+    var sumx_buf = InlineArray[Int32, MUB_MAX_BLOCKS * W_Q4](fill=Int32(0))
+    var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
+    var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
+
+    var xmax = Float32(0)
+    for i in range(cols):
+        var v = x[unsafe_offset=i]
+        if v < Float32(0):
+            v = -v
+        if v > xmax:
+            xmax = v
+    var sx = xmax / Float32(127.0)
+    if sx == Float32(0):
+        sx = Float32(1)
+
+    for i in range(cols):
+        var qv = Int(x[unsafe_offset=i] / sx)
+        if qv > 127:
+            qv = 127
+        if qv < -128:
+            qv = -128
+        xqp[unsafe_offset=i] = Int8(qv)
+
+    # 每段的 Σx，做成"仅 lane 0 非零"的向量：`vpmaddubsw` 送进去的是未减 8 的
+    # nibble，`−8` 这一项只能这样在整数域补回来（放在整数域 ⇒ 不添浮点误差）。
+    var nb = cols // Q4_BLOCK
+    for b in range(nb):
+        var s = Int(0)
+        for j in range(Q4_BLOCK):
+            s += Int(xqp[unsafe_offset=b * Q4_BLOCK + j])
+        sump[unsafe_offset=b * W_Q4] = Int32(-8 * s)
+
+    # --- 点积：每块一条 `vpmaddubsw`，**块内不求和** ---
+    #
+    # 求和推迟到行末，这里是全部的关键：`d` 每块不同，逼着每块把 8 个 i32 并成 1 个，
+    # 而那次 `reduce_add` 几乎抵消掉省下的展开（实测 1.27× vs **1.87×**）。`−8·Σx`
+    # 已经做成"仅 lane 0 非零"的向量 ⇒ 部分和能一直留在 f32 累加器里，到行末才并。
+    var low_mask = SIMD[DType.uint8, W_Q4_HALF](0x0F)
+    var four = SIMD[DType.uint8, W_Q4_HALF](4)
+    var ones = SIMD[DType.int16, W_Q4_HALF](1)
+    for row in range(rows):
+        var acc = Float64(0)
+        if has_bias:
+            acc = Float64(bias[unsafe_offset=row])
+        var acc8 = SIMD[DType.float32, W_Q4](0)
+        for b in range(nb):
+            var base = (row * nb + b) * Q4_BYTES
+            var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
+            var lo = raw & low_mask
+            var hi = (raw >> four) & low_mask
+            var w32 = lo.join(hi)
+            var x32 = xqp.unsafe_load[width=2 * W_Q4_HALF](b * Q4_BLOCK)
+            var p = llvm_intrinsic[MUBSW, SIMD[DType.int16, W_Q4_HALF]](w32, x32)
+            var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, W_Q4]](p, ones)
+            var sh = sump.unsafe_load[width=W_Q4](b * W_Q4)
+            var d = block_scale(blocks, base)
+            acc8 = (q + sh).cast[DType.float32]() * SIMD[DType.float32, W_Q4](
+                d * sx
+            ) + acc8
+        acc += Float64(acc8.reduce_add())
+        dst[unsafe_offset=row] = Float32(acc)
+
+
+def matmul_q4_mub(
+    dst: F32Ptr, x: F32Ptr, blocks: Q4_U8, rows: Int, cols: Int
+) raises AlofaError:
+    """可选通路（**默认不启用**）：激活量化成 int8 + `vpmaddubsw` 整数点积。
+
+    核级比默认通路快约 1.87×，但**多一层激活量化**（相对 L2 约 0.75%）。
+    ⚠️ 够不够格替掉默认通路由 `test-q4` 的 greedy 一致率判 —— 在那之前它只由
+    `ALOFA_Q4_MUB=1` 打开。
+    """
+    _matmul_q4_mub(dst, x, blocks, rows, cols, dst, False)
+
+
+def matmul_q4_mub_bias(
+    dst: F32Ptr, x: F32Ptr, blocks: Q4_U8, rows: Int, cols: Int, bias: F32Ptr
+) raises AlofaError:
+    """同上，带偏置（Qwen2 的 q/k/v 投影）。"""
+    _matmul_q4_mub(dst, x, blocks, rows, cols, bias, True)
 
 
 # ---------------------------------------------------------------------------

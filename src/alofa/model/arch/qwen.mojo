@@ -20,6 +20,7 @@ Run:
 """
 
 from std.math import cos, pow, sin
+from std.os import getenv
 from std.runtime.asyncrt import TaskGroup, parallelism_level
 
 from alofa.core.dtype import DT_FP32
@@ -61,6 +62,8 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
     matmul_q4_f32_rows_band as matmul_q4_f32_rows_band_vec,
     matmul_q4_f32_bias_rows_band as matmul_q4_f32_bias_rows_band_vec,
+    matmul_q4_mub as matmul_q4_mub_vec,
+    matmul_q4_mub_bias as matmul_q4_mub_bias_vec,
     matmul_q8_f32_vec,
 )
 from alofa.kernels.cpu.avx2 import (
@@ -186,6 +189,19 @@ def linear_bias_k[backend: Int](
         linear_bias(dst, x, w, b)
 
 
+def q4_mub_enabled() -> Bool:
+    """`ALOFA_Q4_MUB=1` ⇒ q4 投影改走 `vpmaddubsw` 可选通路。**默认关。**
+
+    为什么是**运行期**开关而不是第四个 `backend`：`backend` 是编译期参数，而这条
+    通路**还没有被判据层认可**（核级快 1.87×，但多一层激活量化，相对 L2 约 0.75%，
+    见 `avx2.mojo` 里那节的说明）。"默认关、想验证时打开"才是不预判决据的写法。
+
+    ⚠️ 每次调用读一次环境变量：一次投影是百 µs 量级，读一个字符串是百 ns 量级 ——
+    一层 7 次，摊不进噪声里。真要长期留着再换成"加载时读一次"。
+    """
+    return getenv("ALOFA_Q4_MUB", "") == "1"
+
+
 def q4_matmul_k[backend: Int](
     dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int
 ) raises AlofaError:
@@ -193,9 +209,15 @@ def q4_matmul_k[backend: Int](
 
     两条实现的契约与数值完全一致（向量版对同一份 fixture 的九条用例与标量版同为
     逐位一致，见 `tests/unit/test_q4_matmul_vec.mojo`），差别只是速度。
+
+    ⚠️ `ALOFA_Q4_MUB=1` 会把它换成 `vpmaddubsw` 可选通路（**默认不走**）；那条通路
+    **不是**"同一份数值的另一条实现"，它多量化一层激活。
     """
     comptime if uses_vector_backend[backend]():
-        matmul_q4_f32_vec(dst, x, blocks, rows, cols)
+        if q4_mub_enabled():
+            matmul_q4_mub_vec(dst, x, blocks, rows, cols)
+        else:
+            matmul_q4_f32_vec(dst, x, blocks, rows, cols)
     else:
         matmul_q4_f32(dst, x, blocks, rows, cols)
 
@@ -203,9 +225,12 @@ def q4_matmul_k[backend: Int](
 def q4_matmul_bias_k[backend: Int](
     dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int, bias: F32Ptr
 ) raises AlofaError:
-    """按 `backend` 分发的 q4_0 融合投影（带偏置）。"""
+    """按 `backend` 分发的 q4_0 融合投影（带偏置）。开关语义同 `q4_matmul_k`。"""
     comptime if uses_vector_backend[backend]():
-        matmul_q4_f32_bias_vec(dst, x, blocks, rows, cols, bias)
+        if q4_mub_enabled():
+            matmul_q4_mub_bias_vec(dst, x, blocks, rows, cols, bias)
+        else:
+            matmul_q4_f32_bias_vec(dst, x, blocks, rows, cols, bias)
     else:
         matmul_q4_f32_bias(dst, x, blocks, rows, cols, bias)
 
