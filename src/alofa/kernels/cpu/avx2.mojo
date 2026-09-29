@@ -1317,7 +1317,13 @@ comptime MUB_ROWS_MAX_SUMS = MUB_ROWS_MAX_XQ // Q4_BLOCK
 comptime MUB_ROW_ACC_TARGET = 8
 
 
-def _matmul_q4_mub_rows[RB: Int](
+# ⚠️ `RU_OVERRIDE` **只给测量探针用**：`0` = 沿用 `MUB_ROW_ACC_TARGET // RB` 的推导值
+# （生产路径不传 ⇒ 推导式与代码一字不变）。为什么要它：`RU`（一次解量化喂几个输出行）一个
+# 二进制里只能有一档 ⇒ 比两档只能跨进程，而本机跨进程噪声 ±25%（2026-09-29：同一二进制
+# 相邻两轮 `gate` 393657 ↔ 581050 ns），`RU=8` vs `16` 那种 ≲10% 的差**量不出来**。有了
+# 这个参数，探针能在同一个二进制里实例化多档、交错计时 + 轮换出场顺序，把系统漂移变成
+# 两臂共有（`scripts/bench_q4_rows_ru.mojo`）。
+def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1429,7 +1435,11 @@ def _matmul_q4_mub_rows[RB: Int](
     # ⇒ 与改前**逐位一致**，不需要重定任何判据基线。
     # ⚠️ `RU` 随 `RB` 反向缩：**累加器组数恒定**（`RB * RU ≈ MUB_ROW_ACC_TARGET`），
     # 免得 `RB=2`（prefill）时 `8 × 2 = 16` 组把寄存器压到溢出。
-    comptime RU = MUB_ROW_ACC_TARGET // RB if RB <= MUB_ROW_ACC_TARGET else 1
+    comptime RU = (
+        RU_OVERRIDE
+        if RU_OVERRIDE > 0
+        else (MUB_ROW_ACC_TARGET // RB if RB <= MUB_ROW_ACC_TARGET else 1)
+    )
     var acc8u = InlineArray[SIMD[DType.float32, W_Q4], RB * RU](
         fill=SIMD[DType.float32, W_Q4](0)
     )
