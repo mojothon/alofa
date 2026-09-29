@@ -146,7 +146,11 @@ def main() raises:
     # 跑什么通路必须打印出来：开关没生效时数字会和默认档一模一样，光看 tok/s 分不出来。
     print(
         "   q4 通路："
-        + ("vpmaddubsw（ALOFA_Q4_MUB=1）" if q4_mub_enabled() else "默认 f32 展开")
+        + (
+            "vpmaddubsw（默认）"
+            if q4_mub_enabled()
+            else "f32 展开（ALOFA_Q4_MUB=0）"
+        )
     )
 
     var tok = load_tokenizer(FIXTURE)
