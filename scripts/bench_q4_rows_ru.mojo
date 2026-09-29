@@ -1,29 +1,39 @@
-"""同进程配对：`RU`（一次解量化喂几个输出行）三档在**同一个二进制**里交错计时。
+"""同进程配对：`RU` / `Σx` 域两个旋钮，**四臂在同一个二进制**里交错计时。
 
 为什么需要它
 ------------
 本机跨进程 A/B 噪声 ±25%（2026-09-29：同一个二进制相邻两轮 `gate` 393657 ↔ 581050 ns），
-而 `RU` 8→16 的效应 ≲10% ⇒ 五次交错配对**全部跨过 1.0、且方向随轮翻转**，判不了。
-同进程配对把系统漂移变成两臂共有：每次计时前**冲刷一遍 256 MB**（与
-`bench_q4_cold_bandwidth.mojo` 同一套口径），两臂**交错**出场，并**逐轮轮换顺序**
+而这两个旋钮的效应 ≲10–20% ⇒ 五次交错配对**全部跨过 1.0、且方向随轮翻转**，判不了。
+同进程配对把系统漂移变成各臂共有：每次计时前**冲刷一遍 256 MB**（与
+`bench_q4_cold_bandwidth.mojo` 同一套口径），各臂**交错**出场，并**逐轮轮换顺序**
 （先跑的那臂不吃亏，也不占便宜）—— `bench_gemm_rb.mojo` 的先例能把比值区间收到
 0.78–0.81 那种紧度。
 
+四臂
+----
+| 臂 | `RU` | `Σx` 修正 | 作用 |
+|----|------|-----------|------|
+| A  | 4    | f32（现状）| `RU` 下探 |
+| B  | 8    | f32（现状）| **基准** |
+| C  | 16   | f32（现状）| `RU` 上探 |
+| D  | 8    | **int32**  | 本轮要判的：`vpaddd`（1 周期）替掉 `vaddps`（4 周期）|
+
 量的是哪一层
 ------------
-直接调核 `_matmul_q4_mub_rows[RB=1, RU]`（decode 档），**不是**模型层的 `q4_matmul_rows_k`：
-后者的分发在编译期定死一个 `RU`，一个二进制里只能有一档。核外剩下的是**两臂完全相同**
-的激活量化（RB=1、cols=896 时约 1 µs，占 `gate` 的 0.3%、占 `k/v` 的 6%）⇒ 它只把比值
-往 1.0 拉一点，不会造出方向。
+直接调核 `_matmul_q4_mub_rows[RB=1, RU, SX]`（decode 档），**不是**模型层的
+`q4_matmul_rows_k`：后者的分发在编译期定死，一个二进制里只能有一档。核外剩下的是**各臂
+完全相同**的激活量化（RB=1、cols=896 时约 1 µs，占 `gate` 的 0.3%、占 `k/v` 的 6%）
+⇒ 它只把比值往 1.0 拉一点，不会造出方向。
 
 怎么读
 ------
-三档 `RU = 4 / 8 / 16`，每轮各一次，报两条比值：`8/16`（>1 表示 16 更快）与 `4/8`
-（>1 表示 8 更快）。判据与别处一致：**一轮一个比值，min…max 全在 1.0 同侧才叫分离**；
-跨过 1.0 就是"判不了"。
+每轮一个比值，**min…max 全在 1.0 同侧**才叫分离；跨过 1.0 就是"判不了"。
+- `RU8/RU16` > 1 表示 `RU=16` 更快；`RU4/RU8` > 1 表示 `RU=8` 更快。
+- `Σx f32/int32` > 1 表示 **int32 那一档更快**。
 
-另有一道自证：三档的输出**必须逐位相同**（`RU` 不改每行的累加顺序）。逐位相同数 ≠ rows
-就说明两臂算的不是同一件事，比值无意义。
+另有一道自证：四臂的输出**必须逐位相同**（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
+`q` 与 `Σx` 都是整数、|q + Σx| < 2^24 ⇒ 两条路在 f32 里都精确）。逐位相同数 ≠ rows 就说明
+两臂算的不是同一件事，比值无意义。
 
 跑法（`-O2`；`fork()` 在 JIT 下会崩，所以先 build）：
 
@@ -42,15 +52,26 @@ from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, quantize_q4_0
 comptime HIDDEN = 896
 comptime INTER = 4864
 comptime KV = 128
+# ⚠️ 冲刷量试过 **64 MB**（≫ L3 12 MB，理论上够），结果**更散**：`gate` 的 RU8/RU16 从
+# 256 MB 那轮的 0.798…0.938（7/7 同侧）变成 0.776…1.111（6/9）⇒ "一轮越短配对越紧"是错的，
+# 长冲刷似乎能把机器状态（频率/内存子系统）压得更一致。故**回到 256 MB**。
 comptime FLUSH_FLOATS = 64 * 1024 * 1024  # 256 MB ≫ L3 12 MB
-comptime REPS = 7
-# ⚠️ 每轮每档取 **best-of-3**：单次计时只有 85…400 µs，本机 runq 6–27 时这一个窗口
+comptime REPS = 9
+# ⚠️ 每轮每臂取 **best-of-5**：单次计时只有 85…400 µs，本机 runq 6–27 时这一个窗口
 # 完全可能被调度打断（实测单样本比值散到 **0.58…2.48**，比跨进程还糟）⇒ 每遍都先
-# 冲刷、跑 `INNER` 遍取最快，再用这个"最快"去做配对比值。
-comptime INNER = 3
-comptime RU_LO = 4
-comptime RU_MID = 8
-comptime RU_HI = 16
+# 冲刷、跑 `INNER` 遍取最快，再用这个"最快"去做配对比值。3 遍时仍有 ±10% 的轮间散度，
+# 提到 5 遍（冲刷一次 70 ms，全程仍 <1 min）。
+comptime INNER = 5
+
+# 四臂：`RU` 与 `Σx` 域各一档（B 是基准，D 只把 `Σx` 挪到 int32）。
+comptime RU_A = 4
+comptime SX_A = 0
+comptime RU_B = 8
+comptime SX_B = 0
+comptime RU_C = 16
+comptime SX_C = 0
+comptime RU_D = 8
+comptime SX_D = 1
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -95,7 +116,7 @@ def same_f32(a: F32Ptr, b: F32Ptr, n: Int) -> Int:
     return hits
 
 
-def time_arm[RU: Int](
+def time_arm[RU: Int, SX: Int](
     pd: F32Ptr,
     px: F32Ptr,
     blocks: Q4_U8,
@@ -104,12 +125,14 @@ def time_arm[RU: Int](
     flush_p: F32Ptr,
     mut sink: Float64,
 ) raises -> Int:
-    """`INNER` 遍里最快的那一遍：每遍都先冲刷（保证冷 cache），再跑 `RU` 那一档。"""
+    """`INNER` 遍里最快的那一遍：每遍都先冲刷（保证冷 cache），再跑这一臂。"""
     var best = Int(0)
     for attempt in range(INNER):
         sink += read_sum(flush_p, FLUSH_FLOATS)
         var t0 = monotonic_ns()
-        _matmul_q4_mub_rows[1, RU](pd, px, blocks, rows, cols, pd, False, rows)
+        _matmul_q4_mub_rows[1, RU, SX](
+            pd, px, blocks, rows, cols, pd, False, rows
+        )
         var t1 = monotonic_ns()
         if best == 0 or t1 - t0 < best:
             best = t1 - t0
@@ -136,93 +159,129 @@ def bench_shape(
     var px = f32_data(x)
 
     # 预热（不计入）：页表、分支预测。
-    _matmul_q4_mub_rows[1, RU_LO](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_MID](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_HI](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_A, SX_A](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_B, SX_B](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D](pd, px, blocks, rows, inner, pd, False, rows)
 
-    # 自证 1：三档必须算出**同一个**结果（`RU` 不动每行的累加顺序）。
-    _matmul_q4_mub_rows[1, RU_LO](pd, px, blocks, rows, inner, pd, False, rows)
+    # 自证：四臂必须算出**同一个**结果（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
+    # 两个操作数都是整数且和 < 2^24 ⇒ 两条路在 f32 里都精确 ⇒ 逐位相同）。
+    _matmul_q4_mub_rows[1, RU_A, SX_A](pd, px, blocks, rows, inner, pd, False, rows)
     copy_f32(pr, pd, rows)
-    _matmul_q4_mub_rows[1, RU_MID](pd, px, blocks, rows, inner, pd, False, rows)
-    var same_mid = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_HI](pd, px, blocks, rows, inner, pd, False, rows)
-    var same_hi = same_f32(pd, pr, rows)
+    _matmul_q4_mub_rows[1, RU_B, SX_B](pd, px, blocks, rows, inner, pd, False, rows)
+    var same_b = same_f32(pd, pr, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
+    var same_c = same_f32(pd, pr, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D](pd, px, blocks, rows, inner, pd, False, rows)
+    var same_d = same_f32(pd, pr, rows)
 
-    var tlo = InlineArray[Int, REPS](uninitialized=True)
-    var tmid = InlineArray[Int, REPS](uninitialized=True)
-    var thi = InlineArray[Int, REPS](uninitialized=True)
+    var ta = InlineArray[Int, REPS](uninitialized=True)
+    var tb = InlineArray[Int, REPS](uninitialized=True)
+    var tc = InlineArray[Int, REPS](uninitialized=True)
+    var td = InlineArray[Int, REPS](uninitialized=True)
     for rep in range(REPS):
         var a = Int(0)
         var b = Int(0)
         var c = Int(0)
-        # ⚠️ 轮换出场顺序：让"先跑"这件事在三档之间轮着来。
-        var phase = rep % 3
+        var d = Int(0)
+        # ⚠️ 轮换出场顺序：让"先跑"这件事在四臂之间轮着来。
+        var phase = rep % 4
         if phase == 0:
-            a = time_arm[RU_LO](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_MID](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_HI](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 1:
-            b = time_arm[RU_MID](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_HI](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_LO](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
+        elif phase == 2:
+            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
         else:
-            c = time_arm[RU_HI](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_LO](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_MID](pd, px, blocks, rows, inner, flush_p, sink)
-        tlo[rep] = a
-        tmid[rep] = b
-        thi[rep] = c
+            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
+        ta[rep] = a
+        tb[rep] = b
+        tc[rep] = c
+        td[rep] = d
 
-    var mlo = tlo[0]
-    var mmid = tmid[0]
-    var mhi = thi[0]
-    var r_mid_hi = InlineArray[Float64, REPS](uninitialized=True)
-    var r_lo_mid = InlineArray[Float64, REPS](uninitialized=True)
+    var ma = ta[0]
+    var mb = tb[0]
+    var mc = tc[0]
+    var md = td[0]
+    var r_sx = InlineArray[Float64, REPS](uninitialized=True)
+    var r_hi = InlineArray[Float64, REPS](uninitialized=True)
+    var r_lo = InlineArray[Float64, REPS](uninitialized=True)
     for rep in range(REPS):
-        if tlo[rep] < mlo:
-            mlo = tlo[rep]
-        if tmid[rep] < mmid:
-            mmid = tmid[rep]
-        if thi[rep] < mhi:
-            mhi = thi[rep]
-        r_mid_hi[rep] = Float64(tmid[rep]) / Float64(thi[rep])
-        r_lo_mid[rep] = Float64(tlo[rep]) / Float64(tmid[rep])
+        if ta[rep] < ma:
+            ma = ta[rep]
+        if tb[rep] < mb:
+            mb = tb[rep]
+        if tc[rep] < mc:
+            mc = tc[rep]
+        if td[rep] < md:
+            md = td[rep]
+        r_sx[rep] = Float64(tb[rep]) / Float64(td[rep])
+        r_hi[rep] = Float64(tb[rep]) / Float64(tc[rep])
+        r_lo[rep] = Float64(ta[rep]) / Float64(tb[rep])
 
-    var lo1 = r_mid_hi[0]
-    var hi1 = r_mid_hi[0]
-    var lo2 = r_lo_mid[0]
-    var hi2 = r_lo_mid[0]
-    var s1 = ""
-    var s2 = ""
+    var s_sx = ""
+    var s_hi = ""
+    var s_lo = ""
+    var lo1 = r_sx[0]
+    var hi1 = r_sx[0]
+    var lo2 = r_hi[0]
+    var hi2 = r_hi[0]
+    var lo3 = r_lo[0]
+    var hi3 = r_lo[0]
     for rep in range(REPS):
-        s1 = s1 + " " + String(r_mid_hi[rep])
-        s2 = s2 + " " + String(r_lo_mid[rep])
-        if r_mid_hi[rep] < lo1:
-            lo1 = r_mid_hi[rep]
-        if r_mid_hi[rep] > hi1:
-            hi1 = r_mid_hi[rep]
-        if r_lo_mid[rep] < lo2:
-            lo2 = r_lo_mid[rep]
-        if r_lo_mid[rep] > hi2:
-            hi2 = r_lo_mid[rep]
+        s_sx = s_sx + " " + String(r_sx[rep])
+        s_hi = s_hi + " " + String(r_hi[rep])
+        s_lo = s_lo + " " + String(r_lo[rep])
+        if r_sx[rep] < lo1:
+            lo1 = r_sx[rep]
+        if r_sx[rep] > hi1:
+            hi1 = r_sx[rep]
+        if r_hi[rep] < lo2:
+            lo2 = r_hi[rep]
+        if r_hi[rep] > hi2:
+            hi2 = r_hi[rep]
+        if r_lo[rep] < lo3:
+            lo3 = r_lo[rep]
+        if r_lo[rep] > hi3:
+            hi3 = r_lo[rep]
 
     print(
         name
         + " rows=" + String(rows) + " inner=" + String(inner)
-        + " | RU=4 最快 " + String(mlo) + " ns   RU=8 " + String(mmid)
-        + " ns   RU=16 " + String(mhi) + " ns"
-        + "\n      逐位相同 vs RU=4：RU=8 " + String(same_mid) + "/" + String(rows)
-        + "  RU=16 " + String(same_hi) + "/" + String(rows)
-        + "\n      逐轮 RU8/RU16 = " + String(lo1) + "…" + String(hi1)
-        + "   （>1 表示 16 更快）\n        " + s1
-        + "\n      逐轮 RU4/RU8  = " + String(lo2) + "…" + String(hi2)
-        + "   （>1 表示 8 更快）\n        " + s2
+        + "\n      RU=4 " + String(ma) + " ns   RU=8 " + String(mb)
+        + " ns   RU=16 " + String(mc) + " ns   RU=8+Σx∈int32 " + String(md) + " ns"
+        + "\n      逐位相同（对 RU=4 那档）：RU=8 " + String(same_b)
+        + "/" + String(rows) + "   RU=16 " + String(same_c) + "/" + String(rows)
+        + "   Σx∈int32 " + String(same_d) + "/" + String(rows)
+        + "\n      逐轮 Σx f32/int32 = " + String(lo1) + "…" + String(hi1)
+        + "   （>1 表示 int32 更快）\n        " + s_sx
+        + "\n      逐轮 RU8/RU16    = " + String(lo2) + "…" + String(hi2)
+        + "   （>1 表示 16 更快）\n        " + s_hi
+        + "\n      逐轮 RU4/RU8     = " + String(lo3) + "…" + String(hi3)
+        + "   （>1 表示 8 更快）\n        " + s_lo
     )
     arena.keep_alive()
 
 
 def main() raises:
-    print("冷 cache（每次计时前扫 256 MB）+ 同进程配对 + 逐轮轮换出场顺序")
+    print(
+        "冷 cache（每次计时前扫 "
+        + String(FLUSH_FLOATS * 4 // (1024 * 1024))
+        + " MB）+ 同进程配对 + 逐轮轮换出场顺序（每轮每臂 best-of-"
+        + String(INNER) + "）"
+    )
     print("")
     var farena = Arena(FLUSH_FLOATS * 4 + 64)
     var flushv = scratch(farena, FLUSH_FLOATS, 1)
