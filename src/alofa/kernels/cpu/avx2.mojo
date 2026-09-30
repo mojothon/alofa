@@ -1331,7 +1331,9 @@ comptime MUB_ROW_ACC_TARGET = 8
 # 逐轮 `Σx f32/int32` 是 `q/o 0.931…1.098`、`gate 0.815…1.073`、`k/v 0.882…1.461`，三组**都
 # 跨 1.0**（中位 ≈1.00）。读法：`RU=8` 给出 8 条独立累加链之后，**链长已经不是瓶颈**（真瓶颈
 # 是每行块 38.4 条指令里那 23% 的栈存取），再短 4 个周期换不到时间。生产路径不传 ⇒ 走 f32 那条。
-def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0](
+def _matmul_q4_mub_rows[
+    RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0, JUNK: Int = 0
+](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1471,6 +1473,17 @@ def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0](
                 var raw = blocks.unsafe_load[width=W_Q4_HALF](
                     base + Q4_SCALE_BYTES
                 )
+                # ⚠️ `JUNK` 只给测量探针用：`1` = 每行每块再挂一个**被迫跨循环存活**的值
+                # （从本块开头再取 16 B：与 `raw`（+2 B）、`d`（2 B）地址都不同 ⇒ 不会被
+                # CSE），末尾把 `0/1` 加进累加器。⚠️ 别写成 `× 0.0` / `+ 0.0` —— Mojo 的浮点
+                # 带 fast-math，那两种写法会被整段折叠掉（实测两臂编出**同一份**代码，
+                # 892 条指令 / 237 次栈存取一模一样）⇒ 必须让它**真改数值**（+0/1）才留得住。
+                # ⇒ 这臂**不逐位相同**（故意），只用来比时间 ⇒ 量"在飞值/spill"值多少钱。
+                var junk = (
+                    blocks.unsafe_load[width=W_Q4_HALF](base)
+                    if JUNK == 1
+                    else SIMD[DType.uint8, W_Q4_HALF](0)
+                )
                 var lo = raw & low_mask
                 var hi = (raw >> four) & low_mask
                 var w32 = lo.join(hi)
@@ -1505,6 +1518,11 @@ def _matmul_q4_mub_rows[RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0](
                         acc8u[rb * RU + u] = (
                             (q.cast[DType.float32]() + c) * dsx
                             + acc8u[rb * RU + u]
+                        )
+                    comptime if JUNK == 1:
+                        var jz = Float32(Int(junk[0]) & 1)
+                        acc8u[rb * RU + u] = (
+                            acc8u[rb * RU + u] + SIMD[DType.float32, W_Q4](jz)
                         )
             b += 1
 

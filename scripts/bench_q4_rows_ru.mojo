@@ -20,7 +20,7 @@
 
 量的是哪一层
 ------------
-直接调核 `_matmul_q4_mub_rows[RB=1, RU, SX]`（decode 档），**不是**模型层的
+直接调核 `_matmul_q4_mub_rows[RB=1, RU, SX, JK](`（decode 档），**不是**模型层的
 `q4_matmul_rows_k`：后者的分发在编译期定死，一个二进制里只能有一档。核外剩下的是**各臂
 完全相同**的激活量化（RB=1、cols=896 时约 1 µs，占 `gate` 的 0.3%、占 `k/v` 的 6%）
 ⇒ 它只把比值往 1.0 拉一点，不会造出方向。
@@ -29,7 +29,7 @@
 ------
 每轮一个比值，**min…max 全在 1.0 同侧**才叫分离；跨过 1.0 就是"判不了"。
 - `RU8/RU16` > 1 表示 `RU=16` 更快；`RU4/RU8` > 1 表示 `RU=8` 更快。
-- `Σx f32/int32` > 1 表示 **int32 那一档更快**。
+- `JUNK/基线` > 1 表示**加料那一档更快**（spill 不值钱）。
 
 另有一道自证：四臂的输出**必须逐位相同**（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
 `q` 与 `Σx` 都是整数、|q + Σx| < 2^24 ⇒ 两条路在 f32 里都精确）。逐位相同数 ≠ rows 就说明
@@ -63,7 +63,8 @@ comptime REPS = 9
 # 提到 5 遍（冲刷一次 70 ms，全程仍 <1 min）。
 comptime INNER = 5
 
-# 四臂：`RU` 与 `Σx` 域各一档（B 是基准，D 只把 `Σx` 挪到 int32）。
+# 四臂：A/B/C 仍是 `RU` = 4/8/16；**D 改成 `RU`=8 + `JUNK`=1** —— 每行每块多挂一个被迫
+# 跨循环存活的值 ⇒ 与 B（基准）只差"在飞值"这一项 ⇒ 配对比出它的价钱。
 comptime RU_A = 4
 comptime SX_A = 0
 comptime RU_B = 8
@@ -71,7 +72,14 @@ comptime SX_B = 0
 comptime RU_C = 16
 comptime SX_C = 0
 comptime RU_D = 8
-comptime SX_D = 1
+comptime SX_D = 0
+# ⚠️ `JK` = 每行每块再挂一个被迫跨循环存活的值（核里 `JUNK`）：数值不
+# 变，只加在飞值与 spill。`B` 是基准，`D` 是加料，两者
+# 同进程配对 ⇒ 量“在飞值值多少钱”。
+comptime JK_A = 0
+comptime JK_B = 0
+comptime JK_C = 0
+comptime JK_D = 1
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -116,7 +124,7 @@ def same_f32(a: F32Ptr, b: F32Ptr, n: Int) -> Int:
     return hits
 
 
-def time_arm[RU: Int, SX: Int](
+def time_arm[RU: Int, SX: Int, JK: Int](
     pd: F32Ptr,
     px: F32Ptr,
     blocks: Q4_U8,
@@ -130,7 +138,7 @@ def time_arm[RU: Int, SX: Int](
     for attempt in range(INNER):
         sink += read_sum(flush_p, FLUSH_FLOATS)
         var t0 = monotonic_ns()
-        _matmul_q4_mub_rows[1, RU, SX](
+        _matmul_q4_mub_rows[1, RU, SX, JK](
             pd, px, blocks, rows, cols, pd, False, rows
         )
         var t1 = monotonic_ns()
@@ -162,7 +170,7 @@ def bench_shape(
     _matmul_q4_mub_rows[1, RU_A, SX_A](pd, px, blocks, rows, inner, pd, False, rows)
     _matmul_q4_mub_rows[1, RU_B, SX_B](pd, px, blocks, rows, inner, pd, False, rows)
     _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, pd, False, rows)
 
     # 自证：四臂必须算出**同一个**结果（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
     # 两个操作数都是整数且和 < 2^24 ⇒ 两条路在 f32 里都精确 ⇒ 逐位相同）。
@@ -172,7 +180,7 @@ def bench_shape(
     var same_b = same_f32(pd, pr, rows)
     _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
     var same_c = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, pd, False, rows)
     var same_d = same_f32(pd, pr, rows)
 
     var ta = InlineArray[Int, REPS](uninitialized=True)
@@ -187,25 +195,25 @@ def bench_shape(
         # ⚠️ 轮换出场顺序：让"先跑"这件事在四臂之间轮着来。
         var phase = rep % 4
         if phase == 0:
-            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 1:
-            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 2:
-            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
         else:
-            d = time_arm[RU_D, SX_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
         ta[rep] = a
         tb[rep] = b
         tc[rep] = c
@@ -261,12 +269,12 @@ def bench_shape(
         name
         + " rows=" + String(rows) + " inner=" + String(inner)
         + "\n      RU=4 " + String(ma) + " ns   RU=8 " + String(mb)
-        + " ns   RU=16 " + String(mc) + " ns   RU=8+Σx∈int32 " + String(md) + " ns"
+        + " ns   RU=16 " + String(mc) + " ns   RU=8+JUNK " + String(md) + " ns"
         + "\n      逐位相同（对 RU=4 那档）：RU=8 " + String(same_b)
         + "/" + String(rows) + "   RU=16 " + String(same_c) + "/" + String(rows)
-        + "   Σx∈int32 " + String(same_d) + "/" + String(rows)
-        + "\n      逐轮 Σx f32/int32 = " + String(lo1) + "…" + String(hi1)
-        + "   （>1 表示 int32 更快）\n        " + s_sx
+        + "   JUNK " + String(same_d) + "/" + String(rows)
+        + "\n      逐轮 JUNK/基线 = " + String(lo1) + "…" + String(hi1)
+        + "   （>1 = 加料更快（spill 不值钱））\n        " + s_sx
         + "\n      逐轮 RU8/RU16    = " + String(lo2) + "…" + String(hi2)
         + "   （>1 表示 16 更快）\n        " + s_hi
         + "\n      逐轮 RU4/RU8     = " + String(lo3) + "…" + String(hi3)
