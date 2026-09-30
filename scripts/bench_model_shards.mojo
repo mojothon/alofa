@@ -86,9 +86,13 @@ comptime ROUNDS = 3
 # 四档片数：1 是不切（基线），8 是本机的核数。
 comptime ARMS = 4
 
-# 每 token 要流的权重字节数。`cli.mojo` 的 `BYTES_PER_TOKEN_FP32`：权重文件的
-# 字节数 1,976,393,216 B，不是估算（`lm_head` 与 `embed_tokens` 绑定共用一份）。
-comptime BYTES_PER_TOKEN = 1.976e9
+# 每 token 要流的权重字节数。
+# ⚠️ 2026-09-30 起切到**主战档** `q4_0 + q8_head` = 345.9 MB（与 llama.cpp 默认档同流量）。
+#    旧值（fp32 档）= 权重文件字节数 1,976,393,216 B，不是估算
+#    （`lm_head` 与 `embed_tokens` 绑定共用一份）。自洽性：主战档 ~30 tok/s × 345.9 MB
+#    ≈ 10 GB/s，与同进程纯读天花板 `B_1 = 9.62` 对得上；若按 745.8 MB 算会到 22 GB/s
+#    > `B_8 = 16.85`，单线程不可能 ⇒ 345.9 才是对的。
+comptime BYTES_PER_TOKEN = 345.9e6
 
 # 纯读天花板的数组：256 MB ≫ L3（12 MB）。
 comptime CEIL_BYTES = 256 * 1024 * 1024
@@ -522,11 +526,14 @@ def ceiling_verdict(lo: Float64, hi: Float64) -> String:
 def main() raises:
     print("")
     print(
-        "== 端到端 decode：投影切成 N 片并发（Qwen2.5-0.5B fp32，"
+        "== 端到端 decode：投影切成 N 片并发（Qwen2.5-0.5B **q4_0+q8_head 主战档**，"
         + "avx2，同一进程同一份权重） =="
     )
     var t0 = monotonic_ns()
-    var model = QwenForward(FIXTURE + "/weights", FIXTURE + "/config.tsv", MAX_TOK)
+    # 第 4 参 True = 在线把 fp32 权重量化成 q4_0；`enable_q8_output()` = 输出头走 q8。
+    # 两者合起来就是主战档 `q4_0 + q8_head`（与 `bench_e2e_junk_pair.mojo` 同一档）。
+    var model = QwenForward(FIXTURE + "/weights", FIXTURE + "/config.tsv", MAX_TOK, True)
+    model.enable_q8_output()
     print(
         "   权重加载 : "
         + String((monotonic_ns() - t0) // 1000000)
