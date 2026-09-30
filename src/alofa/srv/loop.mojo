@@ -414,9 +414,16 @@ struct Loop(Movable):
                 # 槽位换过主人：这个结果属于**上一条**连接。发给这一条，就是那种
                 # "偶发的响应内容不对"，而且只在客户端恰好中途断开时出现。
                 continue
-            if len(res.bytes) > 0:
+            if res.n_bytes > 0:
+                # 字节在**这一条线程**上拷出来（分配与释放都在这边）：跨线程过的只是
+                # 定长内联的那份，没有堆块跟着活一起走。
+                var out = List[UInt8]()
+                var i = 0
+                while i < res.n_bytes:
+                    out.append(res.bytes[i])
+                    i += 1
                 try:
-                    self.conns[slot].enqueue(res.bytes^)
+                    self.conns[slot].enqueue(out^)
                 except err:
                     print("  [srv] connection dropped: " + String(err))
                     self.drop(slot)

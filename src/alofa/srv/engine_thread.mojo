@@ -189,6 +189,8 @@ def opaque_of(imm addr: Int) -> OpaquePtr:
 # 为什么要有它：实测踩踏的表现是"几十条之后在别处随机发作"（`Job.slot` 变成一个堆地址、
 # 请求行开头乱码、随机 abort）。那种失败没法归因 —— 它离真凶太远。有了自证，被踩的那
 # 一次会在**过邮箱的那一刻**变红，而且能分出"进邮箱之前就坏了"与"在邮箱里坏的"。
+comptime MAX_JOB_BYTES = 8192
+comptime MAX_RES_BYTES = 16384
 comptime JOB_MAGIC = 0xA10FA001
 comptime RES_MAGIC = 0xA10FA002
 
@@ -214,7 +216,7 @@ struct Job(Movable):
     # 而拷出来的一份 `List[UInt8]` 是自己的，可以。代价是 engine 线程要**再解析
     # 一次**（`parse_request` 只做切分与拷贝，一次几百字节，而它本来就要跑一次
     # 前向），换来的是"跨线程只过一种形状的东西"。
-    var raw: List[UInt8]
+    var raw: InlineArray[UInt8, MAX_JOB_BYTES]
     var n_raw: Int
 
     def __init__(out self, slot: Int, gen: Int, kind: Int, thread: Int):
@@ -223,7 +225,7 @@ struct Job(Movable):
         self.gen = gen
         self.kind = kind
         self.thread = thread
-        self.raw = List[UInt8]()
+        self.raw = InlineArray[UInt8, MAX_JOB_BYTES](fill=0)
         self.n_raw = 0
 
     def __init__(
@@ -235,8 +237,15 @@ struct Job(Movable):
         self.gen = gen
         self.kind = kind
         self.thread = thread
-        self.raw = raw^
-        self.n_raw = len(self.raw)
+        self.raw = InlineArray[UInt8, MAX_JOB_BYTES](fill=0)
+        self.n_raw = len(raw)
+        if self.n_raw > MAX_JOB_BYTES:
+            print("  [srv] a request was truncated to MAX_JOB_BYTES")
+            self.n_raw = MAX_JOB_BYTES
+        var i = 0
+        while i < self.n_raw:
+            self.raw[i] = raw[i]
+            i += 1
 
     def intact(self) -> Bool:
         """自己还像一件活吗（过邮箱**前后**都该为真）。
@@ -250,7 +259,7 @@ struct Job(Movable):
             return False
         if self.slot < 0 or self.kind < JOB_REQUEST or self.kind > JOB_STREAM_END:
             return False
-        if self.thread < 0 or len(self.raw) != self.n_raw:
+        if self.thread < 0 or self.n_raw < 0 or self.n_raw > MAX_JOB_BYTES:
             return False
         if self.kind == JOB_REQUEST and self.n_raw > 0:
             var head = self.raw[0]
@@ -261,7 +270,7 @@ struct Job(Movable):
     def dump(self) -> String:
         var head = "head="
         var i = 0
-        while i < 8 and i < len(self.raw):
+        while i < 8 and i < self.n_raw:
             head += String(Int(self.raw[i])) + ","
             i += 1
         return (
@@ -276,7 +285,7 @@ struct Job(Movable):
             + " thread="
             + String(self.thread)
             + " raw="
-            + String(len(self.raw))
+            + String(self.n_raw)
             + "/"
             + String(self.n_raw)
             + " "
@@ -297,7 +306,7 @@ struct Result(Movable):
     var gen: Int
     var kind: Int
     var close: Bool
-    var bytes: List[UInt8]
+    var bytes: InlineArray[UInt8, MAX_RES_BYTES]
     var n_bytes: Int
 
     def __init__(out self):
@@ -306,7 +315,7 @@ struct Result(Movable):
         self.gen = -1
         self.kind = RES_DONE
         self.close = False
-        self.bytes = List[UInt8]()
+        self.bytes = InlineArray[UInt8, MAX_RES_BYTES](fill=0)
         self.n_bytes = 0
 
     def __init__(
@@ -322,8 +331,15 @@ struct Result(Movable):
         self.gen = gen
         self.kind = kind
         self.close = close
-        self.bytes = bytes^
-        self.n_bytes = len(self.bytes)
+        self.bytes = InlineArray[UInt8, MAX_RES_BYTES](fill=0)
+        self.n_bytes = len(bytes)
+        if self.n_bytes > MAX_RES_BYTES:
+            print("  [srv] a response was truncated to MAX_RES_BYTES")
+            self.n_bytes = MAX_RES_BYTES
+        var i = 0
+        while i < self.n_bytes:
+            self.bytes[i] = bytes[i]
+            i += 1
 
     def intact(self) -> Bool:
         """自己还像一截应答吗（过邮箱**前后**都该为真）。"""
@@ -332,7 +348,8 @@ struct Result(Movable):
             and self.slot >= -1
             and self.kind >= RES_BYTES
             and self.kind <= RES_STREAM_HEAD
-            and len(self.bytes) == self.n_bytes
+            and self.n_bytes >= 0
+            and self.n_bytes <= MAX_RES_BYTES
         )
 
     def dump(self) -> String:
@@ -346,7 +363,7 @@ struct Result(Movable):
             + " kind="
             + String(self.kind)
             + " bytes="
-            + String(len(self.bytes))
+            + String(self.n_bytes)
             + "/"
             + String(self.n_bytes)
         )
@@ -849,7 +866,12 @@ def _answer[H: EngineHandler](
     # 关的连接会一直占着槽位（`MAX_CONNS` 有上界）。
     var close = True
     try:
-        var request = parse_request(job.raw)
+        var raw = List[UInt8]()
+        var i = 0
+        while i < job.n_raw:
+            raw.append(job.raw[i])
+            i += 1
+        var request = parse_request(raw)
         close = not request.keep_alive()
         response = handler[].handle(job.slot, request)
     except err:
