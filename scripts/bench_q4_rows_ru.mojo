@@ -9,14 +9,14 @@
 （先跑的那臂不吃亏，也不占便宜）—— `bench_gemm_rb.mojo` 的先例能把比值区间收到
 0.78–0.81 那种紧度。
 
-四臂
+四臂（2026-09-30 起改判**预展开权重**；`RU`/`Σx` 那两问已判完）
 ----
-| 臂 | `RU` | `Σx` 修正 | 作用 |
-|----|------|-----------|------|
-| A  | 4    | f32（现状）| `RU` 下探 |
-| B  | 8    | f32（现状）| **基准** |
-| C  | 16   | f32（现状）| `RU` 上探 |
-| D  | 8    | **int32**  | 本轮要判的：`vpaddd`（1 周期）替掉 `vaddps`（4 周期）|
+| 臂 | 权重布局 | 作用 |
+|----|----------|------|
+| A  | 原 18 B/块 | 与 B 同档 ⇒ `A/B` = **噪声底 1** |
+| B  | 原 18 B/块 | **基准**（与 C 比才是要判的那一比）|
+| C  | **预展开 34 B/块** | 内层省 4 条拆半字节指令，代价流量 ×1.89 |
+| D  | **预展开 34 B/块** | 与 C 同档 ⇒ `C/D` = **噪声底 2** |
 
 量的是哪一层
 ------------
@@ -46,7 +46,15 @@ from alofa.core.ffi import monotonic_ns
 from alofa.core.memory import Arena
 from alofa.core.tensor import F32Ptr, TensorView, f32_data, shape2
 from alofa.kernels.cpu.avx2 import Q4_U8, _matmul_q4_mub_rows
-from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, quantize_q4_0
+from alofa.kernels.cpu.quant import (
+    Q4_BLOCK,
+    Q4_BYTES,
+    Q4_SCALE_BYTES,
+    quantize_q4_0,
+)
+
+# 预展开布局的块字节数 = 2 B 步长 + 32 B（每个权重一个字节）⇒ 34 B（核里 `Q4_PRE_BYTES`）。
+comptime Q4_PRE_BYTES = Q4_SCALE_BYTES + Q4_BLOCK
 
 # Qwen2.5-0.5B 的三个真投影形状（`tests/fixtures/qwen2.5-0.5b/config.tsv`）。
 comptime HIDDEN = 896
@@ -78,8 +86,17 @@ comptime SX_D = 0
 # 同进程配对 ⇒ 量“在飞值值多少钱”。
 comptime JK_A = 0
 comptime JK_B = 0
-comptime JK_C = 1
-comptime JK_D = 3
+comptime JK_C = 0
+comptime JK_D = 0
+# ⚠️ `PR` = **预展开权重**（核里 `PRE`）：块 18 B → 34 B（权重流量 **×1.89**），换来内层
+# 省掉拆半字节那 4 条指令（`vpand`+`vpsrlw`+`vpand`+`vinserti128`）。A/B 用原布局、
+# C/D 用预展开 ⇒ `A/B` 与 `C/D` 各是一条**噪声底**，`B/C` 才是要判的那一比
+# （**>1 = 预展开更快**）。⚠️ 数值**逐位相同**（纯重排）⇒ "两臂是不是同一份代码"
+# 只能看 `objdump`，看数值是看不出来的。
+comptime PR_A = 0
+comptime PR_B = 0
+comptime PR_C = 1
+comptime PR_D = 1
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -91,6 +108,30 @@ def fill(p: F32Ptr, n: Int) -> None:
     var i = 0
     while i < n:
         p[unsafe_offset=i] = Float32(i % 17) - Float32(8)
+        i += 1
+
+
+def expand_q4_0(dst: Q4_U8, src: Q4_U8, nblocks: Int) -> None:
+    """把 18 B/块（2 B 步长 + 16 B 半字节）重排成 34 B/块（2 B 步长 + 32 B 字节）。
+
+    排布必须与核里 `lo.join(hi)` **逐字节一致**：q4_0 的 16 个原始字节里，**低**半字节
+    是权重 0…15、**高**半字节是权重 16…31 ⇒ 展开后是 `[W0..W15][W16..W31]`。
+    ⚠️ 这是**纯重排**，不碰算术 ⇒ 输出必须**逐位相同**（探针拿它当自证之一）。
+    """
+    var i = 0
+    while i < nblocks:
+        var sb = i * Q4_BYTES
+        var db = i * Q4_PRE_BYTES
+        dst[unsafe_offset=db] = src[unsafe_offset=sb]
+        dst[unsafe_offset=db + 1] = src[unsafe_offset=sb + 1]
+        var j = 0
+        while j < Q4_BLOCK // 2:
+            var raw = src[unsafe_offset=sb + Q4_SCALE_BYTES + j]
+            dst[unsafe_offset=db + Q4_SCALE_BYTES + j] = raw & UInt8(0x0F)
+            dst[unsafe_offset=db + Q4_SCALE_BYTES + Q4_BLOCK // 2 + j] = (
+                (raw >> UInt8(4)) & UInt8(0x0F)
+            )
+            j += 1
         i += 1
 
 
@@ -124,7 +165,7 @@ def same_f32(a: F32Ptr, b: F32Ptr, n: Int) -> Int:
     return hits
 
 
-def time_arm[RU: Int, SX: Int, JK: Int](
+def time_arm[RU: Int, SX: Int, JK: Int, PRE: Int = 0](
     pd: F32Ptr,
     px: F32Ptr,
     blocks: Q4_U8,
@@ -138,7 +179,7 @@ def time_arm[RU: Int, SX: Int, JK: Int](
     for attempt in range(INNER):
         sink += read_sum(flush_p, FLUSH_FLOATS)
         var t0 = monotonic_ns()
-        _matmul_q4_mub_rows[1, RU, SX, JK](
+        _matmul_q4_mub_rows[1, RU, SX, JK, PRE](
             pd, px, blocks, rows, cols, pd, False, rows
         )
         var t1 = monotonic_ns()
@@ -151,8 +192,12 @@ def bench_shape(
     name: String, rows: Int, inner: Int, flush_p: F32Ptr, mut sink: Float64
 ) raises -> None:
     var n = rows * inner
-    var q4_bytes = n // Q4_BLOCK * Q4_BYTES
-    var arena = Arena((n + inner + 2 * rows) * 4 + q4_bytes + 64)
+    var nblocks = n // Q4_BLOCK
+    var q4_bytes = nblocks * Q4_BYTES
+    var q4_pre_bytes = nblocks * Q4_PRE_BYTES
+    var arena = Arena(
+        (n + inner + 2 * rows) * 4 + q4_bytes + q4_pre_bytes + 64
+    )
     var w = scratch(arena, rows, inner)
     var x = scratch(arena, 1, inner)
     var dst = scratch(arena, 1, rows)
@@ -161,26 +206,28 @@ def bench_shape(
     fill(f32_data(x), inner)
     var blocks = arena.alloc(q4_bytes).unsafe_bitcast[UInt8]()
     quantize_q4_0(blocks, f32_data(w), n)
+    var blocks_pre = arena.alloc(q4_pre_bytes).unsafe_bitcast[UInt8]()
+    expand_q4_0(blocks_pre, blocks, nblocks)
 
     var pd = f32_data(dst)
     var pr = f32_data(refv)
     var px = f32_data(x)
 
     # 预热（不计入）：页表、分支预测。
-    _matmul_q4_mub_rows[1, RU_A, SX_A](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_B, SX_B](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, pd, False, rows)
 
     # 自证：四臂必须算出**同一个**结果（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
     # 两个操作数都是整数且和 < 2^24 ⇒ 两条路在 f32 里都精确 ⇒ 逐位相同）。
-    _matmul_q4_mub_rows[1, RU_A, SX_A](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, pd, False, rows)
     copy_f32(pr, pd, rows)
-    _matmul_q4_mub_rows[1, RU_B, SX_B](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, pd, False, rows)
     var same_b = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_C, SX_C](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, pd, False, rows)
     var same_c = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, pd, False, rows)
     var same_d = same_f32(pd, pr, rows)
 
     var ta = InlineArray[Int, REPS](uninitialized=True)
@@ -195,25 +242,25 @@ def bench_shape(
         # ⚠️ 轮换出场顺序：让"先跑"这件事在四臂之间轮着来。
         var phase = rep % 4
         if phase == 0:
-            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
         elif phase == 1:
-            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 2:
-            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
         else:
-            d = time_arm[RU_D, SX_D, JK_D](pd, px, blocks, rows, inner, flush_p, sink)
-            a = time_arm[RU_A, SX_A, JK_A](pd, px, blocks, rows, inner, flush_p, sink)
-            b = time_arm[RU_B, SX_B, JK_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
+            b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
         ta[rep] = a
         tb[rep] = b
         tc[rep] = c
@@ -235,9 +282,12 @@ def bench_shape(
             mc = tc[rep]
         if td[rep] < md:
             md = td[rep]
-        r_sx[rep] = Float64(tb[rep]) / Float64(td[rep])
-        r_hi[rep] = Float64(tb[rep]) / Float64(tc[rep])
-        r_lo[rep] = Float64(ta[rep]) / Float64(tb[rep])
+        # 要判的那一比：**原布局 / 预展开**（>1 = 预展开更快）
+        r_sx[rep] = Float64(tb[rep]) / Float64(tc[rep])
+        # 噪声底 1：原布局 / 原布局
+        r_hi[rep] = Float64(ta[rep]) / Float64(tb[rep])
+        # 噪声底 2：预展开 / 预展开
+        r_lo[rep] = Float64(tc[rep]) / Float64(td[rep])
 
     var s_sx = ""
     var s_hi = ""
@@ -268,17 +318,19 @@ def bench_shape(
     print(
         name
         + " rows=" + String(rows) + " inner=" + String(inner)
-        + "\n      A 基线 " + String(ma) + " ns   B 基线 " + String(mb)
-        + " ns   C 加料×1 " + String(mc) + " ns   D 加料×2 " + String(md) + " ns"
+        + "\n      A 原布局(18B) " + String(ma) + " ns   B 原布局 " + String(mb)
+        + " ns   C 预展开(34B) " + String(mc) + " ns   D 预展开 " + String(md)
+        + " ns"
         + "\n      逐位相同（对 A 那档）：B " + String(same_b)
-        + "/" + String(rows) + "   C ×1 " + String(same_c) + "/" + String(rows)
-        + "   D ×2 " + String(same_d) + "/" + String(rows)
-        + "\n      逐轮 B/D 基线/加料×2 = " + String(lo1) + "…" + String(hi1)
-        + "   （<1 = 更慢；与 ×1 比 ⇒ 线性否）\n        " + s_sx
-        + "\n      逐轮 B/C 基线/加料×1 = " + String(lo2) + "…" + String(hi2)
-        + "   （<1 = 更慢 ⇒ 指令数要钱）\n        " + s_hi
-        + "\n      逐轮 A/B 基线/基线   = " + String(lo3) + "…" + String(hi3)
-        + "   （**噪声底**，应绕着 1 散）\n        " + s_lo
+        + "/" + String(rows) + "   C " + String(same_c) + "/" + String(rows)
+        + "   D " + String(same_d) + "/" + String(rows)
+        + "   （四臂都该 = rows：预展开是纯重排）"
+        + "\n      逐轮 B/C 原布局/预展开 = " + String(lo1) + "…" + String(hi1)
+        + "   （**>1 = 预展开更快**）\n        " + s_sx
+        + "\n      逐轮 A/B 原布局/原布局 = " + String(lo2) + "…" + String(hi2)
+        + "   （噪声底 1）\n        " + s_hi
+        + "\n      逐轮 C/D 预展开/预展开 = " + String(lo3) + "…" + String(hi3)
+        + "   （噪声底 2）\n        " + s_lo
     )
     arena.keep_alive()
 

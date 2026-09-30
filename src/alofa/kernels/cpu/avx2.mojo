@@ -1316,6 +1316,11 @@ comptime MUB_ROWS_MAX_SUMS = MUB_ROWS_MAX_XQ // Q4_BLOCK
 # `RB=1`（decode）用 8 行一组、`RB=2`（prefill）用 4 行一组，寄存器占用恒定。
 comptime MUB_ROW_ACC_TARGET = 8
 
+# ⚠️ `PRE=1`（**预展开权重**，只给测量探针用）时一个块的字节数：2 B 步长 + 32 B（每个
+# 权重一个字节，排布就是 `lo.join(hi)` 那 32 个字节）⇒ **34 B = `Q4_BYTES`(18) 的 1.89 倍**
+# —— 拿"多读字节"换"少拆半字节"，值不值由探针判（核内省 4 条，流量翻近一倍）。
+comptime Q4_PRE_BYTES = Q4_SCALE_BYTES + Q4_BLOCK
+
 
 # ⚠️ `RU_OVERRIDE` **只给测量探针用**：`0` = 沿用 `MUB_ROW_ACC_TARGET // RB` 的推导值
 # （生产路径不传 ⇒ 推导式与代码一字不变）。为什么要它：`RU`（一次解量化喂几个输出行）一个
@@ -1332,7 +1337,7 @@ comptime MUB_ROW_ACC_TARGET = 8
 # 跨 1.0**（中位 ≈1.00）。读法：`RU=8` 给出 8 条独立累加链之后，**链长已经不是瓶颈**（真瓶颈
 # 是每行块 38.4 条指令里那 23% 的栈存取），再短 4 个周期换不到时间。生产路径不传 ⇒ 走 f32 那条。
 def _matmul_q4_mub_rows[
-    RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0, JUNK: Int = 0
+    RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0, JUNK: Int = 0, PRE: Int = 0
 ](
     dst: F32Ptr,
     x: F32Ptr,
@@ -1469,9 +1474,13 @@ def _matmul_q4_mub_rows[
         var b = 0
         while b < nb:
             comptime for u in range(RU):
-                var base = ((row + u) * nb + b) * Q4_BYTES
-                var raw = blocks.unsafe_load[width=W_Q4_HALF](
-                    base + Q4_SCALE_BYTES
+                # ⚠️ `PRE=1`：**预展开权重** —— 块从 18 B（2 B 步长 + 16 B 半字节）变 34 B
+                # （2 B 步长 + 32 B 已拆成字节的 nibble，就是 `lo.join(hi)` 那个排布）⇒ 内层
+                # 省掉 `vpand` + `vpsrlw` + `vpand` + `vinserti128` 四条，代价是权重流量
+                # **×1.89**（34/18）。数值**逐位相同**（纯重排，算术一个字节都没动）⇒ ⚠️
+                # "它在不在二进制里"只能看 objdump，看数值是看不出来的。
+                var base = ((row + u) * nb + b) * (
+                    Q4_PRE_BYTES if PRE == 1 else Q4_BYTES
                 )
                 # ⚠️ `JUNK` 只给测量探针用：`1` = 每行每块再挂一个**被迫跨循环存活**的值
                 # （从本块开头再取 16 B：与 `raw`（+2 B）、`d`（2 B）地址都不同 ⇒ 不会被
@@ -1495,9 +1504,18 @@ def _matmul_q4_mub_rows[
                     if JUNK == 3
                     else SIMD[DType.uint8, W_Q4_HALF](0)
                 )
-                var lo = raw & low_mask
-                var hi = (raw >> four) & low_mask
-                var w32 = lo.join(hi)
+                var w32 = SIMD[DType.uint8, 2 * W_Q4_HALF](0)
+                comptime if PRE == 1:
+                    w32 = blocks.unsafe_load[width=2 * W_Q4_HALF](
+                        base + Q4_SCALE_BYTES
+                    )
+                else:
+                    var raw = blocks.unsafe_load[width=W_Q4_HALF](
+                        base + Q4_SCALE_BYTES
+                    )
+                    var lo = raw & low_mask
+                    var hi = (raw >> four) & low_mask
+                    w32 = lo.join(hi)
                 var d = block_scale(blocks, base)
                 comptime for rb in range(RB):
                     var dsx = SIMD[DType.float32, W_Q4](
@@ -1558,11 +1576,21 @@ def _matmul_q4_mub_rows[
 
         var b = 0
         while b < nb:
-            var base = (row * nb + b) * Q4_BYTES
-            var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
-            var lo = raw & low_mask
-            var hi = (raw >> four) & low_mask
-            var w32 = lo.join(hi)
+            var base = (row * nb + b) * (
+                Q4_PRE_BYTES if PRE == 1 else Q4_BYTES
+            )
+            var w32 = SIMD[DType.uint8, 2 * W_Q4_HALF](0)
+            comptime if PRE == 1:
+                w32 = blocks.unsafe_load[width=2 * W_Q4_HALF](
+                    base + Q4_SCALE_BYTES
+                )
+            else:
+                var raw = blocks.unsafe_load[width=W_Q4_HALF](
+                    base + Q4_SCALE_BYTES
+                )
+                var lo = raw & low_mask
+                var hi = (raw >> four) & low_mask
+                w32 = lo.join(hi)
             var d = block_scale(blocks, base)
             comptime for rb in range(RB):
                 var dsx = SIMD[DType.float32, W_Q4](
