@@ -65,11 +65,11 @@ comptime INNER = 5
 
 # 四臂：A/B/C 仍是 `RU` = 4/8/16；**D 改成 `RU`=8 + `JUNK`=1** —— 每行每块多挂一个被迫
 # 跨循环存活的值 ⇒ 与 B（基准）只差"在飞值"这一项 ⇒ 配对比出它的价钱。
-comptime RU_A = 4
+comptime RU_A = 8
 comptime SX_A = 0
 comptime RU_B = 8
 comptime SX_B = 0
-comptime RU_C = 16
+comptime RU_C = 8
 comptime SX_C = 0
 comptime RU_D = 8
 comptime SX_D = 0
@@ -78,8 +78,8 @@ comptime SX_D = 0
 # 同进程配对 ⇒ 量“在飞值值多少钱”。
 comptime JK_A = 0
 comptime JK_B = 0
-comptime JK_C = 0
-comptime JK_D = 1
+comptime JK_C = 1
+comptime JK_D = 3
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -268,17 +268,17 @@ def bench_shape(
     print(
         name
         + " rows=" + String(rows) + " inner=" + String(inner)
-        + "\n      RU=4 " + String(ma) + " ns   RU=8 " + String(mb)
-        + " ns   RU=16 " + String(mc) + " ns   RU=8+JUNK " + String(md) + " ns"
-        + "\n      逐位相同（对 RU=4 那档）：RU=8 " + String(same_b)
-        + "/" + String(rows) + "   RU=16 " + String(same_c) + "/" + String(rows)
-        + "   JUNK " + String(same_d) + "/" + String(rows)
-        + "\n      逐轮 JUNK/基线 = " + String(lo1) + "…" + String(hi1)
-        + "   （>1 = 加料更快（spill 不值钱））\n        " + s_sx
-        + "\n      逐轮 RU8/RU16    = " + String(lo2) + "…" + String(hi2)
-        + "   （>1 表示 16 更快）\n        " + s_hi
-        + "\n      逐轮 RU4/RU8     = " + String(lo3) + "…" + String(hi3)
-        + "   （>1 表示 8 更快）\n        " + s_lo
+        + "\n      A 基线 " + String(ma) + " ns   B 基线 " + String(mb)
+        + " ns   C 加料×1 " + String(mc) + " ns   D 加料×2 " + String(md) + " ns"
+        + "\n      逐位相同（对 A 那档）：B " + String(same_b)
+        + "/" + String(rows) + "   C ×1 " + String(same_c) + "/" + String(rows)
+        + "   D ×2 " + String(same_d) + "/" + String(rows)
+        + "\n      逐轮 B/D 基线/加料×2 = " + String(lo1) + "…" + String(hi1)
+        + "   （<1 = 更慢；与 ×1 比 ⇒ 线性否）\n        " + s_sx
+        + "\n      逐轮 B/C 基线/加料×1 = " + String(lo2) + "…" + String(hi2)
+        + "   （<1 = 更慢 ⇒ 指令数要钱）\n        " + s_hi
+        + "\n      逐轮 A/B 基线/基线   = " + String(lo3) + "…" + String(hi3)
+        + "   （**噪声底**，应绕着 1 散）\n        " + s_lo
     )
     arena.keep_alive()
 

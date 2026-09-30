@@ -1479,9 +1479,20 @@ def _matmul_q4_mub_rows[
                 # 带 fast-math，那两种写法会被整段折叠掉（实测两臂编出**同一份**代码，
                 # 892 条指令 / 237 次栈存取一模一样）⇒ 必须让它**真改数值**（+0/1）才留得住。
                 # ⇒ 这臂**不逐位相同**（故意），只用来比时间 ⇒ 量"在飞值/spill"值多少钱。
+                # ⚠️ 消费点必须用**逐块变化**的字节（这里取 `junk[2]` = `raw[0]`）。取 `d` 的
+                # 低字节不行：本探针的填充数据让所有块的 `d` 同构 ⇒ `& 1` 恒 0 ⇒ `+0.0`
+                # 被 fast-math 整段吃掉（实测那一档**逐位相同**，白跑一轮）。
                 var junk = (
                     blocks.unsafe_load[width=W_Q4_HALF](base)
-                    if JUNK == 1
+                    if JUNK != 0
+                    else SIMD[DType.uint8, W_Q4_HALF](0)
+                )
+                # `JUNK=3`：**双份重加料** —— `JUNK=1` 那段消费代码原样走两遍（第二份地址
+                # 差 1 B ⇒ 不会被 CSE）⇒ 每块每行 ≈14 条指令 / 2 次取数。配 `0/1/2` 三档
+                # **剂量** ⇒ 看时间是不是跟着指令数**线性**涨 ⇒ "弹性"这个说法站不站得住。
+                var junkB = (
+                    blocks.unsafe_load[width=W_Q4_HALF](base + 1)
+                    if JUNK == 3
                     else SIMD[DType.uint8, W_Q4_HALF](0)
                 )
                 var lo = raw & low_mask
@@ -1519,10 +1530,15 @@ def _matmul_q4_mub_rows[
                             (q.cast[DType.float32]() + c) * dsx
                             + acc8u[rb * RU + u]
                         )
-                    comptime if JUNK == 1:
-                        var jz = Float32(Int(junk[0]) & 1)
+                    comptime if JUNK != 0:
+                        var jz = Float32(Int(junk[2]))
                         acc8u[rb * RU + u] = (
                             acc8u[rb * RU + u] + SIMD[DType.float32, W_Q4](jz)
+                        )
+                    comptime if JUNK == 3:
+                        acc8u[rb * RU + u] = (
+                            acc8u[rb * RU + u]
+                            + SIMD[DType.float32, W_Q4](Float32(Int(junkB[3])))
                         )
             b += 1
 
