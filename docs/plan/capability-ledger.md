@@ -1628,3 +1628,8 @@
   - **对比 alofa**：mub 通路把 `vpmaddubsw` 的结果在**浮点域**累加（`acc8u[…] = acc8u[…] + SIMD[f32](…)`，见 `avx2.mojo`）；行带 `RB` 默认 2（试过 16，落在 ±25% 内）
   - ⇒ **三条可搬的东西**：(a) **整个点积累加挪 int32 域** —— ⚠️ 注意 09-30 试过的只是「`Σx` 挪 int32」，**不是**「点积累加挪 int32」，这是另一件事、还没试过；(b) **多行交错布局**（repack，不只是"多行同时算"）；(c) `vpshufb` LUT 展开
   - ⚠️ 待确认：本机 `llama-bench` 是否真走 repack 的 8x8 路径（repack 需在加载时转换）。若它走的是 `ggml_vec_dot_q4_0_q8_0`（每块一次 `fmadd` 到**单个** `acc`，同样有链），那 8.17–9.79 GB/s 的对照要换一句解读 ⇒ 下一步先 `gdb`/环境变量确认走的是哪个
+- **2026-10-01** —— ✅ **第一步：确认本机 llama-bench 走的是 repack 的 8x8 路径（对照成立，地基稳了）**
+  - 编译期（读 `build/CMakeCache.txt`）：`GGML_CPU_REPACK=ON`（CMakeLists 默认 ON）、`GGML_AVX2=ON`、`GGML_FMA=ON`
+  - **实测**（不用推理）：`gdb -batch` 对 4 个符号打断点跑 `llama-bench -m qwen25-05b-q4_0.gguf -p 5 -n 8 -r 1 -t 1` ⇒ **只命中 `ggml_gemv_q4_0_8x8_q8_0`**（多次），`ggml_vec_dot_q4_0_q8_0` / `_4x4_` / `_4x8_` **一次都没命中**
+  - ⇒ decode 走的是 `gemv_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8>`（AVX2）⇒ 09-28 量到的 **8.17…9.79 GB/s** 就是**这条**路跑出来的 ⇒ 上一条那三处做法（8x8 交错布局 / `vpshufb` LUT / int32 域累加）**确实是我们 5.60…6.13 的对手**，照搬的地基成立
+  - 方法备注：判断"走哪条路"用 **gdb 断点看命中**（首次命中即 disable 自己，开销可忽略）比读源码推理硬得多 —— 这套模板有 4x4 / 4x8 / 8x8 三个特化，光看代码定不下来
