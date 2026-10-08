@@ -642,6 +642,45 @@ def main() raises:
     var b8 = median_f64(b8s)
     var k1 = median_f64(k1s)
     var k8 = median_f64(k8s)
+
+    # 🔍 2026-10-08 复核：把**每一轮**的分子分母都摊开，不再"各取中位数再相除"。
+    # 要判两件事 ——
+    #   (a) `B_1 < K_1`（纯读慢于 kernel，自相矛盾）是不是**每轮都出现**；
+    #   (b) 利用率的**每轮配对比值**稳不稳：09-30 算出 ~950‰、10-08 算出 ~680‰，
+    #       若每轮比值本身就很散 ⇒ 那个"吃没吃满"的结论是除出来的，不是量出来的。
+    print("")
+    print("   [复核 2026-10-08] 每一轮各自的 分子/分母（同一轮、同一窗口内配好）")
+    print("       A_1 = shards=1 每 token 实测带宽；B_1 = 纯读天花板；K_1 = kernel 天花板")
+    var nrep = len(b1s)
+    var r = 0
+    while r < nrep:
+        var m1 = med[r * ARMS]
+        var a1 = BYTES_PER_TOKEN / Float64(m1)
+        # ⚠️ `ceiling_read` / `ceiling_kernel` 返回的是 **字节/秒**，不是 GB/s
+        # （中位那几行是 `gbps_or_fail` 转过的）⇒ 这里要自己除 1e9，
+        # 否则会打出 11348046163 这种数（2026-10-08 第一次加这段就踩了）。
+        var bb = b1s[r] / 1000000000.0
+        var kk = (k1s[r] / 1000000000.0) if r < len(k1s) else Float64(-1)
+        var bad = "  ❌B_1<K_1" if (kk > Float64(0) and bb < kk) else ""
+        print(
+            "      轮"
+            + String(r)
+            + "  A_1 = "
+            + f2(a1)
+            + "   B_1 = "
+            + f2(bb)
+            + "   K_1 = "
+            + f2(kk)
+            + "   |  B_1/K_1 = "
+            + f2(bb / kk if kk > Float64(0) else Float64(-1))
+            + "   A_1/B_1 = "
+            + f2(a1 * 1000.0 / bb)
+            + "‰   A_1/K_1 = "
+            + f2(a1 * 1000.0 / kk if kk > Float64(0) else Float64(-1))
+            + "‰"
+            + bad
+        )
+        r += 1
     print(
         "      纯读 B_1 = "
         + gbps_or_fail(b1)
