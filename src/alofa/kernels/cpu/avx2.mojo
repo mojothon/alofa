@@ -878,6 +878,8 @@ def _matmul_q4_halves_rows[RB: Int](
     blocks: Q4_U8,
     rows: Int,
     cols: Int,
+    bias: F32Ptr,
+    has_bias: Bool,
     dst_stride: Int,
 ) raises AlofaError:
     """`RB` 个 token 行**共用一次解量化**：`dst[rb, o] = Σ_c w[o,c] · x[rb, c]`。
@@ -925,7 +927,9 @@ def _matmul_q4_halves_rows[RB: Int](
 
     for row in range(rows):
         comptime for rb in range(RB):
-            acc[rb] = Float64(0)
+            # 偏置在块循环**之前**折进 f64 累加器 —— 与 `_matmul_q4_halves` 的
+            # 折法一步一步相同（has_bias 与否由编译期分支收掉）。
+            acc[rb] = Float64(bias[unsafe_offset=row]) if has_bias else Float64(0)
             s0[rb] = SIMD[DType.float32, W_Q4_HALF](0)
             s1[rb] = SIMD[DType.float32, W_Q4_HALF](0)
 
@@ -994,6 +998,8 @@ def matmul_q4_f32_rows[RB: Int = 8](
             blocks,
             rows,
             cols,
+            dst,
+            False,
             rows,
         )
         t += RB
@@ -1048,6 +1054,8 @@ def matmul_q4_f32_rows_band[RB: Int = 8](
             blocks,
             rows,
             cols,
+            dst,
+            False,
             dst_stride,
         )
         t += RB
@@ -1058,6 +1066,8 @@ def matmul_q4_f32_rows_band[RB: Int = 8](
             blocks,
             rows,
             cols,
+            dst,
+            False,
             dst_stride,
         )
         t += 1
@@ -1205,7 +1215,7 @@ def _matmul_q4_wide_rows[wide: Bool, RB: Int](
             dst[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
 
 
-def matmul_q4_f32_bias_rows_band[RB: Int = 2](
+def matmul_q4_f32_bias_rows_band[RB: Int = 8](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1220,10 +1230,11 @@ def matmul_q4_f32_bias_rows_band[RB: Int = 2](
     与**逐行调 `matmul_q4_f32_bias`** 逐位一致（威胁结构一行没改），这条相等由
     `test_q4_rows.mojo` 盯。
 
-    ⚠️ `RB` 默认 **2** 而不是无偏置那条路的 8：这里是 f64 通道累加，每行的累加器
-    有 4 个 f64×8 = 256 B，`RB=4` 就已经把 16 个 ymm 占满（那还要给 x / lo / hi 的
-    临时值留位置），再往上只能溢栈 —— 上一次付这个学费是抬 `_gemm_tile` 的
-    `RB=16`（慢 24%），这里不重蹈。
+    2026-11-04（账本二十九）：累加从 f64 通道（`_matmul_q4_wide_rows`）换成
+    **f32 半块**（`_matmul_q4_halves_rows`），`RB` 默认随之 2 → 8 —— 原来的
+    `RB=2` 是 f64 累加器的寄存器预算逼出来的（每行 4 个 f64×8 = 256 B），halves
+    每行只有 2 个 f32×16，无偏置路在 RB=8 上已经跑了很多轮。qkv 路在批里的
+    解量化遍数因此 4 → 1。
 
     ⚠️ **调用方负责把 `bias` 偏到这一带的起点**（`bias` 按输出行索引，而这一次的
     `rows` 只是其中的一段）。漏偏的表现是"第一个带全对、后面的带全不对"，而且差分门
@@ -1245,7 +1256,7 @@ def matmul_q4_f32_bias_rows_band[RB: Int = 2](
     var limit = n_tok - n_tok % RB if n_tok >= RB else 0
     var t = 0
     while t < limit:
-        _matmul_q4_wide_rows[True, RB](
+        _matmul_q4_halves_rows[RB](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,
@@ -1257,7 +1268,7 @@ def matmul_q4_f32_bias_rows_band[RB: Int = 2](
         )
         t += RB
     while t < n_tok:
-        _matmul_q4_wide_rows[True, 1](
+        _matmul_q4_halves_rows[1](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,
@@ -1315,8 +1326,14 @@ def matmul_q4_f32(
 def matmul_q4_f32_bias(
     dst: F32Ptr, x: F32Ptr, blocks: Q4_U8, rows: Int, cols: Int, bias: F32Ptr
 ) raises AlofaError:
-    """`dst = W · x + bias`，向量版；Qwen2 的 q/k/v 投影都带偏置。"""
-    _matmul_q4(dst, x, blocks, rows, cols, bias, True)
+    """`dst = W · x + bias`，向量版；Qwen2 的 q/k/v 投影都带偏置。
+
+    2026-11-04（账本二十九）：与无偏置的 `matmul_q4_f32` 同一轮账 —— 默认通路从
+    f64 通道切到**半块切分 + f32 累加**。批路（`matmul_q4_f32_bias_rows_band`）
+    与单路都走 halves ⇒ 两条路仍逐位一致；与标量 oracle 的偏差类别不变（~5e-8，
+    判据 1e-5），qkv 的权重形状更小，实测偏差见 `test_q4_matmul_vec`。
+    """
+    _matmul_q4_halves(dst, x, blocks, rows, cols, bias, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1566,12 +1583,12 @@ def _matmul_q4_mub_rows[
             "cols=" + String(cols) + " block=" + String(Q4_BLOCK),
         )
     if RB * cols > MUB_ROWS_MAX_XQ:
-        if has_bias:
-            _matmul_q4_wide_rows[True, RB](
-                dst, x, blocks, rows, cols, bias, has_bias, dst_stride
-            )
-        else:
-            _matmul_q4_halves_rows[RB](dst, x, blocks, rows, cols, dst_stride)
+        # 回退的精确通路必须与"没走 mub 时"逐位一致，否则数值随装不装得下漂移
+        # （账本二十三的教训）。bias 路的精确参照自 2026-11-04（账本二十九）起是
+        # halves，不再指向 wide。
+        _matmul_q4_halves_rows[RB](
+            dst, x, blocks, rows, cols, bias, has_bias, dst_stride
+        )
         return
     var nb = cols // Q4_BLOCK
     var sink = SIMD[DType.float32, W_Q4](0)
@@ -1880,9 +1897,9 @@ def matmul_q4_mub_bias_rows_band[RB: Int = 2, JUNK: Int = 0](
 ) raises AlofaError:
     """整批**带偏置**的 `vpmaddubsw` 行带投影（Qwen2 的 q/k/v）。
 
-    ⚠️ 默认通路在这里是 **f64 通道累加**（`_matmul_q4_wide_rows`），本函数改成 f32
-    八个通道累加、行末才并 —— 这是它与默认通路在数值上的**第二处**差别（第一处是
-    激活量化），不是逐位一致。
+    ⚠️ 默认通路在这里是 **f32 半块累加**（`_matmul_q4_halves_rows`；2026-11-04
+    账本二十九起，此前是 f64 通道），本函数改成 f32 八个通道累加、行末才并 ——
+    这是它与默认通路在数值上的**第二处**差别（第一处是激活量化），不是逐位一致。
 
     ⚠️ **`bias` 须由调用方偏到本带起点**（与默认通路同一个坑）。
     """

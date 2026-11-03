@@ -1823,6 +1823,9 @@ struct QwenForward(Movable):
         var dst_p = f32_data(dst)
         var x_p = f32_data(x)
         if has_bias:
+            # bias 路（q/k/v）此前没打点，整段藏在"未入账"里（账本二十九）——
+            # K_PREP/K_GEMM 与无偏置路同一对桶，两条路的和直接可比。
+            _t_q = self.prof.tick(K_PREP, _t_q)
             q4_matmul_bias_rows_k_shards[backend](
                 dst_p,
                 x_p,
@@ -1835,6 +1838,7 @@ struct QwenForward(Movable):
                 self.shards,
                 self.junk_arm,
             )
+            _ = self.prof.tick(K_GEMM, _t_q)
         else:
             _t_q = self.prof.tick(K_PREP, _t_q)
             q4_matmul_rows_k_shards[backend](

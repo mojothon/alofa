@@ -2310,3 +2310,25 @@
   - **余量清单（下一步入口）**：qkv bias 路 ~20 ms/步（f64 RB=2）；forward 之外
     ~50 ms/步（pick/settle/scheduler）；q4 体核 70.4 ms 是否到带宽墙待核基准复核。
     llama.cpp q4 tg32 单流 40.7 tok/s —— 批路聚合已越过，单流 21.1 仍是天花板参照。
+- **2026-11-04（第二十九条）** —— ✅ q4 主战档批路余量（三）：qkv bias 路换半块累加
+  - **起点**：二十八的 profile 没给带偏置投影打点（q/k/v 走 `has_bias` 分支，K_GEMM
+    桶没记它），整段藏在"未入账 ~19 ms"里。补打点后同桶读数：K_GEMM 70.6 →
+    98.9 ms，**bias 路 ≈ 28.3 ms/步**（72 次调用：q 896×896、k/v 128×896）。
+  - **修**：镜像无偏置路当年的切换 —— per-token `matmul_q4_f32_bias` 与行带
+    `matmul_q4_f32_bias_rows_band` 都从 f64 通道（`_matmul_q4_wide_rows`）换到
+    **f32 半块**（`_matmul_q4_halves_rows` 加 `bias/has_bias` 形参），`RB` 随之
+    2 → 8（原 RB=2 是 f64 累加器 256 B/行的寄存器预算逼出来的；halves 每行只有
+    2 个 f32×16）。批里 qkv 的解量化遍数 4 → 1。MUB 行带核"装不下"的回退同步换
+    halves —— 回退必须与精确通路逐位一致，否则数值随装不装得下漂移（二十三的
+    教训）。
+  - **判定**：同窗 A/B（新旧二进制交替各两轮，load 9.9–10.7）：旧 162/185、
+    新 145/164 ms/步 —— 两轮全向好，**步时 −11%**，聚合中位 46.3 → 51.9 tok/s。
+    单流 47 → **39 ms/步（25.8 tok/s）**。干净环境 dump：forward 打点内
+    115.6 → 95.8 ms，K_GEMM（含两路）98.9 → 70.2 ms。
+  - **门**：`test_q4_rows`（行带 vs per-token 逐位 + 对标量 oracle 1e-5，无偏置与
+    带偏置两节都过）、`test_q4_matmul_vec`、`test_q4_parity`、`test_q4_greedy`
+    —— **贪心一致率钉值 0.8691 未动**（qkv 累加换 f32 没翻转任何贪心 token）；
+    mub 三门、批路/引擎/http 全绿（41+ 套件 0 失败）。
+  - **余量清单**：forward 外 ~50 ms/步（pick/settle/scheduler/拷贝）；q4 体核
+    （无偏置）~60-70 ms 是否到带宽墙；lm_head 20-26 ms（q8 带）。llama.cpp
+    q4 tg32 单流 40.7 tok/s —— 批路聚合已稳定越过，单流 25.8 还差 37%。
