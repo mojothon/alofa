@@ -77,9 +77,9 @@ comptime RU_A = 8
 comptime SX_A = 0
 comptime RU_B = 8
 comptime SX_B = 0
-comptime RU_C = 8
+comptime RU_C = 4
 comptime SX_C = 0
-comptime RU_D = 8
+comptime RU_D = 4
 comptime SX_D = 0
 # ⚠️ `JK` = 每行每块再挂一个被迫跨循环存活的值（核里 `JUNK`）：数值不
 # 变，只加在飞值与 spill。`B` 是基准，`D` 是加料，两者
@@ -95,8 +95,8 @@ comptime JK_D = 0
 # 只能看 `objdump`，看数值是看不出来的。
 comptime PR_A = 0
 comptime PR_B = 0
-comptime PR_C = 1
-comptime PR_D = 1
+comptime PR_C = 0
+comptime PR_D = 0
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -216,8 +216,8 @@ def bench_shape(
     # 预热（不计入）：页表、分支预测。
     _matmul_q4_mub_rows[1, RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, pd, False, rows)
     _matmul_q4_mub_rows[1, RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, pd, False, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, pd, False, rows)
 
     # 自证：四臂必须算出**同一个**结果（`RU` 不动每行的累加顺序；`Σx` 挪 int32 域时
     # 两个操作数都是整数且和 < 2^24 ⇒ 两条路在 f32 里都精确 ⇒ 逐位相同）。
@@ -225,9 +225,9 @@ def bench_shape(
     copy_f32(pr, pd, rows)
     _matmul_q4_mub_rows[1, RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, pd, False, rows)
     var same_b = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, pd, False, rows)
     var same_c = same_f32(pd, pr, rows)
-    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, pd, False, rows)
+    _matmul_q4_mub_rows[1, RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, pd, False, rows)
     var same_d = same_f32(pd, pr, rows)
 
     var ta = InlineArray[Int, REPS](uninitialized=True)
@@ -244,23 +244,23 @@ def bench_shape(
         if phase == 0:
             a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
             b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 1:
             b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, flush_p, sink)
             a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
         elif phase == 2:
-            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
-            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, flush_p, sink)
             a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
             b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
         else:
-            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            d = time_arm[RU_D, SX_D, JK_D, PR_D](pd, px, blocks, rows, inner, flush_p, sink)
             a = time_arm[RU_A, SX_A, JK_A, PR_A](pd, px, blocks, rows, inner, flush_p, sink)
             b = time_arm[RU_B, SX_B, JK_B, PR_B](pd, px, blocks, rows, inner, flush_p, sink)
-            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks_pre, rows, inner, flush_p, sink)
+            c = time_arm[RU_C, SX_C, JK_C, PR_C](pd, px, blocks, rows, inner, flush_p, sink)
         ta[rep] = a
         tb[rep] = b
         tc[rep] = c
@@ -318,19 +318,19 @@ def bench_shape(
     print(
         name
         + " rows=" + String(rows) + " inner=" + String(inner)
-        + "\n      A 原布局(18B) " + String(ma) + " ns   B 原布局 " + String(mb)
-        + " ns   C 预展开(34B) " + String(mc) + " ns   D 预展开 " + String(md)
+        + "\n      A RU8 " + String(ma) + " ns   B RU8 " + String(mb)
+        + " ns   C RU4 " + String(mc) + " ns   D RU4 " + String(md)
         + " ns"
         + "\n      逐位相同（对 A 那档）：B " + String(same_b)
         + "/" + String(rows) + "   C " + String(same_c) + "/" + String(rows)
         + "   D " + String(same_d) + "/" + String(rows)
-        + "   （四臂都该 = rows：预展开是纯重排）"
-        + "\n      逐轮 B/C 原布局/预展开 = " + String(lo1) + "…" + String(hi1)
-        + "   （**>1 = 预展开更快**）\n        " + s_sx
+        + "   （四臂都该 = rows：RU 不动每行累加顺序）"
+        + "\n      逐轮 B/C RU8/RU4 = " + String(lo1) + "…" + String(hi1)
+        + "   （**>1 = RU4 更快**）\n        " + s_sx
         + "\n      逐轮 A/B 原布局/原布局 = " + String(lo2) + "…" + String(hi2)
-        + "   （噪声底 1）\n        " + s_hi
-        + "\n      逐轮 C/D 预展开/预展开 = " + String(lo3) + "…" + String(hi3)
-        + "   （噪声底 2）\n        " + s_lo
+        + "   （噪声底：RU8 vs RU8）\n        " + s_hi
+        + "\n      逐轮 C/D RU4/RU4 = " + String(lo3) + "…" + String(hi3)
+        + "   （噪声底：RU4 vs RU4）\n        " + s_lo
     )
     arena.keep_alive()
 

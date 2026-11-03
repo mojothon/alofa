@@ -481,10 +481,15 @@ def main() raises:
     var db = arena.alloc(NTOK_MAX * INTER * 4).bitcast[Float32]()
     for i in range(NTOK_MAX * INTER):
         xb[i] = Float32(0.01) * Float32(i % 7)
+    # `n_tok=1` 是**单流 decode** 的真实形状（`RB` 只能取 1）；`n_tok=8` 是**并发 8 的
+    # decode 一步**（引擎的批路一次推进所有在批请求 ⇒ `rows=8`）。两者同表 ⇒ 批处理的
+    # 每 token 收益不用跨探针借数。
+    report[1](time_band[1](buf, db, xb, 1), 1, bytes_b)
     var toks = List[Int]()
+    toks.append(8)
     toks.append(16)
     toks.append(32)
-    for ti in range(2):
+    for ti in range(3):
         var nt = toks[ti]
         report[2](time_band[2](buf, db, xb, nt), nt, bytes_b)
         report[4](time_band[4](buf, db, xb, nt), nt, bytes_b)
