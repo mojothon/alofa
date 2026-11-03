@@ -1935,3 +1935,35 @@
     循环）。修好之前，"把并发做上去"到不了 QPS；修好之后模型层的 2.36× 才能兑现
   - **门**：本轮**未改生产代码**（只给 `stress_serve.py` 补了 tok/s 输出行）；`T=0` 并发 1 零错误
     （6/6），并发 8 有 1 个 `timeout`，`T=1` 有超时 —— 这两个失败都是本轮的**发现本身**，不是回归
+- **2026-11-03（同日第十五条）** —— `ALOFA_ENGINE_THREADS=1` 的停摆查清并修掉**两个真 bug**；
+  第三个（并发下的 KV 重号）已定量定位、未修
+  - **怎么拿到现场**（方法本身可复用）：`ptrace_scope=1` ⇒ 不能 attach 非子进程。把服务放在
+    `gdb` 下、命令走 FIFO（`tail -f /tmp/gdb_in | gdb --args ./target/serve`），复现后给被测
+    进程发 `SIGINT` 让 gdb 接管再 `thread apply all bt`；配合 `/proc/<pid>/fdinfo/<epollfd>`
+    （注册表与 token）与 `ss -tnp`（TCP 状态）。**这次的关键证据全都来自后两者。**
+  - **bug 1 = EOF 自旋（活锁的实体）**：客户端一断，连接进 `CLOSE-WAIT`，`recv` 对它**永远返回
+    0**，而 epoll 是 **level-triggered** ⇒ 事件永远报。`read_ready` 收到 EOF 只
+    `mark_peer_closed()` 就返回（**不收连接**），而 `reap` 的四条例外（有请求排队 / 还有字节没写 /
+    流在跑 / 活在途）把一条"对端已经没了"的连接全部豁免；更糟的是 `read_ready` 末尾无条件刷
+    `last_seen`，**自旋亲手把空闲超时喂活**。现场：主线程 `state=R`、gdb 停在 `recv` 且
+    `$rax=0`（返回值就是 0），6 条连接全是 `CLOSE-WAIT`，新客户端 `connect` 成功（内核 backlog）
+    但一个字节也收不到。**修**：`Conn.peer_gone()` + `reap` 里 `peer_gone && drained` 立刻收
+    （还有要写的仍留给 `flush` 的 EPIPE 去收，那是"优雅发完"与"对端没了"的合取）+ EOF 不再刷
+    `last_seen`。**验证**：`T=1` 并发 1 从「2 ok + 120 s 超时」变成 **8/8 零错误**，TTFT p50
+    1.25 s → **2.3 ms**，3.79 tok/s（`T=0` 同轮 3.18）。
+  - **bug 2 = 执行器被一次异常永久毒死**：`decide` 里 `plan` 借走缓冲（`n_handles>0`），只有
+    `settle` 会还；而 `forward` 在借完之后抛（页表不够就是这条），调用方走异常分支就**永远到不了
+    `settle`** ⇒ 之后每一次 `plan` 都报 "the previous step was not finished"。实测**一次**失败
+    之后 **2708 次连败**，服务看着还活着、每个请求都秒挂。**修**：`Executor.abandon()`（只还缓冲、
+    不推进历史）+ `decide` 的 try/except 兜底 + `_batch_tick` 的"先 `settle`（全 `NO_TOKEN`）再
+    抛"。**验证**：同样的并发下不再连败，服务全程存活。
+  - **未修（下一刀）= 并发下的 KV 重号**：并发 8 仍然 **108/122 请求**在
+    `capacity: fewer blocks than it has history` 断流（`tok/s` 5.55 是**假数**，不可引用）。
+    错误路径打点给出 `hist=64 n=1 table=64 runs=4` —— 而合法上限是 **5 prompt + `MAX_GEN` 32 = 37**
+    ⇒ 这个 64 只可能是**请求号复用留下的旧历史**（号 = 连接槽位，断开与重连撞在一起）；且
+    `table == hist` 恰好卡在**块边界**（4×16）上没有余量，`settle` 里 `grow_to(fed + generated)`
+    用的是"这次喂了多少 + 生成了多少"，不是执行器的历史长度。下一刀两件事：① `admit` 遇到重号
+    必须**拒绝并报**，`stream_end` 必须**一定**把引擎侧那一份放掉；② `grow_to` 要预留下一步要写的
+    那个位置（`hist + 1`），否则每跨一个块边界都要靠"表恰好有余量"侥幸。
+  - **门**：`test-batch-forward` 6/6、`test-batch-stream` 6/6、`test-http`、`test-loop`、
+    `test-engine` 全过（engine 门本来就钉着"客户端中途离开之后还能答"——这次修的两处正对着它）。

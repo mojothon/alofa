@@ -662,6 +662,22 @@ struct BatchExecutor:
         if self.pool.n_live() != 0:
             self.defects += 1
 
+    def abandon(mut self) raises AlofaError:
+        """Give back a step that produced **no answer** (the forward raised).
+
+        `finish` is the only place the borrows go back, and it is reached from
+        `settle` — which belongs to the caller. A forward that raises mid-way
+        therefore leaves `n_handles > 0`, and from then on `plan` refuses every
+        step: "the previous step was not finished", forever, for every request
+        (measured: 2708 consecutive failures in one run, ledger §15). So the
+        failure path releases the borrows itself.
+
+        No `advance`: nothing was chosen, so no history may grow. This is
+        exactly `finish` — the name exists to make the "step aborted" site
+        greppable and to keep that reasoning next to it.
+        """
+        self.finish()
+
     def forward[backend: Int = BACKEND_SCALAR](
         mut self, mut model: QwenForward
     ) raises AlofaError -> Int:
@@ -760,6 +776,23 @@ struct BatchExecutor:
                 var at = self.row_start[unsafe_offset=i]
                 var upto = self.hist[i] + n
                 if self.n_page_tokens(i) < upto:
+                    # 只在错误路径上打：正常一拍不碰这几行（热路径上一个 print 会把
+                    # 时序改掉，这个文件以前被那种打印骗过一次）。四个数一起打，
+                    # 才能分清"表少了一格"（table == hist）与"池子不够"（table 差很多）。
+                    print(
+                        "  [srv] kv short: slot="
+                        + String(i)
+                        + " req="
+                        + String(self.req[i])
+                        + " hist="
+                        + String(self.hist[i])
+                        + " n="
+                        + String(n)
+                        + " table="
+                        + String(self.n_page_tokens(i))
+                        + " runs="
+                        + String(self.page_n[i])
+                    )
                     raise AlofaError(
                         ERR_CAPACITY,
                         "the request has fewer blocks than it has history",

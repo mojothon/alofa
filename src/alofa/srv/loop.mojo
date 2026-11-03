@@ -848,6 +848,12 @@ struct Loop(Movable):
             return
         if n == 0:
             # 对端关了。keep-alive 的连接就是这么结束的，不是错误。
+            #
+            # ⚠️ 但**这不刷新 `last_seen`**：EOF 不是"活动"，而这条连接接下来会
+            # 靠 level-triggered 的可读事件**反复**走到这里（recv 对 CLOSE-WAIT
+            # 永远返回 0）—— 刷新它等于让"EOF 自旋"亲手把空闲超时喂活，那条连接
+            # 就谁也收不掉了（实测：主线程满核自旋在 recv=0 上，新连接永远进不来，
+            # 2026-11-03 账本第十五条）。收它的是 `reap` 的 `peer_gone` 分支。
             self.conns[slot].mark_peer_closed()
         else:
             var got = List[UInt8](capacity=n)
@@ -856,7 +862,8 @@ struct Loop(Movable):
                 got.append(buf[i])
                 i += 1
             self.conns[slot].feed(got)
-        self.last_seen[slot] = monotonic_ms()
+            # 只有**真的读到了字节**才算这条连接活着（EOF 不算，见上面那段）。
+            self.last_seen[slot] = monotonic_ms()
 
     def flush(mut self, slot: Int) raises:
         """把队列里的一截写给对端；写多少由 `send(2)` 说了算。"""
@@ -1018,6 +1025,18 @@ struct Loop(Movable):
             if self.live[slot] == 0:
                 continue
             if self.conns[slot].should_close():
+                self.drop(slot)
+                continue
+            # 对端已关 + 该发的都发完了：**现在**就收，不走下面的空闲超时例外。
+            #
+            # 为什么必须有这一条（2026-11-03 账本第十五条的活锁根因）：EOF 之后
+            # level-triggered 的可读事件会**永远**报（recv 对 CLOSE-WAIT 永远返回
+            # 0），`read_ready` 只标记不收；而下面那排例外（等客户端收、流在跑、
+            # 活在途）对一条**对端已经没了**的连接全部不再成立——留着它们，这条
+            # 连接就谁也收不掉，主线程在 recv=0 上满核自旋、再也不 accept，新请求
+            # 永远等不到一个字节。还有要写的（pending>0）不在此列：`flush` 写失败
+            # （EPIPE/RST）会走它自己的 drop，那是"优雅发完"与"对端没了"的合取。
+            if self.conns[slot].peer_gone() and self.conns[slot].drained():
                 self.drop(slot)
                 continue
             if now - self.last_seen[slot] <= IDLE_TIMEOUT_MS:

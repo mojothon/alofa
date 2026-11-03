@@ -695,28 +695,42 @@ struct ModelService(Service, Twinable):
         var chosen = self.engine.step_choices()
         for i in range(MAX_BATCH):
             chosen[unsafe_offset=i] = NO_TOKEN
-        if rows > 0:
-            for i in range(MAX_BATCH):
-                if not self.engine.step_owes(i):
-                    continue
-                var req = self.engine.step_request(i)
-                var slot = self._slot_of(req)
-                if slot < 0:
-                    # 引擎在替一条这边不认得的请求跑。留 `NO_TOKEN` 会让它原地不动
-                    # —— 客户端看到的是"偶发地特别慢"，最难归因的那一种，所以宁可红。
-                    raise AlofaError(
-                        ERR_INVALID_ARGUMENT,
-                        "the engine is generating for a request this service does"
-                        + " not hold",
-                        "request=" + String(req),
+        try:
+            if rows > 0:
+                for i in range(MAX_BATCH):
+                    if not self.engine.step_owes(i):
+                        continue
+                    var req = self.engine.step_request(i)
+                    var slot = self._slot_of(req)
+                    if slot < 0:
+                        # 引擎在替一条这边不认得的请求跑。留 `NO_TOKEN` 会让它原地不动
+                        # —— 客户端看到的是"偶发地特别慢"，最难归因的那一种，所以宁可红。
+                        raise AlofaError(
+                            ERR_INVALID_ARGUMENT,
+                            "the engine is generating for a request this service does"
+                            + " not hold",
+                            "request=" + String(req),
+                        )
+                    chosen[unsafe_offset=i] = self._batch_pick(
+                        slot, self.engine.step_logits(i)
                     )
-                chosen[unsafe_offset=i] = self._batch_pick(
-                    slot, self.engine.step_logits(i)
+        except err:
+            # 决策中途抛：这一拍**也必须落地**（`chosen` 全是 `NO_TOKEN` = 一个
+            # token 都不算）。少了它，`decide` 借走的缓冲没人还，执行器从此进不了
+            # 下一次 `plan` —— 症状是"这条流断了"之后**每一条**请求都秒失败，而
+            # 归因落在几千行之后（账本第十五条）。
+            try:
+                self.engine.settle(chosen)
+            except err2:
+                print(
+                    "  [srv] the step could not be settled after a failure: "
+                    + String(err2)
                 )
+            raise err.copy()
         self.engine.settle(chosen)
         return rows
 
-    def _batch_pick(mut self, slot: Int, logits: F32Ptr) raises -> Int:
+    def _batch_pick(mut self, slot: Int, logits: F32Ptr) raises AlofaError -> Int:
         """批路给 `slot` 选这一步的 token：贪心，或按**它的**温度采样。
 
         与老路 `_pick` 是同一个分支、同一个 `sampler`、同一份参数，唯一的结构差异

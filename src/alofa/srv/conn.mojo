@@ -130,6 +130,15 @@ struct Conn(Movable):
         """还没被切成请求的字节数。门用它钉住"多出来的字节没被吞掉"。"""
         return len(self.inbound)
 
+    def peer_gone(self) -> Bool:
+        """对端关了吗（`read` 已经返回过 0）。
+
+        暴露给 `reap` 的是**这一个**判断而不是 `mark_peer_closed`：对端不会再发
+        字节，这一条连接上一切"等它"的例外（等它收、等它读完流）都不再成立 ——
+        谁该什么时候据此收掉这条连接，是循环的事，连接自己只报事实。
+        """
+        return self.peer_closed
+
     def take(mut self) raises -> Taken:
         """试着切出**一个**完整请求；凑不齐就报 `TAKEN_NEED_MORE`。
 

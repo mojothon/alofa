@@ -630,7 +630,17 @@ struct EngineCore:
         """
         var rows = self.prepare()
         if rows > 0:
-            self.ex.forward[backend](model)
+            try:
+                self.ex.forward[backend](model)
+            except err:
+                # 前向在 `_borrow` 之后抛（页表覆盖不住 hist+n 就是这一条）：
+                # 缓冲只有 `finish` 会还，而 `finish` 挂在 `settle` 上 —— 那是
+                # 调用方的事，它走了异常分支就永远到不了。不还，执行器从此进不了
+                # 下一次 `plan`（之后每个请求都拿到"the previous step was not
+                # finished"，实测 2708 连败）。这一步没有产出 token，所以只还
+                # 缓冲、不推进历史。
+                self.ex.abandon()
+                raise err.copy()
         return rows
 
     def step_owes(self, i: Int) -> Bool:
