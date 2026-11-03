@@ -1743,3 +1743,11 @@
   - ✅ **门二（整网，强）**：`pixi run test-model-avx2` **4/4** 通过，其中 `test_greedy_generation_matches_token_for_token`（128 token 对照 fp32 参考）与 `test_incremental_decode_matches_full_prefill` 都是**在默认 `shards=8` 下跑的** ⇒ **按头分片的路径确实被执行并通过了整网逐 token 门**，不是只跑了串行分支
   - ⚠️ 速度仍未判：本机 `loadavg 15.56 / 8 核`。**并行扩展这条线到此为止**（注意力之后，剩余串行段都被层循环的依赖钉死：q/k/v → attention → o_proj）
   - 🧭 结论：**"并行扩展"不是当前可用的杠杆** —— 切到注意力就到顶了，再往上要拆层循环（重写前向）。下一个杠杆要么等空闲窗口确认注意力这步的真实收益，要么回到单线程（负载无关）的注意力分支消除（10-03 记：注意力 30/44 是 data-dependent 分支）
+- **2026-11-03（同日第五条）** —— 🧭 **"单线程瘦身注意力"的前置：仓库里没有注意力的尺子，先造尺子**
+  - 事实：`grep` 全部 `scripts/bench_*.mojo`，**没有任何一个直接调 `attention` 核**（`bench_head_split` 只在正文里提到"注意力"三个字，它量的是输出投影）。所以"注意力 26.4%""30/44 是 data-dependent 分支"这两条**至今没有一把能复现的尺子**
+  - 先做算术核对（这是我怀疑的地方）：decode 一个 token 的注意力算术量 = 24 层 × 14 头 × 1 query × 17 kv × 64 dim × 2（打分+值归约）≈ **0.73 MFLOP**。若真占 26.4% × 24.6 ms = **6.5 ms**，则有效算力只有 **0.11 GFLOP/s** —— 比同核向量能力低三个数量级 ⇒ **那 6.5 ms 不可能主要是算术**，要么桶里混了 `copy_into`/`rope`/`prof.now()` 的开销，要么是每调用一次的固定成本
+  - ⇒ **下一步必须先量出"一次 `attention` 调用多少纳秒"**（按真实 decode 形状：`n_heads=14, n_kv_heads=2, head_dim=64, q_len=1, kv_len=17/33/65`），再谈优化。规格：
+    ① 新脚本 `scripts/bench_attn_decode.mojo`，只 import `alofa.core.ffi.monotonic_ns` + `alofa.core.memory.Arena` + `alofa.kernels.cpu.avx2.attention`（**不 import 模型**，否则编译几分钟）
+    ② 单线程、每档 `REPS` 次、取 **min**（过载机器上 min 比中位数更抗抢核）；报 ns/调用 + 折算成"占一个 token 的百分比"（÷ 24 层 ÷ 24.6 ms）
+    ③ 同轮对照：`head_lo=0,head_hi=14` 与 `head_lo=0,head_hi=7` ×2 次，验证**按头切分没有引入回归**（这条负载无关）
+  - ⚠️ 在拿到这把尺子之前，**不许再对注意力做任何"优化"** —— 本轮已经因为无尺子下了两次错结论（83 条 / 4.8×，均已撤销）
