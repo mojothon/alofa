@@ -111,6 +111,16 @@ comptime POLL_IDLE_MS = 50
 # 一轮里最多接多少条新连接。上限是为了"接不完"的时候不会一直绕 —— 剩下的连接下一轮
 # 还在 backlog 里，而空转比慢更贵。
 comptime ACCEPT_PER_ROUND = 32
+# 一帧"派出去却没回来"时，先补派几次再掐断。
+#
+# ⚠️ 补派**不等于**那一帧没发生过：handler 那边的游标已经往前走了（`_batch_next` 推进
+# `b_n`、`_batch_text` 推进 `b_emitted`），而 SSE 的增量没有回退接口 —— 所以**丢掉那一帧
+# 的文本补不回来**，流会继续往下走，只是客户端的拼接结果里少了一截。这是**有意的取舍**：
+# 少一帧 vs 整条流在中途断掉（客户端拿不到 `[DONE]`、也拿不到后文），后者坏得多；而且这
+# 条路径只在"应答真的丢了"时走（实测约 1/8 条流会遇到一次）。
+# 要连这一截也补回来，得把 `b_emitted` 的提交从"算出来"挪到"确认发出去"（ack），
+# 那是下一轮的事 —— 记在账本第十六条。
+comptime MAX_STALL_RETRIES = 3
 
 
 def is_would_block(imm err: String) -> Bool:
@@ -182,6 +192,15 @@ struct Loop(Movable):
     # 是：断开时那件在途的活一回来就把待办抹了，`JOB_STREAM_END` 从此再也没人派，
     # engine 那边那个号一直占着（占满的表现是"新请求被拒"，而真正的原因在别处）。
     var release_sent: List[Int]
+    # 诊断用对账：这个槽位**派出去几件**活、**回了几件**应答。`inflight` 卡在 1 而这两
+    # 个数相等，说明活回来了但账没清（循环这一侧的问题）；不等，说明那件活真的没回
+    # （engine 那一侧的问题）。全局的 jpush/jtake 分不出是**哪个**槽位丢的 —— 而这条
+    # 症状（流停一半、客户端挂到超时）只在并发下出现，没有 per-slot 的对账就只能猜。
+    var sent: List[Int]
+    var back: List[Int]
+    # 这个槽位已经补派过几次（见 `MAX_STALL_RETRIES`）。收到应答就清零 —— 它是"**连续**
+    # 丢了几次"的计数，不是这条连接一生里的总数。
+    var stall_retries: List[Int]
 
     def __init__(out self, var listener: TcpListener) raises:
         self.listener = listener^
@@ -200,6 +219,9 @@ struct Loop(Movable):
         self.stall_seen = List[Int]()
         self.release_pending = List[Int]()
         self.release_sent = List[Int]()
+        self.sent = List[Int]()
+        self.back = List[Int]()
+        self.stall_retries = List[Int]()
         self.engines = 1
         self.next_engine = 0
 
@@ -401,6 +423,12 @@ struct Loop(Movable):
                 print("  [srv] a result could not be taken: " + String(err))
                 return
             self.inflight[slot] = 0
+            self.back[slot] += 1
+            # 应答回来了 = 这条流刚才没有卡住。两个计数一起清：`stall_seen` 是"连续几帧
+            # 没动静"，`stall_retries` 是"连续补派了几次" —— 留着一个旧值，下一次偶发
+            # 丢帧会直接跳到"掐断"那一支。
+            self.stall_seen[slot] = 0
+            self.stall_retries[slot] = 0
             # 待办只认**它自己**的回执：这一截是 `JOB_STREAM_END` 的答案才清。
             #
             # 对每一截应答都清（原来的写法）等于把待办提前抹掉：断开时那件在途的活
@@ -492,6 +520,7 @@ struct Loop(Movable):
                 # 糟的是重复释放）。待办要等 `collect` 看见回执才清 —— 那时才真的收完。
                 if box.mailbox.push_job(closing^):
                     self.inflight[slot] = 1
+                    self.sent[slot] += 1
                     # 派出去了：从现在起回来的那一截应答**才是**这份待办的回执
                     # （`collect` 据此清它，见 `release_sent`）。
                     self.release_sent[slot] = 1
@@ -514,6 +543,7 @@ struct Loop(Movable):
             try:
                 if box.mailbox.push_job(step^):
                     self.inflight[slot] = 1
+                    self.sent[slot] += 1
             except err:
                 print("  [srv] a stream step could not be queued: " + String(err))
         if budget <= 0:
@@ -587,6 +617,7 @@ struct Loop(Movable):
             if not queued:
                 continue
             self.inflight[slot] = 1
+            self.sent[slot] += 1
             budget -= 1
 
     def guard_stalls[H: EngineHandler](mut self, mut box: EngineBox) raises:
@@ -674,13 +705,36 @@ struct Loop(Movable):
                 + String(polls)
                 + " runs="
                 + String(runs)
+                + " sent="
+                + String(self.sent[slot])
+                + " back="
+                + String(self.back[slot])
                 + " n="
                 + String(self.stall_seen[slot])
             )
             if self.stall_seen[slot] == 4:
-                # 最后一帧之后收掉它：清掉"还在等它"的标记 → 写完就关（`reap` 见到
-                # `closing` 且队列空就丢槽位）。客户端看到的是"流没走到 `[DONE]` 就断
-                # 了" —— 断言该看的是"没有请求能挂死"，不是"每条都必须走完"。
+                # 到这里已知的只是"这一件派出去了、应答没回来，而引擎不忙、邮箱也空"。
+                # 实测（`sent=2 back=1`，引擎侧 `rpush=162 > jtake=160` 自相矛盾）那截
+                # 应答是**真的丢了**。流本身没坏，但那一帧的文本补不回来（游标已经走了，
+                # 见 `MAX_STALL_RETRIES` 上那段）—— 所以先补派：流继续往下走，代价是客户端
+                # 少一帧，收益是它仍能拿到后文和 `[DONE]`。
+                if self.stall_retries[slot] < MAX_STALL_RETRIES:
+                    self.stall_retries[slot] += 1
+                    self.stall_seen[slot] = 0
+                    self.last_seen[slot] = now
+                    self.inflight[slot] = 0
+                    print(
+                        "  [srv] a frame went missing on slot="
+                        + String(slot)
+                        + ", asking again ("
+                        + String(self.stall_retries[slot])
+                        + "/"
+                        + String(MAX_STALL_RETRIES)
+                        + ")"
+                    )
+                    continue
+                # 补派也还是一样的形状 ⇒ 那是真的坏了，收掉它：清掉"还在等它"的标记
+                # → 写完就关（`reap` 见到 `closing` 且队列空就丢槽位）。
                 #
                 # ⚠️ 差一步：这里**没有**调 handler 的 `stream_end`（`EngineBox` 的约定
                 # 是"循环不碰 handler"），所以引擎那一侧的请求号/槽位还占着。按 `drop`
@@ -820,6 +874,9 @@ struct Loop(Movable):
         self.stall_seen.append(0)
         self.release_pending.append(-1)
         self.release_sent.append(0)
+        self.sent.append(0)
+        self.back.append(0)
+        self.stall_retries.append(0)
         try:
             self.reactor.register(
                 fd, UInt64(CONN_TOKEN_BASE + len(self.live) - 1), INTEREST_READ
