@@ -2060,3 +2060,27 @@
     （jpush 118k）伴随计数器再度破坏 ⇒ engine 线程路径维持 EXPERIMENTAL；受支持的
     `ENGINE_THREADS=0` 不受影响。
   - **门**：`pixi run test`（全绿，含 `check-ledger`）、`test-http`（PASS，跑前 `pkill -f http_e2e`）。
+- **2026-11-03（第十九条）** —— "活件风暴"定位到**收尾件重派**；加一道闸，洪泛 500× 消失
+  - **对账定案**：退化阶段循环侧 `sent_sum=13113` 而邮箱侧 `jpush=111173` —— 差的约 10 万件
+    **不经过 `sent` 计数**，而派件路径里唯一不动 `sent` 的就是 dispatch 第 0 步的收尾件
+    （`JOB_STREAM_END`）。两个佐证一次对齐：`JOB_STREAM_END=2` 与取活环（tj）里满屏的
+    `kind=2` 吻合；`_stream_end` 交回的正是 `RES_DONE n=0` 与结果环（tr）满屏的形状吻合
+    —— 风暴不是请求、也不是幻影件，是**收尾件被一轮一件地重派**。
+  - **机制**：死槽位的收尾回执走"孤儿分支"被丢 —— 那里清了 `inflight`、却不清
+    `release_pending`/`release_sent` ⇒ dispatch 的判据（只看 `inflight`）认为"该再派一件"
+    ⇒ engine 每秒约 200 次对同一个**已死的请求号**调 `stream_end`（每次还带一次
+    `_batch_tick`），直到 8 s 宽限回收才停。8 槽 × 每窗约 1600 件 ≈ 观测到的 `sent_sum`；
+    jpush 的 11 万全来自这里。这个 200 Hz 的重派同时是堆损坏的**放大器**（引擎侧状态被
+    无休止地搅动）。
+  - **修**：第 0 步加一个闸 —— `release_sent == 1`（这份待办的回执已经在路上）就跳过。
+    回执丢了不靠重派去"催"，由 8 s 宽限回收兜底（第十八条那条）。
+  - **实测**：jpush 峰值 **111173 → 223**（约 500×），干净轮 `vio=0`（恒等式不再破）；
+    8 并发 × 3 轮 23/24 完整；受支持路径 `ENGINE_THREADS=0` 24/24 全绿；`pixi run test`
+    全过、`test-http` PASS。
+  - **残余（写明，与闸无因果）**：engine 线程路径仍有**间歇性崩溃**，第 1 轮也会发生（第 1 轮
+    不存在死槽位，闸的跳过条件从未成立 ⇒ 崩溃另有源头）。两副栈：① `stream_next →
+    _batch_tick → EngineCore.decide → BatchExecutor.forward` 崩在 forward（批路径自身）；
+    ② `_engine_main → parse_request → parse_head`（`Job.raw` 被写穿）。路径维持 EXPERIMENTAL，
+    下一个入口 = 引擎侧批执行与 `Job.raw` 的写穿点。
+  - **门**：`pixi run test`（全绿，含 `check-ledger`）、`test-http`（PASS，跑前
+    `pkill -f http_e2e`）。

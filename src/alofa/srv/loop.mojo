@@ -658,7 +658,13 @@ struct Loop(Movable):
         #    下去，收尾是让活停下来，后者先走才不会把号越占越满。
         for slot in range(len(self.live)):
             var thread = self.release_pending[slot]
-            if thread < 0 or self.inflight[slot] == 1:
+            # `release_sent == 1` = 这份待办的回执**已经在路上**：不能再派。原来只看
+            # `inflight`，而死槽位的回执走"孤儿分支"被丢、`inflight` 在那里被清零、
+            # `release_pending` 却没人清 ⇒ **每一轮都重派一件收尾**，engine 每秒约
+            # 200 次对同一个已死的请求号调 `stream_end`，直到 8 s 宽限回收才停
+            # （实测 jpush 冲到 11 万，而循环真正派过的只有 1.3 万 —— 差值全是这件
+            # 事）。丢了的回执就等宽限回收兜底，不靠重派去"催"。
+            if thread < 0 or self.inflight[slot] == 1 or self.release_sent[slot] == 1:
                 continue
             var closing = Job(slot, self.gen[slot], JOB_STREAM_END, thread)
             try:
