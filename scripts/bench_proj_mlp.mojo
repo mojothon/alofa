@@ -57,7 +57,12 @@ from alofa.core.memory import Arena
 from alofa.core.tensor import F32Ptr, RawPtr
 from std.sys import llvm_intrinsic
 
-from alofa.kernels.cpu.avx2 import Q4_U8, matmul_q4_f32, matmul_q4_mub
+from alofa.kernels.cpu.avx2 import (
+    Q4_U8,
+    matmul_q4_f32,
+    matmul_q4_mub,
+    matmul_q4_mub_rows_band,
+)
 from alofa.kernels.cpu.quant import block_scale
 
 # ---- 真实形状（Qwen2.5-0.5B，decode = 每次 1 个 token）----
@@ -258,6 +263,48 @@ def matmul_q4_mub_hoist(
         dst[unsafe_offset=row] = Float32(acc8.reduce_add())
 
 
+comptime NTOK_MAX = 32
+
+
+def time_band[RB: Int](buf: RawPtr, dst: F32Ptr, x: F32Ptr, n_tok: Int) raises -> Int:
+    """`n_tok` 个 token 一批，走 `matmul_q4_mub_rows_band[RB]`（prefill 的实际通路）。"""
+    var best = 0
+    for _ in range(REPS):
+        var t0 = monotonic_ns()
+        for layer in range(LAYERS):
+            var w = buf.unsafe_offset(layer * PROJ_ROWS * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, HID, HID, HID)
+            w = w.unsafe_offset(HID * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, KV_DIM, HID, KV_DIM)
+            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, KV_DIM, HID, KV_DIM)
+            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, HID, HID, HID)
+            w = w.unsafe_offset(HID * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, INTER, HID, INTER)
+            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, INTER, HID, INTER)
+            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
+            matmul_q4_mub_rows_band[RB](dst, x, w, n_tok, HID, INTER, HID)
+        var el = monotonic_ns() - t0
+        if best == 0 or el < best:
+            best = el
+    return best
+
+
+def report[RB: Int](ns: Int, n_tok: Int, bytes_b: Int):
+    """按 `遍数 = ceil(n_tok/RB)` 折算权重流量，打印隐含带宽与每 token 时间。"""
+    var passes = (n_tok + RB - 1) // RB
+    var tb = passes * bytes_b
+    print(
+        "     RB=" + String(RB) + "  n_tok=" + String(n_tok)
+        + "   " + f2(Float64(ns) / 1e6) + " ms"
+        + "   遍数 " + String(passes) + " ⇒ " + f2(Float64(tb) / 1048576.0) + " MB"
+        + " ⇒ " + f2(Float64(tb) / Float64(ns)) + " GB/s"
+        + " ⇒ 每 token " + f2(Float64(ns) / Float64(n_tok) / 1e6) + " ms"
+    )
+
+
 def _mm[mode: Int](dst: F32Ptr, x: F32Ptr, w: Q4_U8, r: Int, c: Int) raises:
     """`mode` 0 = f32 展开，1 = mub（生产），2 = mub 纯重排版。"""
     comptime if mode == 0:
@@ -421,6 +468,27 @@ def main() raises:
     print("      说明单核只要挂够流就能吃满 DRAM，加核的边际收益就很小")
     print("")
     print("   ⚠️ 本机 loadavg 7–9（共享机器），绝对值会被抢核抬高；只看同一轮内的比例。")
+
+    # ---------------- D：prefill 行带的 RB 到底是几 ----------------
+    #
+    # 账本 11-03 第十一条用遍数模型 `passes = shards × ceil(每片行数 / RB)` 反推
+    # prefill 的隐含带宽，拟合结果是 **RB=2**（单核 4.9 GB/s、4 片 9.5 GB/s 都自洽）。
+    # 这张表直接在核级别上量 RB=2/4/8 —— 如果 RB 提上去流量真能按比例降，那 prefill
+    # 的最大杠杆就是改 RB（一行默认值），而不是重写 GEMM。
+    print("")
+    print("   D prefill 行带 RB（24 层 x 7 投影 = 一整个 prompt 的层投影）")
+    var xb = arena.alloc(NTOK_MAX * INTER * 4).bitcast[Float32]()
+    var db = arena.alloc(NTOK_MAX * INTER * 4).bitcast[Float32]()
+    for i in range(NTOK_MAX * INTER):
+        xb[i] = Float32(0.01) * Float32(i % 7)
+    var toks = List[Int]()
+    toks.append(16)
+    toks.append(32)
+    for ti in range(2):
+        var nt = toks[ti]
+        report[2](time_band[2](buf, db, xb, nt), nt, bytes_b)
+        report[4](time_band[4](buf, db, xb, nt), nt, bytes_b)
+        report[8](time_band[8](buf, db, xb, nt), nt, bytes_b)
 
     # ⚠️ 必须是 `main` 的最后一条语句：这是 `arena` 的**最后一次使用**，Mojo 的
     # ASAP 销毁正好发生在这里。写在上面的 `alloc` 之后等于把寿命截断在那里，

@@ -203,6 +203,38 @@ def linear_bias_k[backend: Int](
         linear_bias(dst, x, w, b)
 
 
+comptime Q4_MUB_ROWS_RB_WIDE = 8
+comptime Q4_MUB_ROWS_RB_NARROW = 2
+comptime Q4_MUB_ROWS_MIN_TOK = 4
+"""q4 行带（prefill 通路）一次带几个 token 行共用一份块的解量化 —— **按 `n_tok` 分流**。
+
+成本模型：`passes = shards × ceil(每片行数 / RB)`，权重被读 `passes` 遍。
+
+核级（`scripts/bench_proj_mlp.mojo` 的 D 表，单线程，`n_tok=16`）：
+
+    RB=2 → 353.8 ms（8 遍，4.55 GB/s）｜RB=4 → 299.2（4 遍）｜RB=8 → 266.5（2 遍，1.51 GB/s）
+
+**流量降 4×、时间只降 1.33×** ⇒ 单核下 prefill 不是流量受限而是 ALU 受限。但多片时
+单核 1.51 GB/s × 8 ≈ 12 GB/s 才刚贴 16.6 GB/s 天花板 ⇒ RB 只有在**多线程**下才变现。
+
+模型级同轮 A/B（`scripts/bench_prefill_budget.mojo` + `bench_decode_budget.mojo`，
+无插桩，loadavg 10–11）：
+
+    prefill n=32  shards=4   627.3 → 344.6 ms（**1.82×**）
+    prefill n=32  shards=8   554.5 → 279.6 ms（**1.98×**）
+    prefill n=128 shards=1  2771.6 → 2323.4 ms（1.19×）
+    prefill n=128 shards=8  1198.4 → 987.6 ms（1.21×）
+    🔴 **decode 反向退化**：shards=1 56.4 → 60.7 ms、shards=8 33.2 → 41.3 ms
+
+decode 退化的原因：`n_tok=1` 时**可复用的行为 0**，宽带只是白占 7 个 lane。所以
+按 `n_tok` 分流：≥4 走 `RB=8`，否则留在 `RB=2`。prefill 的每一片（`n/shards`）在
+`shards=4/8、n=32` 时正好是 8 / 4 行，都落在宽带一侧；decode 恒为 1 行，留在窄带。
+
+⚠️ `4` 这个门槛是**量出来的分界**（`n_tok=1` 退化、`n_tok=4` 起有收益），不是推的；
+`n_tok=2..3` 没有实测，故保守留在窄带。
+"""
+
+
 def q4_mub_enabled() -> Bool:
     """q4 投影走 `vpmaddubsw` 整数点积（**默认**）；`ALOFA_Q4_MUB=0` 退回 f32 展开。
 
@@ -663,14 +695,27 @@ def q4_matmul_rows_k[backend: Int](
     """
     comptime if uses_vector_backend[backend]():
         if q4_mub_enabled():
-            if junk == 0:
-                matmul_q4_mub_rows_band_vec[2, 0](
-                    dst, x, blocks, n_tok, rows, cols, dst_stride
-                )
+            # 分流只在 `n_tok` 上：decode 走 `n_tok=1` ⇒ 可复用行为 0，大 `RB` 只会白占
+            # lane（实测退化 8–24%），所以它必须留在窄带那条；prefill 每片 ≥4 行时才
+            # 换宽带（实测把遍数 2→1）。
+            if n_tok >= Q4_MUB_ROWS_MIN_TOK:
+                if junk == 0:
+                    matmul_q4_mub_rows_band_vec[Q4_MUB_ROWS_RB_WIDE, 0](
+                        dst, x, blocks, n_tok, rows, cols, dst_stride
+                    )
+                else:
+                    matmul_q4_mub_rows_band_vec[Q4_MUB_ROWS_RB_WIDE, 3](
+                        dst, x, blocks, n_tok, rows, cols, dst_stride
+                    )
             else:
-                matmul_q4_mub_rows_band_vec[2, 3](
-                    dst, x, blocks, n_tok, rows, cols, dst_stride
-                )
+                if junk == 0:
+                    matmul_q4_mub_rows_band_vec[Q4_MUB_ROWS_RB_NARROW, 0](
+                        dst, x, blocks, n_tok, rows, cols, dst_stride
+                    )
+                else:
+                    matmul_q4_mub_rows_band_vec[Q4_MUB_ROWS_RB_NARROW, 3](
+                        dst, x, blocks, n_tok, rows, cols, dst_stride
+                    )
         else:
             matmul_q4_f32_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
     else:
