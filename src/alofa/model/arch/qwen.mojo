@@ -973,6 +973,21 @@ def attention_k[backend: Int](
         attention(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim, head_lo, head_hi)
 
 
+comptime ATTN_SHARD_MIN_KV = 256
+"""`kv_len` 低于这个值就不按 head 分片 —— 分片自己是亏的。
+
+实测（`scripts/bench_decode_budget.mojo`，真实权重，2026-11-03）：
+
+    注意力整桶（24 层）   kv_len=17 时  shards=1 → 0.31 ms，shards=8 → 1.94 ms
+
+单层实活只有 ~13 µs（`scripts/bench_attn_decode.mojo` 量到 7 µs/次），而每层
+开一个 `TaskGroup` 的固定开销约 68 µs ⇒ **短上下文下分片是净亏**。按 7 µs 的
+实活折算，`kv_len` 要超过 ~165 才够本，这里取 256 留一倍余量。
+
+这也是"切了必须量"的教训：切分本身不改算术（逐位相同已经验过），但**它不免费**。
+"""
+
+
 async def _attention_shard[backend: Int](
     o: RawPtr,
     q: RawPtr,
@@ -1040,7 +1055,8 @@ def attention_k_shards[backend: Int](
     写，会变成 7 片各 1 个 + 最后 1 片独吞 7 个，并行度直接掉一半。
     """
     var n = shard_count(n_heads, shards)
-    if n <= 1 or q_len != 1:
+    # 三个不开的条件：没得切、不是 decode、上下文太短（见 `ATTN_SHARD_MIN_KV`）。
+    if n <= 1 or q_len != 1 or kv_len < ATTN_SHARD_MIN_KV:
         attention_k[backend](dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
         return
     # 先按全量口径把 dtype / 连续性验一遍：`raises` 直接抛给调用方，协程里
