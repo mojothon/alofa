@@ -674,6 +674,18 @@ struct EngineCore:
         """当前 WAITING（还没 prefill 完、进不了解码）的请求数。"""
         return self.sched.count_state(ST_WAITING)
 
+    def blocks_used(self) -> Int:
+        """调度账上的块（含缓存占用）—— 与 `capacity_blocks()`、`cached_blocks()`
+        一起才能判"预填充为什么进不来"：是池子满了，还是缓存占着不放。"""
+        return self.sched.blocks_used
+
+    def blocks_wanted(self) raises -> Int:
+        """排队请求还欠多少块 —— `blocks_used + blocks_wanted` 才是真占用。"""
+        return self.sched.blocks_wanted()
+
+    def capacity_blocks(self) -> Int:
+        return self.sched.cfg.capacity_blocks
+
     def step_owes(self, i: Int) -> Bool:
         """Slot `i` is owed a token this step (it is live and was served)."""
         return self.ex.live[i] == 1 and self.ex.served[i] != 0

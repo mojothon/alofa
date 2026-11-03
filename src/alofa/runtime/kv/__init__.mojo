@@ -61,7 +61,12 @@ comptime MAX_BLOCKS_PER_SEQ = 16
 # Live requests at once.
 comptime MAX_REQUESTS = 8
 # Radix tree nodes.
-comptime MAX_NODES = 32
+# 节点预算从**准入上限**推出来，而不是拍一个数：批路一次最多 8 条（`MAX_BATCH`），
+# 每条最长 64 token（`MAX_SEQ_TOKENS`），每个节点装 16 token（`MAX_NODE_TOKENS`）⇒
+# 8 × (64/16 + 1) = 40，再留一半余量给"已发布但还冷着"的序列。32 装不下八条满长
+# 序列（实测 8 并发 32 token 必撞 "radix tree is full"，见账本第二十一条）；调大之前
+# 每次 publish 都得淘汰冷节点，缓存命中率换来的只是不报错。
+comptime MAX_NODES = 64
 # Tokens covered by one node. Longer runs become a chain of nodes.
 comptime MAX_NODE_TOKENS = 16
 # Blocks one node may reference (>= ceil((MAX_NODE_TOKENS + block_size) / block_size)).
@@ -100,6 +105,15 @@ def ceil_div(a: Int, b: Int) -> Int:
     return (a + b - 1) // b
 
 
+# 一份 op 报告里最多能列多少个 id —— 按**池**的上界给，不按单条序列。
+#
+# 早先是 `MAX_BLOCKS_PER_SEQ`（16），只够一条序列自己的块；而 `evict` 报告的是
+# **整棵子树**还回池多少块。前缀树装得下八条长序列以后（`MAX_NODES=64`），一个
+# 子树跨 30+ 块是常态，于是淘汰一个冷节点就抛 "id list overflow" —— 一个纯报表
+# 容量的错，却把整条流打断（实测 8 并发 32 token 有 2/8 条这样死）。
+comptime MAX_ID_LIST = MAX_BLOCKS
+
+
 struct IdList:
     """A short fixed-capacity list of ids (blocks or nodes).
 
@@ -107,15 +121,15 @@ struct IdList:
     "the pool released 3 blocks" is a claim, "it released 7, 8, 9" is evidence.
     """
 
-    var v: InlineArray[Int, MAX_BLOCKS_PER_SEQ]
+    var v: InlineArray[Int, MAX_ID_LIST]
     var n: Int
 
     def __init__(out self):
-        self.v = InlineArray[Int, MAX_BLOCKS_PER_SEQ](fill=0)
+        self.v = InlineArray[Int, MAX_ID_LIST](fill=0)
         self.n = 0
 
     def push(mut self, value: Int) raises AlofaError:
-        if self.n >= MAX_BLOCKS_PER_SEQ:
+        if self.n >= MAX_ID_LIST:
             raise AlofaError(ERR_CAPACITY, "id list overflow")
         self.v[self.n] = value
         self.n += 1

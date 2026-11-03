@@ -778,6 +778,16 @@ struct ModelService(Service, Twinable):
                     + String(self.engine.waiting_count())
                     + " queued="
                     + String(len(self.w_req))
+                    + " blocks="
+                    + String(self.engine.blocks_used())
+                    + "+"
+                    + String(self.engine.blocks_wanted())
+                    + "/"
+                    + String(self.engine.capacity_blocks())
+                    + " cached="
+                    + String(self.engine.cached_blocks())
+                    + " preempts="
+                    + String(self.engine.preempt_total())
                 )
                 self.batch_win_ticks = 0
                 self.batch_win_widths = 0

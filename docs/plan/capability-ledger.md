@@ -2141,3 +2141,27 @@
     另：连续多轮压测出现 `running=0 waiting=1` 的空转窗口（一条请求卡在 WAITING 反复分块预填
     48 行/拍），受控单轮未复现 —— 单独开一条。
   - ⚠️ 本轮绝对时间不可用：`/proc/loadavg` 13.4（8 核）。
+- **2026-11-03（第二十二条）** —— 节点预算从准入上限推出来（32→64），并修掉"报表容量"的 `id list overflow`
+  - **为什么改常量**：第二十一条的淘汰让 8 并发不再报错，但 32 个节点结构上装不下八条满长序列
+    （8 × (64/16 + 1) = 40），于是**每次 publish 都在淘汰冷节点** —— 不报错，但缓存命中率被
+    这次换掉了。预算改成从准入上限推：`MAX_BATCH(8) × (MAX_SEQ_TOKENS(64)/MAX_NODE_TOKENS(16) + 1)
+    = 40`，再留一半余量 ⇒ **64**（每个节点 ~216 B，64 个 ≈ 14 KB，可忽略）。
+  - **fixture 重生成是安全的**：先验证幂等 —— 在 32 下用 `scripts/dump_kv_reference.py` 重生成
+    `/tmp/fx32`，与 `tests/fixtures/kv` **逐字节相同**（参考实现与仓库同步），说明它能当 oracle
+    重跑。改 64 后重生成 6 个 dumper 的全部产物，diff 只有两类变化：`kv` 的 `CFG ... nn=32→64`
+    与所有 `d=` 摘要（`MAX_NODES` 进哈希），`u=`/`f=`/`c=` 计数一个没变。`pixi run test` 40 套件
+    全绿 ⇒ Mojo 侧摘要与 Python 参考在 64 下仍然一致。
+  - **连带修掉 `id list overflow`**：`IdList` 容量是 `MAX_BLOCKS_PER_SEQ`（16，单条序列的块数），
+    而 `evict` 报告的是**整棵子树**还回池多少块 —— 树装得下八条长序列以后，一个子树跨 30+ 块
+    是常态，于是淘汰一个冷节点就抛 `capacity(5): id list overflow`，把流打断（实测 8 并发
+    32 token 有 2/8 条这样死）。容量改成按**池**的上界 `MAX_ID_LIST = MAX_BLOCKS`（112）：
+    一次 op 能还回池的块最多就是整个池。
+  - **验证**：8 并发（温 0、八条不同 prompt、与各自单跑比）**24 token 8/8 逐字节一致**、
+    **32 token（prompt 34 + 30 顶满 64）8/8 一致**，`error` 帧 0，服务日志零告警。
+    `pixi run test`（40 套件）、`test-batch-stream`（6/6）、`test-http`（PASS）。
+  - **吞吐**（load ~7.6–9.0，同轮）：24 token 单流 150–193 ms/token；8 并发 506–614 ms/token、
+    墙钟 12.9–15.5 s ⇒ 聚合 ~14.2 tok/s ≈ **2.5×** 单流。改 64 之前同一用例 591–765 ms/token、
+    15.2–19.4 s。
+  - **打点补全**：批窗口行加 `blocks=<used>+<wanted>/<cap> cached= preempts=`（`ALOFA_BATCH_STATS=1`）。
+    一次多轮压测曾出现 `running=0 waiting=1` 且每拍 48 行的空转（一条请求卡 WAITING 反复分块
+    预填），受控单轮与本次多轮都没复现，`blocks=68+0/256 cached=2 preempts=0` —— 留待复现再追。
