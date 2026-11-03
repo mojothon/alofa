@@ -864,10 +864,16 @@ def _matmul_q4_halves(
             # 差分门上长得跟"数不对"一模一样。
             var lo = (raw & low_mask).cast[DType.float32]() - eight
             var hi = ((raw >> 4) & low_mask).cast[DType.float32]() - eight
-            var x0 = x.unsafe_load[width=W_Q4_HALF](xb) * d
-            var x1 = x.unsafe_load[width=W_Q4_HALF](xb + W_Q4_HALF) * d
-            s0 += lo * x0
-            s1 += hi * x1
+            # 2026-11-04（账本三十）：`d` 从 x 侧折到**权重侧** —— 单行两种折法
+            # 同价（都是 2 次乘），行带里却是每行 2 次 vs 每块 2 次（RB=8 省 14
+            # 次乘/块）。两条 halves 核同步换，单路/批路仍逐位一致；与标量 oracle
+            # 的偏差类别不变（(lo·d)·x 与 lo·(d·x) 的舍入差，~1e-7，判据 1e-5）。
+            var lod = lo * d
+            var hid = hi * d
+            var x0 = x.unsafe_load[width=W_Q4_HALF](xb)
+            var x1 = x.unsafe_load[width=W_Q4_HALF](xb + W_Q4_HALF)
+            s0 += lod * x0
+            s1 += hid * x1
         acc += Float64((s0 + s1).reduce_add())
         dst[unsafe_offset=row] = Float32(acc)
 
@@ -941,13 +947,14 @@ def _matmul_q4_halves_rows[RB: Int](
             var raw = blocks.unsafe_load[width=W_Q4_HALF](base + Q4_SCALE_BYTES)
             var lo = (raw & low_mask).cast[DType.float32]() - eight
             var hi = ((raw >> 4) & low_mask).cast[DType.float32]() - eight
+            # `d` 折权重侧（账本三十）：2 次乘每块一次，不再每行各来一遍。
+            var lod = lo * d
+            var hid = hi * d
 
             comptime for rb in range(RB):
                 var xr = rb * cols
-                s0[rb] += lo * (x.unsafe_load[width=W_Q4_HALF](xr + xb) * d)
-                s1[rb] += hi * (
-                    x.unsafe_load[width=W_Q4_HALF](xr + xb + W_Q4_HALF) * d
-                )
+                s0[rb] += lod * x.unsafe_load[width=W_Q4_HALF](xr + xb)
+                s1[rb] += hid * x.unsafe_load[width=W_Q4_HALF](xr + xb + W_Q4_HALF)
             b += 1
 
         comptime for rb in range(RB):

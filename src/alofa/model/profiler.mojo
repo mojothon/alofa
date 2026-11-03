@@ -38,6 +38,12 @@ comptime K_PREP = 6
 comptime K_GEMM = 7
 comptime K_ROPE = 8
 comptime K_STEP = 9
+comptime K_PLAN = 10
+comptime K_PICK = 11
+comptime K_SETTLE = 12
+comptime K_DETOK = 13
+comptime K_DELIV = 14
+comptime K_WALL = 15
 
 
 def _f2(x: Float64) -> String:
@@ -68,6 +74,12 @@ struct ForwardProf(Movable):
     var prep: Int
     var gemm: Int
     var step: Int
+    var plan: Int
+    var pick: Int
+    var settle: Int
+    var detok: Int
+    var deliv: Int
+    var wall: Int
     var tokens: Int
 
     def __init__(out self):
@@ -82,6 +94,12 @@ struct ForwardProf(Movable):
         self.prep = 0
         self.gemm = 0
         self.step = 0
+        self.plan = 0
+        self.pick = 0
+        self.settle = 0
+        self.detok = 0
+        self.deliv = 0
+        self.wall = 0
         self.tokens = 0
 
     @always_inline
@@ -117,6 +135,18 @@ struct ForwardProf(Movable):
             self.rope += t1 - t0
         elif k == K_STEP:
             self.step += t1 - t0
+        elif k == K_PLAN:
+            self.plan += t1 - t0
+        elif k == K_PICK:
+            self.pick += t1 - t0
+        elif k == K_SETTLE:
+            self.settle += t1 - t0
+        elif k == K_DETOK:
+            self.detok += t1 - t0
+        elif k == K_DELIV:
+            self.deliv += t1 - t0
+        elif k == K_WALL:
+            self.wall += t1 - t0
         return t1
 
     @always_inline
@@ -143,6 +173,12 @@ struct ForwardProf(Movable):
         self.prep = 0
         self.gemm = 0
         self.step = 0
+        self.plan = 0
+        self.pick = 0
+        self.settle = 0
+        self.detok = 0
+        self.deliv = 0
+        self.wall = 0
         self.tokens = 0
 
     def dump(imm self):
@@ -199,5 +235,36 @@ struct ForwardProf(Movable):
             + _f2(Float64(self.gemm) / per_nb / 1000000.0 * 1000.0)
             + " µs/次 · 合计 "
             + _f2(Float64(self.gemm) / n / 1000000.0)
+            + " ms"
+        )
+        print("     【forward 之外（批步三段）】")
+        print(
+            "       plan（引擎排步）      "
+            + _f2(Float64(self.plan) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       pick（选 token）      "
+            + _f2(Float64(self.pick) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       settle（落地）        "
+            + _f2(Float64(self.settle) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       detok（整段重解码）   "
+            + _f2(Float64(self.detok) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       deliv（_batch_next 整体，8 条求和） "
+            + _f2(Float64(self.deliv) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       wall（服务端相邻两拍间隔） "
+            + _f2(Float64(self.wall) / n / 1000000.0)
             + " ms"
         )

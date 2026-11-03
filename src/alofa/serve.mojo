@@ -67,7 +67,7 @@ from alofa.core.error import (
 from alofa.core.rng import Rng
 from alofa.core.tensor import F32Ptr
 from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
-from alofa.model.profiler import ALOFA_PROFILE
+from alofa.model.profiler import ALOFA_PROFILE, K_DELIV, K_DETOK, K_PICK, K_SETTLE, K_WALL
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
 from alofa.srv.config import ServeConfig
@@ -202,6 +202,7 @@ struct ModelService(Service, Twinable):
     # 看的数就是**宽度**。`window_*` 每 64 拍清一次，`ticks` 是本次进程的总数。
     var batch_stat_on: Bool
     var batch_ticks: Int
+    var t_step_last: Int
     var batch_win_ticks: Int
     var batch_win_widths: Int
     var batch_win_max: Int
@@ -294,6 +295,7 @@ struct ModelService(Service, Twinable):
         self.batch_enabled = batch_default()
         self.batch_stat_on = getenv("ALOFA_BATCH_STATS", "") == "1"
         self.batch_ticks = 0
+        self.t_step_last = 0
         self.batch_win_ticks = 0
         self.batch_win_widths = 0
         self.batch_win_max = 0
@@ -548,7 +550,10 @@ struct ModelService(Service, Twinable):
             return StreamToken("", False, True)
         var slot = self._slot_of(request)
         if slot >= 0:
-            return self._batch_next(slot, request)
+            var t_deliv = self.model.prof.now()
+            var tok = self._batch_next(slot, request)
+            _ = self.model.prof.tick(K_DELIV, t_deliv)
+            return tok^
         if self.stream_request != request:
             # 号对不上 = 有人拿另一条流的号来问这一步。静默答下去就是"接着给别人
             # 生成"，而那一边的客户端看到的是一条完全正常的流 —— 只是内容属于别人。
@@ -755,6 +760,7 @@ struct ModelService(Service, Twinable):
         var chosen = self.engine.step_choices()
         for i in range(MAX_BATCH):
             chosen[unsafe_offset=i] = NO_TOKEN
+        var t_pick = self.model.prof.now()
         try:
             if rows > 0:
                 for i in range(MAX_BATCH):
@@ -787,7 +793,17 @@ struct ModelService(Service, Twinable):
                     + String(err2)
                 )
             raise err.copy()
+        _ = self.model.prof.tick(K_PICK, t_pick)
+        var t_settle = self.model.prof.now()
         self.engine.settle(chosen)
+        _ = self.model.prof.tick(K_SETTLE, t_settle)
+        comptime if ALOFA_PROFILE:
+            # 服务端步墙钟：相邻两次 forward 完成的间隔。客户端（Python 收流）
+            # 的开销不进这个数 —— 它没资格算进服务端的账。
+            var t_now = self.model.prof.now()
+            if self.t_step_last != 0:
+                _ = self.model.prof.tick(K_WALL, self.t_step_last)
+            self.t_step_last = t_now
         if self.batch_stat_on:
             self.batch_ticks += 1
             self.batch_win_ticks += 1
@@ -920,7 +936,9 @@ struct ModelService(Service, Twinable):
         for i in range(n):
             self.b_out[slot * MAX_GEN + i] = dest[unsafe_offset=i]
         arena.keep_alive()  # 同上：指针用完之前 arena 不许析构
+        var t_detok = self.model.prof.now()
         var text = self._batch_text(slot, n)
+        _ = self.model.prof.tick(K_DETOK, t_detok)
         # 口径跟引擎对齐：`b_n` 是**已经交出的 token 数**（`_batch_pick` 拿它当
         # 历史的长度，也拿它判断"到 max_new 了没有"）。
         self.b_n[slot] = n

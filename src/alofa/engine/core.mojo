@@ -51,6 +51,7 @@ from alofa.core.error import (
     ERR_OUT_OF_RANGE,
     AlofaError,
 )
+from alofa.model.profiler import K_PLAN
 
 from alofa.core.memory import Arena
 from alofa.engine.executor import (
@@ -661,7 +662,9 @@ struct EngineCore:
         answer differently in a batch than alone. Splitting the step is what lets
         the caller own the decision without owning the forward.
         """
+        var t_plan = model.prof.now()
         var rows = self.prepare()
+        _ = model.prof.tick(K_PLAN, t_plan)
         if rows > 0:
             try:
                 self.ex.forward[backend](model)
