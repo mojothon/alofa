@@ -116,13 +116,16 @@ def load_weights(weights_file: String, config_path: String, max_tokens: Int, wei
     if weight_bits >= 2:
         model.enable_q8_output()
     if weight_bits > 0 and q4_mub_enabled():
-        # 不静默：mub 有损，而批组合会改它走哪条行带 ⇒ 同一请求的数值会随别的
-        # 请求漂移 1–2 ULP（核级门 `test_q4_mub_rows.mojo` 量到 96 个元素里 34 个
-        # 不同）。要「温 0 下 8 并发与单跑逐字节一致」这条硬判据，就用
-        # `ALOFA_Q4_MUB=0`：实测宽度 8 仍有 22.9 tok/s（mub 开着 20–25，fp32 11.5）。
+        # mub 与精确通路不是逐位一致（多一层激活量化，核级差 1e-7 量级、贪心一致
+        # 率单钉）。但"批==单"这条硬判据它**过得去**：行带核每行的累加链与 RB/RU
+        # 分组无关（每行仍按块序、行末归约），宽带与窄带逐位相同 —— 2026-11-04
+        # （账本三十一）实测：温 0 下 8 条相同/不同 prompt 并发 vs 各自单跑都是
+        # 8/8 逐字节一致，且各宽度都快于 `ALOFA_Q4_MUB=0`（宽 8 聚合 54–56 vs
+        # 47–49 tok/s）。二十三那笔"随批组合漂移"的账，祸根是宽带**退精确通路**
+        # 的回退，回退改成降窄带后就不存在了。
         print(
-            "  [srv] note: ALOFA_Q4_MUB is on; set ALOFA_Q4_MUB=0 for byte-exact "
-            "greedy stability across batch compositions"
+            "  [srv] note: ALOFA_Q4_MUB is on (default); batch-vs-single greedy "
+            "streams stay byte-identical, mub differs from the fp32 reference"
         )
     return model^
 
