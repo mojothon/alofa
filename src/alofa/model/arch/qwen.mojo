@@ -32,6 +32,7 @@ from alofa.model.profiler import (
     K_NORM,
     K_PREP,
     K_RESID,
+    K_ROPE,
     K_ROPE_ATTN,
     K_VIEW,
 )
@@ -1877,6 +1878,9 @@ struct QwenForward(Movable):
             # computation at different row counts.
             copy_into(self.k_store[layer], pos0 * kv_dim, k_rot, t * kv_dim)
             copy_into(self.v_store[layer], pos0 * kv_dim, v, t * kv_dim)
+            # rope 与两次 KV 搬运是**线性**的（∝ t），注意力的分数/AV 是 **n²** 的；
+            # 合成一桶就看不出长 prompt 该往哪儿使力，所以分开打点。
+            var _t_at = self.prof.tick(K_ROPE, _t_ra)
 
             attention_k_shards[backend](
                 attn_out,
@@ -1891,7 +1895,7 @@ struct QwenForward(Movable):
                 self.cfg.head_dim,
                 self.shards,
             )
-            _ = self.prof.tick(K_ROPE_ATTN, _t_ra)
+            _ = self.prof.tick(K_ROPE_ATTN, _t_at)
             self.project[backend](
                 proj,
                 attn_out,

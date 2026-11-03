@@ -36,6 +36,7 @@ comptime K_HEAD = 4
 comptime K_VIEW = 5
 comptime K_PREP = 6
 comptime K_GEMM = 7
+comptime K_ROPE = 8
 
 
 def _f2(x: Float64) -> String:
@@ -58,6 +59,7 @@ struct ForwardProf(Movable):
     var on: Bool
     var norm: Int
     var rope_attn: Int
+    var rope: Int
     var act: Int
     var resid: Int
     var head: Int
@@ -70,6 +72,7 @@ struct ForwardProf(Movable):
         self.on = False
         self.norm = 0
         self.rope_attn = 0
+        self.rope = 0
         self.act = 0
         self.resid = 0
         self.head = 0
@@ -107,6 +110,8 @@ struct ForwardProf(Movable):
             self.prep += t1 - t0
         elif k == K_GEMM:
             self.gemm += t1 - t0
+        elif k == K_ROPE:
+            self.rope += t1 - t0
         return t1
 
     @always_inline
@@ -119,6 +124,7 @@ struct ForwardProf(Movable):
         """清零各桶（`set_profile` 会调）。"""
         self.norm = 0
         self.rope_attn = 0
+        self.rope = 0
         self.act = 0
         self.resid = 0
         self.head = 0
@@ -137,6 +143,7 @@ struct ForwardProf(Movable):
         var n = Float64(self.tokens)
         var norm = Float64(self.norm) / n / 1000000.0
         var ra = Float64(self.rope_attn) / n / 1000000.0
+        var rp = Float64(self.rope) / n / 1000000.0
         var act = Float64(self.act) / n / 1000000.0
         var resid = Float64(self.resid) / n / 1000000.0
         var head = Float64(self.head) / n / 1000000.0
@@ -146,11 +153,12 @@ struct ForwardProf(Movable):
             + " 个 token"
         )
         print("     rmsnorm ×2/层        " + _f2(norm))
-        print("     rope+KVcopy+attn    " + _f2(ra))
+        print("     attn 核（分数+softmax+AV） " + _f2(ra))
+        print("     rope+KVcopy         " + _f2(rp))
         print("     swiglu              " + _f2(act))
         print("     残差 add ×2/层      " + _f2(resid))
         print("     输出投影 lm_head    " + _f2(head))
-        print("     —— 以上合计（非投影串行部分） " + _f2(norm + ra + act + resid))
+        print("     —— 以上合计（非投影串行部分） " + _f2(norm + rp + ra + act + resid))
         # 168 = 7 次投影/层 × 24 层；96 = 其中无 bias 的 4 次/层（o/gate/up/down）
         var per_proj = n * 168.0
         var per_nb = n * 96.0

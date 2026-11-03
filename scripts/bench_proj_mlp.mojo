@@ -489,6 +489,7 @@ def main() raises:
         report[2](time_band[2](buf, db, xb, nt), nt, bytes_b)
         report[4](time_band[4](buf, db, xb, nt), nt, bytes_b)
         report[8](time_band[8](buf, db, xb, nt), nt, bytes_b)
+        report[16](time_band[16](buf, db, xb, nt), nt, bytes_b)
 
     # ⚠️ 必须是 `main` 的最后一条语句：这是 `arena` 的**最后一次使用**，Mojo 的
     # ASAP 销毁正好发生在这里。写在上面的 `alloc` 之后等于把寿命截断在那里，
