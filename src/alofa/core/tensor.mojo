@@ -311,3 +311,22 @@ def f32_data(view: TensorView) raises AlofaError -> F32Ptr:
             ERR_UNSUPPORTED, "view is not contiguous", "strides-mismatch"
         )
     return view.data.unsafe_offset(view.byte_offset).unsafe_bitcast[Float32]()
+
+
+def f32_data_rows(view: TensorView) raises AlofaError -> F32Ptr:
+    """Typed access to a **row-strided** fp32 view's base pointer.
+
+    `f32_data` 拒绝非连续视图，因为它的消费者按 `numel()` 平铺索引；`_gemm` 对
+    `dst` 不是 —— 它二维寻址、行距读 `strides[0]`，所以"母矩阵的列段"（行距 =
+    母矩阵的 `out`）在这里合法。dtype 检查保留。
+
+    ⚠️ 只给 `_gemm` 的 `dst` 用：`x`/`w`/bias 仍是平铺索引，必须继续走
+    `f32_data` 的连续性守卫 —— 守卫本身没松，只是承认了二维寻址这一类消费者。
+    """
+    if view.dtype != DT_FP32:
+        raise AlofaError(
+            ERR_UNSUPPORTED,
+            "view is not fp32",
+            "dtype=" + elem_name(view.dtype),
+        )
+    return view.data.unsafe_offset(view.byte_offset).unsafe_bitcast[Float32]()

@@ -27,7 +27,7 @@ Run:
 from std.math import exp, sqrt
 
 from alofa.core.error import ERR_SHAPE_MISMATCH, ERR_UNSUPPORTED, AlofaError
-from alofa.core.tensor import F32Ptr, TensorView, f32_data
+from alofa.core.tensor import F32Ptr, TensorView, f32_data, f32_data_rows
 
 # The seed for a softmax row maximum: the most negative finite fp32 value.
 # Every unmasked score beats it, so the first comparison always wins and no
@@ -159,7 +159,10 @@ def _gemm(
 
     var px = f32_data(x)
     var pw = f32_data(w)
-    var po = f32_data(dst)
+    var po = f32_data_rows(dst)
+    # dst 行距从视图步长读（元素）：连续视图就是 `cols`；列切的片行距是母矩阵
+    # 的 `out`。与向量版同一个约定（见 avx2 `_gemm` 的注释）。
+    var dstride = dst.strides[0] if dst.shape.rank() == 2 else cols
 
     for row in range(rows):
         var x_base = row * inner
@@ -172,7 +175,7 @@ def _gemm(
                 acc += Float64(px[unsafe_offset=x_base + k]) * Float64(
                     pw[unsafe_offset=w_base + k]
                 )
-            po[unsafe_offset=row * cols + col] = Float32(acc)
+            po[unsafe_offset=row * dstride + col] = Float32(acc)
 
 
 def linear(dst: TensorView, x: TensorView, w: TensorView) raises AlofaError:
@@ -182,7 +185,7 @@ def linear(dst: TensorView, x: TensorView, w: TensorView) raises AlofaError:
     when `has_bias` is set, and passing a real pointer keeps the signature free
     of an optional that every call site would have to unwrap.
     """
-    _gemm(dst, x, w, f32_data(dst), False)
+    _gemm(dst, x, w, f32_data_rows(dst), False)
 
 
 def linear_bias(

@@ -58,7 +58,7 @@ from alofa.core.error import (
     ERR_SHAPE_MISMATCH,
     AlofaError,
 )
-from alofa.core.tensor import F32Ptr, TensorView, f32_data
+from alofa.core.tensor import F32Ptr, TensorView, f32_data, f32_data_rows
 from alofa.kernels.cpu.quant import block_scale
 from alofa.kernels.cpu.scalar import (
     LOWEST_FP32,
@@ -145,6 +145,7 @@ def _gemm_tile[RB: Int](
     row0: Int,
     cols: Int,
     inner: Int,
+    dstride: Int,
 ) -> None:
     """`RB` 行 × 全部 `cols` 列：列外层、`k` 中层、行内层。
 
@@ -167,6 +168,10 @@ def _gemm_tile[RB: Int](
 
     `RB` 取 1/2/4/8 由 `_gemm` 按剩余行数派发：`RB` 行累加器要占 `RB` 个
     ymm 寄存器，取 16 会溢出到栈而失去意义。
+
+    ⚠️ `dstride` 是 `dst` 的**行距**（元素），只在写地址里用：列切的片行距是母
+    矩阵的 `out` 而不是片宽 `cols`。它不参与任何算术 —— 换步长不改变任何一个
+    浮点运算，逐位兼容不受影响。
     """
     var acc = InlineArray[SIMD[DType.float64, W_F64], RB](
         fill=SIMD[DType.float64, W_F64](Float64(0))
@@ -204,7 +209,7 @@ def _gemm_tile[RB: Int](
             k += 1
 
         comptime for r in range(RB):
-            po[unsafe_offset=(row0 + r) * cols + col] = Float32(tail[r])
+            po[unsafe_offset=(row0 + r) * dstride + col] = Float32(tail[r])
 
 
 def _gemm(
@@ -236,28 +241,31 @@ def _gemm(
 
     var px = f32_data(x)
     var pw = f32_data(w)
-    var po = f32_data(dst)
+    var po = f32_data_rows(dst)
+    # dst 的行距从视图步长读（元素）：连续视图就是 `cols`，列切的片是母矩阵的
+    # 几列，行距是母矩阵的 `out`。连续调用行为与老写法逐位相同。
+    var dstride = dst.strides[0] if dst.shape.rank() == 2 else cols
 
     var row = 0
     while row < rows:
         var left = rows - row
         if left >= 8:
-            _gemm_tile[8](po, px, pw, bias, has_bias, row, cols, inner)
+            _gemm_tile[8](po, px, pw, bias, has_bias, row, cols, inner, dstride)
             row += 8
         elif left >= 4:
-            _gemm_tile[4](po, px, pw, bias, has_bias, row, cols, inner)
+            _gemm_tile[4](po, px, pw, bias, has_bias, row, cols, inner, dstride)
             row += 4
         elif left >= 2:
-            _gemm_tile[2](po, px, pw, bias, has_bias, row, cols, inner)
+            _gemm_tile[2](po, px, pw, bias, has_bias, row, cols, inner, dstride)
             row += 2
         else:
-            _gemm_tile[1](po, px, pw, bias, has_bias, row, cols, inner)
+            _gemm_tile[1](po, px, pw, bias, has_bias, row, cols, inner, dstride)
             row += 1
 
 
 def linear(dst: TensorView, x: TensorView, w: TensorView) raises AlofaError:
     """`dst = x @ wᵀ`，向量版；未用的偏置位由 `dst` 自己的指针占位。"""
-    _gemm(dst, x, w, f32_data(dst), False)
+    _gemm(dst, x, w, f32_data_rows(dst), False)
 
 
 def linear_bias(

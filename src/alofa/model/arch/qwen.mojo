@@ -358,6 +358,11 @@ comptime PREFILL_ROWS_MEASURED = 48
 def prefill_shards(rows: Int, shards: Int) -> Int:
     """prefill 这次用几片。
 
+    ⚠️ **生产路径已不再调用**（2026-11-04）：fp32 批路改成切输出列（见
+    `linear_k_shards`），行切的"片越多权重读得越碎"成本模型作废。函数留着是因为
+    `test_parallel_shards.mojo` 还在守它的片数不变量 —— 那条性质（切分不改浮点
+    运算）对新通路依然成立，由 `test_gemm_batch_layout.mojo` 的 ④⑤ 接棒。
+
     只在量过的行数范围内（`rows <= PREFILL_ROWS_MEASURED`）把片数压到实测最好的
     那一档；超出就原样返回 —— 那里没量过，改动前的样子就是最不坏的选择。
 
@@ -388,6 +393,18 @@ def shard_count(n_out: Int, shards: Int) -> Int:
     return n
 
 
+def shard_strides(row_stride: Int) -> InlineArray[Int, MAX_RANK]:
+    """二维 fp32 视图的步长：行距 `row_stride`（元素），列连续。
+
+    列切批路时 `dst` 的片是母矩阵 `[rows, out]` 里**不连续的几列**，行距是母矩
+    阵的 `out` 而不是片宽 —— 步长必须跟着母矩阵走。`fill=1` 让高维步长全是 1，
+    对二维视图无影响（`_gemm` 只读 `strides[0]`）。
+    """
+    var st = InlineArray[Int, MAX_RANK](fill=1)
+    st[0] = row_stride
+    return st^
+
+
 def shard_shape(a: Int, b: Int) -> Shape:
     """二维 fp32 视图的形状，且**不抛错**。
 
@@ -415,7 +432,10 @@ async def _linear_shard[backend: Int](
     cols: Int,
     inner: Int,
     has_bias: Bool,
+    dstride: Int,
 ):
+    """`dstride`：`dst` 的行距（元素）。片是母矩阵的**列段**时行距是母矩阵的
+    `out`，不是片宽 `cols`；连续片两者相等。"""
     """一片输出上的投影（带不带偏置由 `has_bias` 决定）。
 
     ⚠️ 参数不能叫 `out`：它是参数传递约定关键字，写进参数表会被当成 `out` 约定
@@ -426,7 +446,7 @@ async def _linear_shard[backend: Int](
     规则与全量那次**一模一样**，契约由调用方在进协程之前用同一次直呼验过 ——
     这里的 `except` 不是"吞掉错误"。
     """
-    var dv = TensorView(d, shard_shape(rows, cols), DT_FP32)
+    var dv = TensorView(d, shard_shape(rows, cols), shard_strides(dstride), DT_FP32)
     var xv = TensorView(x, shard_shape(rows, inner), DT_FP32)
     var wv = TensorView(w, shard_shape(cols, inner), DT_FP32)
     var bv = TensorView(b, shard_shape(1, cols), DT_FP32)
@@ -463,9 +483,14 @@ def linear_k_shards[backend: Int](
 ) raises AlofaError:
     """把投影按输出切成 `shards` 片并发跑。
 
-    批为 1（decode）时切**输出列**：`w` 的每片是一段连续的行，`dst` 的每片是一
-    段连续的元素。批大于 1（prefill）时列不连续（`dst` 是行主序），于是改切
-    **输出行**：`dst` 与 `x` 各自切一段连续的行，`w` 共享。
+    恒切**输出列**（decode 与批路同构）：`w` 的每片是一段连续的行，合计把权重
+    读 **1 遍**；`dst` 的片是母矩阵 `[rows, out]` 里的几**列**，行距仍是 `out`
+    （`_gemm` 从 `dst.strides[0]` 读行距，写地址不连续但算术逐位不变）。
+
+    ⚠️ 批路**曾经**切输出行（`dst`/`x` 各切一段连续行、`w` 共享）：那版每片都要
+    把整份权重读一遍，4 片 × 1975.8 MB ÷ 10.7 GB/s ≈ 738 ms，与实测 691 ms 吻合
+    —— 切行只在"每片读自己那份 w"时才对，`w` 共享的写法把流量乘了片数。
+    `prefill_shards()` 那套"片越多读得越碎"的成本模型随之作废（账本二十四）。
     """
     if dst.shape.rank() != 2 or x.shape.rank() != 2 or w.shape.rank() != 2:
         linear_k[backend](dst, x, w)
@@ -473,10 +498,10 @@ def linear_k_shards[backend: Int](
     var rows = dst.shape.dims[0]
     var out = dst.shape.dims[1]
     var inner = x.shape.dims[1]
-    var split = out if rows == 1 else rows
-    # decode（批 = 1）切输出列，片数越多聚合带宽越高；prefill 切输出行，片数
-    # 越多反而把权重读得越碎 —— 那一档实测过，见 `prefill_shards()`。
-    var want = shards if rows == 1 else prefill_shards(rows, shards)
+    var split = out
+    # 列切的总流量与片数无关（每片只读自己那段 w，合计 1×），片数只决定并行度
+    # ⇒ 批路也按 `shards` 切，不再走 `prefill_shards`（那是行切的成本模型）。
+    var want = shards
     var n = shard_count(split, want)
     if n <= 1:
         linear_k[backend](dst, x, w)
@@ -502,19 +527,23 @@ def linear_k_shards[backend: Int](
                     cnt,
                     inner,
                     False,
+                    cnt,
                 )
             )
         else:
+            # 列段：`x` 整批共享（rows×inner，几十 KB，留在缓存里），`w` 只读
+            # 自己那几行，`dst` 写进母矩阵的第 `c0..c0+cnt` 列（行距 `out`）。
             tg.create_task(
                 _linear_shard[backend](
-                    d0.unsafe_offset(c0 * out * 4),
-                    x0.unsafe_offset(c0 * inner * 4),
-                    w0,
+                    d0.unsafe_offset(c0 * 4),
+                    x0,
+                    w0.unsafe_offset(c0 * inner * 4),
                     d0,
+                    rows,
                     cnt,
-                    out,
                     inner,
                     False,
+                    out,
                 )
             )
         c0 += cnt
@@ -535,8 +564,8 @@ def linear_bias_k_shards[backend: Int](
     var rows = dst.shape.dims[0]
     var out = dst.shape.dims[1]
     var inner = x.shape.dims[1]
-    var split = out if rows == 1 else rows
-    var want = shards if rows == 1 else prefill_shards(rows, shards)
+    var split = out
+    var want = shards
     var n = shard_count(split, want)
     if n <= 1:
         linear_bias_k[backend](dst, x, w, b)
@@ -563,19 +592,21 @@ def linear_bias_k_shards[backend: Int](
                     cnt,
                     inner,
                     True,
+                    cnt,
                 )
             )
         else:
             tg.create_task(
                 _linear_shard[backend](
-                    d0.unsafe_offset(c0 * out * 4),
-                    x0.unsafe_offset(c0 * inner * 4),
-                    w0,
-                    b0,
+                    d0.unsafe_offset(c0 * 4),
+                    x0,
+                    w0.unsafe_offset(c0 * inner * 4),
+                    b0.unsafe_offset(c0 * 4),
+                    rows,
                     cnt,
-                    out,
                     inner,
                     True,
+                    out,
                 )
             )
         c0 += cnt

@@ -40,6 +40,18 @@
   会保留上一次全量算出的**正确值**，正负两例逐位相同，门自己就是绿的
   （2026-09-20 在分片门上踩过）。
 
+列切片的行距（2026-11-04 加，账本二十四）
+----------------------------------------
+分片批路从「切输出行」改成「切输出列」：`dst` 的片是母矩阵 `[rows, out]` 里
+**不连续的几列**，行距是母矩阵的 `out` 而不是片宽。`_gemm` 从 `dst.strides[0]`
+读行距（连续视图就是 `cols`，老行为逐位不变）。这带来两类新的死法，各配一条：
+
+- **行距用错**（比如退回"永远用 cols"）：切片写进错误的列 —— 第 ⑤ 条用
+  「正确行距 vs 错误行距必须不同」证明判据对行距**敏感**（旧约定下两次相同，
+  这条会红）。
+- **步长换了但片没盖满**：第 ④ 条把整块算与"逐片列切算"逐位比，且片划分带余数
+  （`out=17` 切 4 片 = 5+4+4+4）。
+
 Run:
     pixi run mojo run -O0 -I src tests/unit/test_gemm_batch_layout.mojo
 """
@@ -48,7 +60,7 @@ from std.testing import TestSuite, assert_true
 
 from alofa.core.dtype import DT_FP32
 from alofa.core.memory import Arena
-from alofa.core.tensor import F32Ptr, TensorView, f32_data, shape2
+from alofa.core.tensor import F32Ptr, MAX_RANK, TensorView, f32_data, shape2
 from alofa.kernels.cpu.avx2 import linear, linear_bias
 from alofa.kernels.cpu.scalar import linear as linear_scalar
 
@@ -329,6 +341,148 @@ def test_dropping_the_last_k_is_rejected() raises:
                 + " inner="
                 + String(inner),
             )
+
+
+def column_split_case(
+    rows: Int, ocols: Int, inner: Int, nshards: Int, with_bias: Bool
+) raises -> Bool:
+    """整块算 vs 逐片**列切**算（strided dst），逐位比较。
+
+    与 `linear_k_shards` 批路同一套视图构造：`dst` 片是母矩阵的列段（行距
+    `out`），`w` 片是连续的行段，`x` 整批共享。片划分带余数。
+    """
+    var arena = Arena(
+        (rows * inner + ocols * inner + 3 * rows * ocols + ocols) * 4 + 512
+    )
+    var x_raw = arena.alloc(rows * inner * 4)
+    var w_raw = arena.alloc(ocols * inner * 4)
+    var d_full = arena.alloc(rows * ocols * 4)
+    var d_slice = arena.alloc(rows * ocols * 4)
+    var b_raw = arena.alloc(ocols * 4)
+
+    var x = TensorView(x_raw, shape2(rows, inner), DT_FP32)
+    var w = TensorView(w_raw, shape2(ocols, inner), DT_FP32)
+    var df = TensorView(d_full, shape2(rows, ocols), DT_FP32)
+    var b = TensorView(b_raw, shape2(1, ocols), DT_FP32)
+    fill(f32_data(x), rows * inner, 3)
+    fill(f32_data(w), ocols * inner, 5)
+    fill(f32_data(b), ocols, 7)
+
+    # ① 参考：整块一次算。
+    if with_bias:
+        linear_bias(df, x, w, b)
+    else:
+        linear(df, x, w)
+
+    # ② 被测：按列切成 `nshards` 片，每片行距 = 母矩阵的 `out`。先涂哨兵。
+    var ds = TensorView(d_slice, shape2(rows, ocols), DT_FP32)
+    paint(f32_data(ds), rows * ocols)
+    var per = ocols // nshards
+    var rem = ocols - per * nshards
+    var c0 = 0
+    for k in range(nshards):
+        var cnt = per + (rem if k == nshards - 1 else 0)
+        var dv = TensorView(
+            d_slice.unsafe_offset(c0 * 4),
+            shape2(rows, cnt),
+            row_strides(ocols),
+            DT_FP32,
+        )
+        var wv = TensorView(
+            w_raw.unsafe_offset(c0 * inner * 4), shape2(cnt, inner), DT_FP32
+        )
+        var bv = TensorView(
+            b_raw.unsafe_offset(c0 * 4), shape2(1, cnt), DT_FP32
+        )
+        if with_bias:
+            linear_bias(dv, x, wv, bv)
+        else:
+            linear(dv, x, wv)
+        c0 += cnt
+
+    var ok = same(f32_data(df), f32_data(ds), rows * ocols)
+    arena.keep_alive()
+    return ok
+
+
+def row_strides(row_stride: Int) -> InlineArray[Int, MAX_RANK]:
+    var st = InlineArray[Int, MAX_RANK](fill=1)
+    st[0] = row_stride
+    return st^
+
+
+def test_column_split_slices_are_bit_identical() raises:
+    """④ 逐片**列切**（strided dst）必须与整块算逐位相等，含余数片。"""
+    var shapes = shape_cases()
+    var rowss = InlineArray[Int, 3](fill=0)
+    rowss[0] = 2
+    rowss[1] = 5
+    rowss[2] = 8
+    var shardss = InlineArray[Int, 2](fill=0)
+    shardss[0] = 2
+    shardss[1] = 4
+    for s in range(SHAPES):
+        var ocols = shapes[2 * s]
+        var inner = shapes[2 * s + 1]
+        for ri in range(3):
+            var rows = rowss[ri]
+            for ni in range(2):
+                var nshards = shardss[ni]
+                if nshards > ocols:
+                    continue
+                assert_true(
+                    column_split_case(rows, ocols, inner, nshards, False),
+                    "linear rows=" + String(rows) + " ocols=" + String(ocols)
+                    + " inner=" + String(inner) + " nshards=" + String(nshards),
+                )
+                assert_true(
+                    column_split_case(rows, ocols, inner, nshards, True),
+                    "bias rows=" + String(rows) + " ocols=" + String(ocols)
+                    + " inner=" + String(inner) + " nshards=" + String(nshards),
+                )
+
+
+def test_a_wrong_stride_is_caught() raises:
+    """⑤ 负向对照：行距用成片宽（旧"永远连续"约定）必须**算出不同的数**。
+
+    这条证明 ④ 的判据对行距敏感：若有人把 `_gemm` 退回"忽略 strides、永远用
+    cols"，正确行距的切片就会与这里的错误行距**逐位相同**，④ 当场红。
+    """
+    comptime ROWS = 8
+    comptime OUT = 32
+    comptime INNER = 64
+    comptime CNT = 8  # 一片的宽（OUT // 4），< OUT 才有"行距用错"可言
+    var arena = Arena((ROWS * INNER + OUT * INNER + 3 * ROWS * OUT) * 4 + 512)
+    var x_raw = arena.alloc(ROWS * INNER * 4)
+    var w_raw = arena.alloc(OUT * INNER * 4)
+    var d_good = arena.alloc(ROWS * OUT * 4)
+    var d_bad = arena.alloc(ROWS * OUT * 4)
+
+    var xv = TensorView(x_raw, shape2(ROWS, INNER), DT_FP32)
+    var wv0 = TensorView(w_raw, shape2(OUT, INNER), DT_FP32)
+    fill(f32_data(xv), ROWS * INNER, 3)
+    fill(f32_data(wv0), OUT * INNER, 5)
+
+    # 正确行距：片是母矩阵的列段。
+    var dg = TensorView(d_good, shape2(ROWS, OUT), DT_FP32)
+    var db = TensorView(d_bad, shape2(ROWS, OUT), DT_FP32)
+    # 正确行距：片是母矩阵的列段（行距 OUT）。
+    linear(
+        TensorView(d_good.unsafe_offset(12 * 4), shape2(ROWS, CNT), row_strides(OUT), DT_FP32),
+        xv,
+        TensorView(w_raw.unsafe_offset(12 * INNER * 4), shape2(CNT, INNER), DT_FP32),
+    )
+    # 错误行距：片宽当行距（旧约定会长这样）。
+    linear(
+        TensorView(d_bad.unsafe_offset(12 * 4), shape2(ROWS, CNT), row_strides(CNT), DT_FP32),
+        xv,
+        TensorView(w_raw.unsafe_offset(12 * INNER * 4), shape2(CNT, INNER), DT_FP32),
+    )
+    assert_true(
+        not same(f32_data(dg), f32_data(db), ROWS * OUT),
+        "正确行距与错误行距算出了同样的数：④ 的判据对行距不敏感（瞎的）",
+    )
+    arena.keep_alive()
 
 
 def main() raises:
