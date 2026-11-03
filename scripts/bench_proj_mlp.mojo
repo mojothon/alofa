@@ -55,7 +55,7 @@ from std.runtime.asyncrt import TaskGroup
 from alofa.core.ffi import monotonic_ns
 from alofa.core.memory import Arena
 from alofa.core.tensor import F32Ptr, RawPtr
-from alofa.kernels.cpu.avx2 import Q4_U8, matmul_q4_f32
+from alofa.kernels.cpu.avx2 import Q4_U8, matmul_q4_f32, matmul_q4_mub
 
 # ---- 真实形状（Qwen2.5-0.5B，decode = 每次 1 个 token）----
 comptime HID = 896
@@ -152,6 +152,71 @@ def fill_q4_scales(blocks: Q4_U8, nbytes: Int):
         blocks[unsafe_offset=off + 1] = UInt8(0x3C)
 
 
+def time_layers[use_mub: Bool](buf: RawPtr, dst: F32Ptr, x: F32Ptr) raises -> Int:
+    """一趟 decode 的全部层投影（24 层 × 7 投影），返回最小 ns。
+
+    `use_mub` 选核 —— 这是这张表存在的理由：`_matmul_q4_halves`（f32 展开）和
+    `_matmul_q4_mub`（`vpmaddubsw` 整数点积，`ALOFA_Q4_MUB` 默认开）**不是同一
+    条路**，而 decode 的 `project` 走的是 `q4_matmul_rows_k_shards` ⇒ **mub**。
+    只量 f32 那条会把"核离纯读多远"夸大 1.87 倍（2026-11-03 就踩过这一脚）。
+    """
+    var sink = Float32(0)
+    var best = 0
+    for _ in range(REPS):
+        var t0 = monotonic_ns()
+        # 24 层各一段互不相交的权重（真 decode 就是每层读自己那份）
+        for layer in range(LAYERS):
+            var w = buf.unsafe_offset(layer * PROJ_ROWS * HID // BLOCK * BB)
+            # q / k / v / o / gate / up / down
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, HID, HID)
+            else:
+                matmul_q4_f32(dst, x, w, HID, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(HID * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, KV_DIM, HID)
+            else:
+                matmul_q4_f32(dst, x, w, KV_DIM, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, KV_DIM, HID)
+            else:
+                matmul_q4_f32(dst, x, w, KV_DIM, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, HID, HID)
+            else:
+                matmul_q4_f32(dst, x, w, HID, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(HID * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, INTER, HID)
+            else:
+                matmul_q4_f32(dst, x, w, INTER, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, INTER, HID)
+            else:
+                matmul_q4_f32(dst, x, w, INTER, HID)
+            sink += dst[0]
+            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
+            comptime if use_mub:
+                matmul_q4_mub(dst, x, w, HID, INTER)
+            else:
+                matmul_q4_f32(dst, x, w, HID, INTER)
+            sink += dst[0]
+        var el = monotonic_ns() - t0
+        if best == 0 or el < best:
+            best = el
+    if sink == Float32(1234.5):
+        print("     (unreachable)")
+    return best
+
+
 def main() raises:
     print("")
     print("== 层投影：单核带宽 vs 在飞 load 数 ==")
@@ -204,53 +269,19 @@ def main() raises:
     var x = arena.alloc(HID * 4).bitcast[Float32]()
     for i in range(HID):
         x[i] = Float32(0.01) * Float32(i % 7)
-    var t = List[Int]()
-    var rows = List[Int]()
-    rows.append(HID)
-    rows.append(HID)
-    rows.append(KV_DIM)
-    rows.append(KV_DIM)
-    rows.append(KV_DIM)
-    rows.append(HID)
-    var sink2 = Float32(0)
-    for _ in range(REPS):
-        var t0 = monotonic_ns()
-        # 24 层各一段互不相交的权重（真 decode 就是每层读自己那份）
-        for layer in range(LAYERS):
-            var w = buf.unsafe_offset(layer * PROJ_ROWS * HID // BLOCK * BB)
-            var o = 0
-            # q / k / v / o / gate / up / down
-            matmul_q4_f32(dst, x, w, HID, HID)
-            sink2 += dst[0]
-            o += HID
-            w = w.unsafe_offset(HID * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, KV_DIM, HID)
-            sink2 += dst[0]
-            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, KV_DIM, HID)
-            sink2 += dst[0]
-            w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, HID, HID)
-            sink2 += dst[0]
-            w = w.unsafe_offset(HID * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, INTER, HID)
-            sink2 += dst[0]
-            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, INTER, HID)
-            sink2 += dst[0]
-            w = w.unsafe_offset(INTER * HID // BLOCK * BB)
-            matmul_q4_f32(dst, x, w, HID, INTER)
-            sink2 += dst[0]
-        t.append(monotonic_ns() - t0)
-    var nsb = min_ns(t)
     # 总量按真实 7 个投影算：q/k/v/o 用 HID 列，down 用 INTER 列
     var b_layer = (HID + KV_DIM + KV_DIM + HID + INTER + INTER) * HID // BLOCK * BB + HID * INTER // BLOCK * BB
     var bytes_b = b_layer * LAYERS
+
+    var nsb = time_layers[False](buf, dst, x)
     var gbs_b = Float64(bytes_b) / Float64(nsb)
-    print("     总量 " + String(bytes_b // (1024 * 1024)) + " MB，" + f2(Float64(nsb) / 1e6) + " ms  ⇒ " + f2(gbs_b) + " GB/s")
+    print("     B1 f32 展开核     " + f2(Float64(nsb) / 1e6) + " ms  ⇒ " + f2(gbs_b) + " GB/s")
+
+    var nsm = time_layers[True](buf, dst, x)
+    var gbs_m = Float64(bytes_b) / Float64(nsm)
+    print("     B2 mub 整数点积   " + f2(Float64(nsm) / 1e6) + " ms  ⇒ " + f2(gbs_m) + " GB/s  ← decode 实际走这条")
+    print("     B2/B1 = " + f2(Float64(nsb) / Float64(nsm)) + "×（核级差）")
     print("     对比：profiler 在真机 decode 上量到 33.4–33.9 ms / 201 MB = 5.9–6.0 GB/s")
-    if sink2 == Float32(1234.5):
-        print("     (unreachable)")
 
     # ---------------- C：多线程纯读 ----------------
     print("")
