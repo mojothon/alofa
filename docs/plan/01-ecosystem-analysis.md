@@ -256,7 +256,110 @@ OK: libc FFI path is available
 
 ---
 
+## 7. 第三次调研：Mojo 推理生态五个新项目（2026-09-30）
+
+### 7.0 抓取方式（可复现，别再走弯路）
+
+本轮 `github.com` 网页与 `raw.githubusercontent.com` **全部连不上**（`curl` 返回 http=000），
+但 **`api.github.com`**（仓库元数据、`/readme`、`/git/trees`、`/contents`）与
+**`codeload.github.com`**（仓库归档 tarball）**是通的**。⇒ 以后查 GitHub 仓库直接用这两条路：
+
+```
+curl -s https://api.github.com/repos/<owner>/<repo>                 # 元数据（stars/语言/大小/license/desc）
+curl -s https://api.github.com/repos/<owner>/<repo>/readme          # README（content 是 base64）
+curl -s https://api.github.com/repos/<owner>/<repo>/git/trees/HEAD?recursive=1   # 全量文件树
+curl -sL https://codeload.github.com/<owner>/<repo>/tar.gz/HEAD -o r.tgz         # 归档（可解压看源码）
+```
+
+五家的实测规模（API 给出）：`mojo-inference-engine` 9 KB、`MojoStream` 222 KB、`esper` 3.4 MB、
+`RuneForgeAI-Project-Aesir` **103 MB**、`disk-streaming-moe-engine` **118 MB**。
+
+### 7.1 `disk-streaming-moe-engine`（DISMOEN）—— 本轮唯一值得抄的
+
+Apache-2.0、Mojo 1.0.0、**活跃**（pushed 2026-09-29）、0 star。README 自述：35B 参数 MoE
+（`Qwen3.6-35B-A3B`，20.7 GB GGUF Q4_0）在 **RSS < 450 MB** 下跑，NVMe **逐层流式**，
+**oracle-first**（逐层对 PyTorch fp32 参照验证），精度余弦 > 0.9985。
+
+与 alofa 的**方法论几乎同一套**：纯 Mojo 从零、oracle 差分、里程碑文档（`docs/milestones/M0…M12`）。
+抄它三条判据，已写进 `04-gguf-reader.md` §8：
+
+- **解析阶段不许读 payload**（M0 的硬门：`check-index` 只允许读 `[0, data_base)`，越界 FAIL）；
+- **`/proc` 的 `read_bytes` 只作观测、不作判据**（内核 readahead 让字节预算不可靠）；
+- **fuzz fixture 集**（空文件/截断/`huge_len`/`hole`/`overlap`/`begin>end`… 十余个畸形输入，
+  每个都必须给明确错误码而非崩溃）。
+
+⚠️ **最重要的一条**：它的 **"GGUF MTP Deduplication"** —— 第 0 层 MTP（多头预测）张量与主干
+**重叠**，按"偏移差当大小"读会让余弦掉到 **0.004**，处理后回到 **0.9985**。
+⇒ **这直接推翻了 alofa GGUF 方案里"用相邻张量偏移差 ÷ numel 反推 block layout"的写法**
+（重叠时偏移差 ≠ 大小）。已改为"大小按 type id 声明算、偏移只做校验与重叠检测"，
+见 `04-gguf-reader.md` §4.3。这是本轮唯一一处**推翻既有设计**的外部证据。
+
+其余（MoE / GDN 线性注意力 / 磁盘流式）对 alofa **不适用**：MoE 在账本是 `missing`，而 dense
+模型每 token 用全权重，"按需加载哪一部分"不存在。
+
+### 7.2 `phunck/MojoStream` —— 抄想法，不抄代码
+
+Apache-2.0、222 KB、1 star，但 **Mojo 0.26.2**（旧语法：仍用 `alias` / `UnsafePointer` /
+`MutAnyOrigin`），2026-05 后停更 ⇒ 代码与 1.0 不通，只借鉴两类想法：
+
+- **ShapeGuard / TensorGuard + checksum**：加载期对每个张量做形状守卫与校验和（真权重 12/12
+  通过、给出 checksum）。与 alofa"不信任 type id"同一精神，但**多了一层值级校验** —— 对
+  "直通别人的块流"（GGUF 方案 A 案）尤其该有。
+- **P95 benchmark harness + JSON 输出**：alofa 现在只报中位数 / min…max，而 **PR 级性能回归门
+  在账本里是 `missing`** ⇒ P95 是更合适的统计量。
+
+⚠️ 它的性能数字**不可采信**：声称 i7-7500U（2 核）4 线程上 `matmul_q4_bpack` 达 **128 GFLOPS**，
+而该 CPU 的 AVX2 FMA 理论峰值约 86 GFLOPS —— **超过峰值**。它的核本身是常规 GEMM 分块
+（`MR=4 / NR=16 / BM=64 / BK=128` + L2 分块），方向恰好是 alofa 已否掉的那三档之一
+（2026-09-22：cols 分块、RB=16 均在噪声内）⇒ 无新信息。
+
+### 7.3 `RuneForgeAI-Project-Aesir` —— 有代码，但它是反面教材
+
+AGPL-3.0、103 MB、**533 个文件**：209 个 `.mojo`（共 1.8 MB）+ **191 个 `.md` + 49 张图片**。
+能力面（README 自述）与 alofa 高度重合：zero-copy GGUF 解析、PagedAttention KV、**无状态采样器**。
+
+不抄的两个硬理由：
+
+1. **AGPL-3.0 与 alofa 的 Apache-2.0 不兼容**，代码层面不能碰；
+2. **文档与图片的数量级压过代码**（191 md / 49 图片 vs 209 mojo / 1.8 MB）—— 这正是 alofa
+   账本纪律要避免的形态：判定靠门，不靠文档数量。
+
+可借鉴的一点（**作为反面**）：它的覆盖面很宽（CLI/TUI/`doctor`/`model_selector`/CUDA/AMD 门），
+而 alofa 明确不做服务层 ⇒ 别被"功能清单长度"带偏，那是另一条路。
+
+### 7.4 两家与 LLM 推理无关 / 太早期
+
+- **`shreyanshtiwari02/mojo-inference-engine`**：9 KB、0 star、创建当天即停更，自述
+  "naive CPU phase (Tensor, dot, matmul, linear, ReLU, softmax)" ⇒ 教学玩具，无借鉴价值。
+- **`tacio/esper`**：3.4 MB、2 stars，**"neuro-symbolic reasoning engine… Nested Learning,
+  evolution strategies, ARC-AGI"** ⇒ 不是 LLM 推理引擎，赛道不同。
+
+### 7.5 反过来：alofa 还需增强什么（按 2026-09-30 的证据重排）
+
+1. **串行段（最大一块，66%）** —— shards 1→8 只有 1.42×，Amdahl 反解可并行部分仅 34%。
+   RMSNorm/RoPE/注意力/残差一次都没切，加上每 token 169×8 次协程调度。**这是当前唯一的大
+   头**，且不需要新能力，只需动 `QwenForward.step` 的并发边界。
+2. **PR 级性能回归门（账本 `missing`）** —— 今天亲历：同日三档有效带宽 11.4 / 8.9 / 7.2 GB/s，
+   绝对值抖 2.8×，runq 8–18。没有这道门，"优化"与"噪声"分不开。统计量建议用 **P95**（§7.2）。
+3. **GGUF 读取** —— 覆盖面缺口里最大的一项，方案见 `04-gguf-reader.md`（§4.3 已按 DISMOEN
+   的张量重叠证据修正）。
+4. **KV cache 量化** —— 方案见 `05-kv-cache-quantization.md`。收益是**容量 3.76× 而不是速度**：
+   当前 seq=64 时 KV 只占每 token 流量的 0.5%。
+5. **架构覆盖**：Llama / Mistral / MoE / 多模态仍是 `missing` —— 只有 Qwen2.5 一个架构，
+   任何"格式/算子通用"的主张都还没有第二例可证。
+6. **后端**：CUDA 仅 `partial`（sm_80），AVX512/NEON `hardware-blocked`，无 Metal/ROCm。
+7. **两条工程门**：100 并发 1 小时压测、可在本机跑通的端到端服务（均 `missing`）。
+8. **协议面（Anthropic / MCP / OCI）** —— **有意识不做**：与"服务层不自研、纯 Mojo 引擎"的
+   定位冲突，需要时走 flare。
+
+⚠️ 贯穿第 1 与第 4 条的一条判据：**shards=8 下已经贴在聚合带宽上，减指令没用，只有减字节
+有用**（今天三档拟合 + 单核/多核带宽对比所得）。任何新立项都要先回答"它减的是字节还是指令"。
+
+---
+
 **相关文档**
 - 架构设计 → [`02-architecture.md`](02-architecture.md)
 - 路线图与验收门 → [`03-roadmap.md`](03-roadmap.md)
 - 能力账本 → [`capability-ledger.md`](capability-ledger.md)
+- 方案：GGUF 读取 → [`04-gguf-reader.md`](04-gguf-reader.md)
+- 方案：KV cache 量化 → [`05-kv-cache-quantization.md`](05-kv-cache-quantization.md)

@@ -240,11 +240,13 @@ def main() raises:
         model.set_shards(shard_of(0))
         model.reset()
         var lgt = model.prefill[BACKEND_AVX2](tok.encode(PROMPT))
+        model.set_profile(True)
         var nx = model.argmax(lgt)
         var gids = List[Int]()
         for _ in range(NEW):
             gids.append(nx)
             nx = model.argmax(model.step[BACKEND_AVX2](nx))
+        model.dump_profile()
         var text = tok.decode(gids)
 
         print("   汇总（" + kind_s + "，每档 " + String(ROUNDS) + " 趟，min…max）")

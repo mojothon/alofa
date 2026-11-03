@@ -523,6 +523,32 @@ def ceiling_verdict(lo: Float64, hi: Float64) -> String:
     return "量不出结论（区间跨过 700‰ 与 900‰）"
 
 
+comptime GUARD_NEW = 8
+
+
+def greedy_tokens[backend: Int](
+    mut model: QwenForward, imm tok: Tokenizer, n_new: Int, shards: Int
+) raises -> List[Int]:
+    """贪心解码出 `n_new + 1` 个 token id。只给一致性守卫用，不计时。
+
+    为什么守卫要单独跑：分片是**并行**的，一旦某片写错地址，症状是"数值偶尔
+    不对"，靠计时永远看不出来。这里同一进程、同一份权重、同一 prompt，只改
+    `shards`，两次的 id 序列必须**逐个相同** —— 头与头之间没有共享状态，切分
+    不该改变任何一个头算出来的数，所以"不完全相同"就是 bug，不是容差问题。
+    """
+    model.set_shards(shards)
+    model.reset()
+    var logits = model.prefill[backend](tok.encode(PROMPT))
+    var next = model.argmax(logits)
+    var out = List[Int]()
+    out.append(next)
+    for _ in range(n_new):
+        var lg = model.step[backend](next)
+        next = model.argmax(lg)
+        out.append(next)
+    return out^
+
+
 def main() raises:
     print("")
     print(
@@ -540,6 +566,24 @@ def main() raises:
         + " ms（mmap，惰性；真正的读页在预热轮里）"
     )
     var tok = load_tokenizer(FIXTURE)
+
+    # 一致性守卫：同一个进程里 shards=1 与 shards=8 的贪心 id 序列必须逐位相同。
+    # 放在计时之前，失败就当场停 —— 并行写错地址时时间反而可能更好看。
+    var g1 = greedy_tokens[BACKEND_AVX2](model, tok, GUARD_NEW, 1)
+    var g8 = greedy_tokens[BACKEND_AVX2](model, tok, GUARD_NEW, 8)
+    var same = len(g1) == len(g8)
+    if same:
+        for i in range(len(g1)):
+            if g1[i] != g8[i]:
+                same = False
+    print(
+        "   一致性守卫 shards=1 vs 8 : "
+        + ("逐 token 完全相同（" + String(len(g1)) + " 个 id）" if same else "❌ 不同")
+    )
+    if not same:
+        print("     shards=1 : " + String(g1))
+        print("     shards=8 : " + String(g8))
+        raise Error("shards 分片改变了输出 —— 先修正确性，不要看下面的数")
 
     print("   预热轮（" + String(WARMUP_NEW) + " 个 token，结果丢弃）")
     for k in range(ARMS):

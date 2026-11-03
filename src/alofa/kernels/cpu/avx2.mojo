@@ -403,8 +403,15 @@ def attention(
     n_heads: Int,
     n_kv_heads: Int,
     head_dim: Int,
+    head_lo: Int = 0,
+    head_hi: Int = -1,
 ) raises AlofaError:
     """因果分组注意力，向量版；形状契约与标量版**共用** `attention_shapes`。
+
+    `head_lo..head_hi` 是**只算这段头**的开关，给按 head 分片的并行用（默认
+    `0..n_heads` = 原来的全量）。头与头之间没有任何共享状态：`scores` 每个头
+    都是**整块覆盖后立刻用完**，所以切头不改任何一个头的算术，切与不切逐位相同
+    —— 前提是**每片拿到自己的 `scores`**（调用方负责，见 `attention_k_shards`）。
 
     向量化只落在两处 `O(kv_len × head_dim)` 的工作上 —— 打分点积与值归约，
     因为那才是这段的耗时主体；softmax 的取最大 / 求指数 / 求和仍是标量的，于是
@@ -433,7 +440,13 @@ def attention(
     var kv_cols = n_kv_heads * head_dim
     var d_end = (head_dim // W_F64) * W_F64
 
-    for head in range(n_heads):
+    var lo = head_lo
+    var hi = head_hi
+    if hi < 0 or hi > n_heads:
+        hi = n_heads
+    if lo < 0:
+        lo = 0
+    for head in range(lo, hi):
         var kv_head = head // group
         var q_head_base = head * head_dim
         var kv_head_base = kv_head * head_dim
@@ -1336,6 +1349,13 @@ comptime Q4_PRE_BYTES = Q4_SCALE_BYTES + Q4_BLOCK
 # 逐轮 `Σx f32/int32` 是 `q/o 0.931…1.098`、`gate 0.815…1.073`、`k/v 0.882…1.461`，三组**都
 # 跨 1.0**（中位 ≈1.00）。读法：`RU=8` 给出 8 条独立累加链之后，**链长已经不是瓶颈**（真瓶颈
 # 是每行块 38.4 条指令里那 23% 的栈存取），再短 4 个周期换不到时间。生产路径不传 ⇒ 走 f32 那条。
+# ⚠️ 端到端剂量-响应旋钮（2026-09-30）：把探针里那个 `JUNK` 剂量搬到**真路径**上，用来判
+# "多核端到端离带宽天花板那 2×，是核内还是访存"。默认 0 ⇒ 生产二进制与加这个常量之前
+# **完全一样**（实例化参数一样）。改这里重新 build 即可换档；`JUNK=3` = 双份加料。
+# ⚠️ `JUNK` 剂量-响应（2026-09-30 搬到真路径）：`JUNK` 由 `matmul_q4_mub_*_rows_band` 的
+# 第二个参数传进来，最外层按运行时的 `junk` 选 `0` / `3` 两个实例 ⇒ 同进程两臂可比。
+# ⚠️ 加料是**数值中性**的：只累加进 `sink`，收尾判给一个 f32 取不到的值（+inf）⇒ 分支实际
+# 不命中，**与 JUNK=0 那臂逐位相同**（`+0.0` 那种写法会被 fast-math 整段折叠，留不住剂量）。
 def _matmul_q4_mub_rows[
     RB: Int, RU_OVERRIDE: Int = 0, SX_I32: Int = 0, JUNK: Int = 0, PRE: Int = 0
 ](
@@ -1388,6 +1408,7 @@ def _matmul_q4_mub_rows[
             _matmul_q4_halves_rows[RB](dst, x, blocks, rows, cols, dst_stride)
         return
     var nb = cols // Q4_BLOCK
+    var sink = SIMD[DType.float32, W_Q4](0)
     # ⚠️ **不清零**（`uninitialized=True`）：下面三个缓冲都是**先写后读** —— `xq` 覆盖
     # `RB*cols`、`Σx` 与缩放覆盖 `RB*nb`，点积循环只读这些下标。清零在这里不是"保险"，
     # 是**每次调用的固定税**：16 KB 的 store 与本次真正要读的权重流量无关，shards=8
@@ -1549,14 +1570,12 @@ def _matmul_q4_mub_rows[
                             + acc8u[rb * RU + u]
                         )
                     comptime if JUNK != 0:
-                        var jz = Float32(Int(junk[2]))
-                        acc8u[rb * RU + u] = (
-                            acc8u[rb * RU + u] + SIMD[DType.float32, W_Q4](jz)
+                        sink = sink + SIMD[DType.float32, W_Q4](
+                            Float32(Int(junk[2]))
                         )
                     comptime if JUNK == 3:
-                        acc8u[rb * RU + u] = (
-                            acc8u[rb * RU + u]
-                            + SIMD[DType.float32, W_Q4](Float32(Int(junkB[3])))
+                        sink = sink + SIMD[DType.float32, W_Q4](
+                            Float32(Int(junkB[3]))
                         )
             b += 1
 
@@ -1621,7 +1640,15 @@ def _matmul_q4_mub_rows[
         row += 1
 
 
-def matmul_q4_mub_rows_band[RB: Int = 2](
+    comptime if JUNK != 0:
+        # 让上面那些 load/加法的**剂量**留得住：编译器不能证明这个分支不命中，就不能把
+        # `sink` 的累加删掉。`1e30 × 1e30` 是 +inf，而 `sink` 是有限和 ⇒ **永不命中**
+        # ⇒ 数值与 `JUNK=0` 那臂**逐位相同**，只多付指令。
+        if sink.reduce_add() == Float32(1.0e30) * Float32(1.0e30):
+            dst[0] = sink.reduce_add()
+
+
+def matmul_q4_mub_rows_band[RB: Int = 2, JUNK: Int = 0](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1650,7 +1677,7 @@ def matmul_q4_mub_rows_band[RB: Int = 2](
     var limit = n_tok - n_tok % RB if n_tok >= RB else 0
     var t = 0
     while t < limit:
-        _matmul_q4_mub_rows[RB](
+        _matmul_q4_mub_rows[RB, 0, 0, JUNK, 0](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,
@@ -1662,7 +1689,7 @@ def matmul_q4_mub_rows_band[RB: Int = 2](
         )
         t += RB
     while t < n_tok:
-        _matmul_q4_mub_rows[1](
+        _matmul_q4_mub_rows[1, 0, 0, JUNK, 0](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,
@@ -1675,7 +1702,7 @@ def matmul_q4_mub_rows_band[RB: Int = 2](
         t += 1
 
 
-def matmul_q4_mub_bias_rows_band[RB: Int = 2](
+def matmul_q4_mub_bias_rows_band[RB: Int = 2, JUNK: Int = 0](
     dst: F32Ptr,
     x: F32Ptr,
     blocks: Q4_U8,
@@ -1708,7 +1735,7 @@ def matmul_q4_mub_bias_rows_band[RB: Int = 2](
     var limit = n_tok - n_tok % RB if n_tok >= RB else 0
     var t = 0
     while t < limit:
-        _matmul_q4_mub_rows[RB](
+        _matmul_q4_mub_rows[RB, 0, 0, JUNK, 0](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,
@@ -1720,7 +1747,7 @@ def matmul_q4_mub_bias_rows_band[RB: Int = 2](
         )
         t += RB
     while t < n_tok:
-        _matmul_q4_mub_rows[1](
+        _matmul_q4_mub_rows[1, 0, 0, JUNK, 0](
             dst.unsafe_offset(t * dst_stride),
             x.unsafe_offset(t * cols),
             blocks,

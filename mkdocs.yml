@@ -46,3 +46,5 @@ nav:
       - 架构设计: plan/02-architecture.md
       - 路线图与验收门: plan/03-roadmap.md
       - 能力账本: plan/capability-ledger.md
+      - 方案：GGUF 读取: plan/04-gguf-reader.md
+      - 方案：KV cache 量化: plan/05-kv-cache-quantization.md

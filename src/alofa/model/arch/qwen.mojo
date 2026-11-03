@@ -23,6 +23,18 @@ from std.math import cos, pow, sin
 from std.os import getenv
 from std.runtime.asyncrt import TaskGroup, parallelism_level
 
+from alofa.model.profiler import (
+    ALOFA_PROFILE,
+    ForwardProf,
+    K_ACT,
+    K_GEMM,
+    K_HEAD,
+    K_NORM,
+    K_PREP,
+    K_RESID,
+    K_ROPE_ATTN,
+    K_VIEW,
+)
 from alofa.core.dtype import DT_FP32
 from alofa.core.error import (
     ERR_INVALID_ARGUMENT,
@@ -638,6 +650,7 @@ def q4_matmul_rows_k[backend: Int](
     rows: Int,
     cols: Int,
     dst_stride: Int,
+    junk: Int = 0,
 ) raises AlofaError:
     """按 `backend` 分发的整批 q4_0 投影（**无偏置**；一个输出行带 × 全部 token）。
 
@@ -650,7 +663,14 @@ def q4_matmul_rows_k[backend: Int](
     """
     comptime if uses_vector_backend[backend]():
         if q4_mub_enabled():
-            matmul_q4_mub_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
+            if junk == 0:
+                matmul_q4_mub_rows_band_vec[2, 0](
+                    dst, x, blocks, n_tok, rows, cols, dst_stride
+                )
+            else:
+                matmul_q4_mub_rows_band_vec[2, 3](
+                    dst, x, blocks, n_tok, rows, cols, dst_stride
+                )
         else:
             matmul_q4_f32_rows_band_vec(dst, x, blocks, n_tok, rows, cols, dst_stride)
     else:
@@ -675,6 +695,7 @@ def q4_matmul_bias_rows_k[backend: Int](
     cols: Int,
     bias: F32Ptr,
     dst_stride: Int,
+    junk: Int = 0,
 ) raises AlofaError:
     """按 `backend` 分发的整批 q4_0 投影（**带偏置**；Qwen2 的 q/k/v 用它）。
 
@@ -687,9 +708,14 @@ def q4_matmul_bias_rows_k[backend: Int](
     """
     comptime if uses_vector_backend[backend]():
         if q4_mub_enabled():
-            matmul_q4_mub_bias_rows_band_vec(
-                dst, x, blocks, n_tok, rows, cols, bias, dst_stride
-            )
+            if junk == 0:
+                matmul_q4_mub_bias_rows_band_vec[2, 0](
+                    dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+                )
+            else:
+                matmul_q4_mub_bias_rows_band_vec[2, 3](
+                    dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+                )
         else:
             matmul_q4_f32_bias_rows_band_vec(
                 dst, x, blocks, n_tok, rows, cols, bias, dst_stride
@@ -716,10 +742,11 @@ async def _q4_rows_shard[backend: Int](
     rows: Int,
     cols: Int,
     dst_stride: Int,
+    junk: Int = 0,
 ):
     """同上，但这一片拿到的是**整个 token 批**（顺序见 `q4_matmul_rows_k_shards` 的注释）。"""
     try:
-        q4_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride)
+        q4_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride, junk)
     except err:
         _ = err
 
@@ -733,11 +760,12 @@ async def _q4_bias_rows_shard[backend: Int](
     cols: Int,
     bias: F32Ptr,
     dst_stride: Int,
+    junk: Int = 0,
 ):
     """带偏置的分片：同一个输出行带 × 整个 token 批。"""
     try:
         q4_matmul_bias_rows_k[backend](
-            d, x, blocks, n_tok, rows, cols, bias, dst_stride
+            d, x, blocks, n_tok, rows, cols, bias, dst_stride, junk
         )
     except err:
         _ = err
@@ -753,12 +781,13 @@ def q4_matmul_bias_rows_k_shards[backend: Int](
     bias: F32Ptr,
     dst_stride: Int,
     shards: Int,
+    junk: Int = 0,
 ) raises AlofaError:
     """同上，带偏置版：按输出行切 `shards` 片，每片做完整个 token 批。"""
     var n = shard_count(rows, shards)
     if n <= 1:
         q4_matmul_bias_rows_k[backend](
-            dst, x, blocks, n_tok, rows, cols, bias, dst_stride
+            dst, x, blocks, n_tok, rows, cols, bias, dst_stride, junk
         )
         return
     var row_bytes = cols // Q4_BLOCK * Q4_BYTES
@@ -778,6 +807,7 @@ def q4_matmul_bias_rows_k_shards[backend: Int](
                 cols,
                 bias.unsafe_offset(c0),
                 dst_stride,
+                junk,
             )
         )
         c0 += cnt
@@ -793,6 +823,7 @@ def q4_matmul_rows_k_shards[backend: Int](
     cols: Int,
     dst_stride: Int,
     shards: Int,
+    junk: Int = 0,
 ) raises AlofaError:
     """整批 q4_0 投影：先按输出行切 `shards` 片，**每片一口气做完整个 token 批**。
 
@@ -809,7 +840,7 @@ def q4_matmul_rows_k_shards[backend: Int](
     """
     var n = shard_count(rows, shards)
     if n <= 1:
-        q4_matmul_rows_k[backend](dst, x, blocks, n_tok, rows, cols, dst_stride)
+        q4_matmul_rows_k[backend](dst, x, blocks, n_tok, rows, cols, dst_stride, junk)
         return
     var row_bytes = cols // Q4_BLOCK * Q4_BYTES
     var tg = TaskGroup()
@@ -827,6 +858,7 @@ def q4_matmul_rows_k_shards[backend: Int](
                 cnt,
                 cols,
                 dst_stride,
+                junk,
             )
         )
         c0 += cnt
@@ -931,12 +963,123 @@ def attention_k[backend: Int](
     n_heads: Int,
     n_kv_heads: Int,
     head_dim: Int,
+    head_lo: Int = 0,
+    head_hi: Int = -1,
 ) raises AlofaError:
-    """按 `backend` 分发的注意力。"""
+    """按 `backend` 分发的注意力。`head_lo..head_hi` = 只算这段头（默认全量）。"""
     comptime if uses_vector_backend[backend]():
-        attention_vec(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
+        attention_vec(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim, head_lo, head_hi)
     else:
-        attention(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
+        attention(dst, q, k, v, scores, n_heads, n_kv_heads, head_dim, head_lo, head_hi)
+
+
+async def _attention_shard[backend: Int](
+    o: RawPtr,
+    q: RawPtr,
+    k: RawPtr,
+    v: RawPtr,
+    s: RawPtr,
+    q_len: Int,
+    kv_len: Int,
+    n_heads: Int,
+    n_kv_heads: Int,
+    head_dim: Int,
+    head_lo: Int,
+    head_hi: Int,
+):
+    """一个头段上的注意力。参数只收指针与整数，视图在协程内现造。
+
+    与 `_linear_shard` 同样的两条约束：`create_task` 只收不抛错的协程，所以
+    `attention_k` 的 `raises` 在这里被 `try/except` 兜住 —— 形状契约由调用方
+    在开协程之前用同一次直呼验过，这里的 `except` 不是吞错误。
+    """
+    var q_cols = n_heads * head_dim
+    var kv_cols = n_kv_heads * head_dim
+    try:
+        attention_k[backend](
+            TensorView(o, shard_shape(q_len, q_cols), DT_FP32),
+            TensorView(q, shard_shape(q_len, q_cols), DT_FP32),
+            TensorView(k, shard_shape(kv_len, kv_cols), DT_FP32),
+            TensorView(v, shard_shape(kv_len, kv_cols), DT_FP32),
+            TensorView(s, shard_shape(q_len, kv_len), DT_FP32),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_lo,
+            head_hi,
+        )
+    except err:
+        pass
+
+
+def attention_k_shards[backend: Int](
+    dst: TensorView,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    scores: TensorView,
+    q_len: Int,
+    kv_len: Int,
+    n_heads: Int,
+    n_kv_heads: Int,
+    head_dim: Int,
+    shards: Int,
+) raises AlofaError:
+    """按 **head** 把注意力切成 `shards` 片并发跑。
+
+    为什么这条切分是安全的：头与头之间没有共享状态 —— `scores` 每个头都是
+    "整块覆盖 → 读两遍 → 丢弃"，所以切开之后每个头算出来的数**逐位不变**，
+    不需要任何跨片归约。这是本项目里唯一一种"切了不改算术"的并行。
+
+    ⚠️ **`scores` 必须每片一份**：它是共用 scratch，`q_len` 行覆盖后立刻用完。
+    这里按 `k * q_len * kv_len` 个 float 错开，用的是调用方那块
+    `max_tokens * max_tokens` 的缓冲；只在 `q_len == 1`（decode）时启用 ——
+    prefill 的 `t` 大，`shards * t * kv_len` 会超出现有缓冲，仍走串行。
+
+    ⚠️ 余数**均摊**，不是全给最后一片：14 个头 8 片若照 `_linear_shard` 那样
+    写，会变成 7 片各 1 个 + 最后 1 片独吞 7 个，并行度直接掉一半。
+    """
+    var n = shard_count(n_heads, shards)
+    if n <= 1 or q_len != 1:
+        attention_k[backend](dst, q, k, v, scores, n_heads, n_kv_heads, head_dim)
+        return
+    # 先按全量口径把 dtype / 连续性验一遍：`raises` 直接抛给调用方，协程里
+    # 就不需要（也不能）再抛错。
+    _ = f32_data(dst)
+    _ = f32_data(q)
+    _ = f32_data(k)
+    _ = f32_data(v)
+    _ = f32_data(scores)
+    var d0 = dst.data.unsafe_offset(dst.byte_offset)
+    var q0 = q.data.unsafe_offset(q.byte_offset)
+    var k0 = k.data.unsafe_offset(k.byte_offset)
+    var v0 = v.data.unsafe_offset(v.byte_offset)
+    var s0 = scores.data.unsafe_offset(scores.byte_offset)
+    var per = n_heads // n
+    var rem = n_heads - per * n
+    var h0 = 0
+    var tg = TaskGroup()
+    for k in range(n):
+        var cnt = per + (1 if k < rem else 0)
+        tg.create_task(
+            _attention_shard[backend](
+                d0,
+                q0,
+                k0,
+                v0,
+                s0.unsafe_offset(k * q_len * kv_len * 4),
+                q_len,
+                kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                h0,
+                h0 + cnt,
+            )
+        )
+        h0 += cnt
+    tg.wait()
+
 
 
 def rope_table(
@@ -1022,6 +1165,20 @@ def q4_weight_name(layer: Int, slot: Int) raises AlofaError -> String:
     if slot == Q4_SLOT_DOWN:
         return p + "mlp.down_proj.weight"
     raise AlofaError(ERR_OUT_OF_RANGE, "no such slot", "slot=" + String(slot))
+
+
+def f2(x: Float64) -> String:
+    """两位小数。本机没有 sprintf，整数拼是唯一不引入新依赖的写法。"""
+    var v = x
+    var whole = Int(v)
+    var frac = Int((v - Float64(whole)) * 100.0 + 0.5)
+    if frac >= 100:
+        whole += 1
+        frac -= 100
+    var fs = String(frac)
+    if fs.byte_length() < 2:
+        fs = "0" + fs
+    return String(whole) + "." + fs
 
 
 struct QwenConfig(Movable):
@@ -1137,6 +1294,12 @@ struct QwenForward(Movable):
     var act_arena: Arena
     var k_store: List[RawPtr]
     var v_store: List[RawPtr]
+    # 阶段计时。见 `alofa/model/profiler.mojo`：默认档（ALOFA_PROFILE=False）
+    # 所有打点在编译期折叠掉，这个字段只是个空壳，不进生成的代码。
+    var prof: ForwardProf
+    # 端到端剂量-响应：`0` = 原样，`3` = 双份加料（数值**逐位相同**，只多付指令）。
+    # 只有测量探针会设它；默认 0 ⇒ 走原来那条实例化的核。
+    var junk_arm: Int
     var hidden_ptr: RawPtr
     var normed_ptr: RawPtr
     var q_ptr: RawPtr
@@ -1198,6 +1361,8 @@ struct QwenForward(Movable):
         # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
         # 想退回不切就显式 `set_shards(1)` —— 那条路与分片之前逐位相同。
         self.shards = default_shards()
+        self.prof = ForwardProf()
+        self.junk_arm = 0
 
         # A checkpoint that ties its embeddings ships no `lm_head.weight`; one
         # that does not tie them and still lacks it is a different failure, and
@@ -1409,6 +1574,10 @@ struct QwenForward(Movable):
         （2026-09-20：它变了。现在两条通路都按 `backend` 分发。）
         """
         if not self.q4_enabled or slot == Q4_NO_SLOT:
+            comptime if ALOFA_PROFILE:
+                var _t_v = self.prof.now()
+                _ = self.params.view(name)
+                _ = self.prof.tick(K_VIEW, _t_v)
             if has_bias:
                 linear_bias_k_shards[backend](
                     dst, x, self.params.view(name), bias, self.shards
@@ -1432,6 +1601,7 @@ struct QwenForward(Movable):
                 "a projection needs positive dimensions",
                 "name=" + name,
             )
+        var _t_q = self.prof.now()
         var blocks = self.q4_blocks[slot]
         # 量化核做的是**矩阵乘向量**（一次给一个输出行），这里要的是一整个
         # token 批次。做法是把**整个批次**交给一次调用：每个输出分片一口气做完
@@ -1462,11 +1632,15 @@ struct QwenForward(Movable):
                 f32_data(bias),
                 out,
                 self.shards,
+                self.junk_arm,
             )
         else:
+            _t_q = self.prof.tick(K_PREP, _t_q)
             q4_matmul_rows_k_shards[backend](
-                dst_p, x_p, blocks, t_rows, out, cols, out, self.shards
+                dst_p, x_p, blocks, t_rows, out, cols, out, self.shards,
+                self.junk_arm,
             )
+            _ = self.prof.tick(K_GEMM, _t_q)
         return
 
     def require(imm self, name: String) raises AlofaError:
@@ -1607,7 +1781,9 @@ struct QwenForward(Movable):
             var attn_out = rows_view(self.attn_ptr, t, h)
             var proj = rows_view(self.proj_ptr, t, h)
 
+            var _t_n1 = self.prof.now()
             rmsnorm_k[backend](normed, hidden, self.params.view(p + "input_layernorm.weight"), self.cfg.eps)
+            _ = self.prof.tick(K_NORM, _t_n1)
             self.project[backend](
                 q,
                 normed,
@@ -1632,6 +1808,7 @@ struct QwenForward(Movable):
                 self.params.view(p + "self_attn.v_proj.bias"),
                 True,
             )
+            var _t_ra = self.prof.now()
             rope_k[backend](q_rot, k_rot, q, k, table_cos, table_sin, self.cfg.head_dim)
 
             # Append this step's keys and values, then attend over everything
@@ -1640,16 +1817,20 @@ struct QwenForward(Movable):
             copy_into(self.k_store[layer], pos0 * kv_dim, k_rot, t * kv_dim)
             copy_into(self.v_store[layer], pos0 * kv_dim, v, t * kv_dim)
 
-            attention_k[backend](
+            attention_k_shards[backend](
                 attn_out,
                 q_rot,
                 rows_view(self.k_store[layer], kv_len, kv_dim),
                 rows_view(self.v_store[layer], kv_len, kv_dim),
                 rows_view(self.scores_ptr, t, kv_len),
+                t,
+                kv_len,
                 self.cfg.n_heads,
                 self.cfg.n_kv_heads,
                 self.cfg.head_dim,
+                self.shards,
             )
+            _ = self.prof.tick(K_ROPE_ATTN, _t_ra)
             self.project[backend](
                 proj,
                 attn_out,
@@ -1658,9 +1839,15 @@ struct QwenForward(Movable):
                 proj,
                 False,
             )
+            var _t_r1 = self.prof.now()
+            var _t_r2 = self.prof.now()
             add_k[backend](hidden, hidden, proj)
+            _t_r2 = self.prof.tick(K_RESID, _t_r2)
+            _ = self.prof.tick(K_RESID, _t_r1)
 
+            var _t_n2 = self.prof.now()
             rmsnorm_k[backend](normed, hidden, self.params.view(p + "post_attention_layernorm.weight"), self.cfg.eps)
+            _ = self.prof.tick(K_NORM, _t_n2)
             var gate = rows_view(self.gate_ptr, t, self.cfg.intermediate)
             var up = rows_view(self.up_ptr, t, self.cfg.intermediate)
             var activated = rows_view(self.act_ptr, t, self.cfg.intermediate)
@@ -1680,7 +1867,9 @@ struct QwenForward(Movable):
                 up,
                 False,
             )
+            var _t_act = self.prof.now()
             swiglu_k[backend](activated, gate, up)
+            _ = self.prof.tick(K_ACT, _t_act)
             self.project[backend](
                 proj,
                 activated,
@@ -1697,6 +1886,7 @@ struct QwenForward(Movable):
         var last_hidden = hidden.slice_dim(0, t - 1, 1)
         var last_normed = rows_view(self.normed_ptr, 1, h)
         rmsnorm_k[backend](last_normed, last_hidden, self.params.view(FINAL_NORM), self.cfg.eps)
+        var _t_h = self.prof.now()
         var logits = rows_view(self.logits_ptr, 1, self.cfg.vocab)
         # Copied out of `self` first: the projection reads the name while the
         # call writes through `self`, and the borrow checker is right that a
@@ -1718,9 +1908,28 @@ struct QwenForward(Movable):
             )
         else:
             self.project[backend](logits, last_normed, head_name, Q4_NO_SLOT, logits, False)
+        _ = self.prof.tick(K_HEAD, _t_h)
+        self.prof.count_token()
         self.kv_len = kv_len
         return f32_data(logits)
 
+    def set_junk_arm(mut self, arm: Int):
+        """端到端剂量-响应档位：`0` = 原样，`3` = 双份加料（数值逐位相同）。"""
+        self.junk_arm = arm
+
+    def set_profile(mut self, on: Bool):
+        """打开阶段计时并清零。"""
+        comptime if not ALOFA_PROFILE:
+            if on:
+                print("   [profile] ALOFA_PROFILE=False：插桩没编进二进制，"
+                    + "改 src/alofa/model/profiler.mojo 里的常量后重新 build")
+            return
+        self.prof.on = on
+        self.prof.reset()
+
+    def dump_profile(imm self):
+        """打印每 token 各阶段的毫秒。打印逻辑在 `ForwardProf.dump`。"""
+        self.prof.dump()
     def argmax(self, logits: F32Ptr) -> Int:
         """Index of the largest logit; ties go to the lowest index.
 

@@ -398,6 +398,8 @@ def attention(
     n_heads: Int,
     n_kv_heads: Int,
     head_dim: Int,
+    head_lo: Int = 0,
+    head_hi: Int = -1,
 ) raises AlofaError:
     """Causal grouped-query attention: `softmax(q kᵀ / √d, masked) · v`.
 
@@ -435,7 +437,16 @@ def attention(
     var q_cols = n_heads * head_dim
     var kv_cols = n_kv_heads * head_dim
 
-    for head in range(n_heads):
+    # `head_lo..head_hi`：只算这段头，给按 head 分片的并行用（默认 = 全量）。
+    # 头之间没有共享状态，`scores` 每个头整块覆盖后立刻用完 ⇒ 切开逐位相同，
+    # 前提是每片拿到自己的 `scores`（调用方负责）。
+    var lo = head_lo
+    var hi = head_hi
+    if hi < 0 or hi > n_heads:
+        hi = n_heads
+    if lo < 0:
+        lo = 0
+    for head in range(lo, hi):
         var kv_head = head // group
         var q_head_base = head * head_dim
         var kv_head_base = kv_head * head_dim
