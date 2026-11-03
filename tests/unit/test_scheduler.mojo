@@ -284,6 +284,42 @@ def test_a_finished_request_hands_its_blocks_to_the_cache() raises:
     assert_equal(sch.blocks_used, 0)
 
 
+def test_a_cache_hit_credit_keeps_the_books_honest() raises:
+    """命中准入必须冲回垫付的块账，完成发布只记**自己的**块。
+
+    反面（账本二十六实测）：调度账按满长记块，池子对命中的前缀一块没拿 ——
+    每条命中请求虚涨几块；几十条之后水位之下再无余量，准入即抢占，引擎活锁
+    （`running=0`、`preempts` 每拍 +8、零进度、200 条请求全截断）。
+    """
+    var sch = Scheduler(SchedConfig(16, 16, 16, 12, 1000, 8))
+    # 32 token 的 prompt，两片预填充：调度账按满长记 2 块。
+    var first = SchedInput()
+    first.add_arrival(1, 32, 4)
+    _ = sch.step(first)
+    var second = SchedInput()
+    _ = sch.step(second)
+    assert_equal(sch.blocks_used, 2, "预填充没有按满长记块")
+    # 整条 prompt 命中缓存：池子一块没拿，账必须冲回到 0。
+    sch.credit_shared(1, 2)
+    assert_equal(sch.blocks_used, 0, "命中垫付的块账没有冲回")
+    assert_equal(sch.blocks_held(), 0, "命中请求自己的块数应当是 0")
+    # 生成 4 个 token：自己的 1 块（token 32 起是新块），完成发布只把这块记进缓存
+    # —— 而不是满长的 3 块。
+    var act = Action()
+    for _ in range(4):
+        var d = SchedInput()
+        act = sch.step(d)
+    assert_equal(act.n_finished, 1)
+    assert_equal(sch.blocks_used, 1, "生成期自己的块没有按增量记账")
+    assert_equal(sch.cached_blocks, 1, "发布把不是自己的块记进了缓存")
+    assert_equal(sch.blocks_held(), 0)
+    var back = SchedInput()
+    back.add_freed_blocks(sch.cached_blocks)
+    _ = sch.step(back)
+    assert_equal(sch.blocks_used, 0, "缓存归还后账没有归零")
+    assert_equal(sch.cached_blocks, 0, "缓存归还后缓存账没有归零")
+
+
 def test_a_return_of_blocks_nobody_cached_is_refused() raises:
     """归还数超过缓存数必须具名拒绝 —— 静默夹住会让两本账从此分家。
 

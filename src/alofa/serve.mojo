@@ -817,8 +817,10 @@ struct ModelService(Service, Twinable):
                     + String(self.engine.capacity_blocks())
                     + " cached="
                     + String(self.engine.cached_blocks())
+
                     + " preempts="
                     + String(self.engine.preempt_total())
+
                 )
                 self.batch_win_ticks = 0
                 self.batch_win_widths = 0

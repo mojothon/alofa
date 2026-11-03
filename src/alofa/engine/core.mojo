@@ -71,6 +71,7 @@ from alofa.engine.scheduler import (
     SchedConfig,
     SchedInput,
     Scheduler,
+    blocks_for,
 )
 from alofa.model.arch.qwen import BACKEND_SCALAR, QwenForward
 from alofa.runtime.kv import MAX_SEQ_TOKENS
@@ -591,6 +592,15 @@ struct EngineCore:
                 # slice: those are different numbers whenever the scheduler
                 # slices, and the room needs both.
                 _ = self.room.admit(req, self.kv_tokens(i), self.p_len[i], end)
+                # 缓存命中垫付的块账当场冲回：调度账记了满长，池子只新拿了
+                # `last_fresh` 块（命中的前缀保留已缓存的块）。差额不冲回就是
+                # 每条命中请求几块的永久虚账 —— 活锁的根（账本二十六）。
+                if self.room.last_matched > 0:
+                    self.sched.credit_shared(
+                        req,
+                        blocks_for(end, self.sched.cfg.block_size)
+                        - self.room.last_fresh,
+                    )
                 # The whole prompt's length, not the slice's: an executor told
                 # only about this slice cannot tell a slice boundary from the
                 # end of the prompt, and would choose a token in the middle.
@@ -844,6 +854,9 @@ struct EngineCore:
     def cached_blocks(self) raises AlofaError -> Int:
         """Blocks held by the prefix cache and by no request."""
         return self.room.cached_blocks()
+
+
+
 
     def used_blocks(self) raises AlofaError -> Int:
         """Blocks actually out of `runtime/kv`'s pool."""

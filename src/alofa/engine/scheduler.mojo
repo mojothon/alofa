@@ -344,6 +344,7 @@ struct Scheduler:
     var state: InlineArray[Int, MAX_BATCH]
     var wait_ticks: InlineArray[Int, MAX_BATCH]
     var preempt_count: InlineArray[Int, MAX_BATCH]
+    var blk_base: InlineArray[Int, MAX_BATCH]
     # Scratch: cleared at the top of every step, never read across ticks. It is
     # a field rather than a local so that `step` needs no per-tick buffer.
     var progressed: InlineArray[Int, MAX_BATCH]
@@ -365,6 +366,7 @@ struct Scheduler:
         self.wait_ticks = InlineArray[Int, MAX_BATCH](fill=0)
         self.preempt_count = InlineArray[Int, MAX_BATCH](fill=0)
         self.progressed = InlineArray[Int, MAX_BATCH](fill=0)
+        self.blk_base = InlineArray[Int, MAX_BATCH](fill=0)
         self.blocks_used = 0
         self.cached_blocks = 0
         self.preempt_total = 0
@@ -388,6 +390,7 @@ struct Scheduler:
         self.wait_ticks = InlineArray[Int, MAX_BATCH](fill=0)
         self.preempt_count = InlineArray[Int, MAX_BATCH](fill=0)
         self.progressed = InlineArray[Int, MAX_BATCH](fill=0)
+        self.blk_base = InlineArray[Int, MAX_BATCH](fill=0)
         self.blocks_used = 0
         self.cached_blocks = 0
         self.preempt_total = 0
@@ -438,7 +441,12 @@ struct Scheduler:
         var total = 0
         for i in range(MAX_BATCH):
             if self.state[i] != ST_FREE:
-                total += blocks_for(self.done[i] + self.generated[i], self.cfg.block_size)
+                var own = blocks_for(
+                    self.done[i] + self.generated[i], self.cfg.block_size
+                ) - self.blk_base[i]
+                if own < 0:
+                    own = 0
+                total += own
         return total
 
     def blocks_wanted(self) raises AlofaError -> Int:
@@ -532,7 +540,27 @@ struct Scheduler:
         self.generated[slot] = 0
         self.wait_ticks[slot] = 0
         self.preempt_count[slot] = 0
+        self.blk_base[slot] = 0
         self.state[slot] = ST_WAITING
+
+    def credit_shared(mut self, req: Int, blocks: Int) raises AlofaError:
+        """冲回缓存命中垫付的块账。
+
+        调度账按**满长**给预填充记块（`blocks_for(end)`），但房间对命中的前缀
+        **保留**已有块、只新分配命中尾部之后的部分（token 级共享最多费一个
+        部分块）。差额是池子从来没拿过的块 —— 不冲回，每条命中请求虚涨几块，
+        几十条之后水位之下再无余量，准入即抢占，引擎活锁（账本二十六：
+        `blocks=229` vs 池子实占 23，缓存账 220 vs 房间 8）。
+        `blocks` 由引擎按 `blocks_for(slice) - room.last_fresh` 算好送进来，
+        每次准入（含抢占后的重准入）至多冲一次。
+        """
+        if blocks <= 0:
+            return
+        var slot = self.find(req)
+        if slot < 0 or self.state[slot] == ST_FREE:
+            return
+        self.blocks_used -= blocks
+        self.blk_base[slot] += blocks
 
     def release(mut self, slot: Int, to_cache: Bool) raises AlofaError:
         """Drop a request's own view of its blocks.
@@ -556,18 +584,26 @@ struct Scheduler:
             # is the one that crosses a block boundary.
             held = blocks_for(
                 self.prompt_len[slot] + self.max_new[slot], self.cfg.block_size
-            )
+            ) - self.blk_base[slot]
             # The live request was charged one block at a time, and the last of
             # those charges was a token short. Nothing comes back to the pool —
             # the blocks change owner — so the pool book keeps its count and
             # picks up the difference, or it would go on believing the pool has
             # room it does not have.
-            self.blocks_used += held - blocks_for(
+            var own_now = blocks_for(
                 self.done[slot] + self.generated[slot], self.cfg.block_size
-            )
+            ) - self.blk_base[slot]
+            if own_now < 0:
+                own_now = 0
+            self.blocks_used += held - own_now
             self.cached_blocks += held
         else:
-            self.blocks_used -= held
+            var own_now = blocks_for(
+                self.done[slot] + self.generated[slot], self.cfg.block_size
+            ) - self.blk_base[slot]
+            if own_now < 0:
+                own_now = 0
+            self.blocks_used -= own_now
         self.ids[slot] = 0
         self.prompt_len[slot] = 0
         self.done[slot] = 0
@@ -575,6 +611,7 @@ struct Scheduler:
         self.max_new[slot] = 0
         self.wait_ticks[slot] = 0
         self.preempt_count[slot] = 0
+        self.blk_base[slot] = 0
         self.state[slot] = ST_FREE
 
     def preempt_one(mut self, mut act: Action, protect: Int) raises AlofaError -> Bool:
@@ -591,12 +628,16 @@ struct Scheduler:
                 if self.state[i] == ST_RUNNING:
                     if self.done[i] + self.generated[i] > 0:
                         act.add_preempted(self.ids[i])
-                        self.blocks_used -= blocks_for(
+                        var own_now = blocks_for(
                             self.done[i] + self.generated[i], self.cfg.block_size
-                        )
+                        ) - self.blk_base[i]
+                        if own_now < 0:
+                            own_now = 0
+                        self.blocks_used -= own_now
                         self.done[i] = 0
                         self.generated[i] = 0
                         self.wait_ticks[i] = 0
+                        self.blk_base[i] = 0
                         self.preempt_count[i] += 1
                         self.preempt_total += 1
                         self.state[i] = ST_WAITING

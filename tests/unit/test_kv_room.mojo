@@ -310,6 +310,26 @@ def test_an_unpublished_drop_gives_the_blocks_back() raises:
     assert_equal(room.cached_blocks(), 0, "没发布过的请求竟然留下了缓存")
 
 
+def test_publish_evictions_report_their_freed_blocks() raises:
+    """腾节点淘汰掉的纯缓存块必须上报，否则调度账永远比池子多。
+
+    反面（实测，账本二十六）：`_make_node_room` 直接 `evict`、不进 `freed_pending`
+    —— 池子把块真还了，调度账还把它们记在缓存名下。每条完成序列漏几块，64 条
+    之后虚账 ~200 块，水位之下没有余量，准入即抢占，引擎活锁（`running=0`、
+    `preempts` 每拍 +8、零进度）。
+    """
+    var room = KvRoom(16)
+    for r in range(40):
+        var req = r + 1
+        _ = room.admit(req, prompt_tokens(5000 + r * 100, 32), 32, 32)
+        _ = room.publish(req)
+        _ = room.drop(req)
+    assert_true(
+        room.take_freed() > 0, "腾节点淘汰的块没有上报 —— 调度账会虚涨到活锁"
+    )
+    assert_equal(room.take_freed(), 0, "同一批淘汰被上报了两次")
+
+
 def test_reclaim_cannot_touch_a_live_request() raises:
     """活着的请求的块不能被回收 —— 回收的是缓存，不是正在读的 KV。
 

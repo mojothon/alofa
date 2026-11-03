@@ -239,12 +239,20 @@ struct KvRoom:
         页表，照常解码（`evict` 对还被引用的块只剪树、不还池）。
         """
         var guard = 0
+        var before = self.cached_blocks()
         while MAX_NODES - self.space.tree.n_live < need and guard < MAX_NODES:
             var node = self.coldest_node()
             if node < 0:
                 break
             _ = self.space.evict(node)
             guard += 1
+        # 腾节点淘汰的块和 `reclaim` 的是同一笔账：被逐节点若还压着活请求，块不回池
+        # （`cached_blocks` 本来就不数它们）；逐掉纯缓存块，块真回池。这个差值必须进
+        # `freed_pending` 报给调度器 —— 少了这一步，池子把块还了，调度账却还把它们记
+        # 在缓存名下：每条完成序列虚涨几块，几十条之后水位之下再无余量，准入即抢占，
+        # 引擎活锁（实测 64 条后 `book=224` vs `cached=25`、`pool=31` vs 账 227，
+        # `running=0`、`preempts` 每拍 +8、零进度 —— 账本二十六）。
+        self.freed_pending += before - self.cached_blocks()
 
     def publish(mut self, req: Int) raises AlofaError -> Int:
         """Hand the sequence to the prefix tree; returns cached blocks after.

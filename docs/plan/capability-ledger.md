@@ -2246,3 +2246,26 @@
     仍是已知开放项（见「未复现」清单）。
   - ⚠️ 过程教训（重犯）：后台编译**先删旧产物再等大小稳定** —— 今晚 `serve_dbg`
     拿了昨晚的陈旧产物跑出"env 校验变了 + 请求挂死"两个假象，白白烧掉一轮排查。
+- **2026-11-04（第二十六条）** —— 🔴→✅ 间歇 `stalled`/`running=0 waiting=N` 空转：**块账两处漏账 ⇒ 水位活锁**（复现、定位、修复）
+  - **复现**：宽 8 × 多轮不同 prompt。8~14 轮后引擎整体楔死：`running=0 waiting=2~5`、
+    `preempts` 每 64 拍 +8~112、`window_width_sum` 冻结（零进度），之后所有流空返回
+    （25 轮 200 条里 128 条空）。
+  - **诊断**（按因记账 + 双账对照）：`blocks=229` vs **池子实占 23**；调度账的"缓存"
+    ~220 vs 房间实际 8 —— 虚账 ≈2 块/条 × 100+ 条。
+  - **漏账 ①**（`kv_room`）：`_make_node_room` 腾节点直接 `space.evict`，绕过 `reclaim`
+    的 `freed_pending` 上报 —— 池子真把块还了，调度账还把它们记在缓存名下。修：淘汰
+    前后测 `cached_blocks()` 差值进 `freed_pending`（与 `reclaim` 同一测量口径）。
+  - **漏账 ②**（`scheduler`，主根）：命中准入的**垫付块**没人冲 —— 调度账按满长给
+    预填充记块（`blocks_for(end)`），房间对命中的前缀**保留**已有块（`last_fresh` 才是
+    真新拿的；token 级共享最多费一个部分块）。差额每条命中请求虚涨 ~2 块。修：
+    `Scheduler.credit_shared(req, blocks)` —— 引擎在 `room.admit` 后按
+    `blocks_for(end) - room.last_fresh` 冲回，每次准入至多一次；`blk_base` 进入
+    发布/抢占/`blocks_held` 的记账（base=0 时与旧式逐位相同）。
+  - **门**：`test_publish_evictions_report_their_freed_blocks`（kv_room）+
+    `test_a_cache_hit_credit_keeps_the_books_honest`（scheduler）。scheduler 的
+    fixture 逐字节门全绿 —— 信用只对 `matched>0` 生效，旧 fixture 走 base=0 支路，
+    行为逐位不变。
+  - **效果**：25 轮 × 8 = 200 条 **0 截断**，`preempts=0`（此前 3468），两本账随跑随对；
+    墙钟 792s → 258s。
+  - **关联**：会话一的孤立 `stalled(13)`（2 条截断流）大概率同源（块账虚涨把水位顶死），
+    未证同一；若再复发，先看 `preempts` 是否又在涨、`blocks` 是否钉在水位线上。
