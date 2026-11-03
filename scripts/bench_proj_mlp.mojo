@@ -55,7 +55,10 @@ from std.runtime.asyncrt import TaskGroup
 from alofa.core.ffi import monotonic_ns
 from alofa.core.memory import Arena
 from alofa.core.tensor import F32Ptr, RawPtr
+from std.sys import llvm_intrinsic
+
 from alofa.kernels.cpu.avx2 import Q4_U8, matmul_q4_f32, matmul_q4_mub
+from alofa.kernels.cpu.quant import block_scale
 
 # ---- 真实形状（Qwen2.5-0.5B，decode = 每次 1 个 token）----
 comptime HID = 896
@@ -152,15 +155,121 @@ def fill_q4_scales(blocks: Q4_U8, nbytes: Int):
         blocks[unsafe_offset=off + 1] = UInt8(0x3C)
 
 
-def time_layers[use_mub: Bool](buf: RawPtr, dst: F32Ptr, x: F32Ptr) raises -> Int:
-    """一趟 decode 的全部层投影（24 层 × 7 投影），返回最小 ns。
+comptime MUBSW = "llvm.x86.avx2.pmadd.ub.sw"
+comptime MADDWD = "llvm.x86.avx2.pmadd.wd"
+comptime MAX_BLOCKS = INTER // BLOCK
 
-    `use_mub` 选核 —— 这是这张表存在的理由：`_matmul_q4_halves`（f32 展开）和
-    `_matmul_q4_mub`（`vpmaddubsw` 整数点积，`ALOFA_Q4_MUB` 默认开）**不是同一
-    条路**，而 decode 的 `project` 走的是 `q4_matmul_rows_k_shards` ⇒ **mub**。
-    只量 f32 那条会把"核离纯读多远"夸大 1.87 倍（2026-11-03 就踩过这一脚）。
+
+def matmul_q4_mub_hoist(
+    dst: F32Ptr, x: F32Ptr, blocks: Q4_U8, rows: Int, cols: Int
+) raises:
+    """🔴 **失败实验（留作反面证据，别照抄）**：把 `d·sc` 的小预扫提到行外。
+
+    **实测结果（2026-11-03，同轮交替）**：
+      * **不逐位相同** —— 896 行里 896 行不一致，最大绝对差 12.61。所谓"纯重排"
+        这个前提本身就是错的：Mojo 带 fast-math，`x·(d·sc)` 与 `(x·d)·sc` 的结合
+        顺序不同 ⇒ **提前算 `d·sc` 会改数值**。
+      * **更慢 0.64×**（B3 3.25 vs B2 5.12 GB/s）—— 省掉热循环里 7 条，却多出一趟
+        `nb` 次标量预扫（每次还要过 `block_scale` 的守卫），**净亏**。
+
+    ⇒ 想省那 5 条守卫只能做 `block_scale_fast`（去掉 inf/NaN 判断、保留 inline
+    转换），约省 5/29 = 17%，核级预期 <1.1×，**不值得**。这个函数留着是因为
+    "把不变量提出循环"在这类数值核里看起来天经地义，而它在 fast-math 下会静默
+    改数 —— 比慢更危险。
+
+    原文（未改）：生产 mub 核的**纯重排**版：把 `d·sc` 的小预扫提到行外。
+
+    为什么这么改（`objdump` 实测，2026-11-03）：热循环 **29 条/块**，其中
+
+        vpinsrw + vcvtph2ps            2 条   读 fp16 scale
+        movzbl + mov + not + test + jne 5 条   inf/NaN 守卫（`block_scale` 内部）
+        vmulss + vbroadcastss          2 条   算 `d * sc`
+
+    **7 条（24%）只是把每块的 scale 取出来**，而它每块都要重算一遍、其中 5 条还是
+    一个**永不成立的冷分支判断**。这里改成：每个输出行开始前，先用一趟只读 2 字节
+    scale 的小循环把 `d_b * sc_b` 算进一个 `nb` 长的缓冲（`nb` = 28 或 152），
+    点积循环里只剩一次 `vbroadcastss`。
+
+    同一行的权重一共 `nb*18` 字节 = 504 B（`cols=896`），预扫与点积两趟贴着跑，
+    第二趟全在 L1 —— **不增加 DRAM 流量**。
+
+    ⚠️ 这是**纯重排**，不是新算术：`q + sh`、`cast`、`* dsc`、`+ acc` 一条不动，
+    只是把同一个 `d * sc` 挪到循环外算 ⇒ 输出必须**逐位相同**（下面 `main` 里验）。
     """
-    var sink = Float32(0)
+    var xq_buf = InlineArray[Int8, INTER](uninitialized=True)
+    var sumx_buf = InlineArray[Int32, MAX_BLOCKS * 8](uninitialized=True)
+    var scale_buf = InlineArray[Float32, MAX_BLOCKS](uninitialized=True)
+    var dsc_buf = InlineArray[Float32, MAX_BLOCKS](uninitialized=True)
+    var xqp = xq_buf.unsafe_ptr().unsafe_bitcast[Int8]()
+    var sump = sumx_buf.unsafe_ptr().unsafe_bitcast[Int32]()
+    var scp = scale_buf.unsafe_ptr().unsafe_bitcast[Float32]()
+    var dscp = dsc_buf.unsafe_ptr().unsafe_bitcast[Float32]()
+
+    var nb = cols // BLOCK
+    # --- 激活量化（与生产核一字不差地照抄，只做一次）---
+    for b in range(nb):
+        var xb = b * BLOCK
+        var amax = Float32(0)
+        for j in range(BLOCK):
+            var v = x[unsafe_offset=xb + j]
+            if v < Float32(0):
+                v = -v
+            if v > amax:
+                amax = v
+        var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+        scp[unsafe_offset=b] = amax / Float32(127.0)
+        var s = Int(0)
+        for j in range(BLOCK):
+            var t = x[unsafe_offset=xb + j] * inv
+            var qv = Int(t + Float32(0.5)) if t >= Float32(0) else Int(t - Float32(0.5))
+            if qv > 127:
+                qv = 127
+            if qv < -128:
+                qv = -128
+            xqp[unsafe_offset=xb + j] = Int8(qv)
+            s += qv
+        var sv = SIMD[DType.int32, 8](0)
+        sv[0] = Int32(-8 * s)
+        sump.unsafe_store[width=8](b * 8, sv)
+
+    var low_mask = SIMD[DType.uint8, 16](0x0F)
+    var four = SIMD[DType.uint8, 16](4)
+    var ones = SIMD[DType.int16, 16](1)
+    for row in range(rows):
+        # --- 预扫：只取每块的 scale，算出 d*sc（守卫在这里，不在热循环里）---
+        var rbase = row * nb * BB
+        for b in range(nb):
+            dscp[unsafe_offset=b] = block_scale(blocks, rbase + b * BB) * scp[unsafe_offset=b]
+        var acc8 = SIMD[DType.float32, 8](0)
+        var base = rbase + BB
+        for b in range(nb):
+            var raw = blocks.unsafe_load[width=16](base)
+            var lo = raw & low_mask
+            var hi = (raw >> four) & low_mask
+            var w32 = lo.join(hi)
+            var x32 = xqp.unsafe_load[width=32](b * BLOCK)
+            var p = llvm_intrinsic[MUBSW, SIMD[DType.int16, 16]](w32, x32)
+            var q = llvm_intrinsic[MADDWD, SIMD[DType.int32, 8]](p, ones)
+            var sh = sump.unsafe_load[width=8](b * 8)
+            acc8 = (q + sh).cast[DType.float32]() * SIMD[DType.float32, 8](
+                dscp[unsafe_offset=b]
+            ) + acc8
+            base += BB
+        dst[unsafe_offset=row] = Float32(acc8.reduce_add())
+
+
+def _mm[mode: Int](dst: F32Ptr, x: F32Ptr, w: Q4_U8, r: Int, c: Int) raises:
+    """`mode` 0 = f32 展开，1 = mub（生产），2 = mub 纯重排版。"""
+    comptime if mode == 0:
+        matmul_q4_f32(dst, x, w, r, c)
+    elif mode == 1:
+        matmul_q4_mub(dst, x, w, r, c)
+    else:
+        matmul_q4_mub_hoist(dst, x, w, r, c)
+
+
+def time_layers[mode: Int](buf: RawPtr, dst: F32Ptr, x: F32Ptr) raises -> Int:
+    """一趟 decode 的全部层投影（24 层 x 7 投影 = 191 MB），返回最小 ns。"""
     var best = 0
     for _ in range(REPS):
         var t0 = monotonic_ns()
@@ -168,52 +277,22 @@ def time_layers[use_mub: Bool](buf: RawPtr, dst: F32Ptr, x: F32Ptr) raises -> In
         for layer in range(LAYERS):
             var w = buf.unsafe_offset(layer * PROJ_ROWS * HID // BLOCK * BB)
             # q / k / v / o / gate / up / down
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, HID, HID)
-            else:
-                matmul_q4_f32(dst, x, w, HID, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, HID, HID)
             w = w.unsafe_offset(HID * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, KV_DIM, HID)
-            else:
-                matmul_q4_f32(dst, x, w, KV_DIM, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, KV_DIM, HID)
             w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, KV_DIM, HID)
-            else:
-                matmul_q4_f32(dst, x, w, KV_DIM, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, KV_DIM, HID)
             w = w.unsafe_offset(KV_DIM * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, HID, HID)
-            else:
-                matmul_q4_f32(dst, x, w, HID, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, HID, HID)
             w = w.unsafe_offset(HID * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, INTER, HID)
-            else:
-                matmul_q4_f32(dst, x, w, INTER, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, INTER, HID)
             w = w.unsafe_offset(INTER * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, INTER, HID)
-            else:
-                matmul_q4_f32(dst, x, w, INTER, HID)
-            sink += dst[0]
+            _mm[mode](dst, x, w, INTER, HID)
             w = w.unsafe_offset(INTER * HID // BLOCK * BB)
-            comptime if use_mub:
-                matmul_q4_mub(dst, x, w, HID, INTER)
-            else:
-                matmul_q4_f32(dst, x, w, HID, INTER)
-            sink += dst[0]
+            _mm[mode](dst, x, w, HID, INTER)
         var el = monotonic_ns() - t0
         if best == 0 or el < best:
             best = el
-    if sink == Float32(1234.5):
-        print("     (unreachable)")
     return best
 
 
@@ -273,14 +352,37 @@ def main() raises:
     var b_layer = (HID + KV_DIM + KV_DIM + HID + INTER + INTER) * HID // BLOCK * BB + HID * INTER // BLOCK * BB
     var bytes_b = b_layer * LAYERS
 
-    var nsb = time_layers[False](buf, dst, x)
+    # --- 先验"纯重排"必须逐位相同 ---
+    var dst2 = arena.alloc(INTER * 4).bitcast[Float32]()
+    matmul_q4_mub(dst, x, buf, HID, HID)
+    matmul_q4_mub_hoist(dst2, x, buf, HID, HID)
+    var bad = 0
+    var maxd = Float64(0)
+    for i in range(HID):
+        if dst[i] != dst2[i]:
+            bad += 1
+            var e = Float64(dst[i] - dst2[i])
+            if e < Float64(0):
+                e = -e
+            if e > maxd:
+                maxd = e
+    print(
+        "     逐位校验（mub vs 重排版，同输入 "
+        + String(HID) + " 行）：不一致 " + String(bad) + "，最大绝对差 " + f2(maxd)
+    )
+
+    var nsb = time_layers[0](buf, dst, x)
     var gbs_b = Float64(bytes_b) / Float64(nsb)
     print("     B1 f32 展开核     " + f2(Float64(nsb) / 1e6) + " ms  ⇒ " + f2(gbs_b) + " GB/s")
 
-    var nsm = time_layers[True](buf, dst, x)
+    var nsm = time_layers[1](buf, dst, x)
     var gbs_m = Float64(bytes_b) / Float64(nsm)
-    print("     B2 mub 整数点积   " + f2(Float64(nsm) / 1e6) + " ms  ⇒ " + f2(gbs_m) + " GB/s  ← decode 实际走这条")
-    print("     B2/B1 = " + f2(Float64(nsb) / Float64(nsm)) + "×（核级差）")
+    print("     B2 mub 整数点积   " + f2(Float64(nsm) / 1e6) + " ms  ⇒ " + f2(gbs_m) + " GB/s  ← 生产走这条")
+
+    var nsh = time_layers[2](buf, dst, x)
+    var gbs_h = Float64(bytes_b) / Float64(nsh)
+    print("     B3 mub 重排版     " + f2(Float64(nsh) / 1e6) + " ms  ⇒ " + f2(gbs_h) + " GB/s")
+    print("     B3/B2 = " + f2(Float64(nsm) / Float64(nsh)) + "×（同轮交替，只读比例）")
     print("     对比：profiler 在真机 decode 上量到 33.4–33.9 ms / 201 MB = 5.9–6.0 GB/s")
 
     # ---------------- C：多线程纯读 ----------------
