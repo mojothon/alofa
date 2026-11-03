@@ -52,6 +52,7 @@ from alofa.engine.batch import (
     ceil_bytes,
 )
 from alofa.kernels.cpu.paged import PagedTable, paged_attention, paged_scatter
+from alofa.kernels.cpu.avx2 import paged_attention_vec
 from alofa.kernels.cpu.segments import PtrPtr, row_rope, select_rows
 from alofa.runtime.kv import (
     MAX_BLOCKS,
@@ -60,6 +61,7 @@ from alofa.runtime.kv import (
 )
 from alofa.model.profiler import K_HEAD, K_ROPE_ATTN, K_STEP
 from alofa.model.arch.qwen import (
+    BACKEND_AVX2,
     BACKEND_SCALAR,
     EMBED,
     FINAL_NORM,
@@ -829,17 +831,32 @@ struct BatchExecutor:
                 var n = self.served[i]
                 var at = self.row_start[unsafe_offset=i]
                 var table = self._table_of(i, layer, self.hist[i] + n)
-                paged_attention(
-                    attn.slice_dim(0, at, n),
-                    q_rot.slice_dim(0, at, n),
-                    self.k_cache,
-                    self.v_cache,
-                    table,
-                    scores,
-                    self.n_heads,
-                    self.n_kv_heads,
-                    self.head_dim,
-                )
+                # 向量版与单路 avx2.attention 逐位一致（账本二十八）；标量后端继续
+                # 走 oracle —— 它给逐位门当参照，不当性能通路。
+                comptime if backend == BACKEND_AVX2:
+                    paged_attention_vec(
+                        attn.slice_dim(0, at, n),
+                        q_rot.slice_dim(0, at, n),
+                        self.k_cache,
+                        self.v_cache,
+                        table,
+                        scores,
+                        self.n_heads,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    )
+                else:
+                    paged_attention(
+                        attn.slice_dim(0, at, n),
+                        q_rot.slice_dim(0, at, n),
+                        self.k_cache,
+                        self.v_cache,
+                        table,
+                        scores,
+                        self.n_heads,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    )
             _ = model.prof.tick(K_ROPE_ATTN, t_at)
             model.project[backend](
                 proj,

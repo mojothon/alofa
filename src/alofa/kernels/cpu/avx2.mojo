@@ -59,6 +59,11 @@ from alofa.core.error import (
     AlofaError,
 )
 from alofa.core.tensor import F32Ptr, TensorView, f32_data, f32_data_rows
+from alofa.kernels.cpu.paged import (
+    PagedTable,
+    cache_cols,
+    check_table,
+)
 from alofa.kernels.cpu.quant import block_scale
 from alofa.kernels.cpu.scalar import (
     LOWEST_FP32,
@@ -510,6 +515,159 @@ def attention(
                     acc += Float64(ps[unsafe_offset=row + j]) * Float64(
                         pv[unsafe_offset=j * kv_cols + kv_head_base + d]
                     )
+                po[unsafe_offset=ob + d] = Float32(acc / total)
+                d += 1
+
+
+def paged_attention_vec[MAX_ENTRIES: Int](
+    dst: TensorView,
+    q: TensorView,
+    k_cache: TensorView,
+    v_cache: TensorView,
+    table: PagedTable[MAX_ENTRIES],
+    scores: TensorView,
+    n_heads: Int,
+    n_kv_heads: Int,
+    head_dim: Int,
+) raises AlofaError:
+    """分页注意力的向量版：`avx2.attention` 的算术，读的是页表寻址的缓存。
+
+    批路此前用 `paged.attention` 的标量 oracle（f64 顺序点积），单路却用本文件的
+    向量版（打分点积 4 通道 f64 重排）—— 两条路对同一个请求给出 ulp 级不同的数，
+    "并发 vs 单跑逐字节一致"那条门全靠 argmax 不翻转撑着（账本二十八）。这一版把
+    差异清零：**打分点积与值归约照抄 `avx2.attention` 的通道结构与累加顺序**，
+    只把"第 j 行在哪"从 `j * kv_cols` 换成页表的 `(block, slot)` 地址。
+
+    **与 `avx2.attention` 逐位一致**是这一版的全部主张（`test_paged_attention_vec`
+    在全部 11 个夹具用例上逐字节比对，含块内偏移、共享前缀、q_len>1 的因果截断）
+    —— 同样的值、同样的顺序，只有取数路径不同。标量 oracle（`paged.attention`）
+    保持原样：它继续当独立参照，给 oracle 逐位门用。
+
+    ⚠️ 行地址**不逐 `j` 走 `row_offset`**（那是线性扫 run 列表，值归约里每对
+    `(d, j)` 都要重走一遍）：按 run 推进 —— 一个 run 的基地址算一次，run 内
+    `j` 每步 `+ kv_cols`。`j` 的**顺序**不变（run 有序且连续覆盖），所以这纯粹
+    是寻址提速，不是重排。
+    """
+    if n_heads <= 0 or n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "n_kv_heads must divide n_heads",
+            "n_heads=" + String(n_heads) + " n_kv_heads=" + String(n_kv_heads),
+        )
+    var kv_cols = cache_cols(k_cache, table.block_size)
+    if cache_cols(v_cache, table.block_size) != kv_cols:
+        raise AlofaError(ERR_SHAPE_MISMATCH, "k and v caches differ in column count", "")
+    if k_cache.shape.dims[0] != v_cache.shape.dims[0]:
+        raise AlofaError(ERR_SHAPE_MISMATCH, "k and v caches differ in block count", "")
+    if kv_cols != n_kv_heads * head_dim:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "cache columns disagree with head counts",
+            "kv_cols=" + String(kv_cols),
+        )
+
+    var kv_len = check_table(table, k_cache.shape.dims[0])
+    var q_len = rows_of(q, "q")
+    if q_len > kv_len:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "more queries than cached positions",
+            "q_len=" + String(q_len) + " kv_len=" + String(kv_len),
+        )
+    expect_matrix(q, q_len, n_heads * head_dim, "q")
+    expect_matrix(dst, q_len, n_heads * head_dim, "dst")
+    if scores.numel() < q_len * kv_len:
+        raise AlofaError(ERR_SHAPE_MISMATCH, "score scratch is too small", "")
+
+    var pq = f32_data(q)
+    var pk = f32_data(k_cache)
+    var pv = f32_data(v_cache)
+    var ps = f32_data(scores)
+    var po = f32_data(dst)
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var group = n_heads // n_kv_heads
+    var q_cols = n_heads * head_dim
+    var d_end = (head_dim // W_F64) * W_F64
+
+    for head in range(n_heads):
+        var kv_head = head // group
+        var q_head_base = head * head_dim
+        var kv_head_base = kv_head * head_dim
+        for t in range(q_len):
+            var upto = kv_len - q_len + t
+            var row = t * kv_len
+            var qb = t * q_cols + q_head_base
+            # ---- 打分：与 avx2.attention 同一通道结构（4 通道 f64 + 标量尾巴），
+            # ---- j 沿 run 升序推进 ⇒ 逐位同序。
+            var best = LOWEST_FP32
+            var cum = 0
+            for r in range(table.n):
+                var rbase = (table.ids[r] * table.block_size + table.starts[r]) * kv_cols
+                var j_end = cum + table.lens[r]
+                var j = cum
+                while j < j_end and j <= upto:
+                    var kb = rbase + (j - cum) * kv_cols + kv_head_base
+                    var acc = SIMD[DType.float64, W_F64](Float64(0))
+                    var d = 0
+                    while d < d_end:
+                        var qv = pq.unsafe_load[width=W_F64](qb + d).cast[DType.float64]()
+                        var kvv = pk.unsafe_load[width=W_F64](kb + d).cast[DType.float64]()
+                        acc += qv * kvv
+                        d += W_F64
+                    var tail = Float64(0)
+                    while d < head_dim:
+                        tail += Float64(pq[unsafe_offset=qb + d]) * Float64(
+                            pk[unsafe_offset=kb + d]
+                        )
+                        d += 1
+                    var s = Float32(acc.reduce_add() + tail) * scale
+                    ps[unsafe_offset=row + j] = s
+                    if s > best:
+                        best = s
+                    j += 1
+                cum = j_end
+            # ---- softmax：三遍标量，与两版完全一致。
+            var total = Float64(0)
+            for j in range(upto + 1):
+                var e = Float64(exp(ps[unsafe_offset=row + j] - best))
+                ps[unsafe_offset=row + j] = Float32(e)
+                total += e
+            # ---- 值归约：d 通道外层、j 内层升序 —— 与 avx2.attention 逐位同构。
+            var ob = t * q_cols + q_head_base
+            var d = 0
+            while d + W_F64 <= head_dim:
+                var acc = SIMD[DType.float64, W_F64](Float64(0))
+                var rcum = 0
+                for r in range(table.n):
+                    var rbase = (table.ids[r] * table.block_size + table.starts[r]) * kv_cols
+                    var j_end = rcum + table.lens[r]
+                    var j = rcum
+                    while j < j_end and j <= upto:
+                        var w = Float64(ps[unsafe_offset=row + j])
+                        var vv = pv.unsafe_load[width=W_F64](
+                            rbase + (j - rcum) * kv_cols + kv_head_base + d
+                        ).cast[DType.float64]()
+                        acc += w * vv
+                        j += 1
+                    rcum = j_end
+                po.unsafe_store[width=W_F64](
+                    ob + d,
+                    (acc / SIMD[DType.float64, W_F64](total)).cast[DType.float32](),
+                )
+                d += W_F64
+            while d < head_dim:
+                var acc = Float64(0)
+                var rcum = 0
+                for r in range(table.n):
+                    var rbase = (table.ids[r] * table.block_size + table.starts[r]) * kv_cols
+                    var j_end = rcum + table.lens[r]
+                    var j = rcum
+                    while j < j_end and j <= upto:
+                        acc += Float64(ps[unsafe_offset=row + j]) * Float64(
+                            pv[unsafe_offset=rbase + (j - rcum) * kv_cols + kv_head_base + d]
+                        )
+                        j += 1
+                    rcum = j_end
                 po[unsafe_offset=ob + d] = Float32(acc / total)
                 d += 1
 

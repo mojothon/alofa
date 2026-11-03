@@ -70,6 +70,7 @@ SUITES=(
   "tests/unit/test_scheduler.mojo|-O0 -I src"
   "tests/unit/test_kv_pool.mojo|-O0 -I src"
   "tests/unit/test_paged_attention.mojo|-O0 -I src"
+  "tests/unit/test_paged_attention_vec.mojo|-O0 -I src"
   "tests/unit/test_paged_scatter.mojo|-O0 -I src"
   "tests/unit/test_batch_pool.mojo|-O0 -I src"
   "tests/unit/test_batch_executor.mojo|-O0 -I src"
