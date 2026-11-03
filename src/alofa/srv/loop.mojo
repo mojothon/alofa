@@ -93,6 +93,67 @@ from alofa.srv.http import (
     serialize_stream_head,
 )
 from alofa.srv.server import Handler, stop_requested
+from alofa.srv.sse import sse_done
+
+
+def has_sse_done(imm out: List[UInt8]) -> Bool:
+    """这一截里有 `[DONE]` 吗（6 个字节 `[DONE]`）。用来防**重复补**终止符。"""
+    var n = len(out)
+    if n < 6:
+        return False
+    var i = 0
+    while i + 6 <= n:
+        if (
+            Int(out[i]) == 91  # [
+            and Int(out[i + 1]) == 68  # D
+            and Int(out[i + 2]) == 79  # O
+            and Int(out[i + 3]) == 78  # N
+            and Int(out[i + 4]) == 69  # E
+            and Int(out[i + 5]) == 93  # ]
+        ):
+            return True
+        i += 1
+    return False
+
+
+def ends_sse_stream(imm out: List[UInt8]) -> Bool:
+    """这一截字节里有没有**带值的** `finish_reason`（`"finish_reason":"stop"` 那种）。
+
+    ⚠️ 不能只找 `"finish_reason":`：文本帧里是 `"finish_reason":null`，那样每一帧
+    都会被当成收尾。这里要求冒号后面紧跟一个引号 —— 值是非 null 的字符串。
+
+    为什么要认这一帧：它是**内容的最后一帧**。引擎交回的下一截才是 `data: [DONE]`
+    （16 字节），而那一截如果丢了，客户端就永远等不到终点（SSE 没有 Content-Length，
+    只能靠 `[DONE]` 或关连接定界）。内容在手上，终止符循环自己能造 —— 见
+    `guard_stalls` 收尾那一支。
+    """
+    var n = len(out)
+    if n < 17:
+        return False
+    var i = 0
+    while i + 17 <= n:
+        if (
+            Int(out[i]) == 34  # "
+            and Int(out[i + 1]) == 102  # f
+            and Int(out[i + 2]) == 105  # i
+            and Int(out[i + 3]) == 110  # n
+            and Int(out[i + 4]) == 105  # i
+            and Int(out[i + 5]) == 115  # s
+            and Int(out[i + 6]) == 104  # h
+            and Int(out[i + 7]) == 95  # _
+            and Int(out[i + 8]) == 114  # r
+            and Int(out[i + 9]) == 101  # e
+            and Int(out[i + 10]) == 97  # a
+            and Int(out[i + 11]) == 115  # s
+            and Int(out[i + 12]) == 111  # o
+            and Int(out[i + 13]) == 110  # n
+            and Int(out[i + 14]) == 34  # "
+            and Int(out[i + 15]) == 58  # :
+            and Int(out[i + 16]) == 34  # "
+        ):
+            return True
+        i += 1
+    return False
 
 # 同时挂在一条循环上的连接数上限。它是**有意的**上界：每条连接带一个发送队列
 # （`SEND_HIGH_WATER` 1 MiB），无上界等于把内存交给客户端决定。
@@ -198,6 +259,15 @@ struct Loop(Movable):
     # 症状（流停一半、客户端挂到超时）只在并发下出现，没有 per-slot 的对账就只能猜。
     var sent: List[Int]
     var back: List[Int]
+    # 这条流**已经把收尾那一帧发出去了**（见 `ends_sse_stream`）。收尾那一支据此决定
+    # 要不要补一个 `[DONE]`：内容发完了、只差定界符，补上是如实的；内容没发完就补，
+    # 等于告诉客户端"正常结束" —— 那是撒谎，宁可让它看到断流。
+    var ended: List[Int]
+    # 这条流的 `[DONE]` 已经发出去了 —— 补终止符之前必须看它，否则会补成两帧。
+    var done_sent: List[Int]
+    # 诊断打点的次数上限（见 `collect` 那两个分支）：异常分支才用，热路径只做一次
+    # 比较。放开它会用几十行日志把真信号埋掉。
+    var noise: Int
     # 这个槽位已经补派过几次（见 `MAX_STALL_RETRIES`）。收到应答就清零 —— 它是"**连续**
     # 丢了几次"的计数，不是这条连接一生里的总数。
     var stall_retries: List[Int]
@@ -221,6 +291,9 @@ struct Loop(Movable):
         self.release_sent = List[Int]()
         self.sent = List[Int]()
         self.back = List[Int]()
+        self.noise = 0
+        self.ended = List[Int]()
+        self.done_sent = List[Int]()
         self.stall_retries = List[Int]()
         self.engines = 1
         self.next_engine = 0
@@ -404,10 +477,48 @@ struct Loop(Movable):
             if slot < 0 or slot >= len(self.live) or self.live[slot] == 0:
                 # 连接已经不在了（客户端走了）：结果没有主人，丢掉。
                 var dead = Result()
+                var took = False
                 try:
-                    _ = box.mailbox.take_result(dead)
+                    took = box.mailbox.take_result(dead)
                 except:
                     pass
+                # ⚠️ **但这一支必须把"收尾"的账结掉**：它手上这一截通常正是 `drop`
+                # 派出去的那件 `JOB_STREAM_END` 的回执（`kind=RES_DONE`、`gen` 对得上）。
+                # 不清 `release_pending`，这个槽位就永远"等着收尾" —— `adopt` 不给它
+                # 新连接、`has_room` 也不把它算成空位，于是**每结束一条连接就漏一个
+                # 槽位**，`live` 只长不缩。实测连打 12 轮（96 条连接）之后第 12 轮
+                # 8/8 全部失败：槽位用光了。`gen` 对不上就是上一代的回执（真正的孤儿），
+                # 那时什么也不该动。
+                if took and slot >= 0 and slot < len(self.live):
+                    self.inflight[slot] = 0
+                # ⚠️ 这一支**不碰** `back` —— 它把一截应答从账上彻底抹掉了。
+                # 于是"`sent` 比 `back` 多 1 而邮箱空、四个计数全平"这个形状就是它
+                # 留下的：那条连接明明还活着（`live[slot]` 在派帧时是 1），结果却被
+                # 当成"没有主人"。要定的是**为什么** `slot` 走到这里：槽位号越界、
+                # 已死、还是队首那截应答本来就不是派出去的那一帧。
+                if self.noise < 40:
+                    self.noise += 1
+                    var live_now = -1
+                    if slot >= 0 and slot < len(self.live):
+                        live_now = self.live[slot]
+                    print(
+                        "  [dbg] result dropped as orphan: peeked="
+                        + String(slot)
+                        + " live_n="
+                        + String(len(self.live))
+                        + " live="
+                        + String(live_now)
+                        + " took="
+                        + String(Int(took))
+                        + " got_slot="
+                        + String(dead.slot)
+                        + " got_gen="
+                        + String(dead.gen)
+                        + " kind="
+                        + String(dead.kind)
+                        + " n="
+                        + String(dead.n_bytes)
+                    )
                 continue
             if self.conns[slot].backpressure():
                 self.sync_interest(slot)
@@ -422,6 +533,20 @@ struct Loop(Movable):
             except err:
                 print("  [srv] a result could not be taken: " + String(err))
                 return
+            if res.slot != slot and self.noise < 40:
+                self.noise += 1
+                print(
+                    "  [dbg] result misrouted: peeked="
+                    + String(slot)
+                    + " got="
+                    + String(res.slot)
+                    + " gen_peek="
+                    + String(gen)
+                    + " gen_got="
+                    + String(res.gen)
+                    + " kind="
+                    + String(res.kind)
+                )
             self.inflight[slot] = 0
             self.back[slot] += 1
             # 应答回来了 = 这条流刚才没有卡住。两个计数一起清：`stall_seen` 是"连续几帧
@@ -450,6 +575,10 @@ struct Loop(Movable):
                 while i < res.n_bytes:
                     out.append(res.bytes[i])
                     i += 1
+                if ends_sse_stream(out):
+                    self.ended[slot] = 1
+                if has_sse_done(out):
+                    self.done_sent[slot] = 1
                 try:
                     self.conns[slot].enqueue(out^)
                 except err:
@@ -467,6 +596,24 @@ struct Loop(Movable):
                 # 一条：`progress` 在有流时会立刻返回）。
                 self.streaming[slot] = 1
             if res.kind == RES_DONE:
+                # 引擎侧这条流结束了，但 `[DONE]` 那一帧**可能根本没回来**：它是一次
+                # 独立的往返，丢了之后连补派都补不回来 —— 那时 handler 的相位已经
+                # 是 `STREAM_IDLE`，再问一次只会拿到空串（这就是"收尾帧有、终止符没
+                # 有"那条实测形状）。
+                #
+                # 循环自己知道收尾帧发出去没有（`ended`）。内容既然全了，缺的就只是
+                # 一个定界符 —— 由这边造：SSE 没有 `Content-Length`，客户端只能靠
+                # `[DONE]` 或关连接分辨"生成完了"和"连接断了"。
+                if self.ended[slot] == 1 and self.done_sent[slot] == 0:
+                    try:
+                        var tail = bytes_of_text(sse_done())
+                        self.conns[slot].enqueue(tail^)
+                        self.done_sent[slot] = 1
+                    except err:
+                        print(
+                            "  [srv] the stream terminator could not be queued: "
+                            + String(err)
+                        )
                 if res.close:
                     self.conns[slot].close_when_drained()
                 self.streaming[slot] = 0
@@ -640,6 +787,20 @@ struct Loop(Movable):
         定界，于是"流其实吐完了"也照样挂。
         """
         var now = monotonic_ms()
+        # 死槽位等收尾回执等到超时：那份回执丢了（孤儿分支上面那段有形状）。**不清它，
+        # 槽位就再也回不来** —— `adopt` 只挑 `release_pending < 0` 的槽位，于是每结束
+        # 一条连接漏一个，`live` 只长不缩，实测连打 96 条之后新连接被全部拒绝。
+        #
+        # ⚠️ 为什么不"看到回执就清"：那样死槽位会被**立刻**交给下一条连接，而引擎那
+        # 一侧的相位未必真的收干净了。试过——engine 线程直接崩在 `chunk_finish_json`
+        # 里（堆被写穿）。宽限期给到 8 s（卡点判据是 6 s，真正还在算的活那时早该有结果），
+        # 只求"有界"，不求"马上回收"。
+        for slot in range(len(self.live)):
+            if self.live[slot] == 0 and self.release_pending[slot] >= 0:
+                if now - self.last_seen[slot] > 8000:
+                    self.release_pending[slot] = -1
+                    self.release_sent[slot] = 0
+                    self.inflight[slot] = 0
         for slot in range(len(self.live)):
             # 没有主人的槽位不看：它可能正在等 engine 收尾（`release_pending`），那个
             # 在途是有意为之，不是卡住。
@@ -657,9 +818,12 @@ struct Loop(Movable):
             var busy = 0
             var polls = 0
             var runs = 0
+            var jq = 0
+            var rq = 0
+            var vio = 0
             try:
                 box.mailbox.read_counters(
-                    jpush, jtake, rpush, rtake, busy, polls, runs
+                    jpush, jtake, rpush, rtake, busy, polls, runs, jq, rq, vio
                 )
             except err:
                 print("  [srv] the engine counters could not be read: " + String(err))
@@ -705,6 +869,14 @@ struct Loop(Movable):
                 + String(polls)
                 + " runs="
                 + String(runs)
+                + " jq="
+                + String(jq)
+                + " rq="
+                + String(rq)
+                # `vio != 0` = 账在邮箱里就对不上了（哪个方法第一次发现看数字）：
+                # 那意味着字段或 `List` 被写穿，而不是调度逻辑错。
+                + " vio="
+                + String(vio)
                 + " sent="
                 + String(self.sent[slot])
                 + " back="
@@ -712,6 +884,44 @@ struct Loop(Movable):
                 + " n="
                 + String(self.stall_seen[slot])
             )
+            # 只在第一帧打这几行：卡住的槽位可能有好几个，四帧 × 每条 24 个数会把
+            # 日志淹掉。
+            if self.stall_seen[slot] == 1:
+                # 同一个瞬间的第二条读数（锁内拼串，不走 `mut` 出参）；和上面那行不
+                # 一样就说明"出参传送"是假的。再算两条**只由循环自己维护**的恒等式：
+                # `Σsent - Σback` 必须等于"inflight 为 1 的槽位数"。
+                var s_sent = 0
+                var s_back = 0
+                var n_inf = 0
+                for i in range(len(self.live)):
+                    s_sent += self.sent[i]
+                    s_back += self.back[i]
+                    if self.inflight[i] == 1:
+                        n_inf += 1
+                print(
+                    "  [dbg] loop sent_sum="
+                    + String(s_sent)
+                    + " back_sum="
+                    + String(s_back)
+                    + " inflight_n="
+                    + String(n_inf)
+                    + " live_n="
+                    + String(len(self.live))
+                )
+                var tj = List[Int]()
+                var tr = List[Int]()
+                try:
+                    box.mailbox.read_trace(tj, tr)
+                except err:
+                    print("  [dbg] the engine trace could not be read: " + String(err))
+                var sj = "  [dbg] tj="
+                for e in tj:
+                    sj = sj + String(e) + " "
+                print(sj)
+                var sr = "  [dbg] tr="
+                for e in tr:
+                    sr = sr + String(e) + " "
+                print(sr)
             if self.stall_seen[slot] == 4:
                 # 到这里已知的只是"这一件派出去了、应答没回来，而引擎不忙、邮箱也空"。
                 # 实测（`sent=2 back=1`，引擎侧 `rpush=162 > jtake=160` 自相矛盾）那截
@@ -739,6 +949,18 @@ struct Loop(Movable):
                 # ⚠️ 差一步：这里**没有**调 handler 的 `stream_end`（`EngineBox` 的约定
                 # 是"循环不碰 handler"），所以引擎那一侧的请求号/槽位还占着。按 `drop`
                 # 那条 TODO，把 handler 带进来才能连这一步一起收干净。
+                # 内容发完了、只差定界符 ⇒ 补上，别让"最后 16 字节没送到"变成
+                # "客户端挂到超时"。只在这一支做：这条流反正要关了，不会重复。
+                if self.ended[slot] == 1 and self.done_sent[slot] == 0:
+                    try:
+                        var tail = bytes_of_text(sse_done())
+                        self.conns[slot].enqueue(tail^)
+                        self.done_sent[slot] = 1
+                    except err:
+                        print(
+                            "  [srv] the stream terminator could not be queued: "
+                            + String(err)
+                        )
                 self.inflight[slot] = 0
                 self.streaming[slot] = 0
                 self.conns[slot].close_when_drained()
@@ -846,6 +1068,10 @@ struct Loop(Movable):
             # 是按请求号（= 槽位）找流的 —— 再派一次就会收掉**新**那条流。
             self.release_pending[slot] = -1
             self.release_sent[slot] = 0
+            self.sent[slot] = 0
+            self.back[slot] = 0
+            self.ended[slot] = 0
+            self.done_sent[slot] = 0
             # ⚠️ 代号**不动**：换主人正是靠它自增来标记的（见 `drop`）。
             try:
                 self.reactor.register(
@@ -876,6 +1102,8 @@ struct Loop(Movable):
         self.release_sent.append(0)
         self.sent.append(0)
         self.back.append(0)
+        self.ended.append(0)
+        self.done_sent.append(0)
         self.stall_retries.append(0)
         try:
             self.reactor.register(
@@ -1149,6 +1377,9 @@ struct Loop(Movable):
         # 占着这个号（等到同槽的下一条请求撞上来，两条活的相位叠在一起）。
         var was_inflight = self.inflight[slot]
         self.inflight[slot] = 0
+        # 这一代结束了：下一代的"收尾帧发出去没有、终止符发出去没有"都从零开始。
+        self.ended[slot] = 0
+        self.done_sent[slot] = 0
         # 流跟着连接一起没了（在途的那一帧回来时对不上代号，会被 `collect` 丢掉）。
         # ⚠️ 但**engine 那一份还在**：登记待收尾，交给 `dispatch` 派 `JOB_STREAM_END`。
         # 只有"确实有一条流、且它已经有归属"才登记 —— 没有归属说明它还没派出去过，

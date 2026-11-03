@@ -2029,3 +2029,34 @@
   - **仍未定位的残余**：60 s / 27 条里还有 2 条截断，且出现过一次"连响应头都没收到"（客户端
     0 字节、42 s 后 EOF），形状与上面不同 —— 下一轮从邮箱归账入手。
   - **门**：`test-loop`、`test-engine`、`test-batch-stream`、`test-batch-forward`、`test-http`。
+- **2026-11-03（第十八条）** —— 终止帧 `[DONE]` 本地补发 + 死槽位宽限回收；第十七条留下的"邮箱归账不可靠"又剥掉两层
+  - **把"不可靠"往下剥了两层（都证伪）**：
+    - 出参不是凶手：`read_counters`（十一个 `mut` 出参）与"锁内直接拼串"（`counters_text`）逐字一致 ⇒
+      读数这条链是自洽的；
+    - 锁与 `List` 不是凶手：两个最小复现 —— `scripts/mailbox_race_int.mojo`（pthread 锁 +
+      `List[Int]`，双方各 20000 次）与 `scripts/mailbox_list_big.mojo`（**大结构体**、字段形状与
+      `Job` 一致、内容校验 + 只取一次校验）—— 都**干净**。留在 scripts/ 里，下一个人不必再猜。
+  - **但恒等式破坏仍在**：`runs(57) > jpush(56)`、退化阶段 `jtake(117927) > jpush(117926)` ——
+    `end_job` 只跟着"取到活"走、`jobs_pushed` 只跟着"循环派活"走，用户层代码**不可能**造出这两个
+    组合 ⇒ 状态在临界区之外被改。与启动警告（"a client leaving mid-generation is known to
+    corrupt the heap"）同源。**根因仍未定位**，入口在 handler/service 的跨线程相位上。
+  - **丢的那一帧定位到了**：被截断流的尾巴**都带** `finish_reason:"stop"` ⇒ 丢的是它后面的
+    `data: [DONE]`（16 字节，一次**独立往返**）。补派救不了它：handler 交出 `[DONE]` 那一步已经
+    `stream_end`，相位是 `STREAM_IDLE`，再问一次只会拿到空串 → 循环按"流结束"关连接，终止符永远缺。
+  - **修（可验证）**：`ends_sse_stream`（找**带值的** `"finish_reason":"`，文本帧是 `null` 不能
+    碰）把"收尾帧已发"记进 `ended`，`has_sse_done` 记"终止符已发"（`done_sent`，防补成两帧）；
+    `RES_DONE` 到达而终止符没发过 ⇒ 循环本地造 `sse_done()` 补上。**只在内容已完整时补** ——
+    收尾帧都没送到的流宁可见断流，不给它一个假的"正常结束"。
+  - **实测（8 并发 × 12 轮 = 96 条，engine 线程路径）**：**94/96** 完整（改动前同载荷 41/48）；
+    受支持路径 `ALOFA_ENGINE_THREADS=0` 24/24 全绿、零 `stalled`/零补派；`pixi run test` 全过、
+    `test-http` PASS。
+  - **槽位泄漏（同轮发现并修）**：死槽位等 `JOB_STREAM_END` 的回执，而回执走"孤儿分支"被丢、
+    `release_pending` 永不清 ⇒ `adopt` 不再复用它 ⇒ `live` 只长不缩 ⇒ 连打 96 条连接后新连接
+    **全部被拒**（0/8）。修法：死槽位等回执**超 8 s** 由 `guard_stalls` 回收。⚠️ 试过"见回执即清"
+    （立刻复用）：engine 线程**崩**在 `chunk_finish_json`（堆写穿）⇒ 立刻复用不安全；宽限回收
+    实测 12 轮无崩溃、`live` 有界（多为 8、峰值 14）。
+  - **残余（写明）**：① 2/96 截断的尾巴**没有** finish ⇒ 是内容真缺一帧（第十七条"游标已前进"
+    的已知边界，补不回）；② 连打 ~16 轮后出现过 `JOB_REQUEST → RES_DONE(n=0)` 的**活件风暴**
+    （jpush 118k）伴随计数器再度破坏 ⇒ engine 线程路径维持 EXPERIMENTAL；受支持的
+    `ENGINE_THREADS=0` 不受影响。
+  - **门**：`pixi run test`（全绿，含 `check-ledger`）、`test-http`（PASS，跑前 `pkill -f http_e2e`）。

@@ -394,6 +394,21 @@ struct Mailbox(Movable):
     var engine_busy: Int
     var engine_polls: Int
     var engine_runs: Int
+    # 账**第一次**对不上的地方（0 = 没对不上；1/2/3/4 = 在 `push_job`/`take_job`/
+    # `push_result`/`take_result` 里第一次发现）。
+    #
+    # 为什么需要它：`results_pushed` 只有 `push_result` 一处自增、`jobs_taken` 只有
+    # `take_job` 一处自增，所以"一件活回一截应答"意味着这两个数**恒等**。实测出现过
+    # `rpush=162 > jtake=160` —— 单靠打印分不清是"我读错了"还是"字段被踩了"，而这两条
+    # 的后续动作完全相反。下面那条恒等式（pushed - taken == len(queue)）一旦破，就是
+    # 字段或 `List` 被写穿，不是逻辑错。
+    var vio: Int
+    # 最近 24 件**被取走的活** / **交回的结果**，编码成 `slot*1e6+gen*1e4+kind*1e2+n`。
+    # 卡住时把这两条打出来，就能回答"那一帧到底进没进 engine"：进了取活环、
+    # 没进结果环 = 丢在 `_run_job`/`push_result` 之间；两个环都没有 = `take_job`
+    # 根本没看见它（而邮箱已经空了 —— 那就是被别的路径吃掉了）。
+    var tj: List[Int]
+    var tr: List[Int]
 
     def __init__(out self) raises:
         self.mutex = Mutex()
@@ -421,6 +436,9 @@ struct Mailbox(Movable):
         self.engine_busy = 0
         self.engine_polls = 0
         self.engine_runs = 0
+        self.vio = 0
+        self.tj = List[Int]()
+        self.tr = List[Int]()
 
     def claim_thread(mut self) raises -> Int:
         """领一个 engine 编号（0, 1, 2 …）。第一条起来的线程不一定是第一条 spawn
@@ -451,6 +469,8 @@ struct Mailbox(Movable):
             return False
         self.jobs.append(job^)
         self.jobs_pushed += 1
+        if self.vio == 0 and self.jobs_pushed - self.jobs_taken != len(self.jobs):
+            self.vio = 1
         self.mutex.unlock()
         return True
 
@@ -472,6 +492,15 @@ struct Mailbox(Movable):
             if self.jobs[i].thread == thread:
                 job = self.jobs.pop(i)
                 self.jobs_taken += 1
+                self.tj.append(
+                    job.slot * 1000000 + job.gen * 10000 + job.kind * 100
+                )
+                if len(self.tj) > 24:
+                    _ = self.tj.pop(0)
+                if self.vio == 0 and self.jobs_pushed - self.jobs_taken != len(
+                    self.jobs
+                ):
+                    self.vio = 2
                 self.mutex.unlock()
                 # 出邮箱**之后**再自证：进来时是好的、出去时坏了 = 踩它的在邮箱里
                 # （`List` 的搬运、或者别处这次写穿到这儿）。
@@ -491,8 +520,19 @@ struct Mailbox(Movable):
                 + res.dump()
             )
         self.mutex.lock()
+        self.tr.append(
+            res.slot * 1000000 + res.gen * 10000 + res.kind * 100 + min(
+                res.n_bytes, 99
+            )
+        )
+        if len(self.tr) > 24:
+            _ = self.tr.pop(0)
         self.results.append(res^)
         self.results_pushed += 1
+        if self.vio == 0 and self.results_pushed - self.results_taken != len(
+            self.results
+        ):
+            self.vio = 3
         self.mutex.unlock()
 
     def first_result(mut self, mut slot: Int, mut gen: Int) raises -> Bool:
@@ -519,6 +559,10 @@ struct Mailbox(Movable):
             return False
         res = self.results.pop(0)
         self.results_taken += 1
+        if self.vio == 0 and self.results_pushed - self.results_taken != len(
+            self.results
+        ):
+            self.vio = 4
         self.mutex.unlock()
         if not res.intact():
             print("  [srv] a result was damaged in the mailbox: " + res.dump())
@@ -571,6 +615,9 @@ struct Mailbox(Movable):
         mut busy: Int,
         mut polls: Int,
         mut runs: Int,
+        mut jq: Int,
+        mut rq: Int,
+        mut vio: Int,
     ) raises:
         """七个诊断数**在锁内**一次读完。
 
@@ -590,6 +637,55 @@ struct Mailbox(Movable):
         busy = self.engine_busy
         polls = self.engine_polls
         runs = self.engine_runs
+        # `jpush - jtake` 必须等于 `jq`（每个派出去的活要么还在队里、要么已被取走）
+        # —— 对账的三个数一起读，破了就是字段/列表被写穿，见 `vio`。
+        jq = len(self.jobs)
+        rq = len(self.results)
+        vio = self.vio
+        self.mutex.unlock()
+
+    def counters_text(mut self) raises -> String:
+        """十一个诊断数**在锁内**拼成一个串（不走 `mut` 出参）。
+
+        为什么要另开一条：`read_counters` 的十一个 `mut` 出参在调用方是十一个局部
+        变量，而服务里打出来的数字出现过**在锁内不可能成立的组合**（`rpush > jtake`
+        —— `push_result` 只跟着被取走的活走）。最小复现（`scripts/tmp_mailbox_race.mojo`）
+        证明锁与 `List` 这一层不丢更新，那么剩下的可能就只有"出参这条路把值传错了"。
+        两条路同时打出来，一样就排除、不一样就定案。
+        """
+        self.mutex.lock()
+        var s = (
+            "jpush="
+            + String(self.jobs_pushed)
+            + " jtake="
+            + String(self.jobs_taken)
+            + " rpush="
+            + String(self.results_pushed)
+            + " rtake="
+            + String(self.results_taken)
+            + " busy="
+            + String(self.engine_busy)
+            + " polls="
+            + String(self.engine_polls)
+            + " runs="
+            + String(self.engine_runs)
+            + " jq="
+            + String(len(self.jobs))
+            + " rq="
+            + String(len(self.results))
+            + " vio="
+            + String(self.vio)
+        )
+        self.mutex.unlock()
+        return s^
+
+    def read_trace(mut self, mut jobs: List[Int], mut res: List[Int]) raises:
+        """拷一份最近取走的活与交回的结果（编码见 `tj` 的注释）。"""
+        self.mutex.lock()
+        for e in self.tj:
+            jobs.append(e)
+        for e in self.tr:
+            res.append(e)
         self.mutex.unlock()
 
     def set_stop(mut self) raises:
