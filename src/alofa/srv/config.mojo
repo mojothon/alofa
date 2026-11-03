@@ -82,6 +82,16 @@ struct ServeConfig(Movable):
     # 只读权重"那一层），所以把它调大之前先算内存。想并发又想让权重真的共享，加
     # worker（进程级共享靠 fork 的写时复制）。
     var engine_threads: Int
+    # 权重档：0 = fp32（默认），1 = 体走 q4_0（加载时在线量化），
+    # 2 = 体 q4_0 + 输出头 q8_0。
+    #
+    # ⚠️ **默认留 0**，因为 0 是"与参考实现逐字节相同"的那一档：q4 是有损的，
+    # 教师强制贪心一致率也是按量化档单独量的（见账本）。但 0 **不是**流量最小的
+    # 那一档 —— 每 token 要读 1975.8 MB，而账本里 q4_0+q8_head 只有 345.9 MB
+    # （5.7×）。decode 是带宽受限的，所以这个档位直接决定每 token 的墙钟。
+    # ⚠️ 非 0 档要**逐字节稳定**就配 `ALOFA_Q4_MUB=0`：mub 行带的结果随批组合
+    # 漂移 1–2 ULP，关掉它仍比 fp32 快约 2×（见账本第二十三条）。
+    var weight_bits: Int
 
     @staticmethod
     def from_env() raises -> ServeConfig:
@@ -111,4 +121,5 @@ struct ServeConfig(Movable):
             # 0 = 串行（生成在循环上）；>=1 = 那么多条 engine 线程（见字段上的注释：
             # 那条路现在会把请求搞坏，所以默认取 0）。
             engine_threads=env_int("ALOFA_ENGINE_THREADS", 0, 0, 16),
+            weight_bits=env_int("ALOFA_WEIGHT_BITS", 0, 0, 2),
         )

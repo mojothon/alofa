@@ -2165,3 +2165,36 @@
   - **打点补全**：批窗口行加 `blocks=<used>+<wanted>/<cap> cached= preempts=`（`ALOFA_BATCH_STATS=1`）。
     一次多轮压测曾出现 `running=0 waiting=1` 且每拍 48 行的空转（一条请求卡 WAITING 反复分块
     预填），受控单轮与本次多轮都没复现，`blocks=68+0/256 cached=2 preempts=0` —— 留待复现再追。
+- **2026-11-03（第二十三条）** —— 服务默认跑 fp32；接上量化档的同时修掉「批组合改数值」的 mub 分发缺陷
+  - **起点**：量宽度曲线时发现服务每 token 读 **1975.8 MB**（fp32，arena 1.98 GB），而账本
+    里 q4_0+q8_head 只有 345.9 MB —— decode 带宽受限，档位直接决定墙钟。但 `QwenForward`
+    的 `quantize=False` 是默认，服务从没开过量化。
+  - **接入**：`ServeConfig.weight_bits`（`ALOFA_WEIGHT_BITS`，0=fp32 默认 / 1=体 q4_0 /
+    2=体 q4_0+头 q8_0），`load_weights()` 一处决定装载，`spawn_twin` 按同档重载。默认留 0
+    （与参考实现逐字节的那一档）。
+  - **缺陷（修了）**：q4 + 默认 mub 下，8 条**相同** prompt 并发出 **7 种输出**、2 条截短
+    （fp32 同用例 1 种、8/8 一致；`ALOFA_Q4_MUB=0` 同样 8/8 ⇒ 定位到 mub）。根因在
+    `q4_matmul_rows_k` 的分流：`down_proj`（cols=4864）在 `n_tok≥4` 时选 `RB_WIDE=8`，
+    `8×4864 > MUB_ROWS_MAX_XQ(16384)` ⇒ 核内退回**精确通路**；`n_tok<4` 时 `RB_NARROW=2`
+    走 **mub**。mub 与精确通路不是逐位一致（多一层激活量化）⇒ 同一请求的数值随「这一步
+    批里有几行」漂移。**修法**：宽带装不下就降到窄带（仍 mub），不退精确；窄带也装不下
+    （cols>8192，本项目没有）才退 —— 那时对所有 `n_tok` 恒退，同样稳定。
+  - **新门（④）** `test_wide_batch_stays_on_the_mub_band`（进 `pixi run test`）：直接打
+    分发器，cols=4864、n_tok=8 的结果与精确行带**不许逐位相同**（负向对照），与逐行
+    `n_tok=1` 参照的相对 L2 ≤ 1%。**负向对照有效性验证过**：把分发器临时改回旧行为，
+    这条 FAIL；修后 PASS。⚠️ 不要求宽批与逐行参照逐位相同 —— mub 有损，RB 不同的实例化
+    有 1–2 ULP 漂移（实测 96 个元素 34 个不同，L2 千分量级）；要逐位稳定就用
+    `ALOFA_Q4_MUB=0`。服务对 `weight_bits>0 且 mub 开` 的情况启动时打一行提示。
+  - **数**（同轮，load 12.6–13.2，三档紧挨着跑；24 token）：
+    宽 1 —— fp32 169–193 / q4(MUB=0) 83–109 / q4(mub) 77–99 ms/token；
+    宽 8 —— fp32 571–598 / q4(MUB=0) 331–355 / q4(mub) 341–343 ms/token。
+    ⇒ q4 档约 **1.7–1.9×**；**MUB=0 与 MUB=1 在噪声内打平** ⇒ 推荐 q4 档配
+    `ALOFA_Q4_MUB=0`：逐位稳定不花钱。
+  - **门**：`pixi run test`（40 套件，含新门）、`test-q4-mub`（2/2，整网一致率下限仍过 ——
+    down_proj 在 prefill 也换到 mub 窄带后）、`test-q8-head`（4/4）、`test-batch-stream`
+    （6/6）、`test-http`（PASS）、`test-q4`（1/1）。
+  - **残余**：① `stalled(13) ticks=256` 间歇性复现（本轮宽 8 第 2 轮墙钟 94.55s，带打点
+    复测 5 轮干净；`blocks=140+0/256 cached=2 preempts=0`，块账在累积）—— 单独开条。
+    ② fp32 批路按**批行**切分（`w` 共享）⇒ 权重被读 shards 遍：4 片 × 1975.8 MB ÷
+    10.7 GB/s ≈ 738 ms，与实测 691 ms 吻合；按**输出列**切才能回到 1× 流量（TensorView
+    支持 strides，但 `linear_k` 假定连续）—— 下一入口。

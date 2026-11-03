@@ -66,7 +66,7 @@ from alofa.core.error import (
 )
 from alofa.core.rng import Rng
 from alofa.core.tensor import F32Ptr
-from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward
+from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
 from alofa.srv.config import ServeConfig
@@ -102,6 +102,28 @@ comptime BATCH_MAX_WAIT = 8
 # 为什么是 256：正常每 token 一拍（批满时加上 prefill 分块也不过十几拍），256 是
 # 一个数量级的余量 —— 上界只用来兜住"永远不前进"，不该在正常的排队等待时先跳出来。
 comptime MAX_PROGRESS_TICKS = 256
+
+
+def load_weights(weights_file: String, config_path: String, max_tokens: Int, weight_bits: Int) raises -> QwenForward:
+    """按 `weight_bits` 装一份模型（0 = fp32，1 = 体 q4_0，2 = 体 q4_0 + 头 q8_0）。
+
+    ⚠️ 量化是**加载后在线做的**：fp32 原始映射仍然留着（`enable_q4` 的注释里写了
+    为什么先不丢），所以这一档省的是每 token 的**读流量**，不是常驻内存。
+    """
+    var quantize = weight_bits >= 1
+    var model = QwenForward(weights_file, config_path, max_tokens, quantize)
+    if weight_bits >= 2:
+        model.enable_q8_output()
+    if weight_bits > 0 and q4_mub_enabled():
+        # 不静默：mub 有损，而批组合会改它走哪条行带 ⇒ 同一请求的数值会随别的
+        # 请求漂移 1–2 ULP（核级门 `test_q4_mub_rows.mojo` 量到 96 个元素里 34 个
+        # 不同）。要「温 0 下 8 并发与单跑逐字节一致」这条硬判据，就用
+        # `ALOFA_Q4_MUB=0`：实测宽度 8 仍有 22.9 tok/s（mub 开着 20–25，fp32 11.5）。
+        print(
+            "  [srv] note: ALOFA_Q4_MUB is on; set ALOFA_Q4_MUB=0 for byte-exact "
+            "greedy stability across batch compositions"
+        )
+    return model^
 
 
 def batch_default() -> Bool:
@@ -227,6 +249,9 @@ struct ModelService(Service, Twinable):
     var weights_file: String
     var config_path: String
     var tokenizer_json: String
+    # 权重档（见 `ServeConfig.weight_bits`）：`spawn_twin` 要**按同一档**重新加载，
+    # 否则同进程里两种精度的权重并存，答出来的 token 视走哪条路而定。
+    var weight_bits: Int
 
     def __init__(
         out self,
@@ -239,6 +264,7 @@ struct ModelService(Service, Twinable):
         weights_file: String,
         config_path: String,
         tokenizer_json: String,
+        weight_bits: Int,
     ) raises:
         self.model = model^
         self.tokenizer = tokenizer^
@@ -251,6 +277,7 @@ struct ModelService(Service, Twinable):
         self.weights_file = weights_file
         self.config_path = config_path
         self.tokenizer_json = tokenizer_json
+        self.weight_bits = weight_bits
         self.sampler = Sampler(vocab, MAX_SEQ_TOKENS)
         self.params = SampleParams()
         self.rng = Rng(UInt64(seed))
@@ -318,7 +345,7 @@ struct ModelService(Service, Twinable):
     def load(cfg: ServeConfig) raises -> ModelService:
         # 注意 params_dir 是权重**文件**，不是目录（真实 HF 目录里参数就是
         # `model.safetensors` 这一份，目录下没有散着的分片）。
-        var model = QwenForward(cfg.weights_file, cfg.config_path, cfg.max_tokens)
+        var model = load_weights(cfg.weights_file, cfg.config_path, cfg.max_tokens, cfg.weight_bits)
         var vocab = model.cfg.vocab
         var tokenizer = load_tokenizer_json(cfg.tokenizer_json)
         return ModelService(
@@ -331,6 +358,7 @@ struct ModelService(Service, Twinable):
             cfg.weights_file,
             cfg.config_path,
             cfg.tokenizer_json,
+            cfg.weight_bits,
         )
 
     def spawn_twin(self, index: Int) raises -> Int:
@@ -344,7 +372,9 @@ struct ModelService(Service, Twinable):
 
         分片数跟着原型走（多 worker 下它是 1，见 `main` 里那段 fork 的说明）。
         """
-        var model = QwenForward(self.weights_file, self.config_path, self.max_tokens)
+        var model = load_weights(
+            self.weights_file, self.config_path, self.max_tokens, self.weight_bits
+        )
         model.shards = self.model.shards
         var tokenizer = load_tokenizer_json(self.tokenizer_json)
         var twin = ModelService(
@@ -357,6 +387,7 @@ struct ModelService(Service, Twinable):
             self.weights_file,
             self.config_path,
             self.tokenizer_json,
+            self.weight_bits,
         )
         return heap_place(twin^)
 

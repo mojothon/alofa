@@ -23,6 +23,16 @@
 
 形状故意**除不尽**：`cols` 取 3 / 5 个块（96 / 160），`n_tok` 取 1 / 2 / 5 / 8，
 逼 `RB=2` 的整带与余下的单行后备路径都走到。
+
+④ **批组合不许换通路**（2026-11-03 加）：`down_proj` 的 `cols=4864` 时
+`RB_WIDE(8) × cols > MUB_ROWS_MAX_XQ(16384)`，核会退回**精确通路**；而 `n_tok<4` 时
+分发器用 `RB_NARROW=2` 走 **mub**。mub 与精确通路不是逐位一致的（多一层激活量化），
+于是同一请求的数值随「这一步批里有几行」漂移 —— 服务里 8 条相同 prompt 各出各的
+token（7 种输出 + 两条截短）。修法：宽带装不下就降到窄带（仍 mub），别退精确。
+这条用例直接打**分发器**：宽批与精确行带**不许逐位相同**（负向对照，改之前必然红），
+同时宽批与逐行参照的相对 L2 必须在 1% 内。
+⚠️ 不要求宽批与逐行参照**逐位相同**：mub 有损，RB 不同的实例化会有 1–2 ULP 漂移
+（实测 96 个元素里 34 个不同，L2 仍在千分量级）。要逐位稳定就用 `ALOFA_Q4_MUB=0`。
 """
 
 from std.math import sqrt
@@ -37,6 +47,7 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_mub_rows_band,
 )
 from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, quantize_q4_0
+from alofa.model.arch.qwen import BACKEND_AVX2, q4_matmul_rows_k, q4_mub_enabled
 
 comptime ROWS = 12
 comptime GUARD = 16
@@ -265,6 +276,74 @@ def test_a_bad_destination_stride_trips_the_guard() raises:
         touched > 0,
         "守卫区没抓住多乘 4 的步长：这个守卫抓不住它本该抓的 bug",
     )
+    arena.keep_alive()
+
+
+def test_wide_batch_stays_on_the_mub_band() raises:
+    """④ 宽批不许退回精确行带（down_proj 形状，走真分发器）。
+
+    负向对照：mub 开着时，n_tok=8 的结果**不许**与精确行带逐位相同 —— 相同就说明
+    分发器退回去了（2026-11-03 那个缺陷的原样），守卫会瞎。改之前这里必然红。
+    mub 关着时两条都精确，这条对照不适用，跳过。
+
+    另把宽批与「逐行 n_tok=1」的参照比相对 L2：只许 1–2 ULP 的漂移，不许又变成
+    换通路那种量级。逐位相同是 mub 给不了的（多一层激活量化），不拿它当判据。
+    """
+    comptime COLS = 4864  # down_proj 的 inner：8 × 4864 = 38912 > 16384
+    comptime NT = 8
+    var nb = COLS // Q4_BLOCK
+    var nbytes = (
+        ROWS * COLS * 4
+        + ROWS * nb * Q4_BYTES
+        + NT * COLS * 4
+        + 3 * (NT * ROWS + GUARD) * 4
+        + 65536
+    )
+    var arena = Arena(nbytes)
+    var w = arena.alloc(ROWS * COLS * 4).unsafe_bitcast[Float32]()
+    var blocks = arena.alloc(ROWS * nb * Q4_BYTES)  # RawPtr == Q4_U8
+    var x = arena.alloc(NT * COLS * 4).unsafe_bitcast[Float32]()
+    var d_one = arena.alloc((NT * ROWS + GUARD) * 4).unsafe_bitcast[Float32]()
+    var d_batch = arena.alloc((NT * ROWS + GUARD) * 4).unsafe_bitcast[Float32]()
+    var d_exact = arena.alloc((NT * ROWS + GUARD) * 4).unsafe_bitcast[Float32]()
+
+    var seed = UInt64(20261103)
+    for i in range(ROWS * COLS):
+        seed = u32_seed_next(seed)
+        w[unsafe_offset=i] = Float32(Int((seed >> 40) & UInt64(0xFFFF))) / Float32(
+            32768.0
+        ) - Float32(1.0)
+    quantize_q4_0(blocks, w, ROWS * COLS)
+    fill_activation(x, NT, COLS, False)
+
+    # 逐行参照（n_tok=1）与整批（n_tok=8）走同一个分发器
+    for t in range(NT):
+        q4_matmul_rows_k[BACKEND_AVX2](
+            d_one.unsafe_offset(t * ROWS),
+            x.unsafe_offset(t * COLS),
+            blocks,
+            1,
+            ROWS,
+            COLS,
+            ROWS,
+        )
+    q4_matmul_rows_k[BACKEND_AVX2](
+        d_batch, x, blocks, NT, ROWS, COLS, ROWS
+    )
+    var rel = rel_l2(d_batch, d_one, NT * ROWS)
+    assert_true(
+        rel <= MUB_REL_L2_GATE,
+        "宽批与逐行参照的相对 L2 超了（像是又换了通路）：rel=" + String(rel),
+    )
+
+    # 负向对照：宽批确实还在 mub 上，没退回精确行带
+    if q4_mub_enabled():
+        matmul_q4_f32_rows_band(d_exact, x, blocks, NT, ROWS, COLS, ROWS)
+        var mub_diffs = bitwise_diffs(d_batch, d_exact, NT * ROWS)
+        assert_true(
+            mub_diffs > 0,
+            "宽批与精确行带逐位相同：分发器退回精确通路了（mub 没生效）",
+        )
     arena.keep_alive()
 
 

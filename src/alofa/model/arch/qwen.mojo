@@ -80,6 +80,7 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_mub as matmul_q4_mub_vec,
     matmul_q4_mub_bias as matmul_q4_mub_bias_vec,
     matmul_q8_f32_vec,
+    MUB_ROWS_MAX_XQ,
 )
 from alofa.kernels.cpu.avx2 import (
     add as add_vec,
@@ -699,7 +700,18 @@ def q4_matmul_rows_k[backend: Int](
             # 分流只在 `n_tok` 上：decode 走 `n_tok=1` ⇒ 可复用行为 0，大 `RB` 只会白占
             # lane（实测退化 8–24%），所以它必须留在窄带那条；prefill 每片 ≥4 行时才
             # 换宽带（实测把遍数 2→1）。
-            if n_tok >= Q4_MUB_ROWS_MIN_TOK:
+            #
+            # ⚠️ 宽带装不下（`RB * cols > MUB_ROWS_MAX_XQ`）时**降到窄带**，不要让核
+            # 退回精确通路：mub 与精确通路**不是逐位一致**（多一层激活量化），退不退若
+            # 由 `n_tok` 决定，同一请求的数值就随批组合漂移 —— 8 条相同 prompt 各出
+            # 各的 token（2026-11-03 实测 7 种输出；fp32 与 `ALOFA_Q4_MUB=0` 都 8/8 一
+            # 致，定位到这里）。`down_proj`（cols=4864）正是这一档：RB=8 时 38912 超
+            # 16384 退精确、RB=2 时 9728 走 mub。窄带也装不下（cols > 8192，本项目没有）
+            # 才退精确 —— 那时对所有 `n_tok` 恒退，同样稳定。
+            var wide = n_tok >= Q4_MUB_ROWS_MIN_TOK and (
+                Q4_MUB_ROWS_RB_WIDE * cols <= MUB_ROWS_MAX_XQ
+            )
+            if wide:
                 if junk == 0:
                     matmul_q4_mub_rows_band_vec[Q4_MUB_ROWS_RB_WIDE, 0](
                         dst, x, blocks, n_tok, rows, cols, dst_stride
