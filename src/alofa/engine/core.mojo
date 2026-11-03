@@ -64,7 +64,14 @@ from alofa.engine.executor import (
     int_map,
 )
 from alofa.engine.kv_room import KvRoom
-from alofa.engine.scheduler import Action, SchedConfig, SchedInput, Scheduler
+from alofa.engine.scheduler import (
+    ST_RUNNING,
+    ST_WAITING,
+    Action,
+    SchedConfig,
+    SchedInput,
+    Scheduler,
+)
 from alofa.model.arch.qwen import BACKEND_SCALAR, QwenForward
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 
@@ -652,6 +659,14 @@ struct EngineCore:
                 self.ex.abandon()
                 raise err.copy()
         return rows
+
+    def running_count(self) -> Int:
+        """当前 RUNNING（每条一拍一 token）的请求数 —— 批宽度的上界。"""
+        return self.sched.count_state(ST_RUNNING)
+
+    def waiting_count(self) -> Int:
+        """当前 WAITING（还没 prefill 完、进不了解码）的请求数。"""
+        return self.sched.count_state(ST_WAITING)
 
     def step_owes(self, i: Int) -> Bool:
         """Slot `i` is owed a token this step (it is live and was served)."""

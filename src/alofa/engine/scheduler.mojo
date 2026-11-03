@@ -460,6 +460,15 @@ struct Scheduler:
                     total += want
         return total
 
+    def count_state(self, want: Int) -> Int:
+        """有多少槽位处于 `want` 态。只给诊断用（批宽度为什么上不去，第一个要
+        分清的就是"卡在 WAITING"还是"根本没进来"）。"""
+        var n = 0
+        for i in range(MAX_BATCH):
+            if self.state[i] == want:
+                n += 1
+        return n
+
     def digest(self) -> Int:
         """Integer rolling hash of the state, so a trace can be checked for more
         than just the emitted plan."""

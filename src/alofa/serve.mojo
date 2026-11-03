@@ -174,6 +174,14 @@ struct ModelService(Service, Twinable):
     # 关掉它（`ALOFA_BATCH=0`）就是退回批调度之前那条路：一条一条跑。所以它也
     # 是"批调度出问题时"的退路 —— 明着慢，而不是静默变慢。
     var batch_enabled: Bool
+    # 批路开窗统计（`ALOFA_BATCH_STATS=1` 才开，默认零输出）：一拍一行太吵、没有又
+    # 判不了"批到底拼起来没有" —— tick 级探针说 2.36×，端到端却只多 7%，第一个要
+    # 看的数就是**宽度**。`window_*` 每 64 拍清一次，`ticks` 是本次进程的总数。
+    var batch_stat_on: Bool
+    var batch_ticks: Int
+    var batch_win_ticks: Int
+    var batch_win_widths: Int
+    var batch_win_max: Int
 
     # 批调度（P2 已 verified 的那条执行器）：一次前向推进**多条**请求。
     var engine: EngineCore
@@ -256,6 +264,11 @@ struct ModelService(Service, Twinable):
         self.stream_started = False
         self.stream_request = NO_REQUEST
         self.batch_enabled = batch_default()
+        self.batch_stat_on = getenv("ALOFA_BATCH_STATS", "") == "1"
+        self.batch_ticks = 0
+        self.batch_win_ticks = 0
+        self.batch_win_widths = 0
+        self.batch_win_max = 0
         # 批路：形状参数全部来自**这份权重**（不从配置里再抄一遍 —— 抄错了会静默
         # 算错，而从同一个 cfg 读出来的是同一份真值）。
         self.engine = EngineCore(
@@ -743,6 +756,32 @@ struct ModelService(Service, Twinable):
                 )
             raise err.copy()
         self.engine.settle(chosen)
+        if self.batch_stat_on:
+            self.batch_ticks += 1
+            self.batch_win_ticks += 1
+            self.batch_win_widths += rows
+            if rows > self.batch_win_max:
+                self.batch_win_max = rows
+            if self.batch_win_ticks >= 64:
+                print(
+                    "  [srv] batch: ticks="
+                    + String(self.batch_ticks)
+                    + " window_ticks="
+                    + String(self.batch_win_ticks)
+                    + " window_width_sum="
+                    + String(self.batch_win_widths)
+                    + " window_width_max="
+                    + String(self.batch_win_max)
+                    + " running="
+                    + String(self.engine.running_count())
+                    + " waiting="
+                    + String(self.engine.waiting_count())
+                    + " queued="
+                    + String(len(self.w_req))
+                )
+                self.batch_win_ticks = 0
+                self.batch_win_widths = 0
+                self.batch_win_max = 0
         return rows
 
     def _batch_pick(mut self, slot: Int, logits: F32Ptr) raises AlofaError -> Int:
@@ -775,6 +814,13 @@ struct ModelService(Service, Twinable):
         一次 `tick` 推进**所有**在批里的请求 —— 这正是批调度的收益所在：八条流的
         第 k 个 token 是同一次前向算出来的。
         """
+        # ⚠️ `want` 是**引擎交出的 token 数**，不是"我调了几次"。早先这里记的是
+        # 调用次数（`b_n = want + 1`），与引擎的 `n_out` 一旦错开 —— 一拍里引擎
+        # 可能已经推进了两步、或者这一拍纯粹是"回炉重填" —— 就会出现"缓冲里有
+        # token、`_batch_text` 却交空串"（文本在上一帧已经发完了）。而空串在
+        # `step_stream` 那里是**流结束**的暗号：客户端于是拿到一条正文被截短、
+        # 却带着 `finish_reason` 与 `[DONE]` 的"正常"流 —— 实测 8 并发同 prompt
+        # 下 7/8 条短一截，温 0 也不一致（丢的是尾巴，不是算错）。
         var want = self.b_n[slot]
         var spins = 0
         while self.engine.n_output(request) <= want:
@@ -799,6 +845,28 @@ struct ModelService(Service, Twinable):
         if self.engine.n_output(request) <= want:
             # 引擎交不出更多了：这条流到终点了（也可能被抢占后没再排上 —— 无论哪
             # 一种，"给一个终点"都比"一直等"好：后者在客户端是永远等不到 `[DONE]`）。
+            if self.batch_stat_on:
+                # 为什么"交不出更多"是个必须说清的事：它决定了客户端看到的是
+                # "答完了"还是"答到一半"。`n_out` 掉回 `want` 以下只有两种来路 ——
+                # 引擎按 `max_new` 收工（正常），或请求被抢占/整槽回炉（错）。
+                print(
+                    "  [srv] batch end: req="
+                    + String(request)
+                    + " want="
+                    + String(want)
+                    + " n_out="
+                    + String(self.engine.n_output(request))
+                    + " in_slot="
+                    + String(self.engine.find(request))
+                    + " done="
+                    + String(self.engine.is_done(request))
+                    + " preempts="
+                    + String(self.engine.preempt_total())
+                    + " running="
+                    + String(self.engine.running_count())
+                    + " waiting="
+                    + String(self.engine.waiting_count())
+                )
             return StreamToken("", True, False)
         var arena = Arena(MAX_GEN * 8 + 64)
         var dest = int_map(arena.alloc(MAX_GEN * 8))
@@ -807,8 +875,18 @@ struct ModelService(Service, Twinable):
             self.b_out[slot * MAX_GEN + i] = dest[unsafe_offset=i]
         arena.keep_alive()  # 同上：指针用完之前 arena 不许析构
         var text = self._batch_text(slot, n)
-        self.b_n[slot] = want + 1
-        return StreamToken(text, self.b_n[slot] >= self.b_steps[slot], False)
+        # 口径跟引擎对齐：`b_n` 是**已经交出的 token 数**（`_batch_pick` 拿它当
+        # 历史的长度，也拿它判断"到 max_new 了没有"）。
+        self.b_n[slot] = n
+        if text.byte_length() == 0 and n < self.b_steps[slot]:
+            # 交了 token 但这段没有新文本（比如 tokens 都落在上一帧的同一个
+            # 多字节字符里）。**这不是终点** —— 再要一步，绝不把空串交出去：
+            # 空串在 `step_stream` 那里就是"流结束"。
+            want = n
+            if not self.engine.has_work():
+                return StreamToken("", True, False)
+            return self._batch_next(slot, request)
+        return StreamToken(text, n >= self.b_steps[slot], False)
 
     def _batch_text(mut self, slot: Int, n: Int) raises -> String:
         """批路这一步新增的文本 —— 与 `_new_text` **同一个**算法（整段前缀解码减去

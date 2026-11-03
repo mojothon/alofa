@@ -926,6 +926,15 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
             try:
                 token = self.service.stream_next(request)
             except err:
+                # 这一帧 error 是客户端**唯一**能看到的痕迹，而它常常被当成
+                # "答完了"（正文短了、`[DONE]` 也到了）。日志里必须留一条 ——
+                # 否则"偶发地少几个字"没有任何着手点。
+                print(
+                    "  [srv] stream failed on slot="
+                    + String(request)
+                    + ": "
+                    + String(err)
+                )
                 self.stream_phase[request] = STREAM_DONE
                 return sse_frame(
                     error_json(String(err), "server_error", "stream_failed")

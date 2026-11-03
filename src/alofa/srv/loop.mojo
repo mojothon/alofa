@@ -1182,12 +1182,21 @@ struct Loop(Movable):
 
     def progress[H: Handler](mut self, mut handler: H) raises:
         """每一条连接往前走一步：流在途的喂一帧，别的试着切一个请求来答。"""
-        # 一次一条流（handler 的流状态只有一份）：有流在途就先喂它，这一轮不再答
-        # 新的请求 —— 否则第二条流会从第一条的中间接着取帧。
-        var s = self.streaming_slot()
-        if s >= 0:
-            self.step_stream[H](handler, s)
-            return
+        # 先喂**每一条**在途的流各一帧，再切新请求。
+        #
+        # "一次一条流"是批调度之前的老约束：那时 handler 的流状态只有一份，第二条
+        # 流会从第一条的中间接着取帧。批路把状态按槽位分开了（`b_req` 一族），
+        # 一拍前向就推进**所有**在批请求（`_batch_tick`），其余调用只是吃缓冲 ——
+        # 所以逐条喂完，一轮仍然只有**一拍**前向。
+        #
+        # 留着这条老约束的代价是实测出来的：`ENGINE_THREADS=0` 下 8 并发 16 token
+        # 的每拍宽度恒为 **1**（`ALOFA_BATCH_STATS` 窗口 `width_sum=64/64`），总
+        # 吞吐只有单流的 1.07× —— 八条流被排成一条队，批从未拼起来。采样那条老路
+        # 仍然只有一条在途（`submit` 对第二条采样流指名拒绝），所以放宽它不改变
+        # 那条路的语义。
+        for slot in range(len(self.live)):
+            if self.live[slot] == 1 and self.streaming[slot] == 1:
+                self.step_stream[H](handler, slot)
         for slot in range(len(self.live)):
             if self.live[slot] == 0:
                 continue

@@ -2084,3 +2084,33 @@
     下一个入口 = 引擎侧批执行与 `Job.raw` 的写穿点。
   - **门**：`pixi run test`（全绿，含 `check-ledger`）、`test-http`（PASS，跑前
     `pkill -f http_e2e`）。
+- **2026-11-03（第二十条）** —— 批从未拼起来：`progress` 一次只驱动一条流；外加"空帧当终点"的静默截短
+  - **宽度打点**（`ALOFA_BATCH_STATS=1`，窗口 64 拍）才是判"批拼没拼起来"的数：改前
+    `window_width_sum=64/64` = **每拍恒 1 行**，`running=1 waiting=0 queued=0`，`w_req`
+    长度恒 0（队列只 append，长度不回落 ⇒ 八条请求都提交过）。八条流被排成一条队，
+    所以 8 并发 16 token 的聚合吞吐只有单流的 1.07×（5.2 vs 5.1 tok/s）——tick 级探针
+    的 2.36× 从来没到过端到端。
+  - **根因一（`progress`）**：`ENGINE_THREADS=0` 那条路上 `progress` 开头是
+    "有流在途就喂它、这一轮不再答新请求"——那是批调度之前"handler 流状态只有一份"的
+    老约束。批路状态早已按槽位分开（`b_req` 一族），一拍前向推进所有在批请求。改成
+    **逐条喂完所有在途流、再按原规矩一轮答一个新请求**：`running` 1→4、宽度 1→5.9
+    （峰值 8）。
+  - **根因二（`_batch_next`）**：`b_n` 记的是**调用次数**而引擎的 `n_out` 是 **token
+    数**。两者一错开，某次调用就会拿到"缓冲里有 token、文本已在上一帧发完"的**空串**，
+    而空串在 `step_stream` 那里是"流结束"的暗号 ⇒ 客户端拿到一条正文被截短、却带着
+    `finish_reason` 与 `[DONE]` 的"正常"流（8 并发同 prompt 下 7/8 条短一截，温 0
+    也不一致；丢的是尾巴，不是算错）。改成 `b_n = n`（与引擎同口径）且**空帧不许当
+    终点**（再要一步）。
+  - **顺带补的日志**：handler 的 `except err` 分支原来静默回一帧 error —— 客户端只看到
+    "短了"。现在打印 `stream failed on slot=…: …`；正是它把下面那批 KV room 错误捞了出来。
+  - **实测**（同轮 A/B，`ENGINE_THREADS=0`，16 token）：单流 184–223 ms/token（4.9–5.4
+    tok/s）；8 并发 529–577 ms/token、128 token / 9.6 s ≈ **13.3 tok/s**（改前 856–927
+    ms/token、墙钟 24.5–25.5 s、聚合 5.1 tok/s）⇒ **聚合 2.7×、墙钟 2.6×**。8 token 用例
+    8 并发与单跑**逐字节一致 8/8**（温 0）。
+  - **门**：`pixi run test`（全绿）、`test-http`（PASS）、`test-batch-stream`（服务层批一致
+    性门，6/6 通过）。
+  - **残余（新入口，引擎侧）**：8 并发 × 32 token（prompt 34 + 生成 30）撞 KV room：
+    `capacity(5): radix tree is full`、`invalid_argument(1): duplicate request id (kv room)`、
+    `the scheduler asked to decode a request that is not resident`、
+    `the request has fewer blocks than it has history`。都是"请求号 = 连接槽位"复用与
+    room 节点预算的交互；16 token 不触发。下一步从这里进。
