@@ -1858,6 +1858,123 @@ def _matmul_q8_vec(
         dst[unsafe_offset=row] = Float32(acc)
 
 
+def matmul_q8_f32_rows_band[RB: Int = 8](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: Q8_U8,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """`RB` 个 token 行共用一遍权重读：`dst[rb, o] = Σ_c w[o,c] · x[rb, c]`。
+
+    批路的输出投影专用（账本二十七）：批路此前把头交给 fp32 通路，一步读
+    544 MB；q8 块流是 165 MB，但逐 token 的 `matmul_q8_f32_vec` 会把这份读乘以
+    批宽。行带结构与 `_matmul_q4_halves_rows` 同一招 —— 权重的 load/解量化与
+    输入行无关，`RB` 行共用一次。
+
+    **逐位等于**对每个 token 单独调 `matmul_q8_f32_vec`：每个 token 行自己的
+    累加结构（四条 f32 向量按块序累加、行末一次归约进 f64）与单行版一字不差，
+    只是那段算术被搬进了 `comptime for rb` 的循环体里。这条相等由
+    `test_q8_rows_band.mojo` 盯。
+
+    ⚠️ `dst` 第 `t` 个 token 的第 `row` 个输出落在 `t * dst_stride + row`（批路
+    的 logits 行是隔开的）；`x` 步长固定 `cols`。指针全是类型化的，
+    `unsafe_offset` 按**元素**走。`dst_stride >= rows` 由调用方保管（q4 行带核
+    同款约定）。余数 token（不足 `RB` 个）走单行通路。
+
+    ⚠️ RB=8 时每 token 4 条 f32 累加器共 32 条 ymm，必然溢栈 —— 头是带宽受限
+    的（165 MB 一次流），溢栈伤的是算术吞吐不是流量；量过不行再降 RB，别提前
+    优化。
+    """
+    if n_tok <= 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "a token batch must hold at least one row",
+            "n_tok=" + String(n_tok),
+        )
+    if dst_stride < rows:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "the destination stride must span a whole row band",
+            "dst_stride=" + String(dst_stride) + " rows=" + String(rows),
+        )
+    if cols % Q8_BLOCK != 0:
+        raise AlofaError(
+            ERR_SHAPE_MISMATCH,
+            "inner dimension must be a whole number of blocks",
+            "cols=" + String(cols) + " block=" + String(Q8_BLOCK),
+        )
+    var blocks_per_row = cols // Q8_BLOCK
+    var sblocks = blocks.unsafe_bitcast[Int8]()
+    var limit = n_tok - n_tok % RB if n_tok >= RB else 0
+    var t = 0
+    while t < limit:
+        var x0 = x.unsafe_offset(t * cols)
+        var d0 = dst.unsafe_offset(t * dst_stride)
+        for row in range(rows):
+            var base_row = row * blocks_per_row
+            var acc = InlineArray[Float64, RB](fill=Float64(0))
+            var va = InlineArray[SIMD[DType.float32, W_Q8], RB](
+                fill=SIMD[DType.float32, W_Q8](0)
+            )
+            var vb = InlineArray[SIMD[DType.float32, W_Q8], RB](
+                fill=SIMD[DType.float32, W_Q8](0)
+            )
+            var vc = InlineArray[SIMD[DType.float32, W_Q8], RB](
+                fill=SIMD[DType.float32, W_Q8](0)
+            )
+            var vd = InlineArray[SIMD[DType.float32, W_Q8], RB](
+                fill=SIMD[DType.float32, W_Q8](0)
+            )
+            var b = 0
+            while b < blocks_per_row:
+                var base = (base_row + b) * Q8_BYTES
+                var dv = SIMD[DType.float32, W_Q8](block_scale(blocks, base))
+                var v0 = sblocks.unsafe_load[width=W_Q8](
+                    base + Q8_SCALE_BYTES
+                ).cast[DType.float32]()
+                var v1 = sblocks.unsafe_load[width=W_Q8](
+                    base + Q8_SCALE_BYTES + W_Q8
+                ).cast[DType.float32]()
+                var v2 = sblocks.unsafe_load[width=W_Q8](
+                    base + Q8_SCALE_BYTES + 2 * W_Q8
+                ).cast[DType.float32]()
+                var v3 = sblocks.unsafe_load[width=W_Q8](
+                    base + Q8_SCALE_BYTES + 3 * W_Q8
+                ).cast[DType.float32]()
+                var xb = b * Q8_BLOCK
+                comptime for rb in range(RB):
+                    var xr = rb * cols + xb
+                    va[rb] = v0.fma(x0.unsafe_load[width=W_Q8](xr) * dv, va[rb])
+                    vb[rb] = v1.fma(
+                        x0.unsafe_load[width=W_Q8](xr + W_Q8) * dv, vb[rb]
+                    )
+                    vc[rb] = v2.fma(
+                        x0.unsafe_load[width=W_Q8](xr + 2 * W_Q8) * dv, vc[rb]
+                    )
+                    vd[rb] = v3.fma(
+                        x0.unsafe_load[width=W_Q8](xr + 3 * W_Q8) * dv, vd[rb]
+                    )
+                b += 1
+            comptime for rb in range(RB):
+                acc[rb] += Float64((va[rb] + vb[rb] + vc[rb] + vd[rb]).reduce_add())
+                d0[unsafe_offset=rb * dst_stride + row] = Float32(acc[rb])
+        t += RB
+    while t < n_tok:
+        _matmul_q8_vec(
+            dst.unsafe_offset(t * dst_stride),
+            x.unsafe_offset(t * cols),
+            blocks,
+            rows,
+            cols,
+            dst,
+            False,
+        )
+        t += 1
+
+
 def matmul_q8_f32_vec(
     dst: F32Ptr, x: F32Ptr, blocks: Q8_U8, rows: Int, cols: Int
 ) raises AlofaError:

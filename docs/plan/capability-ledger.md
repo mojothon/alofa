@@ -2269,3 +2269,24 @@
     墙钟 792s → 258s。
   - **关联**：会话一的孤立 `stalled(13)`（2 条截断流）大概率同源（块账虚涨把水位顶死），
     未证同一；若再复发，先看 `preempts` 是否又在涨、`blocks` 是否钉在水位线上。
+- **2026-11-04（第二十七条）** —— ✅ q4 主战档批路余量（一）：批头走 q8 行带核
+  - **起点**：宽 8 聚合 23.1 tok/s vs 单流 17.7 —— 批几乎没赚到。第一版宽度曲线
+    （非流式）显示"步时随批宽线性涨"是**假象**：非流式 `/v1/chat/completions` 走
+    老串行路、根本不进批调度；**量批路必须用流式**。
+  - **profile 打点**（executor.forward 加 K_STEP/K_ROPE_ATTN/K_HEAD，编译期门，
+    `ALOFA_PROFILE=1` 时随批统计行 dump）：宽 8 一步 301 ms 里 q4 体核 131.6 +
+    **fp32 头 72.0**（批路经 `project(Q4_NO_SLOT)` 落 fp32 通路 —— q8 头块流明明
+    加载了，批路没用）+ 标量注意力 57.6 + qkv bias 路 ~40（未打点）。
+  - **修**：`matmul_q8_f32_rows_band[RB=8]`（一个 q8 块只 load/解量化一次、`RB` 个
+    token 行共用；每 token 行的累加结构与单行 vec 核一字不差 ⇒ **逐位一致**）+
+    `q8_matmul_rows_k_shards`（行带 × 整批，切法同 q4 行带）+
+    `QwenForward.project_head_batch`（q8 优先、fp32 回退）+ executor 接线。
+  - **门**：`test_q8_rows_band.mojo`（逐位等于单行核 + 哨兵/守卫区 + 两条负向对照）。
+    TDD 过程里红出两个真 bug：带内写出漏 `rb * dst_stride` 和 `+ row` —— 96 行全写
+    进同一格。q8/q4/引擎/批路/http/全量套件全绿。
+  - **数**（load 5.8，与基线同水位）：宽 8 每步 346 → **251 ms**，聚合 23.1 →
+    **31.8 tok/s（1.38×）**；单流不变（56 ms）；批摊销 6.2× → 4.5×；15 轮 × 8 =
+    120 条 0 截断。
+  - **余量清单（下一步入口）**：标量分页注意力 57.6 ms/步（向量化是核工程）；
+    qkv bias 路 f64 累加 RB=2（~40 ms）；forward 之外 ~50 ms/步（pick/settle/
+    scheduler）。llama.cpp q4_0 tg32 单流 40.7 tok/s（同机带载）仍是单流天花板参照。

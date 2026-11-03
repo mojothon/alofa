@@ -58,6 +58,7 @@ from alofa.runtime.kv import (
     MAX_BLOCKS_PER_SEQ,
     MAX_SEQ_TOKENS,
 )
+from alofa.model.profiler import K_HEAD, K_ROPE_ATTN, K_STEP
 from alofa.model.arch.qwen import (
     BACKEND_SCALAR,
     EMBED,
@@ -697,6 +698,7 @@ struct BatchExecutor:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "the step was not borrowed for", ""
             )
+        var t_step = model.prof.now()
         var h = self.hidden
         var kv_dim = self.kv_dim
         var hidden = rows_view(self.raw_of(0), t, h)
@@ -817,6 +819,7 @@ struct BatchExecutor:
                     self.v_cache, table, self.hist[i], v.slice_dim(0, at, n)
                 )
 
+            var t_at = model.prof.now()
             # One call per request, each with its own table: a row attends to
             # its own history because it is given that history's address, not
             # because a mask says it may not look further.
@@ -837,6 +840,7 @@ struct BatchExecutor:
                     self.n_kv_heads,
                     self.head_dim,
                 )
+            _ = model.prof.tick(K_ROPE_ATTN, t_at)
             model.project[backend](
                 proj,
                 attn,
@@ -898,8 +902,13 @@ struct BatchExecutor:
         # 好的 —— 症状看着像"批调度不能用"，其实是这一行没有跟上模型层。
         # 名字先拷到局部：`model` 要被 `project` 可变借用，而 `model.head` 是它的
         # 字段，两个借用同时存在编译不过（先把值拷出来是这里唯一干净的做法）。
-        var head = model.head
-        model.project[backend](logits, tail_normed, head, Q4_NO_SLOT, logits, False)
+        var t_h = model.prof.now()
+        # 头走 q8 块流（q8 档）：批路此前经 `project(Q4_NO_SLOT)` 落进 fp32 通路，
+        # 一步读 544 MB —— q8 档明明加载了 165 MB 的头块流却没用上（账本二十七）。
+        model.project_head_batch(logits, tail_normed)
+        _ = model.prof.tick(K_HEAD, t_h)
+        _ = model.prof.tick(K_STEP, t_step)
+        model.prof.count_step()
         return served
 
     def logits_of(self, request: Int) raises AlofaError -> F32Ptr:

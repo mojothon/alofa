@@ -37,6 +37,7 @@ comptime K_VIEW = 5
 comptime K_PREP = 6
 comptime K_GEMM = 7
 comptime K_ROPE = 8
+comptime K_STEP = 9
 
 
 def _f2(x: Float64) -> String:
@@ -66,6 +67,7 @@ struct ForwardProf(Movable):
     var view: Int
     var prep: Int
     var gemm: Int
+    var step: Int
     var tokens: Int
 
     def __init__(out self):
@@ -79,6 +81,7 @@ struct ForwardProf(Movable):
         self.view = 0
         self.prep = 0
         self.gemm = 0
+        self.step = 0
         self.tokens = 0
 
     @always_inline
@@ -112,11 +115,19 @@ struct ForwardProf(Movable):
             self.gemm += t1 - t0
         elif k == K_ROPE:
             self.rope += t1 - t0
+        elif k == K_STEP:
+            self.step += t1 - t0
         return t1
 
     @always_inline
     def count_token(mut self):
         """一个 token 走完。默认档是空操作。"""
+        comptime if ALOFA_PROFILE:
+            self.tokens += 1
+
+    @always_inline
+    def count_step(mut self):
+        """批路一个 forward（= 一次整步）走完；样本数与单路的 tokens 共用桶。"""
         comptime if ALOFA_PROFILE:
             self.tokens += 1
 
@@ -131,6 +142,7 @@ struct ForwardProf(Movable):
         self.view = 0
         self.prep = 0
         self.gemm = 0
+        self.step = 0
         self.tokens = 0
 
     def dump(imm self):
@@ -175,6 +187,11 @@ struct ForwardProf(Movable):
             + _f2(Float64(self.prep) / per_nb / 1000000.0 * 1000.0)
             + " µs/次 · 合计 "
             + _f2(Float64(self.prep) / n / 1000000.0)
+            + " ms"
+        )
+        print(
+            "       整步（executor.forward，每样本一步）  "
+            + _f2(Float64(self.step) / n / 1000000.0)
             + " ms"
         )
         print(

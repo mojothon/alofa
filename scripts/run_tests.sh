@@ -56,6 +56,7 @@ SUITES=(
   "tests/unit/test_sampler_parity.mojo|-O0 -I src"
   "tests/unit/test_q4_parity.mojo|-O0 -I src"
   "tests/unit/test_q8_parity.mojo|-O0 -I src"
+  "tests/unit/test_q8_rows_band.mojo|-O0 -I src"
   "tests/unit/test_q4_matmul_vec.mojo|-O0 -I src"
   "tests/unit/test_q4_rows.mojo|-O0 -I src"
   # `vpmaddubsw` 行带通路的核级差分门：贴着默认 f32 行带（相对 L2 ≤ 1%）+ 两条通路

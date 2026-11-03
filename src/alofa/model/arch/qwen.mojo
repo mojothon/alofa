@@ -75,6 +75,7 @@ from alofa.kernels.cpu.avx2 import (
     matmul_q4_f32_bias as matmul_q4_f32_bias_vec,
     matmul_q4_f32_rows_band as matmul_q4_f32_rows_band_vec,
     matmul_q4_f32_bias_rows_band as matmul_q4_f32_bias_rows_band_vec,
+    matmul_q8_f32_rows_band as matmul_q8_f32_rows_band_vec,
     matmul_q4_mub_rows_band as matmul_q4_mub_rows_band_vec,
     matmul_q4_mub_bias_rows_band as matmul_q4_mub_bias_rows_band_vec,
     matmul_q4_mub as matmul_q4_mub_vec,
@@ -707,6 +708,100 @@ def q8_matmul_k_shards[backend: Int](
     tg.wait()
 
 
+def q8_matmul_rows_k[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+) raises AlofaError:
+    """按 `backend` 分发的整批 q8_0 投影（无偏置；批路的输出投影用它）。
+
+    `n_tok=1` 时就是 `q8_matmul_k`（同一份权重读，无摊销可言）；`n_tok>1` 走
+    行带核，一个 q8 块只为 `RB` 行解量化一次 —— 头是全模型最大的单次读，批路
+    不摊销它就等于把 fp32 那份流量原样买回来（账本二十七）。
+    """
+    comptime if uses_vector_backend[backend]():
+        if n_tok <= 1:
+            matmul_q8_f32_vec(
+                dst, x, blocks.unsafe_bitcast[UInt8](), rows, cols
+            )
+        else:
+            matmul_q8_f32_rows_band_vec[8](
+                dst, x, blocks.unsafe_bitcast[UInt8](), n_tok, rows, cols, dst_stride
+            )
+    else:
+        var t = 0
+        while t < n_tok:
+            matmul_q8_f32(
+                dst.unsafe_offset(t * dst_stride),
+                x.unsafe_offset(t * cols),
+                blocks,
+                rows,
+                cols,
+            )
+            t += 1
+
+
+async def _q8_rows_shard[backend: Int](
+    d: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+):
+    """同上，但这一片拿到的是**整个 token 批**（切法同 `q4_matmul_rows_k_shards`）。"""
+    try:
+        q8_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride)
+    except err:
+        _ = err
+
+
+def q8_matmul_rows_k_shards[backend: Int](
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    n_tok: Int,
+    rows: Int,
+    cols: Int,
+    dst_stride: Int,
+    shards: Int,
+) raises AlofaError:
+    """整批 q8_0 投影：按输出行切 `shards` 片，每片做完整个 token 批。
+
+    切法与 `q4_matmul_rows_k_shards` 同一个顺序（行带 × 整批），理由也一样：
+    逐 token 切片会让整份头权重被读 `n_tok` 遍。
+    """
+    var n = shard_count(rows, shards)
+    if n <= 1:
+        q8_matmul_rows_k[backend](dst, x, blocks, n_tok, rows, cols, dst_stride)
+        return
+    var row_bytes = cols // Q8_BLOCK * Q8_BYTES
+    var tg = TaskGroup()
+    var per = rows // n
+    var rem = rows - per * n
+    var c0 = 0
+    for k in range(n):
+        var cnt = per + (rem if k == n - 1 else 0)
+        tg.create_task(
+            _q8_rows_shard[backend](
+                dst.unsafe_offset(c0),
+                x,
+                blocks.unsafe_offset(c0 * row_bytes),
+                n_tok,
+                cnt,
+                cols,
+                dst_stride,
+            )
+        )
+        c0 += cnt
+    tg.wait()
+
+
 def q4_matmul_rows_k[backend: Int](
     dst: F32Ptr,
     x: F32Ptr,
@@ -723,8 +818,9 @@ def q4_matmul_rows_k[backend: Int](
     量化被 `RB` 行共用），这条相等由 `test_q4_rows.mojo` 盯；模型层这边看的则是
     `test_q4_greedy.mojo` 的一致率不该动（0.8691）。
 
-    ⚠️ 带偏置那条（`q/k/v`）今天还没有整批版 —— 它的累加结构与无偏置的不是同一个
-    函数，另行开门之前继续走逐 token 的老路。
+    带偏置的那条（`q/k/v`）是另一个函数（`_matmul_q4_wide_rows`，f64 通道累加，
+    最优 `RB=2` —— 两种累加结构的寄存器预算不同），由 `project` 的 `has_bias`
+    分支走 `q4_matmul_bias_rows_k_shards`，同样是一条块只为 `RB` 行解量化一次。
     """
     comptime if uses_vector_backend[backend]():
         if q4_mub_enabled():
@@ -1747,6 +1843,41 @@ struct QwenForward(Movable):
             )
             _ = self.prof.tick(K_GEMM, _t_q)
         return
+
+    def project_head_batch(
+        mut self, dst: TensorView, x: TensorView
+    ) raises AlofaError:
+        """批路的输出投影：`dst[t] = head · x[t]`，t = 0..批宽-1。
+
+        q8 档走行带核（165 MB 一步读一遍，`RB` 行摊销）；fp32 档与单路同一个
+        `linear_k_shards`（它本来就按列切、整批一遍权重）。两条路的判据同单路：
+        q8 对 fp64 参考 1e-5，fp32 逐位。
+        """
+        var t_rows = dst.shape.dims[0]
+        var out = dst.shape.dims[1]
+        var cols = x.shape.dims[1]
+        if t_rows <= 0 or out <= 0 or cols <= 0:
+            raise AlofaError(
+                ERR_SHAPE_MISMATCH,
+                "a projection needs positive dimensions",
+                "",
+            )
+        if self.q8_enabled:
+            q8_matmul_rows_k_shards[BACKEND_AVX2](
+                f32_data(dst),
+                f32_data(x),
+                self.q8_blocks[0],
+                t_rows,
+                out,
+                cols,
+                out,
+                self.shards,
+            )
+        else:
+            var head_name = self.head
+            linear_k_shards[BACKEND_AVX2](
+                dst, x, self.params.view(head_name), self.shards
+            )
 
     def require(imm self, name: String) raises AlofaError:
         """Fail with the parameter's name if it is not in the file."""

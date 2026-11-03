@@ -67,6 +67,7 @@ from alofa.core.error import (
 from alofa.core.rng import Rng
 from alofa.core.tensor import F32Ptr
 from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
+from alofa.model.profiler import ALOFA_PROFILE
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
 from alofa.srv.config import ServeConfig
@@ -822,6 +823,8 @@ struct ModelService(Service, Twinable):
                     + String(self.engine.preempt_total())
 
                 )
+                comptime if ALOFA_PROFILE:
+                    self.model.dump_profile()
                 self.batch_win_ticks = 0
                 self.batch_win_widths = 0
                 self.batch_win_max = 0
@@ -990,6 +993,9 @@ def main() raises:
             + " loop with many connections"
         )
     var service = ModelService.load(cfg)
+    if getenv("ALOFA_PROFILE", "") == "1":
+        service.model.set_profile(True)
+        print("  [srv] profiling on（每 64 拍随统计行 dump）")
     if cfg.shards > 0:
         # 显式给了分片数就尊重它（含单进程模式）。
         service.model.shards = cfg.shards
