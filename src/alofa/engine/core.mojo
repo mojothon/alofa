@@ -277,6 +277,16 @@ struct EngineCore:
             raise AlofaError(
                 ERR_CAPACITY, "max_new is more than the engine records", ""
             )
+        # 前两条各自成立不等于装得下：一条序列的长**上限**是 `MAX_SEQ_TOKENS`，
+        # prompt 与生成一起占它。少了这一条，越界会晚 30 个 token 才暴露 ——
+        # 那时已经写了一半的 KV，报的是前向内部的 "fewer blocks than history"，
+        # 而真正的原因（这条请求从来就装不下）在几十次前向之前（账本第十五条）。
+        if n + max_new > MAX_SEQ_TOKENS:
+            raise AlofaError(
+                ERR_CAPACITY,
+                "the prompt and the transcript do not fit in one KV sequence",
+                "prompt=" + String(n) + " new=" + String(max_new),
+            )
         if self.find(req) >= 0:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "duplicate request id (engine)", ""

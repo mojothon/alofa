@@ -435,19 +435,34 @@ struct ModelService(Service, Twinable):
         # 只跑前向，选谁由这边按槽位答）—— 每条请求带自己的温度与自己的随机源，
         # 所以批里的采样与单跑的采样抽的是**同一个**序列。
         var slot = self._free_slot()
+        # 批路的形状上限还有**第四条**：一条序列的**总长**。
+        #
+        # `MAX_GEN`（32）和 `MAX_SEQ_TOKENS`（64，`runtime/kv` 的序列上限，引擎与
+        # KV 房间用的是同一个常数）不是一回事 —— 前者管"生成多少"，后者管"prompt
+        # + 生成加起来多少"。少了这一条，`prompt 34`（chat 模板带 system 段）`+ 32`
+        # 会进批路，而引擎在 `hist` 撞到 64（= 4 个 16-token 块）时扩不出第 5 块：
+        # 客户端看到的是流走到一半断掉，日志里是
+        # `capacity: the request has fewer blocks than it has history`
+        # （账本第十五条，实测 108/122 条这么死）。
+        #
+        # 装不下的按上下文窗口的规矩**截短**（客户端的 `finish_reason` 会说
+        # `length`），那与 `steps = min(max_tokens, 窗口 - prompt)` 是同一条语义；
+        # 静默塞进去则是"服务自己把自己毒死"。
+        var batch_steps = min(steps, MAX_SEQ_TOKENS - len(ids))
         if (
             self.batch_enabled
             and steps > 0
             and len(ids) <= MAX_PROMPT
             and steps <= MAX_GEN
+            and batch_steps > 0
         ):
             if slot >= 0:
-                self._submit(slot, request, ids, steps, temperature)
+                self._submit(slot, request, ids, batch_steps, temperature)
                 return
             # 槽位满了 → **排队**而不是拒绝（为什么是排队、以及它为什么必须有上
             # 界，写在 `_enqueue` 上）。队列也满了才落到老路去 —— 那里会指名拒绝
             # （`capacity`），那是有上界的拒绝，不是无上界的排队。
-            if self._enqueue(request, prompt, steps, temperature):
+            if self._enqueue(request, prompt, batch_steps, temperature):
                 return
 
         # ---- 老路（采样，或装不进引擎的请求）：一次只握一条 ----

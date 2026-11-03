@@ -1965,5 +1965,42 @@
     用的是"这次喂了多少 + 生成了多少"，不是执行器的历史长度。下一刀两件事：① `admit` 遇到重号
     必须**拒绝并报**，`stream_end` 必须**一定**把引擎侧那一份放掉；② `grow_to` 要预留下一步要写的
     那个位置（`hist + 1`），否则每跨一个块边界都要靠"表恰好有余量"侥幸。
-  - **门**：`test-batch-forward` 6/6、`test-batch-stream` 6/6、`test-http`、`test-loop`、
-    `test-engine` 全过（engine 门本来就钉着"客户端中途离开之后还能答"——这次修的两处正对着它）。
+  - **门**：`test-batch-forward` 6/6、`test-batch-stream` 6/6、`test-loop`、`test-engine` 过
+    （engine 门本来就钉着"客户端中途离开之后还能答"——这次修的两处正对着它）。
+    ⚠️ **当时把 `test-http` 记成"过"是错的**（只看了 `tail -3` 里的响应体）：它在 HEAD 上就是
+    红的，原因见第十六条末尾（断言没跟上 chat 模板渲染）。
+- **2026-11-03（同日第十六条）** —— 并发下 `capacity: fewer blocks than history` 的**真凶**：
+  批路入场只判"prompt ≤128 / 新 token ≤32"，没判二者**加起来**是否装得进一条 KV 序列
+  - **先记一条被证伪的假设**：第十五条曾判成"请求号复用留下旧历史"。打点给出的
+    `hist=64 table=64 runs=4 out=31` 看着像，但补上 `prompt` 之后一句话就推翻了 ——
+    `prompt=34`（chat 模板自带 ~29 token 的 system 段），**34 + 32 = 66 > 64**
+    （`runtime/kv` 的 `MAX_SEQ_TOKENS`，引擎与 KV 房间共用同一个常数）。历史没被谁污染，
+    它是**合法地**涨到 64 的，之后房间扩不出第 5 块（4×16 已满），`forward` 报的正是
+    "表的覆盖 < hist + 本拍的行数"。教训：**打点要一次打全**（`hist/table/n` 三个数分不出
+    "表少一格"与"历史长得不对"，加 `prompt/out/runs` 才能一句话定案）。
+  - **为什么早没炸**：老路（单流）用的是模型自己的上下文窗口（`self.max_tokens`，≈256），
+    比 KV 序列的 64 宽得多 ⇒ 同一形状的请求走老路不炸；只有进批路才撞 64。
+  - **修（两层，都在"入场"而不是"炸了再救"）**：
+    ① `serve.mojo` 批路门加第四条判据 —— `batch_steps = min(steps, MAX_SEQ_TOKENS - len(ids))`，
+    `≤0` 就不走批路；装不下按上下文窗口的规矩**截短**（`finish_reason` 会说 `length`，
+    与既有 `steps = min(max_tokens, 窗口 - prompt)` 同一条语义）；
+    ② `EngineCore.submit` 钉住不变量：`n + max_new > MAX_SEQ_TOKENS` ⇒ **入场就指名拒绝**
+    （否则越界会晚 30 个 token 才以"前向内部"的形状暴露）。
+  - **验证（同轮、runq ≈13）**：并发 8、`max_tokens=32`，`[srv]` 里
+    `capacity … fewer blocks` 由 **108/122 条 → 0 条**，服务端其余错误行也归零。
+    16-token 请求的对照：并发 1 **4.89 tok/s**、并发 8 **6.61 tok/s**（1.35×，此前是 1.01×）。
+  - **仍未定位**：并发 8 每轮还有 4–5 条 `stream_truncated`（200 + 若干帧、无 `[DONE]`）
+    与 1 条 `timeout`，而服务端**一行日志都没有**（`[dbg] stalled` 也没打）⇒ 不是已知的
+    guard/EOF/毒死三条。下一个入口写在 `_batch_next`：它把"`has_work()` 为假"直接当成
+    **流结束**返回（`StreamToken("", True, False)`），而"这一拍没轮到它"与"它永远走不动"
+    在那里是同一个分支 —— 与 `_batch_next` 的 `MAX_PROGRESS_TICKS` 判据正相反。
+  - **门**：`test-batch-forward` 6/6、`test-batch-stream` 6/6、`test-engine`、`test-loop` 过。
+    ⚠️ **`test-http` 是一条既有红门，本轮顺手查清并修好**：它在 HEAD（`7a2b935`，不含本轮
+    改动）上同样红 —— `git stash` + 重建复现，所以**不是**本轮引入。成因是断言漂移：
+    `cba53a8`（messages 交给渲染器）之后 handler 交给 service 的是**渲染过的**整段 prompt，
+    而门里仍断言回显 `S:hi`（渲染前的原始用户文本）。修的是**断言**而不是门限：新断言同时
+    钉渲染头（`S:<|im_start|>system`）与用户文本（`hi<|im_end|>`），其余性质（200、keep-alive、
+    `finish_reason`、流以 `[DONE]` 收尾）一条没减 ⇒ 修后 `PASS http server: …`（exit=0）。
+    ⚠️ 该门 fork 一个子进程占 18123：**前一次失败会留下子进程**，下一次会 `AddressInUse`
+    并且客户端连到**旧的**那个子进程上（表面症状是"流头不是 200"）—— 重跑前先
+    `pkill -f http_e2e`。

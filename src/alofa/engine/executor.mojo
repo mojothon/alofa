@@ -777,8 +777,11 @@ struct BatchExecutor:
                 var upto = self.hist[i] + n
                 if self.n_page_tokens(i) < upto:
                     # 只在错误路径上打：正常一拍不碰这几行（热路径上一个 print 会把
-                    # 时序改掉，这个文件以前被那种打印骗过一次）。四个数一起打，
-                    # 才能分清"表少了一格"（table == hist）与"池子不够"（table 差很多）。
+                    # 时序改掉，这个文件以前被那种打印骗过一次）。一起打的这几个数
+                    # 是为了分清三种"表不够"：池子真的空了（table 差很多）、表少算
+                    # 一格（table == hist）、还是**历史本身就长得不对**
+                    # （`hist > n_prompt + 已生成` —— 那说明这个执行器槽被两条请求
+                    # 共用了，历史是两条加起来涨的）。
                     print(
                         "  [srv] kv short: slot="
                         + String(i)
@@ -792,6 +795,14 @@ struct BatchExecutor:
                         + String(self.n_page_tokens(i))
                         + " runs="
                         + String(self.page_n[i])
+                        + " prompt="
+                        + String(self.n_prompt[i])
+                        + " pending="
+                        + String(self.n_pending[i])
+                        + " served="
+                        + String(self.served[i])
+                        + " out="
+                        + String(self.n_out[i])
                     )
                     raise AlofaError(
                         ERR_CAPACITY,

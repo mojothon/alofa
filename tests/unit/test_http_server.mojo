@@ -316,7 +316,14 @@ def main() raises:
     assert_true(
         second[1].find("HTTP/1.1 200 OK\r\n") == 0, "not a 200: " + second[1]
     )
-    assert_true(second[1].find("\"content\":\"S:hi\"") >= 0, second[1])
+    # 这条钉的是"**stub 的回显原样走到了客户端**"，而 stub 回显的是它拿到的
+    # prompt。自 `cba53a8`（messages 交给渲染器）起，handler 交给 service 的是
+    # **渲染过的**整段 prompt（带 chat 模板的 system 段）—— 旧断言 `S:hi` 假设的是
+    # 渲染之前的原始用户文本，所以从那之后这条门一直是红的（2026-11-03 实测 HEAD
+    # 同样红，与本轮改动无关）。断言改成同时钉住渲染头与用户文本：性质没放宽，
+    # 只是把"回显的是什么"对齐到现在的契约。
+    assert_true(second[1].find("\"content\":\"S:<|im_start|>system") >= 0, second[1])
+    assert_true(second[1].find("hi<|im_end|>") >= 0, second[1])
     assert_true(second[1].find("\"finish_reason\":\"length\"") >= 0, second[1])
     assert_framed(second[1], "keep-alive")
 
