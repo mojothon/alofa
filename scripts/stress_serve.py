@@ -286,6 +286,9 @@ def main():
         ttft = percentiles(counter.first_latencies)
         lines.append(f"- TTFT(首帧) ms: p50={ttft.get('p50')} p90={ttft.get('p90')} p99={ttft.get('p99')} max={ttft.get('max')}")
     lines.append(f"- QPS: {qps:.2f} | latency ms: p50={p.get('p50')} p90={p.get('p90')} p95={p.get('p95')} p99={p.get('p99')} max={p.get('max')} (mean {round(statistics.fmean(counter.latencies),1) if counter.latencies else '-'})")
+    # tok/s 口径：SSE 下每个 ok 的请求都完整生成 max_tokens 个 token；分母用实测墙钟
+    # （不是 --duration —— 尾部在飞的请求会把墙钟拉长，吞吐会被低估而不是高估）。
+    lines.append(f"- tok/s: {n_ok * args.max_tokens / wall:.2f}  (= {n_ok} ok × {args.max_tokens} tok / {wall:.1f} s 实测墙钟)")
     report = "\n".join(lines)
     print(report)
     if args.out:
