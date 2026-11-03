@@ -342,7 +342,13 @@ struct EngineCore:
         # the room has said anything, and the engine owes the difference.
         if self.room.has(req) < 0:
             return
-        _ = self.room.publish(req)
+        # `drop` 必须无条件跑到：缓存这一份掉了是**优化**掉了，而 room 里那份视图
+        # 是**账**。早先 publish 一抛就跳过 drop，槽位一个个泄漏，`MAX_REQUESTS`
+        # 用完之后每条新请求都撞 "duplicate request id (kv room)"。
+        try:
+            _ = self.room.publish(req)
+        except err:
+            print("  [srv] the prefix cache dropped a finished request: " + String(err))
         _ = self.room.drop(req)
 
     def is_done(self, req: Int) -> Bool:

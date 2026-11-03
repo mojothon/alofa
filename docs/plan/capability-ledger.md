@@ -2114,3 +2114,30 @@
     `the scheduler asked to decode a request that is not resident`、
     `the request has fewer blocks than it has history`。都是"请求号 = 连接槽位"复用与
     room 节点预算的交互；16 token 不触发。下一步从这里进。
+- **2026-11-03（第二十一条）** —— 前缀树没有节点淘汰路径：8 并发长序列把 32 个节点填满后永久失败，并伪装成"请求号冲突"
+  - **症状**（8 并发 × 32 token，`ALOFA_BATCH_STATS=1`）：四条不同的错同时出现 ——
+    `capacity(5): radix tree is full`、`invalid_argument(1): duplicate request id (kv room)`、
+    `the scheduler asked to decode a request that is not resident`、
+    `the request has fewer blocks than it has history`。16 token 不触发，32 token（prompt 34
+    + 生成 30）必触发。
+  - **根因**：块有 `reclaim` 这条路，**节点没有**。`MAX_NODES = 32` 是死预算，而八条 64 token
+    的序列每条要 ~5 个节点（`MAX_NODE_TOKENS=16`）⇒ 40 > 32，第一次批就填满，之后每次
+    `publish` 都抛。更糟的是 `EngineCore.publish` 的顺序是 publish→drop：抛在中间就跳过
+    `drop`，room 里那个请求槽位永久占着；`MAX_REQUESTS` 也是 8 ⇒ 复用同一号（request 号 =
+    连接槽位）的下一条立刻收到 `duplicate request id (kv room)` —— 一个缓存预算问题被伪装成
+    "请求号冲突"。另外两条是同一棵树的连锁：publish 抛 → executor 已 `drop` 而 scheduler 仍
+    当它 RUNNING ⇒ `not resident` / `fewer blocks than history`。
+  - **修法**（与块侧对称，不动常量）：`KvRoom._make_node_room(need)` —— `commit` 之前按
+    `rq_ntok/MAX_NODE_TOKENS + 3` 预留节点，不够就淘汰 `coldest_node()`（`evict` 对还被引用
+    的块只剪树、不还池，活请求有自己的页表，照常解码）；`EngineCore.publish` 的 `drop` 改成
+    无条件执行，publish 失败只打一行日志（缓存掉了是优化掉了，room 里那份是账）。
+  - **验证**：8 并发 24 token（prompt 34 + 24 = 58，进批路）**零告警**、`error` 帧 0，且温 0 下
+    八条不同 prompt 与单跑**逐字节一致 8/8**（改前同一用例 3/8）；帧数从 29 回到 24/32。
+    `pixi run test`（40 套件全绿）、`test-batch-stream`（6/6）、`test-http`（PASS）。
+  - **残余（下一入口）**：`MAX_NODES=32` 结构上装不下 8 条满长序列（要 ~40），所以现在每次
+    publish 都在淘汰 ⇒ 缓存命中率掉、`evict` 走子树有成本。干净解法是把预算从准入上限推出来
+    （`MAX_BATCH × (MAX_SEQ_TOKENS/MAX_NODE_TOKENS + 1) + 余量` = 64），并用独立 Python 参考
+    （`scripts/dump_kv_reference.py` 里钉着 `MAX_NODES=32`）重生成 42 个 KV/scheduler fixture。
+    另：连续多轮压测出现 `running=0 waiting=1` 的空转窗口（一条请求卡在 WAITING 反复分块预填
+    48 行/拍），受控单轮未复现 —— 单独开一条。
+  - ⚠️ 本轮绝对时间不可用：`/proc/loadavg` 13.4（8 核）。

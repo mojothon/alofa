@@ -37,6 +37,7 @@ from alofa.core.error import (
 from alofa.runtime.kv import (
     MAX_BLOCKS,
     MAX_NODES,
+    MAX_NODE_TOKENS,
     MAX_REQUESTS,
     MAX_SEQ_TOKENS,
     OpResult,
@@ -224,6 +225,27 @@ struct KvRoom:
         var slot = self.slot_of(req)
         return self.space.rq_ntok[slot] >= self.n_prompt[slot]
 
+    def _make_node_room(mut self, need: Int) raises AlofaError:
+        """Evict cold nodes until `need` of them are free.
+
+        块有 `reclaim` 这条路，节点却一直没有：32 个节点（`MAX_NODES`）全活着以后
+        `commit` 直接抛 "radix tree is full"，八条并发长序列第一次就能把它填满
+        （每条 prompt+生成 64 token ≈ 5 个节点）。更糟的是调用方的顺序 ——
+        `EngineCore.publish` 先 `publish` 再 `drop`，抛在中间就让 room 里那个请求
+        槽位永远占着；`MAX_REQUESTS` 也是 8，于是复用同一号的下一条请求收到
+        "duplicate request id (kv room)" —— 一个缓存预算问题被伪装成"请求号冲突"。
+
+        淘汰是块那边早就做过的同一种取舍：树丢掉一段缓存前缀，活着的请求有自己的
+        页表，照常解码（`evict` 对还被引用的块只剪树、不还池）。
+        """
+        var guard = 0
+        while MAX_NODES - self.space.tree.n_live < need and guard < MAX_NODES:
+            var node = self.coldest_node()
+            if node < 0:
+                break
+            _ = self.space.evict(node)
+            guard += 1
+
     def publish(mut self, req: Int) raises AlofaError -> Int:
         """Hand the sequence to the prefix tree; returns cached blocks after.
 
@@ -237,6 +259,9 @@ struct KvRoom:
                 ERR_INVALID_ARGUMENT,
                 "refusing to cache a prompt that was never fully seen",
             )
+        # 一条序列最多占 rq_ntok/16 个新节点，再加一次拆分（+1）和余数（+1）；
+        # +3 是留出来的余量，宁可多淘汰一个冷节点，也不要让 `commit` 抛。
+        self._make_node_room(self.space.rq_ntok[slot] / MAX_NODE_TOKENS + 3)
         _ = self.space.commit(slot)
         self.published[slot] = 1
         return self.cached_blocks()
