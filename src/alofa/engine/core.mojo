@@ -147,6 +147,10 @@ struct EngineCore:
 
     var tmp: IntPtr
     var chosen: IntPtr
+    # 二分诊断刀第四把（账本三十五）：`cut_fwd=True` 时 `decide` 里 prepare/borrow
+    # 照跑、`forward` 缺席 —— settle 仍合法还缓冲。由 `ModelService` 按
+    # `ALOFA_ET_CUT_FWD=1` 置位（仅诊断用，默认关）。
+    var cut_fwd: Bool
     var arena: Arena
 
     var ticks: Int
@@ -219,6 +223,7 @@ struct EngineCore:
         self.prompts = int_map(self.arena.alloc(MAX_BATCH * MAX_PROMPT * 8))
         self.tmp = int_map(self.arena.alloc(MAX_GEN * 8))
         self.chosen = int_map(self.arena.alloc(MAX_BATCH * 8))
+        self.cut_fwd = False
         self.ticks = 0
         self.rows_run = 0
         self.last_rows = 0
@@ -665,7 +670,7 @@ struct EngineCore:
         var t_plan = model.prof.now()
         var rows = self.prepare()
         _ = model.prof.tick(K_PLAN, t_plan)
-        if rows > 0:
+        if rows > 0 and not self.cut_fwd:
             try:
                 self.ex.forward[backend](model)
             except err:

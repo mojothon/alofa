@@ -62,6 +62,7 @@ from alofa.core.error import (
     AlofaError,
 )
 from alofa.core.text import parse_float64, parse_int
+from alofa.srv.config import env_str
 from alofa.srv.http import (
     SSE_CONTENT_TYPE,
     HttpRequest,
@@ -765,11 +766,16 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
     var stream_max: List[Int]
     var stream_id: List[String]
     var stream_model: List[String]
+    # 二分诊断刀（账本三十五）：`ALOFA_ET_FAKE=1` 时 STREAM_TEXT 交假 token ——
+    # mailbox/collect/SSE 管道保真，只砍 `service.stream_next`（_batch_tick→forward）。
+    # 崩 ⇒ 写者在管道；活 ⇒ 写者在批/前向路。env 只在构造时读一次，热路径零开销。
+    var fake_step: Bool
 
     def __init__(out self, var service: Self.S, model: String):
         self.service = service^
         self.model = model
         self.next_id = 1
+        self.fake_step = env_str("ALOFA_ET_FAKE", "0") == "1"
         self.stream_phase = List[Int]()
         self.stream_count = List[Int]()
         self.stream_max = List[Int]()
@@ -924,7 +930,16 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         if phase == STREAM_TEXT:
             var token: StreamToken
             try:
-                token = self.service.stream_next(request)
+                if self.fake_step:
+                    # 诊断刀（见 fake_step 字段注释）：走完 max_tokens 步「x」后收尾，
+                    # 不碰 service.stream_next —— 批/前向整段缺席。
+                    var done_now = self.stream_count[request] >= self.stream_max[request]
+                    var txt = ""
+                    if not done_now:
+                        txt = "x"
+                    token = StreamToken(txt, done_now, False)
+                else:
+                    token = self.service.stream_next(request)
             except err:
                 # 这一帧 error 是客户端**唯一**能看到的痕迹，而它常常被当成
                 # "答完了"（正文短了、`[DONE]` 也到了）。日志里必须留一条 ——

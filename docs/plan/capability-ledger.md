@@ -2448,3 +2448,32 @@
     short-circuit（先砍 `_batch_tick` 的 forward、再砍 settle、再砍 collect 的 enqueue）
     定位哪个环节在场才崩；② 静态审 executor 宽批 scratch 的按宽度寻址（崩溃面与宽度
     相关 ⇒ 写者的写入量随宽度涨）；③ 找 root 把 `core_pattern` 改成文件拿故障地址。
+- **2026-11-04（第三十六条）** —— 🔴→✅ **engine 线程崩溃破案：栈溢出，不是堆写坏**（八轮排查的总根因）
+  - **二分刀**（全部 env 门控默认关，随本轮提交）：`ALOFA_ET_FAKE`（假 token，砍
+    `service.stream_next`）活（390 ok）⇒ mailbox/collect/SSE 管道洗清；
+    `ALOFA_ET_CUT_TICK`（砍整个 `_batch_tick`）活（508 ok）⇒ decide/forward/settle
+    是嫌疑；`ALOFA_ET_CUT_FWD`（`decide` 里 prepare/borrow/pick/settle 照跑、**只有
+    forward 缺席**）**活** ⇒ 写者（当时误称）在 `ex.forward`。
+  - **破案**：同一份 forward 在支持路径（reactor）24/7 无恙，唯一差异是线程 ⇒
+    栈。`flare` 的 `ThreadHandle.spawn` 走 `pthread_create`（NULL attr）⇒ 默认栈 =
+    soft `RLIMIT_STACK` = **8 MiB**；批前向调用链（执行器/模型按值传递大结构体 +
+    宽带核深调用链）在 8 MiB 上**栈溢出**。**零代码判定**：`ulimit -s 65536` 起
+    服务，c4 流式活（30 ok）；默认 8 MiB 同二进制同载荷秒崩（4 条全截断）。
+    c2 活 / c4 崩 = `MIN_TOK=4` 处宽带核（RB=8）调用链更深。**全部历史观测一次
+    自洽**：崩点随机落点（谁先碰 guard page 谁死）、三副栈都是分配器受害者
+    （溢出后第一次 malloc 内部帧踩 guard）、插桩即愈（帧布局变）、-O0 不崩、
+    gdb 掩盖（栈布局变）、gdb 下「病灶」照跑（孤儿丢弃/槽位泄漏/恒等式破坏
+    都是溢出踩坏的周边状态，不是独立 bug）。
+  - **修**：`core/ffi/mem.mojo` 加 `raise_stack_limit`（getrlimit/setrlimit，抬
+    soft 不需要特权，必须在线程 spawn 前调，只影响之后创建的线程）；`serve.main`
+    开头按 `ALOFA_STACK_MB`（默认 64，0 = 关）调它并打一行日志。
+  - **验证**（fp32，`ALOFA_ENGINE_THREADS=1`）：c4 流式 40 s 活（22 ok）、
+    c8 流式 60 s 活（62 ok）、**断开风暴**（8 条流生成中途掐 ×3 轮）后探活有
+    `[DONE]`、零 `damaged` —— 修复前全部秒级必死。门：test-memory/test-core-ffi/
+    test-engine/test-http/test-batch-stream/test-batch-forward 41 套件 0 失败
+    （分层门先抓 `mem.mojo` 注释提「engine」，改措辞后绿）。
+  - **reinterpretation（诚实写明）**：`ALOFA_ET_CUT_DECIDE`（无 decide 的 settle
+    自旋）当时判「崩」—— 按栈溢出重读，它的每帧 `MAX_PROGRESS_TICKS` 自旋 +
+    `ERR_STALLED` raise 链是另一种深帧布局，与根因不矛盾；该刀的协议疑点
+    （settle 必须跟在 decide 后）仍然成立。EXPERIMENTAL 警示语里的「corrupt the
+    heap」从此改述：不是谁写坏了堆，是**栈太小**。

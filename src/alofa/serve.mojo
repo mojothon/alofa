@@ -70,11 +70,12 @@ from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
 from alofa.model.profiler import ALOFA_PROFILE, K_DELIV, K_DETOK, K_PICK, K_SETTLE, K_WALL
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
-from alofa.srv.config import env_str, ServeConfig
+from alofa.srv.config import env_int, env_str, ServeConfig
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import MAX_CONNS, Loop
 from alofa.srv.master import run_workers
+from alofa.core.ffi.mem import raise_stack_limit
 from alofa.core.memory import Arena
 from alofa.engine.core import MAX_PROMPT, EngineCore
 from alofa.engine.executor import MAX_BATCH, MAX_GEN, NO_TOKEN, int_map
@@ -189,6 +190,14 @@ struct ModelService(Service, Twinable):
     var stream_count: Int
     var stream_last: Int
     var stream_emitted: Int
+    # 二分诊断刀第二把（账本三十五）：`ALOFA_ET_CUT_TICK=1` 时 `_batch_next` 不推
+    # `_batch_tick`（decide→forward→settle 整段缺席），交 done 终点。_admit/engine
+    # 记账/submit 与整条 mailbox/collect 管道保真。
+    var cut_tick: Bool
+    # 第三把刀：`ALOFA_ET_CUT_DECIDE=1` 时 `_batch_tick` 不跑 `decide`（前向缺席）
+    # 也不 pick，只做 `step_choices` 清 `NO_TOKEN` + `settle`（与 except 路同款）。
+    # 活⇒写者在 decide/forward 或 pick；崩⇒写者在 choices 写或 settle。
+    var cut_decide: Bool
     var stream_temp: Float64
     var stream_started: Bool
     # 在途那条流的**请求号**（`NO_REQUEST` = 没有）。这一整块状态只属于它 ——
@@ -298,6 +307,9 @@ struct ModelService(Service, Twinable):
         self.stream_count = 0
         self.stream_last = 0
         self.stream_emitted = 0
+        self.cut_tick = env_str("ALOFA_ET_CUT_TICK", "0") == "1"
+        self.cut_decide = env_str("ALOFA_ET_CUT_DECIDE", "0") == "1"
+        self.engine.cut_fwd = env_str("ALOFA_ET_CUT_FWD", "0") == "1"
         self.stream_temp = 0.0
         self.stream_started = False
         self.stream_request = NO_REQUEST
@@ -765,6 +777,12 @@ struct ModelService(Service, Twinable):
         （落地）。贪心那条路走的是**同一个** `decide` / `settle`，只是决策是一行
         `argmax`，所以两条路的"一拍"不可能走偏。
         """
+        if self.cut_decide:
+            var chosen0 = self.engine.step_choices()
+            for i in range(MAX_BATCH):
+                chosen0[unsafe_offset=i] = NO_TOKEN
+            self.engine.settle(chosen0)
+            return 0
         var rows = self.engine.decide[BACKEND_AVX2](self.model)
         var chosen = self.engine.step_choices()
         for i in range(MAX_BATCH):
@@ -892,6 +910,9 @@ struct ModelService(Service, Twinable):
         # `step_stream` 那里是**流结束**的暗号：客户端于是拿到一条正文被截短、
         # 却带着 `finish_reason` 与 `[DONE]` 的"正常"流 —— 实测 8 并发同 prompt
         # 下 7/8 条短一截，温 0 也不一致（丢的是尾巴，不是算错）。
+        if self.cut_tick:
+            # 二分刀（见 cut_tick 字段注释）：活⇒写者在 _batch_tick 内。
+            return StreamToken("", True, False)
         var want = self.b_n[slot]
         var spins = 0
         while self.engine.n_output(request) <= want:
@@ -1008,6 +1029,17 @@ struct ModelService(Service, Twinable):
 
 
 def main() raises:
+    # engine 线程是 pthread 默认栈（= soft RLIMIT_STACK，本机 8 MiB）；批前向的
+    # 调用链在 8 MiB 上栈溢出（2026-11-04 钉死，账本三十五）。必须在任何线程
+    # spawn 之前抬 —— 它只影响之后创建的线程。`ALOFA_STACK_MB=0` 关掉。
+    var stack_mb = env_int("ALOFA_STACK_MB", 64, 0, 1024)
+    if stack_mb > 0:
+        var got = raise_stack_limit(stack_mb * 1024 * 1024)
+        print(
+            "  [srv] stack limit: "
+            + String(got // (1024 * 1024))
+            + " MiB (engine threads spawn after this)"
+        )
     var cfg = ServeConfig.from_env()
     if cfg.workers > 1:
         print(
