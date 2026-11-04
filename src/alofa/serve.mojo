@@ -70,7 +70,7 @@ from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
 from alofa.model.profiler import ALOFA_PROFILE, K_DELIV, K_DETOK, K_PICK, K_SETTLE, K_WALL
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
-from alofa.srv.config import ServeConfig
+from alofa.srv.config import env_str, ServeConfig
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import MAX_CONNS, Loop
@@ -115,6 +115,12 @@ def load_weights(weights_file: String, config_path: String, max_tokens: Int, wei
     var model = QwenForward(weights_file, config_path, max_tokens, quantize)
     if weight_bits >= 2:
         model.enable_q8_output()
+    # 剂量-响应档位（账本三十二）：`ALOFA_JUNK_ARM=3` = 双份加料（数值逐位相同，
+    # 只多 ~30% 指令）。同二进制两臂，重启即切 —— 判"解码体离带宽墙的差，是核内
+    # 指令还是访存"：加料后时间线性涨 ⇒ 指令受限；平坦 ⇒ 访存受限。
+    if env_str("ALOFA_JUNK_ARM", "0") == "3":
+        model.set_junk_arm(3)
+        print("  [srv] note: ALOFA_JUNK_ARM=3 (dose-response probe)")
     if weight_bits > 0 and q4_mub_enabled():
         # mub 与精确通路不是逐位一致（多一层激活量化，核级差 1e-7 量级、贪心一致
         # 率单钉）。但"批==单"这条硬判据它**过得去**：行带核每行的累加链与 RB/RU
