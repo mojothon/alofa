@@ -2425,3 +2425,26 @@
     生产零改动；批路行分片的并行收益真实存在（单片慢 ~1.7×），mub 快核没有把
     调度开销吃成负收益。
   - **净变化**：`default_shards` 注释把「没量过」改成量到的结论；性能总账不动。
+- **2026-11-04（第三十五条）** —— 🔴 engine 线程崩溃：复现从「间歇」升级到「秒级必现」，触发面收窄到**并发流式批路**
+  - **复现矩阵**（`stress_serve.py`，fp32，`ALOFA_ENGINE_THREADS=1`，`max_tokens=8`，30–90 s）：
+    - c8 流式：**崩**（shards=8 与 shards=1 都崩；8 条流先全截断，秒级死）
+    - c4 流式：**崩**（同形状，4 条全截断）
+    - c2 流式：**活**（18 ok；但 `[dbg] result dropped as orphan` 泛滥，`live_n` 涨到 5）
+    - c8 非流式 / c1 流式 / c1 非流式：**全活、零错误**
+    ⇒ **写者住在「≥4 条并发流式」（批宽度 ≥4）的引擎侧路径**，与客户端断开**无关**
+    （11-03 的「第 1 轮也会崩」从此有了稳定配方），与 TaskGroup/分片无关（s1 照崩）。
+  - **两副崩溃栈（受害者）**：① `forward ← decide`（TaskGroup/asyncrt 帧内）；
+    ② `serialize ← String::_add ← _alloc_bytes ← asyncrt/KGEN` —— **都是 engine 线程上的
+    分配器/运行时 machinery**。⇒ 崩点是**受害者不是写者**：堆被别处写坏，下一次分配死。
+    与「崩溃点随机落点」「插桩即愈」「-O0 不崩」全部自洽。
+  - **gdb 下不崩**（Heisenbug 再证）但病灶照跑：`peeked=10 live_n=13 live=0`（孤儿丢弃 +
+    槽位泄漏持续）。core dump 被 apport 接管（`core_pattern` 管道），无 root 改不了；
+    gdb 附着被 `ptrace_scope` 挡 ⇒ 运行时自身的符号化栈是唯一免插桩观测。
+  - **已排除**：TaskGroup（s1 照崩）、栈溢出（flare `ThreadHandle.spawn` 默认 8 MB 栈）、
+    邮箱锁/List（第十八、十九条最小复现干净）、reactor 双重推进（现行 `run_threaded`
+    零 handler 触点，09-30 读码结论在 11-03 重写后仍成立）、`Job.raw` 拷贝上界（8192
+    截断有检查，magic 四点校验在邮箱两侧）。
+  - **下一步**（按性价比排序）：① 用 c4 流式（秒崩）做**二分移除**——engine 侧逐段
+    short-circuit（先砍 `_batch_tick` 的 forward、再砍 settle、再砍 collect 的 enqueue）
+    定位哪个环节在场才崩；② 静态审 executor 宽批 scratch 的按宽度寻址（崩溃面与宽度
+    相关 ⇒ 写者的写入量随宽度涨）；③ 找 root 把 `core_pattern` 改成文件拿故障地址。
