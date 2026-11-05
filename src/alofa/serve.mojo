@@ -70,8 +70,10 @@ from alofa.model.arch.qwen import BACKEND_AVX2, QwenForward, q4_mub_enabled
 from alofa.model.profiler import ALOFA_PROFILE, K_DELIV, K_DETOK, K_PICK, K_SETTLE, K_WALL
 from alofa.runtime.kv import MAX_SEQ_TOKENS
 from alofa.runtime.sampler import LogitBias, SampleParams, Sampler
+from std.ffi import dlsym, external_call
+from std.memory import Pointer
 from alofa.srv.config import env_int, env_str, ServeConfig
-from alofa.srv.engine_thread import Twinable, heap_place
+from alofa.srv.engine_thread import alloc_churn, Twinable, heap_place
 from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import MAX_CONNS, Loop
 from alofa.srv.master import run_workers
@@ -1028,10 +1030,45 @@ struct ModelService(Service, Twinable):
         return bytes_to_text(full, sent, len(full))
 
 
+comptime _OpaquePtr = Pointer[UInt8, MutUntrackedOrigin]
+
+
+@export("alofa_segv_probe")
+def _segv_probe(sig: Int32, info: _OpaquePtr, ctx: _OpaquePtr) abi("C"):
+    """崩溃探针：write(2) 三段原始字节（tag + si_addr + rsp）然后 `_exit`。
+
+    不分配、不返回 —— 返回会重新执行同一条故障指令，死循环。si_addr 在
+    siginfo+16；x86_64 ucontext 的 rsp 在 uc_mcontext.gregs[15] = ctx+160。
+    安装后**顶掉**运行时自己的符号化栈打印（探针期间拿不到栈，拿到地址）。
+    """
+    var tag = UInt64(0x3252444441564753)  # b"SGVADDR2" 小端
+    var addr = info.unsafe_offset(16).unsafe_bitcast[UInt64]()[unsafe_offset=0]
+    var rsp = ctx.unsafe_offset(160).unsafe_bitcast[UInt64]()[unsafe_offset=0]
+    # ucontext: uc_mcontext 在 +40；gregs[REG_RIP=16] → +168，[REG_RBP=10] → +120
+    var rip = ctx.unsafe_offset(168).unsafe_bitcast[UInt64]()[unsafe_offset=0]
+    var rbp = ctx.unsafe_offset(120).unsafe_bitcast[UInt64]()[unsafe_offset=0]
+    var tp = Pointer[UInt64, _](to=tag)
+    _ = external_call["write", Int](Int(2), tp, Int(8))
+    var ap = Pointer[UInt64, _](to=addr)
+    _ = external_call["write", Int](Int(2), ap, Int(8))
+    var rp = Pointer[UInt64, _](to=rsp)
+    _ = external_call["write", Int](Int(2), rp, Int(8))
+    var ip = Pointer[UInt64, _](to=rip)
+    _ = external_call["write", Int](Int(2), ip, Int(8))
+    var bp = Pointer[UInt64, _](to=rbp)
+    _ = external_call["write", Int](Int(2), bp, Int(8))
+    # 恢复运行时自己的处理器（oldact 存在 MAP_FIXED 固定页 0x6a0000000000），
+    # 然后**返回** —— 故障指令重执行，运行时处理器打印完整符号化栈后进程死。
+    var z2 = 0
+    var oldp = _OpaquePtr(unsafe_from_address=0x6a0000000000)
+    _ = external_call["sigaction", Int32](Int32(11), oldp, _OpaquePtr(unsafe_from_address=z2))
+
+
 def main() raises:
-    # engine 线程是 pthread 默认栈（= soft RLIMIT_STACK，本机 8 MiB）；批前向的
-    # 调用链在 8 MiB 上栈溢出（2026-11-04 钉死，账本三十五）。必须在任何线程
-    # spawn 之前抬 —— 它只影响之后创建的线程。`ALOFA_STACK_MB=0` 关掉。
+    # 抬高 soft RLIMIT_STACK。注意（2026-11-05 实测）：glibc 缓存启动时的值，
+    # 这里改不动本进程内新建 pthread 的栈（engine 线程实测仍 8 MiB）；它只利
+    # 于之后 exec 的子进程。栈溢出已排除为崩溃根因（账本三十七）—— 保留是因为
+    # 无害且 worker 子进程受益。`ALOFA_STACK_MB=0` 关掉。
     var stack_mb = env_int("ALOFA_STACK_MB", 64, 0, 1024)
     if stack_mb > 0:
         var got = raise_stack_limit(stack_mb * 1024 * 1024)
@@ -1040,6 +1077,41 @@ def main() raises:
             + String(got // (1024 * 1024))
             + " MiB (engine threads spawn after this)"
         )
+    var churn = 0
+    if env_str("ALOFA_ALLOC_CHURN", "0") == "1":
+        churn = 200000
+    if churn > 0:
+        # 与 engine 线程的 churn 并发跑（见 engine_thread.alloc_churn）——
+        # 两线程纯分配即崩 ⇒ 运行时分配器缺陷。
+        alloc_churn(churn)
+        print("  [dbg] main thread churn done")
+    if env_str("ALOFA_SEGV_PROBE", "0") == "1":
+        # 探针处理器经 dlsym(RTLD_DEFAULT) 取址（@export 符号要 --export-dynamic
+        # 才进 .dynsym）。sigaction 结构体 = 一页 mmap 零页：handler 偏移 0，
+        # sa_flags(SA_SIGINFO=4) 偏移 136。装上后顶掉运行时自己的栈打印。
+        var fp = dlsym[_OpaquePtr](
+            OptionalPointer[NoneType, MutUntrackedOrigin](),
+            String("alofa_segv_probe").unsafe_ptr().unsafe_bitcast[Int8](),
+        )
+        if fp:
+            var sa = external_call["mmap", _OpaquePtr](
+                Int(0), Int(4096), Int32(3), Int32(34), Int32(-1), Int(0)
+            )
+            var w = sa.unsafe_bitcast[UInt64]()
+            w[unsafe_offset=0] = UInt64(Int(fp.value()))
+            w[unsafe_offset=17] = UInt64(4)  # sa_flags = SA_SIGINFO
+            var z2 = 0
+            var oldact = external_call["mmap", _OpaquePtr](
+                Int(0x6a0000000000), Int(4096), Int32(3), Int32(0x32), Int32(-1), Int(0)
+            )
+            _ = external_call["sigaction", Int32](
+                Int32(11), sa, oldact
+            )
+            print(
+                "  [srv] segv probe installed at 0x" + String(Int(fp.value()))
+            )
+        else:
+            print("  [srv] segv probe unavailable (需要 -Xlinker --export-dynamic)")
     var cfg = ServeConfig.from_env()
     if cfg.workers > 1:
         print(

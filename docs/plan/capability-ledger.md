@@ -2477,3 +2477,44 @@
     `ERR_STALLED` raise 链是另一种深帧布局，与根因不矛盾；该刀的协议疑点
     （settle 必须跟在 decide 后）仍然成立。EXPERIMENTAL 警示语里的「corrupt the
     heap」从此改述：不是谁写坏了堆，是**栈太小**。
+- **2026-11-05（第三十七条）** —— 🔴 **推翻「栈溢出」结论，崩溃收窄到运行时格式化/追踪内部；建立免插桩崩溃探针**
+  - **账本三十六作废的部分**：`setrlimit` 修复**无效** —— glibc 在进程启动时缓存
+    默认 pthread 栈大小（读一次 soft RLIMIT_STACK），之后 setrlimit 改不动它。
+    实证：`pthread_getattr_np` 打在 `ALOFA_STACK_MB=64` 下仍是 **8388608**。
+    并且 **bash `ulimit -s 65536` 今天同载荷也秒崩** ⇒ 栈溢出**不是**根因。
+  - **刀法全面作废（重要教训）**：同条件交替多轮取样（每臂 5 轮 × 18 s）后，
+    FAKE 5/5、CUT_TICK 3/5、CUT_FWD 2/5、全量 2–3/5、shards=1 2/5 —— 
+    单轮存活全是**运气**。以前任何「砍 X 后活」的结论（含 09-30、11-03 两轮）
+    都不能作为证据。**规矩**：能崩的题一律 5 轮 × 交替臂；单轮只算轶事。
+  - **干净的对照**：`ENGINE_THREADS=0` 0/5 崩；纯并发分配 churn（两线程各 20 万
+    次 String 建/毁，含 `print` 与异常抛出/捕获）**0/5** ⇒（a）线程化专属；
+    （b）分配器双线程并发本身清白。崩溃率随**请求量**涨（FAKE 模式请求率最高、
+    崩得最密）。
+  - **新仪器：崩溃探针**（`ALOFA_SEGV_PROBE=1`，serve.mojo）：`@export("alofa_segv_probe")`
+    + `abi("C")` 处理器 → `dlsym(RTLD_DEFAULT)` 取址（构建必须加
+    `-Xlinker --export-dynamic`，否则符号不进 .dynsym）→ `sigaction`（结构体
+    一页零 mmap：handler@0、SA_SIGINFO@136；oldact 存 `MAP_FIXED` 固定页
+    `0x6a0000000000`）。处理器把 `si_addr`(siginfo+16)/`rsp`/`rip`/`rbp`
+    (ucontext gregs[15]/[16]/[10]，即 +160/+168/+120) **原字节 write(2)**
+    （tag `b"SGVADDR2"`）后**恢复运行时处理器并返回** —— 故障指令重执行，
+    运行时打印完整符号化栈。两份信息同一次崩溃都拿到。
+  - **崩溃画像（首次拿到完整证据）**：典型链
+    `#8 Tokenizer::decode ← #9 _batch_text ← #10 _batch_next ← #11 stream_next`
+    ← `#7/#6/#5 libAsyncRTRuntimeGlobals` ← `#4`（故障指令）。#4 所在函数是
+    **snprintf 风格格式化器**：`{ptr,len,pos}` 结构（`mov (%rbx),%rdi; mov
+    0x8(%rbx),%rsi` → 定长片段拷贝 → `add %rax,0x10(%rbx)`），上下文串取自
+    `0x14a0(%r13/%r14)`，`r13` 从栈上取再 `mov 0x18(%r13),%r14` 解引用。
+    历次 `si_addr`：`0x54534f50`（ASCII **"POST"**！）、`0`、`0x11817`
+    （前者减 0x18 恰为圆整的 `0x11800`，像整数被当指针）。rip 收敛到同一
+    函数（+0x70433/70449 两站点）。⇒ 损坏的是**运行时格式化/追踪路径的上下文
+    或缓冲指针**，且值带着「请求字节/整数」的味道 —— 要么运行时外部线程的
+    上下文未初始化，要么仍有把整数/请求字节写进指针槽的堆损坏。
+  - **注意**：`#0–#3` 是运行时处理器自己的 backtrace/符号化帧（#0 就是
+    `call backtrace@plt`），**历次日志里的"分配器受害者栈"全部读错** —— 
+    真正的故障帧是 #4 起、受害者调用链是 #8 起。
+  - **下一步**（按序）：① 独立最小复现器（flare 式裸 pthread + 真实字符串/格式化
+    混合，不依赖整个服务）；② 用 `LD_PRELOAD`/`LD_BIND_NOW` 或 MOJO 环境变量
+    尝试拿到运行时调试信息；③ 既然 8 MiB → 64 MiB 不影响，试**显式 attr 起线程**
+    （64 MiB + 大 guard）看崩溃率是否变化 —— 这是区分"栈/线程布局"与"上下文"
+    的廉价实验；④ 若确认运行时缺陷，向上游报 issue 并考虑「engine 线程不做
+    String 格式化」的绕行（把 decode/serialize 挪回 reactor）。

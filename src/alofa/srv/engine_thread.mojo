@@ -72,6 +72,8 @@ from std.collections import List
 from std.ffi import external_call
 from std.memory import Pointer
 from std.sys import size_of
+from alofa.srv.config import env_int, env_str
+from alofa.core.error import ERR_CAPACITY, AlofaError
 
 from flare.runtime import Reactor
 from flare.runtime._thread import ThreadHandle
@@ -806,6 +808,28 @@ def spawn_engines[H: EngineHandler](
     return threads^
 
 
+def alloc_churn(n: Int):
+    """诊断（账本三十七）：纯分配/释放压测 —— 不碰 handler、不碰模型。
+
+    两个线程同时跑它就崩 ⇒ Mojo 运行时的分配器（AsyncRT/TcmallocSlab）在
+    「非运行时线程 + 主线程」并发分配下有缺陷，与本项目代码无关。
+    """
+    var do_print = env_str("ALOFA_CHURN_PRINT", "0") == "1"
+    for i in range(n):
+        var s = String()
+        for j in range(48):
+            s += "abcdefgh"
+        _ = s^
+        if do_print and i % 997 == 0:
+            print("  [dbg] churn " + String(i))
+        if i % 97 == 0:
+            # 异常路径（错误对象要分配字符串），可能触发 AsyncRT 的追踪/状态路径
+            try:
+                raise AlofaError(ERR_CAPACITY, "churn probe", "i=" + String(i))
+            except e:
+                _ = String(e)
+
+
 def _engine_entry[H: EngineHandler](arg: OpaquePtr) -> OpaquePtr:
     """pthread 的入口。**不许让异常跑出去**（pthread 没有异常通道）。
 
@@ -813,6 +837,33 @@ def _engine_entry[H: EngineHandler](arg: OpaquePtr) -> OpaquePtr:
     因为 `Pointer` 不接受字面量 0。
     """
     var box = arg.unsafe_bitcast[EngineBox]()
+    # 诊断探针（账本三十七复核）：报这条线程自己的栈基址与大小。pthread 默认栈
+    # = **进程启动时**的 soft RLIMIT_STACK —— glibc 启动即缓存，之后 setrlimit
+    # 改不动它；这条打印就是来验证这一点的。`ALOFA_SEGV_PROBE=1` 才打。
+    if env_str("ALOFA_SEGV_PROBE", "0") == "1":
+        var z = 0
+        var me = external_call["pthread_self", UInt64]()
+        var attr = external_call["mmap", OpaquePtr](
+            Int(0), Int(4096), Int32(3), Int32(34), Int32(-1), Int(0)
+        )
+        _ = external_call["pthread_getattr_np", Int32](me, attr)
+        var base = UInt64(0)
+        var span = UInt64(0)
+        var bp = Pointer[UInt64, _](to=base)
+        var sp = Pointer[UInt64, _](to=span)
+        _ = external_call["pthread_attr_getstack", Int32](attr, bp, sp)
+        print(
+            "  [srv] engine thread stack: base="
+            + String(Int(base))
+            + " size="
+            + String(Int(span))
+        )
+    var churn = 0
+    if env_str("ALOFA_ALLOC_CHURN", "0") == "1":
+        churn = 200000
+    if churn > 0:
+        alloc_churn(churn)
+        print("  [dbg] engine thread churn done")
     var index = -1
     try:
         index = box[].mailbox.claim_thread()

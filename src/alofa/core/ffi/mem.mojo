@@ -90,13 +90,14 @@ comptime RLIM_INFINITY = UInt64(0xFFFFFFFFFFFFFFFF)
 def raise_stack_limit(want_bytes: Int) raises -> Int:
     """把 `RLIMIT_STACK` 的 soft 上限抬到至少 `want_bytes`，返回生效值（-1 = 失败）。
 
-    为什么需要它：`pthread_create`（NULL attr）起的线程，默认栈 =
-    `RLIMIT_STACK` 的 soft 值（本机 8 MiB）。本项目的批前向调用链（执行器与
-    模型按值传递的大结构体 + 宽带核的深调用链）在 8 MiB 上**栈溢出**：溢出点
-    是谁先碰到 guard page 谁死，所以表现为「崩溃点随机落点、插桩即愈、gdb
-    掩盖」，2026-11-04 用 64 MiB 栈 A/B 钉死（账本三十五）。必须在**任何线程
-    spawn 之前**调用 —— 它只影响之后创建的线程。抬 soft 不需要特权
-    （hard = unlimited）。
+    实测边界（2026-11-05，账本三十七）：glibc 在**进程启动时**读一次 soft
+    `RLIMIT_STACK` 并缓存为默认 pthread 栈大小，**之后 setrlimit 改不动它** ——
+    `ALOFA_STACK_MB=64` 启动后在 engine 线程里 `pthread_getattr_np` 实测仍是
+    8388608。所以这个函数只影响「之后 exec 出去的子进程」（它们启动时读到新值）
+    与主线程本身，对已在跑的进程里新建的 pthread 无效。要真正给线程大栈，只能
+    `pthread_attr_setstacksize` 显式起线程。栈溢出也已被排除为崩溃根因
+    （64 MiB 下照崩）。保留此函数：抬高进程 soft 上限本身无害，且 worker 模式
+    的 fork+exec 子进程能继承到。
     """
     var p = mmap_anonymous(4096)
     var rc = external_call["getrlimit", Int32](Int32(RLIMIT_STACK), p)
