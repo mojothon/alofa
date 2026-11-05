@@ -62,7 +62,7 @@ from alofa.core.error import (
     AlofaError,
 )
 from alofa.core.text import parse_float64, parse_int
-from alofa.srv.config import env_str
+from alofa.srv.config import env_int, env_str
 from alofa.srv.http import (
     SSE_CONTENT_TYPE,
     HttpRequest,
@@ -943,9 +943,26 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
                 self.stream_phase[request] = STREAM_TEXT
                 return "data: r\r\n\r\n"
             if self.fake_step:
-                # 反向二分（账本三十八）：字面量帧 + 单独加回 escape_json ——
-                # 崩 ⇒ escape_json 是触发点；净 ⇒ 排除它。
-                _ = escape_json("x")
+                # 帧构造链四分刀（账本三十九）：CUT_FRAME=1 时按 FRAME_MODE 单独
+                # 加回一种操作，其余全部字面量。mode: 1=纯 `+` 拼接链；2=+Int→String；
+                # 3=+find；4=+List[String] 读改写。escape_json 已单独洗清（0/5）。
+                var fmode = env_int("ALOFA_ET_FRAME_MODE", 0, 0, 4)
+                if fmode >= 1:
+                    var s = (
+                        "{\"id\":\"" + "chatcmpl-1" + "\",\"object\":"
+                        + "\"chat.completion.chunk\",\"created\":"
+                    )
+                    if fmode >= 2:
+                        s = s + String(CREATED)
+                    s = (
+                        s + ",\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+                        + "\"x\"}}]}"
+                    )
+                    if fmode >= 3:
+                        _ = s.find("\n")
+                    if fmode >= 4:
+                        var sid = self.stream_id[request]
+                        self.stream_id[request] = sid
                 if self.stream_count[request] >= self.stream_max[request]:
                     self.stream_phase[request] = STREAM_DONE
                     return "data: f\r\n\r\n"

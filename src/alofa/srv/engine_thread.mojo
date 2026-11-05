@@ -77,7 +77,6 @@ from alofa.core.error import ERR_CAPACITY, ERR_INVALID_ARGUMENT, AlofaError
 
 from flare.runtime import Reactor
 from flare.runtime._thread import ThreadHandle
-from flare.runtime.mutex import Mutex
 
 from alofa.srv.http import (
     HttpRequest,
@@ -380,7 +379,7 @@ struct Mailbox(Movable):
     `poll`。
     """
 
-    var mutex: Mutex
+    var mutex: RawMutex
     var jobs: List[Job]
     var results: List[Result]
     var stop: Bool
@@ -414,7 +413,7 @@ struct Mailbox(Movable):
     var tr: List[Int]
 
     def __init__(out self) raises:
-        self.mutex = Mutex()
+        self.mutex = RawMutex()
         self.jobs = List[Job]()
         self.results = List[Result]()
         # 一次把容量留到上界，**让这两个 `List` 永不扩容**：扩容要把每个元素搬到新
@@ -818,6 +817,54 @@ def spawn_with_stack[
     return ThreadHandle(_thread_id=tid)
 
 
+# 线程间互斥（账本三十九）：**raw pthread 互斥体**，不 flare 的 Mutex。
+#
+# 为什么不用 flare 的：独立复现器（scripts/diag_repro_mailbox_burst.mojo）实测，
+# 两条线程对同一个 flare `Mutex` 只做 lock/unlock（不碰任何 List、零分配），
+# 10 秒内就会 `pthread_mutex_(un)lock failed with rc=22`——互斥体自身的堆存储
+# 被写坏；同样负载换 raw pthread 互斥体则全数存活。服务器上 engine 线程模式
+# 的"堆损坏/运行时格式化器崩溃"（账本三十六以来的一切症状）与它同链：邮箱的
+# 锁在并发下坏掉，坏的是分配器的账，崩点才散落在谁先碰谁倒霉的地方。
+#
+# 存储是 **inline 的 48 字节**（pthread_mutex_t 的上界），不 unsafe_alloc ——
+# 没有可被复用的堆块，也没有拷贝/析构会把它还回分配器。锁点一处不改：这个
+# 类型与 flare Mutex 同 API（`lock()`/`unlock()`，均不抛）。
+struct RawMutex(Movable):
+    var storage: InlineArray[UInt8, 48]
+
+    def __init__(out self) raises:
+        self.storage = InlineArray[UInt8, 48](fill=0)
+        _ = external_call[
+            "pthread_mutex_init",
+            Int32,
+            Pointer[UInt8, MutUntrackedOrigin],
+            Pointer[UInt8, MutUntrackedOrigin],
+        ](
+            Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=self.storage))
+            ),
+            Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(0)),
+        )
+
+    def lock(self):
+        _ = external_call[
+            "pthread_mutex_lock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+        ](
+            Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=self.storage))
+            )
+        )
+
+    def unlock(self):
+        _ = external_call[
+            "pthread_mutex_unlock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+        ](
+            Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=self.storage))
+            )
+        )
+
+
 def spawn_engines[H: EngineHandler](
     mut box: EngineBox, engines: Int
 ) raises -> EngineThreads:
@@ -1018,6 +1065,21 @@ def _run_job[H: EngineHandler](
     # handler/parse/serialize，直接回一截固定字节。崩 ⇒ mailbox 机制在双线程
     # 并发下自身就是问题；不崩 ⇒ engine 侧的 handler 工作在因果链上。
     if env_str("ALOFA_ET_MAILBOX_ONLY", "0") == "1":
+        # 最小复现器（账本三十九）：纯 String 拼接/丢弃 N 个/活 —— 不碰 handler、
+        # 不碰 sse、不碰表。崩 ⇒ 复现条件 = mailbox 双向流量 × engine 线程 alloc/free。
+        try:
+            var burst = env_int("ALOFA_ET_ALLOC_BURST", 0, 0, 4096)
+            var k = 0
+            while k < burst:
+                var s = (
+                    '{"id":"chatcmpl-1","object":"chat.completion.chunk","created":'
+                    + String(1234567890)
+                    + ',"choices":[{"index":0,"delta":{"content":"x"}}]}'
+                )
+                _ = s.byte_length()
+                k += 1
+        except:
+            pass
         var fixed = List[UInt8]()
         fixed.append(111)  # 'o'
         fixed.append(107)  # 'k'

@@ -2554,3 +2554,32 @@
     帧的 JSON 拼接挪回 reactor（engine 只交 token 与相位），或给 parse/帧路径做缓冲复用；
     ③ 带着 #4/#7 偏移与探针证据向 Modular 报 issue（外来 pthread 上的 per-thread
     采样/追踪状态未初始化）。
+
+- **2026-11-06（第三十九条）** —— 🟢 **破案：flare `Mutex` 在双线程并发下腐坏堆；邮箱换 raw pthread 互斥体，engine 线程崩溃根除**
+  - **符号化定案**（上条遗留的 #4-#7 偏移）：全部落在 `TCMallocInternalDeleteArraySizedAligned`
+    —— sized-delete 的 CHECK/采样路径。1 GiB 采样间隔 A/B（5/6 vs 6/6）把"采样"嫌疑否掉：
+    崩在 delete 路径是因为**堆账已坏**，不是因为采样。
+  - **独立复现器**（`scripts/diag_repro_mailbox_burst.mojo`，约 200 行，不依赖服务器/模型）：
+    两条 flare 线程 + 互斥邮箱（Job 8 KB/Result 16 KB 内联元素，`reserve` 到上界）。
+    - 单线程同序列自环 **1736 万次 ops 存活** ⇒ `List` 大元素 push/pop 无辜。
+    - 双线程（burst=0，无任何用户分配）：**崩率 5/5**；burst=32 崩率同样 5/5。
+    - 现行捕获：互斥体的 pthread 结构被写坏后 `pthread_mutex_(un)lock` 返回
+      **rc=22 (EINVAL)**（flare 对 rc 断言 ⇒ SIGILL）；堆坏后两个活块重叠（一个
+      String 的缓冲被分配到互斥体存储上）⇒ 服务器上"si_addr=POST"（指针槽里是请求
+      字节）与崩点函数同源。
+  - **根因：flare `Mutex`**。对照刀（复现器内）：
+    - 纯 lock/unlock 隔离（无 List）：flare Mutex 多轮内必现 rc=22；**raw pthread 4/4 存活**。
+    - 全邮箱高速搬运：flare Mutex ~半数崩；**raw pthread 4/4 存活**。
+    - 即 `Mutex._storage`（unsafe_alloc 堆块）在并发下被写坏 —— 与分配器交互的
+      运行时级问题（待上游 issue，复现器可交）。
+  - **修复**：`srv/engine_thread.mojo` 新增 `RawMutex`（inline 48 字节 pthread 互斥体，
+    与 flare Mutex 同 `lock()/unlock()` API，36 个锁点零改动），邮箱 `mutex` 字段换型。
+    服务器验证（同轮、8 并发、30 s）：
+    - FAKE 6 轮：**0/6**（修复前 FAKE 基线 4–6/6）。
+    - 真模型 `ALOFA_ENGINE_THREADS=1`：70/70 请求 0 错误、无 damaged、服务器存活
+      （17.7 tok/s 宽 4，仅作存活口径不作性能口径）。
+  - **状态改判**：⑥ "engine 线程崩溃"由 🔴 未破改判 **🟢 已根因修复**（flare Mutex 上游
+    bug，本仓库侧已绕开）。`ALOFA_ENGINE_THREADS` 默认仍 0（保守，待更长 soak 再开默认）。
+  - **遗留**：① 向 flare/Modular 报 Mutex 并发 bug（附复现器）；② 复现器里的
+    `REPRO_MUTEX_ONLY`/`REPRO_RAW_MUTEX`/`REPRO_SINGLE`/burst 旋钮保留作回归刀；
+    ③ 服务器全部诊断刀（CUT_* 系列）保留，默认关。
