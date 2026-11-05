@@ -92,7 +92,7 @@ def raise_stack_limit(want_bytes: Int) raises -> Int:
 
     实测边界（2026-11-05，账本三十七）：glibc 在**进程启动时**读一次 soft
     `RLIMIT_STACK` 并缓存为默认 pthread 栈大小，**之后 setrlimit 改不动它** ——
-    `ALOFA_STACK_MB=64` 启动后在 engine 线程里 `pthread_getattr_np` 实测仍是
+    `ALOFA_STACK_MB=64` 启动后在后台工作线程里 `pthread_getattr_np` 实测仍是
     8388608。所以这个函数只影响「之后 exec 出去的子进程」（它们启动时读到新值）
     与主线程本身，对已在跑的进程里新建的 pthread 无效。要真正给线程大栈，只能
     `pthread_attr_setstacksize` 显式起线程。栈溢出也已被排除为崩溃根因
