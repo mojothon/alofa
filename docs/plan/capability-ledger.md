@@ -2583,3 +2583,24 @@
   - **遗留**：① 向 flare/Modular 报 Mutex 并发 bug（附复现器）；② 复现器里的
     `REPRO_MUTEX_ONLY`/`REPRO_RAW_MUTEX`/`REPRO_SINGLE`/burst 旋钮保留作回归刀；
     ③ 服务器全部诊断刀（CUT_* 系列）保留，默认关。
+
+- **2026-11-06（第四十条）** —— 🟢 **soak 全绿 + 重门 `test-engine` 由红转绿：非流式应答被补 `[DONE]`（预存，非 RawMutex 回归）**
+  - **soak**（`ALOFA_ENGINE_THREADS=1` + `RawMutex`）：FAKE 6 轮 × 60 s **0/6 崩**；
+    真模型 3 轮 × 120 s **0/3 崩**（流式，4 并发，70/70 口径照旧）；异常日志零条。
+    三十九"待 soak 再开默认"的前提已满足。
+  - **重门 `test-engine` 首次复跑即红**：`the plain answer changed shape` —— 线程路
+    非流式应答尾部多 16 字节 `data: [DONE]\r\n\r\n`。worktree 在三十九之前的
+    `caa2094` 上跑同门**同形状同红** ⇒ **预存**，与 RawMutex 无关（这重门故意不进
+    `pixi run test`，自 09-28 加"中途断开"性质后没人跑过）。
+  - **根因**：`collect` 里 `ends_sse_stream(out)` 认 `"finish_reason":"`（非 null 值），
+    而**非流式应答同样含 `"finish_reason":"stop"`** ⇒ 普通应答被误标"流结束"，
+    `RES_DONE` 一支按 `ended[slot]==1 && !done_sent` 补了终止符。客户端按
+    Content-Length 读不受影响，但 **keep-alive 上的下一个响应前面会多 16 字节垃圾**。
+  - **修复**：标记与判重都加 `self.streaming[slot] == 1` 前置（由 `RES_STREAM_HEAD`
+    置位；非流式请求没有头，永远到不了）。一行语义修复，`guard_stalls` 的同款
+    补终止符分支随之干净。
+  - **验证**：`test-engine` 红 → **绿**（三种模式逐字节形状 + 三次中途断开 + 探活
+    答自己的，全过）。`test-http` 兜底重跑。
+  - **状态**：⑥ 维持 🟢；线程路的两个历史已知病（堆腐坏 = flare Mutex、断开串味 =
+    finish_reason 误判）都已根因修复。`ALOFA_ENGINE_THREADS` 默认仍 0 —— 翻默认
+    是下一步（需要连带重跑全部重门，另一轮做）。

@@ -1145,10 +1145,12 @@ def main() raises:
         service.model.shards = 1
     print("  model loaded: " + cfg.model_name + " (vocab " + String(service.vocab) + ")")
     if cfg.engine_threads >= 1:
-        # ⚠️ 这是**警示**不是装饰：engine 线程路已知会在"真模型 + 客户端中途断开"
-        # 时把请求搞坏（`Job` 的缓冲被别人 free —— 那次排查的硬事实在账本 §8），所以
-        # 默认不开（`ALOFA_ENGINE_THREADS=0` = 生成就在循环上）。把它打开的人必须
-        # **当场**看见，而不是等它把请求搞坏之后才知道。
+        # ⚠️ 这是**口径**不是装饰：线程路的历史崩溃（堆腐坏）已根因到 flare `Mutex`
+        # 并发下写坏自己的堆存储（账本三十九，独立复现器 + raw pthread 对照刀定罪），
+        # 邮箱已换 `RawMutex`；"中途断开串味"也修了（`ends_sse_stream` 曾把非流式
+        # 应答误标成流结束，账本四十，test-engine 抓到）。两条重验证都过：重门
+        # `test-engine`（真线程 + 三次中途断开 + 逐字节形状）与 soak（FAKE 0/6、
+        # 真模型 0/3）。默认仍 0 = 生成就在 reactor 循环上（串行），打开是有意选择。
         var extra = ""
         if cfg.engine_threads > 1:
             # 多一条就多**一份权重**（`spawn_twin` 是重新加载一份），而"为什么内存翻
@@ -1159,10 +1161,9 @@ def main() raises:
                 + " copies of them"
             )
         print(
-            "  [warn] engine threads: "
+            "  [note] engine threads: "
             + String(cfg.engine_threads)
-            + " (EXPERIMENTAL — a client leaving mid-generation is known to"
-            + " corrupt the heap; the supported path is ALOFA_ENGINE_THREADS=0)"
+            + " (mailbox lock: RawMutex; generation off the reactor loop)"
             + extra
         )
 

@@ -1,18 +1,29 @@
-# 独立复现器（账本三十九）：mailbox 双向流量 × 另一线程的小字符串分配/释放。
+# 独立复现器（账本三十九）：**flare `Mutex` 在双线程并发下腐坏自己的堆存储**。
 #
-# 服务器里的最小触发条件（逐刀切出来的）：
-#   1. 一条**外来线程**（flare spawn / pthread）跑一个循环；
-#   2. 循环里反复分配并丢弃小字符串（`+` 拼接，每活 32 个起量）；
-#   3. **同时**主线程与它双向搬运大内联元素（Job 8 KB / Result 16 KB 的
-#      `List`，互斥锁保护）—— 这是它与"纯分配 churn 0/5"的差别。
-#   服务器内实测：BURST8 0/6、BURST32 2/6、FAKE 4-6/6；非线程同代码 0/6。
-#   崩点：tcmalloc sized-delete 的 CHECK 格式化路径
-#   （libAsyncRTRuntimeGlobals.so +0x94433，符号化 = TCMallocInternalDeleteArraySizedAligned）。
+# 最终触发条件（逐刀切出来的，每刀 3-6 轮交替）：
+#   1. 两条线程对同一个 flare `Mutex` **只做 lock/unlock**（REPRO_MUTEX_ONLY=1，
+#      不碰任何 List、零用户分配）—— 10 秒内即可 `pthread_mutex_(un)lock`
+#      返回 rc=22 (EINVAL)，互斥体的 unsafe_alloc 堆存储被写坏；
+#   2. 或者：一条外来线程分配/丢弃小字符串（burst）× 主线程与之双向搬运
+#      大内联元素邮箱（Job 8 KB / Result 16 KB，REPRO_BURST 默认 32）
+#      —— 同样的堆腐坏，崩点散落在 tcmalloc sized-delete 的 CHECK 格式化
+#      路径（libAsyncRTRuntimeGlobals.so +0x94433 = TCMallocInternalDeleteArraySizedAligned）。
+#   排除项（都有对照数据）：
+#   - 单线程同序列自环 1736 万次 ops 存活 ⇒ `List` 大元素 push/pop 无辜；
+#   - 换 raw pthread 互斥体（REPRO_RAW_MUTEX=1 / REPRO_MUTEX_ONLY+raw）：
+#     隔离 4/4 存活、全邮箱 4/4 存活 ⇒ 腐坏源是 flare Mutex 本身，不是
+#     mailbox/分配模式；
+#   - 堆坏后两个活块重叠：String 的缓冲被 malloc 到互斥体存储上
+#     （互斥体字节对账器抓到的现行）。
+#   服务器侧由此根因修复：邮箱换 RawMutex（inline 48B pthread 互斥体）。
 #
-# 这个文件把三样东西缩到最小：Job/Result 形状、互斥邮箱、对侧 burst。
-# 用法：pixi run mojo build -O2 -I src scripts/diag_repro_mailbox_burst.mojo -o target/repro_burst
-#       ./target/repro_burst [秒数，默认 10] [burst，默认 32]
-# 判据：进程活着跑满 = 未复现；SIGSEGV（probe 打印）= 复现。
+# 用法：
+#   pixi run mojo build -O2 -I src scripts/diag_repro_mailbox_burst.mojo -o target/repro_burst
+#   REPRO_SECONDS=15 REPRO_BURST=32 ./target/repro_burst          # 全邮箱（默认崩）
+#   REPRO_SECONDS=10 REPRO_MUTEX_ONLY=1 REPRO_BURST=0 ./target/repro_burst   # 纯 Mutex 隔离
+#   REPRO_RAW_MUTEX=1 REPRO_SECONDS=15 ./target/repro_burst       # raw pthread 对照（应存活）
+#   REPRO_SINGLE=1 REPRO_SECONDS=15 ./target/repro_burst          # 单线程自环（应存活）
+# 判据：进程跑满秒数并打印 survived = 未复现；SIGSEGV/SIGILL = 复现。
 
 from std.collections import List
 from std.ffi import external_call

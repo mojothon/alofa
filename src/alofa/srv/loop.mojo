@@ -575,9 +575,18 @@ struct Loop(Movable):
                 while i < res.n_bytes:
                     out.append(res.bytes[i])
                     i += 1
-                if ends_sse_stream(out):
+                # ⚠️ 这两个判定**只对真流做**（账本四十）：`ends_sse_stream` 认的是
+                # `"finish_reason":"`（非 null 值），而**非流式应答里也有它**
+                # （`"finish_reason":"stop"`）—— 不看 `streaming` 的话，普通应答会被
+                # 误标成"流结束"，`RES_DONE` 那一支就往非流式应答后面补一截
+                # `data: [DONE]`：客户端按 Content-Length 读不受影响，但 keep-alive
+                # 上的**下一个**响应前面会多出这 16 字节垃圾（test-engine 的
+                # "the plain answer changed shape" 抓到的正是它，差 16 字节）。
+                # `streaming[slot]` 由 `RES_STREAM_HEAD` 置位 —— 非流式请求没有头，
+                # 永远到不了这里。
+                if self.streaming[slot] == 1 and ends_sse_stream(out):
                     self.ended[slot] = 1
-                if has_sse_done(out):
+                if self.streaming[slot] == 1 and has_sse_done(out):
                     self.done_sent[slot] = 1
                 try:
                     self.conns[slot].enqueue(out^)
