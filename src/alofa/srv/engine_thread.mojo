@@ -73,13 +73,14 @@ from std.ffi import external_call
 from std.memory import Pointer
 from std.sys import size_of
 from alofa.srv.config import env_int, env_str
-from alofa.core.error import ERR_CAPACITY, AlofaError
+from alofa.core.error import ERR_CAPACITY, ERR_INVALID_ARGUMENT, AlofaError
 
 from flare.runtime import Reactor
 from flare.runtime._thread import ThreadHandle
 from flare.runtime.mutex import Mutex
 
 from alofa.srv.http import (
+    HttpRequest,
     SSE_CONTENT_TYPE,
     HttpResponse,
     bytes_of_text,
@@ -786,6 +787,37 @@ struct EngineThreads(Movable):
         self.n = 0
 
 
+def spawn_with_stack[
+    start: def(OpaquePtr) thin -> OpaquePtr
+](arg: OpaquePtr, stack_bytes: Int) raises -> ThreadHandle:
+    """用**显式 attr**（指定栈大小）起线程 —— 诊断实验（账本三十七下一步②）。
+
+    为什么 flare 的 `spawn` 不够：它传 NULL attr，pthread 默认栈 = glibc 在
+    **进程启动时**缓存的 soft `RLIMIT_STACK`（本机 8 MiB，进程内 setrlimit 改
+    不动它 —— `pthread_getattr_np` 实测过）。要给线程大栈只能显式 attr。
+    这个函数与 flare 的 spawn 只差一个 attr；用它跑崩溃载荷，崩溃率若不变
+    ⇒ 线程栈大小/布局与崩溃无关。
+    """
+    # ⚠️ malloc 在本模块已有 Int 返回的实例（external_call 每符号限一签名），
+    # 这里只能拿 Int 再转指针。
+    var raw = external_call["malloc", Int](Int(256))
+    var attr = OpaquePtr(unsafe_from_address=raw)
+    from std.memory import unsafe_memset_zero
+    unsafe_memset_zero(attr, 256)
+    _ = external_call["pthread_attr_init", Int32](attr)
+    _ = external_call["pthread_attr_setstacksize", Int32](attr, stack_bytes)
+    var tid = UInt64(0)
+    var tid_ptr = Pointer[UInt64, _](to=tid)
+    var rc = external_call["pthread_create", Int32](tid_ptr, attr, start, arg)
+    _ = external_call["pthread_attr_destroy", Int32](attr)
+    _ = external_call["free", NoneType](Int(attr))
+    if rc != 0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT, "pthread_create(with attr) failed", ""
+        )
+    return ThreadHandle(_thread_id=tid)
+
+
 def spawn_engines[H: EngineHandler](
     mut box: EngineBox, engines: Int
 ) raises -> EngineThreads:
@@ -801,9 +833,26 @@ def spawn_engines[H: EngineHandler](
         count = 1
     var addr = Int(Pointer(to=box))
     var threads = EngineThreads.alloc(count)
+    # 诊断（账本三十七下一步②）：ALOFA_THREAD_STACK_MB>0 时改用显式 attr 起线程，
+    # 线程拿到指定大小的栈（同时绕开 glibc 的默认栈缓存）。
+    var stack_mb = env_int("ALOFA_THREAD_STACK_MB", 0, 0, 1024)
+    if stack_mb > 0:
+        print(
+            "  [srv] engine threads with explicit stack: "
+            + String(stack_mb)
+            + " MiB"
+        )
     var i = 0
     while i < count:
-        threads.put(i, ThreadHandle.spawn[_engine_entry[H]](opaque_of(addr)))
+        if stack_mb > 0:
+            threads.put(
+                i,
+                spawn_with_stack[_engine_entry[H]](
+                    opaque_of(addr), stack_mb * 1024 * 1024
+                ),
+            )
+        else:
+            threads.put(i, ThreadHandle.spawn[_engine_entry[H]](opaque_of(addr)))
         i += 1
     return threads^
 
@@ -965,6 +1014,14 @@ def _run_job[H: EngineHandler](
     handler: Pointer[H, MutUntrackedOrigin], var job: Job
 ) -> Result:
     """跑一件活，交回一截字节。这一层不许抛（见 `_engine_entry`）。"""
+    # 诊断刀（账本三十八，5 轮×交替臂才作数）：**mailbox-only** —— 取到活不碰
+    # handler/parse/serialize，直接回一截固定字节。崩 ⇒ mailbox 机制在双线程
+    # 并发下自身就是问题；不崩 ⇒ engine 侧的 handler 工作在因果链上。
+    if env_str("ALOFA_ET_MAILBOX_ONLY", "0") == "1":
+        var fixed = List[UInt8]()
+        fixed.append(111)  # 'o'
+        fixed.append(107)  # 'k'
+        return Result(job.slot, job.gen, RES_DONE, job.kind == JOB_STREAM_END, fixed^)
     if job.kind == JOB_STREAM_STEP:
         return _stream_step[H](handler, job^)
     if job.kind == JOB_STREAM_END:
@@ -1013,12 +1070,37 @@ def _answer[H: EngineHandler](
     # 关的连接会一直占着槽位（`MAX_CONNS` 有上界）。
     var close = True
     try:
-        var raw = List[UInt8]()
-        var i = 0
-        while i < job.n_raw:
-            raw.append(job.raw[i])
-            i += 1
-        var request = parse_request(raw)
+        # 诊断刀（账本三十八）：**不碰 handler** —— 保留 parse 与响应构造（与
+        # MAILBOX_ONLY 的差别），只把 handler/service 簿记摘出去。0/5 ⇒ 触发点在
+        # handler 侧。
+        if env_str("ALOFA_ET_CUT_HANDLER", "0") == "1":
+            var fixed = json_response(200, "{\"ok\":true}", False)
+            return Result(
+                job.slot,
+                job.gen,
+                RES_DONE,
+                True,
+                bytes_of_text(serialize(fixed)),
+            )
+        var request: HttpRequest
+        # 诊断刀（账本三十八）：跳过 parse_request（硬编码一个请求）—— 判定解析
+        # 路径是否在因果链上。开着它请求内容全不看，只用于崩不崩的 A/B。
+        if env_str("ALOFA_ET_CUT_PARSE", "0") == "1":
+            request = HttpRequest()
+            request.method = "POST"
+            request.target = "/v1/chat/completions"
+            request.version = "HTTP/1.1"
+            request.body = (
+                '{"model":"m","messages":[{"role":"user","content":"hi"}],'
+                + '"max_tokens":8,"stream":true}'
+            )
+        else:
+            var raw = List[UInt8]()
+            var i = 0
+            while i < job.n_raw:
+                raw.append(job.raw[i])
+                i += 1
+            request = parse_request(raw)
         close = not request.keep_alive()
         response = handler[].handle(job.slot, request)
     except err:

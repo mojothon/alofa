@@ -831,7 +831,18 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
 
         var chat: ChatRequest
         try:
-            chat = parse_chat_request(req.body)
+            # 诊断刀（账本三十八）：跳过 JSON 体解析（硬编码 ChatRequest）——
+            # FAKE 模式下这是 engine 线程上唯一没被洗清的组件。开着它请求内容
+            # 全不看，只用于崩不崩的 A/B。
+            if env_str("ALOFA_ET_CUT_CHAT", "0") == "1":
+                chat = ChatRequest()
+                chat.model = "m"
+                chat.prompt = "hi"
+                chat.max_tokens = 8
+                chat.temperature = 0.0
+                chat.stream = True
+            else:
+                chat = parse_chat_request(req.body)
         except err:
             # 请求体的错是**对端**的错，所以是 400 而不是 500；把消息带回去是因为
             # "哪个字节不对"正是请求方唯一能据此修的东西。
@@ -882,19 +893,23 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         # 先把它收掉：漏掉它占的是表里一个位置，占满了就是"新请求被拒"。
         if self.stream_phase[request] != STREAM_IDLE:
             self.stream_end(request)
-        try:
-            self.service.stream_begin(
-                chat.prompt, chat.max_tokens, chat.temperature, request
-            )
-        except err:
-            # `stream_begin` 只做校验，所以这里的错都是**请求**的错（prompt 分词
-            # 为空 / 过长）—— 而不是"服务坏了"。回 400 且**不关连接**：客户端可以
-            # 立刻改一个 prompt 重试。
-            return json_response(
-                400,
-                error_json(String(err), "invalid_request_error", "invalid_body"),
-                False,
-            )
+        # 诊断刀（账本三十八）：跳过 service.stream_begin（KV/admit 簿记）——
+        # FAKE 模式下它与 stream_end 是最后没被洗清的组件。开着它排不上队，
+        # 只用于崩不崩的 A/B。
+        if env_str("ALOFA_ET_CUT_SVC", "0") != "1":
+            try:
+                self.service.stream_begin(
+                    chat.prompt, chat.max_tokens, chat.temperature, request
+                )
+            except err:
+                # `stream_begin` 只做校验，所以这里的错都是**请求**的错（prompt 分词
+                # 为空 / 过长）—— 而不是"服务坏了"。回 400 且**不关连接**：客户端可以
+                # 立刻改一个 prompt 重试。
+                return json_response(
+                    400,
+                    error_json(String(err), "invalid_request_error", "invalid_body"),
+                    False,
+                )
 
         var model = self.model
         if chat.model.byte_length() > 0:
@@ -917,6 +932,25 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         那边就表现为"永远等不到 `[DONE]`"（见文件头：这是最糟的失败形态）。
         """
         self._check_request(request)
+        # 诊断刀（账本三十八）：返回**字面量帧**，不构造 sse/JSON 字符串 —— 保留
+        # 表写入与相位机。与 ALOFA_ET_FAKE 同开。0/5 ⇒ sse 帧构造链在因果链上；
+        # 照崩 ⇒ 剩下的只有表写入了。
+        if env_str("ALOFA_ET_CUT_FRAME", "0") == "1":
+            var p0 = self.stream_phase[request]
+            if p0 == STREAM_IDLE:
+                return ""
+            if p0 == STREAM_ROLE:
+                self.stream_phase[request] = STREAM_TEXT
+                return "data: r\r\n\r\n"
+            if self.fake_step:
+                # 反向二分（账本三十八）：字面量帧 + 单独加回 escape_json ——
+                # 崩 ⇒ escape_json 是触发点；净 ⇒ 排除它。
+                _ = escape_json("x")
+                if self.stream_count[request] >= self.stream_max[request]:
+                    self.stream_phase[request] = STREAM_DONE
+                    return "data: f\r\n\r\n"
+                self.stream_count[request] += 1
+                return "data: x\r\n\r\n"
         var phase = self.stream_phase[request]
         if phase == STREAM_IDLE:
             # 这个号上**没有**流。返回空串而不是"答一条别人的流"：后者在客户端看来
@@ -997,7 +1031,8 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
             return
         if self.stream_phase[request] == STREAM_IDLE:
             return
-        self.service.stream_end(request)
+        if env_str("ALOFA_ET_CUT_SVC", "0") != "1":
+            self.service.stream_end(request)
         self.stream_phase[request] = STREAM_IDLE
         self.stream_count[request] = 0
 

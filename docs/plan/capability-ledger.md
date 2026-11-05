@@ -2518,3 +2518,39 @@
     （64 MiB + 大 guard）看崩溃率是否变化 —— 这是区分"栈/线程布局"与"上下文"
     的廉价实验；④ 若确认运行时缺陷，向上游报 issue 并考虑「engine 线程不做
     String 格式化」的绕行（把 decode/serialize 挪回 reactor）。
+
+- **2026-11-05（第三十八条）** —— 🟢 **触发面收窄到「engine 线程上的 sse 帧构造」，tcmalloc 分配采样嫌疑坐实一半；bisect 刀全套入列**
+  - 本条所有 A/B 都是**同轮交替、每臂 5–6 轮**（三十七的规矩）。今天先做两组对照再动刀：
+    **显式 attr 起线程**（`ALOFA_THREAD_STACK_MB`，自写 `spawn_with_stack`：`pthread_attr_setstacksize`，
+    flare 的 spawn 写死 NULL attr）：default 4/5 / attr64 4/5 / attr8 3/5 ⇒ **线程栈大小与布局彻底无关**
+    （"64 MiB 大栈修复"这条线正式埋葬）。
+  - **bisect 链**（臂 → 崩率；FAKE 基线 4–5/5；全部同轮交替）：
+    - `ALOFA_ET_MAILBOX_ONLY`（取活不碰 handler，回固定字节）→ **0/5**：mailbox 机制并发清白。
+    - `ALOFA_ET_CUT_HANDLER`（不碰 handler，保留 parse+serialize）→ **0/5**：触发点在 handler 侧。
+    - `ALOFA_ET_CUT_PARSE`（跳过 parse_request）→ 1/5：parse 清白。
+    - `ALOFA_ET_CUT_CHAT`（跳过 JSON 体解析）→ 2/5：JSON 解析清白。
+    - `ALOFA_ET_CUT_TEXT`（跳过 decode）→ 1/5：decode 清白（"挪回 reactor"绕行死刑）。
+    - `ALOFA_ET_CUT_SVC`（跳过 service.stream_begin/end）→ 3/5：service 簿记清白。
+    - **`ALOFA_ET_CUT_FRAME`（帧改字面量，保留表写入与相位机）→ 0–1/5：触发点 = sse 帧构造链**。
+    - CUT_FRAME + escape_json 加回 → 0/5：escape_json 清白。
+  - **FAKE 模式崩溃栈（探针链式捕获）**：`#8 parse_head ← #9 parse_request ← #10 _engine_main`
+    → 运行时 `#7(+0x51303)` → 格式化器 `#4(+0x94433)` —— **与 decode 链同一个 #4**。
+    parse_head 在崩路上只做 `bytes_to_text`（构造 String = 分配）⇒ 崩点函数是
+    **由分配路径进入的运行时 per-thread 追踪/采样记录写入器**。
+  - **tcmalloc 采样在场**：`_ZTH16tcmalloc_sampler`（TLS 采样器）、`allocation_sampling.h`、
+    `profile_sampling_interval`。**关采样两形式都显著降但不除根**：
+    `TCMALLOC_SAMPLE_PARAMETER=0` 4/6→2/6；`MALLOC_CONF=sample_parameter:0` 3/6→1/6。
+    ⇒ 采样是**贡献者**（崩率随 engine 线程分配量涨），要么 env 没真正关掉内嵌版的采样，
+    要么另有第二触发源。
+  - **解释力**：采样按分配字节量 1-in-N 触发 ⇒ 完美解释"插桩即愈/时序敏感/请求量相关/
+    刀法的剂量效应"（CUT_FRAME 砍掉的正是每帧十几个小分配）。si_addr 的 "POST"/0x11817
+    = 采样记录写入器读到了被复用内存的垃圾指针。
+  - **新刀（全部 env 门控默认关）**：`ALOFA_ET_MAILBOX_ONLY` / `ALOFA_ET_CUT_HANDLER` /
+    `ALOFA_ET_CUT_PARSE` / `ALOFA_ET_CUT_CHAT` / `ALOFA_ET_CUT_TEXT` / `ALOFA_ET_CUT_FRAME` /
+    `ALOFA_ET_CUT_SVC` / `ALOFA_THREAD_STACK_MB`。CUT_FRAME 内置 escape_json 反向二分子刀。
+  - **下一步**：① 找准内嵌 tcmalloc 的采样开关（试 `TCMALLOC_SAMPLE_PARAMETER` 大值 2^30、
+    `MALLOC_CONF=tcmalloc_sample_parameter:0`、或启动时 ` mallopt`/符号 interpose）——
+    若能真关掉且 0/5，就得到一个可发布的一行缓解；② 工程绕行：**engine 线程不做小分配**——
+    帧的 JSON 拼接挪回 reactor（engine 只交 token 与相位），或给 parse/帧路径做缓冲复用；
+    ③ 带着 #4/#7 偏移与探针证据向 Modular 报 issue（外来 pthread 上的 per-thread
+    采样/追踪状态未初始化）。

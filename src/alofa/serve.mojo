@@ -991,6 +991,12 @@ struct ModelService(Service, Twinable):
         两边必须同一个算法：不一样的话，流式拼出来的文本会**不等于**非流式那份，
         而"多字节字符被切成两半"正是它要防的。
         """
+        # 诊断刀（账本三十八，5 轮×交替臂才作数）：跳过 decode（返回字面量）——
+        # 崩点函数是 decode 调下来的运行时格式化路径，这把刀判定 decode 是否在
+        # 因果链上。开着它文本全错，只用于崩不崩的 A/B。
+        if env_str("ALOFA_ET_CUT_TEXT", "0") == "1":
+            self.b_emitted[slot] = self.b_emitted[slot] + n
+            return "ok"
         var ids = List[Int]()
         for i in range(n):
             ids.append(self.b_out[slot * MAX_GEN + i])
