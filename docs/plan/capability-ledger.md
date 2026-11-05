@@ -2604,3 +2604,17 @@
   - **状态**：⑥ 维持 🟢；线程路的两个历史已知病（堆腐坏 = flare Mutex、断开串味 =
     finish_reason 误判）都已根因修复。`ALOFA_ENGINE_THREADS` 默认仍 0 —— 翻默认
     是下一步（需要连带重跑全部重门，另一轮做）。
+
+- **2026-11-06（第四十一条）** —— 🟢 **`ALOFA_ENGINE_THREADS` 默认翻转 0→1**
+  - **波及面核对**：默认值只有生产 serve 二进制消费 —— test-engine 直连
+    `Loop.run`/`run_threaded`（免疫）、test-serve-soak 显式 `engine_threads=1`
+    （免疫）、没有任何测试读该 env。README:46 本就写着"默认 1"，这条翻转只是
+    让代码追上文档。
+  - **改动**：`srv/config.mojo` 默认 `0→1`；字段文档与 serve.mojo 文件头、README:113
+    的旧口径（"实验路/断开会搞坏请求/§8"）一并翻新到三十九/四十的最终事实。
+  - **验证**：serve_probe 重编后**默认 env** 冒烟（不设任何 ENGINE_THREADS）：
+    启动口径 `[note] engine threads: 1`、非流式无 `[DONE]` 泄漏、流式 `[DONE]`
+    完整、服务存活；`pixi run test`（41 套件）+ `test-batch-stream` +
+    `test-http` 三重绿。test-engine 不走 config（上轮已绿）。
+  - **状态**：线程化成为默认生成路（一条 5 s 生成不再占住 reactor 循环）；
+    `=0` 仍是受支持串行退路。⑥ 至此彻底收官（破案 → 根治 → soak → 重门 → 默认开）。

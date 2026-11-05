@@ -44,12 +44,12 @@ UTF-8，`decode` 会把它丢掉 —— 那样流式拼出来的文本会**不�
 ------
 `llama.cpp` 的 server。差异：一个 worker 一条 reactor 循环（`srv/loop.mojo`），
 上面同时挂着多条连接（旧形态是「一个 worker 同时只处理一条连接」，多 worker 只修
-进程数、修不了单 worker 的串行）。生成默认**就在这条循环上**（`ALOFA_ENGINE_THREADS=0`
-= 串行，一次生成占住这条循环直到它结束）。`>=1` 才把生成搬到 `srv/engine_thread.mojo`
-的 engine 线程上（roadmap 3.2b → 3.2c），同时能生成几条 = 那个数（每多一条就多一份权
-重，那是 3.2c 明文写下的代价）—— ⚠️ **那条路是实验的**：真模型 + 客户端中途断开会把
-请求搞坏（堆被踩，见账本 §8），所以它不默认开。兼容
-面是 OpenAI 的 `/v1/chat/completions`：不改代码、只改 `base_url` 就能用官方 SDK
+进程数、修不了单 worker 的串行）。生成默认走 engine 线程（`ALOFA_ENGINE_THREADS=1`，
+reactor 循环只管连接；`0` = 串行，一次生成占住这条循环直到它结束）。同时能生成几条 =
+engine 线程数（每多一条就多一份权重，那是 3.2c 明文写下的代价）。两条路的历史病均已
+根因修复：堆腐坏 = flare `Mutex`（账本三十九，邮箱已换 `RawMutex`）、断开串味 =
+`ends_sse_stream` 把非流式应答误标流结束（账本四十），重门 `test-engine` + soak 全绿。
+兼容面是 OpenAI 的 `/v1/chat/completions`：不改代码、只改 `base_url` 就能用官方 SDK
 打到它。
 """
 

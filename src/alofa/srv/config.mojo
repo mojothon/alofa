@@ -73,10 +73,13 @@ struct ServeConfig(Movable):
     # 每个 worker（单进程时就是那一个进程）里 **engine 线程的条数** = 同时能生成的
     # 条数（roadmap 3.2c）。
     #
-    # ⚠️ **默认是 0 = 生成就在这条循环上**（`Loop.run`，不过线程、不用邮箱），
-    # **不是** 1 条 engine 线程。为什么：走线程那条路会把请求搞坏 —— 实测（2026-09-25）
-    # 同一份二进制上 8 条几乎每条挂到超时，而 `run` 是 8/8 全过、~1 s、零报错。性质
-    # 还没修好，而"能用的服务"不该等它。要并发生成就把它设成 1（或更多），代价见下。
+    # **默认 1** = 生成走 engine 线程（`Loop.run_threaded`），reactor 循环只管
+    # accept/解析/回写 —— 一条 5 s 的生成不再卡住别的连接（账本四十：`test-engine`
+    # 的"生成期间循环还在 accept"性质 + 三种断开性质全绿）。设 **0** 退回串行路
+    # （`Loop.run`，生成就在循环上）：单请求路径少一次跨线程往返，但要独占循环。
+    # 两条路的历史病都已根因修复：堆腐坏 = flare `Mutex`（账本三十九，邮箱已换
+    # `RawMutex`，soak FAKE 0/6、真模型 0/3）；断开串味 = `ends_sse_stream` 把
+    # 非流式应答误标流结束（账本四十）。
     #
     # ⚠️ **N 条 = N 份权重**：`handler.spawn_twin` 是重新加载一份（现在还没有"共享
     # 只读权重"那一层），所以把它调大之前先算内存。想并发又想让权重真的共享，加
@@ -119,8 +122,8 @@ struct ServeConfig(Movable):
             run_seconds=env_int("ALOFA_RUN_SECONDS", 0, 0, 86_400),
             grace_ms=env_int("ALOFA_GRACE_MS", 120_000, 1, 3_600_000),
             max_requests=env_int("ALOFA_MAX_REQUESTS", 0, 0, 2_000_000_000),
-            # 0 = 串行（生成在循环上）；>=1 = 那么多条 engine 线程（见字段上的注释：
-            # 那条路现在会把请求搞坏，所以默认取 0）。
-            engine_threads=env_int("ALOFA_ENGINE_THREADS", 0, 0, 16),
+            # 默认 1（账本四十：两条路的历史病都已根因修复，重门 + soak 全绿后翻转）；
+            # 0 = 串行（生成在循环上），仍是受支持的退路。
+            engine_threads=env_int("ALOFA_ENGINE_THREADS", 1, 0, 16),
             weight_bits=env_int("ALOFA_WEIGHT_BITS", 0, 0, 2),
         )

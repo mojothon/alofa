@@ -110,10 +110,10 @@ curl -s localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","cont
 
 - 配置走**环境变量**（Mojo 1.0 编译产物里 `sys.argv` 是空的），全量清单与默认值见
   `src/alofa/srv/config.mojo`。注意 `ALOFA_MAX_TOKENS` 是**上下文窗口**（prompt+生成
-  总槽位），不是生成步数上限；`ALOFA_ENGINE_THREADS` 是同时能生成的条数，**默认 0 =
-  生成就在 reactor 循环上（串行）**。`>=1` 走 engine 线程，但那条路是**实验**的：真
-  模型 + 客户端中途断开会把请求搞坏（堆被踩，见账本 §8），开它之前先看那一条 —— 启动
-  时它会当场打 `[warn]`。
+  总槽位），不是生成步数上限；`ALOFA_ENGINE_THREADS` 是同时能生成的条数，**默认 1 =
+  生成走 engine 线程**（reactor 循环只管连接，一条慢生成不挡别人；设 `0` 退回串行路）。
+  两条路的历史病（堆腐坏 = flare `Mutex`；断开串味 = 流结束误判）均已根因修复并过重门
+  `test-engine` + soak（账本三十九/四十）。N 条 engine = N 份权重（还没有共享只读权重）。
 - 多 worker：master 加载一次权重后 fork，worker 靠写时复制共享（8 worker 的实际内存
   ≈ 单进程）；**worker 内分片请保持 1** —— fork 之后 asyncrt 不可用（账本 §8 有实测）。
 - 流式：`stream=true` 走 SSE（`text/event-stream`，逐 token 一帧，以 `data: [DONE]`
