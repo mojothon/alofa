@@ -46,7 +46,7 @@ from alofa.core.error import (
     AlofaError,
 )
 from alofa.core.ffi.mem import RawPtr
-from alofa.core.memory import Arena
+from alofa.core.memory import Arena, SharedRegion
 from alofa.core.tensor import (
     MAX_RANK,
     F32Ptr,
@@ -1484,6 +1484,9 @@ struct QwenForward(Movable):
     """
 
     var cfg: QwenConfig
+    # 构造时用的配置路径。孪生体要重解析一遍（`QwenConfig` 不可复制，而它只是
+    # 十个数字的解析，代价可以忽略）。
+    var config_path: String
     var params: TensorFile
     # The output projection's name. Tied embeddings (`tie_word_embeddings`)
     # mean the checkpoint has no `lm_head.weight` — the reference reads the
@@ -1493,7 +1496,7 @@ struct QwenForward(Movable):
     var cos: TensorView
     var sin: TensorView
     # Owns the rotary tables when the parameter file does not carry them.
-    var rope_arena: Arena
+    var rope_arena: SharedRegion
     var kv_arena: Arena
     var act_arena: Arena
     var k_store: List[RawPtr]
@@ -1522,7 +1525,7 @@ struct QwenForward(Movable):
     var max_tokens: Int
     # 量化后的投影矩阵：每个槽位一段 q4_0 块流，索引直接由层号算出，运行期不
     # 做任何名字查找。空列表 = 走 fp32 通路。
-    var q4_arena: Arena
+    var q4_arena: SharedRegion
     var q4_blocks: List[RawPtr]
     var q4_enabled: Bool
     # 输出投影（`self.head`）的 q8_0 块流，单独一条通路。
@@ -1535,7 +1538,7 @@ struct QwenForward(Movable):
     #
     # ⚠️ tied embedding 时 `self.head` 指向的就是 `embed_tokens` 那份字节 ⇒ 启用
     # 这条通路后，**embedding 查表也得从块流里解**，不是只改 matmul 一侧。
-    var q8_arena: Arena
+    var q8_arena: SharedRegion
     var q8_blocks: List[RawPtr]
     var q8_enabled: Bool
     # 一次投影切成几片并发跑。1 = 不切（与加这个字段之前完全同一条代码路径）；
@@ -1558,6 +1561,7 @@ struct QwenForward(Movable):
                 "max_tokens=" + String(max_tokens),
             )
         self.cfg = QwenConfig(config_path)
+        self.config_path = config_path
         self.params = TensorFile(params_dir)
         self.max_tokens = max_tokens
         self.kv_len = 0
@@ -1588,7 +1592,7 @@ struct QwenForward(Movable):
         var table_rows = max_tokens
         var table_cols = self.cfg.head_dim
         var derives_table = not (self.params.has(COS) and self.params.has(SIN))
-        self.rope_arena = Arena(
+        self.rope_arena = SharedRegion(
             table_rows * table_cols * 2 * 4 if derives_table else 1
         )
         if derives_table:
@@ -1649,7 +1653,7 @@ struct QwenForward(Movable):
         # 里才按实际张量大小开 arena，这里给 1 字节只是为了让字段有个值。
         self.q8_enabled = False
         self.q8_blocks = List[RawPtr]()
-        self.q8_arena = Arena(1)
+        self.q8_arena = SharedRegion(1)
         var q4_bytes = 0
         for layer in range(self.cfg.n_layers):
             for slot in range(Q4_SLOTS_PER_LAYER):
@@ -1661,7 +1665,7 @@ struct QwenForward(Movable):
                         "name=" + q4_weight_name(layer, slot) + " numel=" + String(n),
                     )
                 q4_bytes += n // Q4_BLOCK * Q4_BYTES
-        self.q4_arena = Arena(q4_bytes + q4_slot_count(self.cfg.n_layers) * 64)
+        self.q4_arena = SharedRegion(q4_bytes + q4_slot_count(self.cfg.n_layers) * 64)
         if quantize:
             self.enable_q4()
 
@@ -1702,6 +1706,86 @@ struct QwenForward(Movable):
                 "shards=" + String(shards) + " max=" + String(MAX_SHARDS),
             )
         self.shards = shards
+
+    def __init__(out self, proto: QwenForward, max_tokens: Int) raises AlofaError:
+        """孪生体：**借用** `proto` 的只读权重，KV/scratch 自己一份（账本四十三）。
+
+        为什么要有这一条：`spawn_twin` 原来是重新 `load_weights`，而 bf16
+        checkpoint 会被加宽成 fp32 私有副本（988 MB → 1.98 GB），每个 engine
+        线程一份 —— 实测 engines=2 比 engines=1 多 1.96 GB PSS。权重加载完就是
+        只读的，所以孪生体只需要"指向同一批字节"。
+
+        借用的安全性来自 工作线程池的构造顺序：孪生体是在原型上
+        `spawn_twin` 出来的，原型归 `Loop.run_threaded` 的调用方、要等
+        `join_all` 之后才析构 —— 借用者一定先死（见 `SharedRegion`）。
+
+        ⚠️ 不共享的东西：KV、scratch（`act_arena` 与那十几个 `*_ptr`）、
+        `kv_len`。共享它们等于两条线程往同一块缓冲里写，症状会是"偶尔答错一个
+        token"，那是这里最贵的失败模式。下面这段分配与 `__init__` 里那段是
+        **同一份逻辑的两处副本**，改一处必须改另一处（门用逐位相同的 logits
+        盯住它）。
+        """
+        if max_tokens <= 0:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "max_tokens must be positive",
+                "max_tokens=" + String(max_tokens),
+            )
+        self.cfg = QwenConfig(proto.config_path)
+        self.config_path = proto.config_path
+        self.params = TensorFile(proto.params, True)
+        self.max_tokens = max_tokens
+        self.kv_len = 0
+        self.shards = proto.shards
+        self.prof = ForwardProf()
+        self.junk_arm = 0
+        self.head = proto.head
+        # rope 表：派生表的字节在 `rope_arena` 里（借用）；checkpoint 自带的那
+        # 两张表的视图指向 `params` 的映射（孪生体自己重新映射了同一份文件，
+        # 视图仍然只读有效 —— 但为了不依赖"两份映射地址相同"这个巧合，视图直接
+        # 用原型的：原型活得更久）。
+        self.cos = proto.cos.copy()
+        self.sin = proto.sin.copy()
+        self.rope_arena = proto.rope_arena.borrowed()
+        # 量化块流：指针指向原型 arena 里的字节，列表本身各一份（内容相同）。
+        self.q4_arena = proto.q4_arena.borrowed()
+        self.q4_blocks = proto.q4_blocks.copy()
+        self.q4_enabled = proto.q4_enabled
+        self.q8_arena = proto.q8_arena.borrowed()
+        self.q8_blocks = proto.q8_blocks.copy()
+        self.q8_enabled = proto.q8_enabled
+
+        # ↓↓↓ 与 `__init__` 里的流状态分配保持同步（KV/scratch 必须逐实例）。
+        var kv_dim = self.cfg.kv_dim()
+        var store_bytes = max_tokens * kv_dim * 4
+        self.kv_arena = Arena(store_bytes * self.cfg.n_layers * 2)
+        self.k_store = List[RawPtr]()
+        self.v_store = List[RawPtr]()
+        for _ in range(self.cfg.n_layers):
+            self.k_store.append(self.kv_arena.alloc(store_bytes))
+            self.v_store.append(self.kv_arena.alloc(store_bytes))
+
+        var h = self.cfg.hidden
+        var inter = self.cfg.intermediate
+        var act_bytes = max_tokens * (h * 6 + inter * 3 + self.cfg.kv_dim() * 3) * 4
+        var logits_bytes = self.cfg.vocab * 4
+        self.act_arena = Arena(
+            act_bytes + logits_bytes + max_tokens * max_tokens * 4
+        )
+        self.hidden_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.normed_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.q_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.q_rot_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.attn_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.proj_ptr = self.act_arena.alloc(max_tokens * h * 4)
+        self.k_ptr = self.act_arena.alloc(max_tokens * kv_dim * 4)
+        self.k_rot_ptr = self.act_arena.alloc(max_tokens * kv_dim * 4)
+        self.v_ptr = self.act_arena.alloc(max_tokens * kv_dim * 4)
+        self.gate_ptr = self.act_arena.alloc(max_tokens * inter * 4)
+        self.up_ptr = self.act_arena.alloc(max_tokens * inter * 4)
+        self.act_ptr = self.act_arena.alloc(max_tokens * inter * 4)
+        self.scores_ptr = self.act_arena.alloc(max_tokens * max_tokens * 4)
+        self.logits_ptr = self.act_arena.alloc(logits_bytes)
 
     def enable_q4(mut self) raises AlofaError:
         """把所有投影矩阵就地压成 q4_0，之后的前向走量化通路。
@@ -1751,7 +1835,7 @@ struct QwenForward(Movable):
                 "name=" + head_name + " numel=" + String(n),
             )
         var total = n // Q8_BLOCK * Q8_BYTES
-        self.q8_arena = Arena(total + 64)
+        self.q8_arena = SharedRegion(total + 64)
         var blocks = self.q8_arena.alloc(total)
         quantize_q8_0(blocks, self.params.ptr(head_name), n)
         self.q8_blocks.append(blocks)

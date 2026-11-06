@@ -31,7 +31,7 @@ from alofa.core.error import (
     ERR_UNSUPPORTED,
     AlofaError,
 )
-from alofa.core.memory import Arena
+from alofa.core.memory import Arena, SharedRegion
 from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr, Shape, TensorView, f32_data
 from alofa.core.text import parse_int, read_text
@@ -100,10 +100,17 @@ struct TensorFile(Movable):
     # bf16, and widening it cannot be done in the mapping — a mapping is
     # read-only — so the widened copy is owned here and outlives every view
     # handed out of it.
-    var arena: Arena
+    #
+    # 类型是 `SharedRegion` 而不是 `Arena`：工作线程池里的孪生体**借用原型
+    # 这一块**（借用 = 析构不还），见 `SharedRegion` 与下面的 `borrowing`。
+    var arena: SharedRegion
     var converted: Bool
+    # 用于孪生体重新映射同一份文件（映射本身是 MAP_PRIVATE 只读，同一份文件的
+    # 页在进程内共享）。
+    var path: String
 
     def __init__(out self, dir_path: String) raises AlofaError:
+        self.path = dir_path
         self.converted = False
         if _has_suffix(dir_path, ".safetensors"):
             var safe = SafeTensorFile(dir_path)
@@ -138,12 +145,12 @@ struct TensorFile(Movable):
                 # initialised on every path, and the alternative — an optional
                 # arena — would make each reader answer a question the file
                 # answers once.
-                self.arena = Arena(1)
+                self.arena = SharedRegion(1)
                 for i in range(n):
                     self.offsets.append(safe.data_base + safe.begins[i])
                 return
             self.converted = True
-            self.arena = Arena(total * 4 + 16 * (n + 1))
+            self.arena = SharedRegion(total * 4 + 16 * (n + 1))
             var base = self.arena.alloc(total * 4)
             var cursor = 0
             for i in range(n):
@@ -169,7 +176,7 @@ struct TensorFile(Movable):
                     )
                 cursor += self.counts[i] * 4
             return
-        self.arena = Arena(1)
+        self.arena = SharedRegion(1)
         var index = read_text(dir_path + "/tensors.tsv")
         self.mapped = MappedFile(dir_path + "/tensors.f32")
         self.names = List[String]()
@@ -222,6 +229,26 @@ struct TensorFile(Movable):
 
         if len(self.names) == 0:
             raise AlofaError(ERR_PARSE, "index is empty", "dir=" + dir_path)
+
+    def __init__(out self, proto: TensorFile, borrowed: Bool) raises AlofaError:
+        """搭在 `proto` 的只读权重上（服务线程孪生体用；`borrowed` 只做区分）。
+
+        这里**不再加宽**：加宽后的 fp32 副本是那份 bf16 checkpoint 的 2 倍大
+        （988 MB → 1.98 GB），每个工作线程各来一份就是账本四十三量到的那
+        +1.96 GB/条。孪生体要的只是"能读到同一批字节"，所以映射重新开一份
+        （同一文件的页在进程内共享），加宽区按 `SharedRegion.borrowed` 借过来。
+
+        `offsets` 直接抄原型的：加宽分支里它们相对加宽区基址、不加宽的分支里
+        相对映射基址，两种口径在孪生体上都成立（基址来源一一对应）。
+        """
+        self.path = proto.path
+        self.mapped = MappedFile(proto.path)
+        self.names = proto.names.copy()
+        self.shape_text = proto.shape_text.copy()
+        self.offsets = proto.offsets.copy()
+        self.counts = proto.counts.copy()
+        self.arena = proto.arena.borrowed()
+        self.converted = proto.converted
 
     def keep_alive(self):
         """State that the mapping is still in use here.

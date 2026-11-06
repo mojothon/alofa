@@ -284,6 +284,39 @@ def test_prefill_logits_match_the_reference() raises:
     mapped.keep_alive()
 
 
+def test_twin_borrows_weights_and_matches_logits() raises:
+    """engine 孪生体：共享只读权重，logits 与原型逐位相同（账本四十三）。"""
+    var prompts = load_prompt_ids()
+    var model = QwenForward(REAL_WEIGHTS, REAL_CONFIG, MAX_TOKENS)
+    var twin = QwenForward(model, MAX_TOKENS)
+    # 1) 同一个加宽区：孪生体没有第二次 bf16→fp32（那是 1.98 GB/条）。
+    assert_true(
+        Int(twin.params.arena.data) == Int(model.params.arena.data),
+        "孪生体的参数区不是借来的（又加宽了一份）",
+    )
+    assert_true(
+        Int(twin.params.view("model.embed_tokens.weight").data)
+        == Int(model.params.view("model.embed_tokens.weight").data),
+        "孪生体的 embedding 地址与原型不同",
+    )
+    # 2) 流状态各自一份。
+    assert_true(
+        Int(twin.k_store[0]) != Int(model.k_store[0]),
+        "两条流共用同一块 KV",
+    )
+    # 3) 借用是只读的：同一条 prompt 的 logits 必须逐位相同。
+    var vocab = vocab_size()
+    model.reset()
+    var a = model.prefill(prompts[0].copy())
+    twin.reset()
+    var b = twin.prefill(prompts[0].copy())
+    for i in range(vocab):
+        if a[i] != b[i]:
+            assert_true(False, "第 " + String(i) + " 个 logit 与原型不同")
+    model.keep_alive()
+    twin.keep_alive()
+
+
 def test_greedy_generation_matches_the_reference() raises:
     """Sixteen generated tokens, identical to Hugging Face's continuation.
 

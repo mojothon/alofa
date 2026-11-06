@@ -388,20 +388,17 @@ struct ModelService(Service, Twinable):
         )
 
     def spawn_twin(self, index: Int) raises -> Int:
-        """engine 线程池里的"再加载一份"（roadmap 3.2c）。
+        """engine 线程池里的那份"自己"（roadmap 3.2c）。
 
-        ⚠️ **一份 = 一份权重**：这里是**重新加载**（`QwenForward` 从权重文件再来一
-        次），不是"共享只读权重 + 各自一份 KV"。所以 `ALOFA_ENGINE_THREADS=N` 的
-        内存是 N 份权重 —— 这个代价写在 `srv/engine_thread.mojo` 的文件头，启动时
-        也会跟着实验警示一起打出来，不是疏漏。共享那一层要动到 model（把"只读的
-        权重"和"每条流的状态"分开），那是下一件事。
+        **权重共享、KV 各自一份**（账本四十三）：模型侧走
+        `QwenForward(proto, max_tokens)`，只读字节（bf16 加宽后的 fp32、q4/q8
+        块流、rope 表）全部借用原型，只有 KV/scratch 与流相位是新的。原来是重新
+        `load_weights`，每个孪生体自带一份 1.98 GB 加宽副本（实测 engines=2 比
+        engines=1 多 1.96 GB PSS）。
 
         分片数跟着原型走（多 worker 下它是 1，见 `main` 里那段 fork 的说明）。
         """
-        var model = load_weights(
-            self.weights_file, self.config_path, self.max_tokens, self.weight_bits
-        )
-        model.shards = self.model.shards
+        var model = QwenForward(self.model, self.max_tokens)
         var tokenizer = load_tokenizer_json(self.tokenizer_json)
         var twin = ModelService(
             model^,

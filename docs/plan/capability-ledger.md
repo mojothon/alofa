@@ -2631,3 +2631,33 @@
   - **issue 内嵌最小片段独立验证过**：从草稿原样提取 → 编译通过 → 20 秒内
     复现（同款 start_thread 栈形）；初版片段漏 `raises`（`Mutex()` 会抛）已修。
   - 环境：Mojo 1.0.0 (ed45d567) / Ubuntu 22.04.5 / i7-9700K。
+
+- **2026-11-06（第四十三条）** —— 🟢 **engine 孪生体共享只读权重**（roadmap 3.2c 的代价消掉）
+  - **先量再改**：engines=1 的 PSS 2.94 GB，engines=2 是 4.90 GB —— 每多一条
+    engine 线程 **+1.96 GB**。实体不是文件映射（`MappedFile` 是 PROT_READ 的
+    MAP_PRIVATE，同一文件的页在进程内本就共享），而是 loader 里那份 **bf16→fp32
+    加宽副本**（988 MB 文件 → 1.98 GB 私有 arena），外加 q4 档每 twin 再一份
+    0.2 GB 量化块。注释里"一份 = 一份权重"说的就是它们。
+  - **改法**：`TensorFile.arena` 与 qwen 的 `rope/q4/q8` 三个 arena 换成新的
+    `SharedRegion`；`TensorFile(proto, ...)` 与 `QwenForward(proto, max_tokens)`
+    两条借用构造；`ModelService.spawn_twin` 改走后者。KV / scratch / 流相位
+    仍是逐 twin 新建（共享它们是"偶尔答错一个 token"那一类失败）。
+  - **生命周期（本轮最贵的一课）**：先试了引用计数，失败 —— Mojo 按**字段最后
+    一次使用**析构，而 `TensorView` 里是未跟踪的裸指针，借用计数会在临时量析构
+    里被吃掉、字段又可能提前回收，实测权重在第一次前向之前就被 munmap（`rope`
+    里读到已解映射地址）。最终改成**只进不出的借用标记**：映射头 64 字节，发生
+    过一次 `borrowed` 就把标记置位，此后所有句柄都不回收；**没人借过的单实例
+    照常 munmap**（这一条是被 `test-batch-stream` 抓出来的：纯泄漏版连跑六个
+    测试攒到 ~13 GB，排队那条 stream 的 token 开始对不上）。
+  - **量到的结果**：engines=2 的 PSS 增量 **+1.96 GB → +34 MB**（2.94 → 2.98 GB，
+    余下是 tokenizer/act/KV/sampler）；engines=2 双并发贪心答案与 engines=1
+    单跑**逐条相同**。
+  - **门**：`test-model-dir` 新增
+    `test_twin_borrows_weights_and_matches_logits`（同一加宽区地址、KV 地址不同、
+    同 prompt 的 logits **逐位相同**）→ 7/7；`test`(41 套件)、`test-memory`、
+    `test-engine`、`test-http`、`test-batch-stream` 全绿。
+  - **边界**：借用过的权重区不回收（服务只在启动时加载一次，代价可忽略；测试里
+    重复加载会累积，这是它唯一的代价）；N 条 engine = 1 份权重 + N 份 KV/scratch。
+  - **旁注（未处理，与本条无关）**：裸 `main()` 程序里直接调 `prefill` 会崩
+    （`libKGENCompilerRTShared` 帧），基线与改动后同样崩、`TestSuite` 里同一段
+    代码正常 —— 属于既有的"程序形状"问题，没有追。
