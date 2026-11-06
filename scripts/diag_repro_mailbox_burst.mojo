@@ -2,8 +2,9 @@
 #
 # 最终触发条件（逐刀切出来的，每刀 3-6 轮交替）：
 #   1. 两条线程对同一个 flare `Mutex` **只做 lock/unlock**（REPRO_MUTEX_ONLY=1，
-#      不碰任何 List、零用户分配）—— 10 秒内即可 `pthread_mutex_(un)lock`
-#      返回 rc=22 (EINVAL)，互斥体的 unsafe_alloc 堆存储被写坏；
+#      不碰任何 List、零用户分配）—— 8-10 秒一轮：rc=22 (EINVAL，flare 自己的
+#      assert 在 mutex.mojo:114 打出)/SIGILL/挂死 三种收场都见过（非确定，
+#      2026-11-06 四轮：1 崩 / 1 挂 / 2 存活）；
 #   2. 或者：一条外来线程分配/丢弃小字符串（burst）× 主线程与之双向搬运
 #      大内联元素邮箱（Job 8 KB / Result 16 KB，REPRO_BURST 默认 32）
 #      —— 同样的堆腐坏，崩点散落在 tcmalloc sized-delete 的 CHECK 格式化
@@ -199,21 +200,32 @@ def engine_entry(arg: OpaquePtr) -> OpaquePtr:
     var mbp = Pointer(to=box[].mb)
     var done_jobs = 0
     if box[].burst == 0 and env_str("REPRO_MUTEX_ONLY", "0") == "1":
-        # 纯 Mutex 隔离：两线程只 lock/unlock，不碰任何 List。raw pthread 版。
+        # 纯 Mutex 隔离：两线程只 lock/unlock **同一个**互斥体，不碰任何 List。
+        # 默认打 flare `Mutex`；REPRO_RAW_MUTEX=1 换 raw pthread（对照）。
         var n = 0
         var mptr = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(Pointer(to=box[].raw_mtx)))
+        var use_raw = env_str("REPRO_RAW_MUTEX", "0") == "1"
         try:
             while box[].stop == 0:
-                _ = external_call[
-                    "pthread_mutex_lock", Int32, Pointer[UInt8, MutUntrackedOrigin]
-                ](mptr)
-                _ = external_call[
-                    "pthread_mutex_unlock", Int32, Pointer[UInt8, MutUntrackedOrigin]
-                ](mptr)
+                if use_raw:
+                    _ = external_call[
+                        "pthread_mutex_lock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+                    ](mptr)
+                    _ = external_call[
+                        "pthread_mutex_unlock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+                    ](mptr)
+                else:
+                    mbp[].mutex.lock()
+                    mbp[].mutex.unlock()
                 n += 1
         except:
             pass
-        print("[repro] mutex-only engine side: locks=" + String(n))
+        print(
+            "[repro] mutex-only engine side: raw="
+            + String(Int(use_raw))
+            + " locks="
+            + String(n)
+        )
         var zero1 = Int(0)
         return OpaquePtr(unsafe_from_address=zero1)
     try:
@@ -356,12 +368,16 @@ def main() raises:
                 return
             k1 += 1
         if env_str("REPRO_MUTEX_ONLY", "0") == "1":
-            _ = external_call[
-                "pthread_mutex_lock", Int32, Pointer[UInt8, MutUntrackedOrigin]
-            ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(Pointer(to=box.raw_mtx))))
-            _ = external_call[
-                "pthread_mutex_unlock", Int32, Pointer[UInt8, MutUntrackedOrigin]
-            ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(Pointer(to=box.raw_mtx))))
+            if env_str("REPRO_RAW_MUTEX", "0") == "1":
+                _ = external_call[
+                    "pthread_mutex_lock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+                ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(Pointer(to=box.raw_mtx))))
+                _ = external_call[
+                    "pthread_mutex_unlock", Int32, Pointer[UInt8, MutUntrackedOrigin]
+                ](Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(Pointer(to=box.raw_mtx))))
+            else:
+                box.mb.mutex.lock()
+                box.mb.mutex.unlock()
         if box.mb.push_job(job^):
             sent += 1
         if box.mb.take_result(res):

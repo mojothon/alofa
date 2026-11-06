@@ -2618,3 +2618,16 @@
     `test-http` 三重绿。test-engine 不走 config（上轮已绿）。
   - **状态**：线程化成为默认生成路（一条 5 s 生成不再占住 reactor 循环）；
     `=0` 仍是受支持串行退路。⑥ 至此彻底收官（破案 → 根治 → soak → 重门 → 默认开）。
+
+- **2026-11-06（第四十二条）** —— 🟢 **上游 issue 材料定稿**（`docs/plan/upstream-issue-flare-mutex.md`，待提交 modular/modular）
+  - **复现器 MONLY 臂补flare/raw 分刀**（此前 MONLY 两边都走 raw，头注释声称的
+    "纯 flare lock/unlock 崩"没被代码覆盖）：默认打 flare `Mutex`，
+    `REPRO_RAW_MUTEX=1` 才走 raw 对照。
+  - **最小复现确认**：两线程只 lock/unlock 同一个 flare `Mutex` —— 新鲜四轮
+    （8-10s/轮）：1× SIGILL（flare 自己 assert `mutex.mojo:114:41` 打出
+    `pthread_mutex_unlock failed with rc=22`）/ 1× 挂死 / 2× 存活，非确定；
+    raw pthread 对照存活。FULL 邮箱臂依旧每跑必崩（764,370 jobs 后 SIGSEGV，
+    `String._add → alloc → libAsyncRTRuntimeGlobals.so+0x4f2c2`）。
+  - **issue 内嵌最小片段独立验证过**：从草稿原样提取 → 编译通过 → 20 秒内
+    复现（同款 start_thread 栈形）；初版片段漏 `raises`（`Mutex()` 会抛）已修。
+  - 环境：Mojo 1.0.0 (ed45d567) / Ubuntu 22.04.5 / i7-9700K。
