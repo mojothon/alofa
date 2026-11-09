@@ -69,7 +69,14 @@ from alofa.kernels.cuda.basic import (
     linear_gpu,
     rmsnorm_gpu,
 )
-from alofa.kernels.cuda.elementwise import add_gpu, copy_gpu, gather_gpu, rope_gpu, swiglu_gpu
+from alofa.kernels.cuda.elementwise import (
+    add_gpu,
+    add_into_gpu,
+    copy_gpu,
+    gather_gpu,
+    rope_gpu,
+    swiglu_gpu,
+)
 from alofa.kernels.cuda.matmul import q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
@@ -672,11 +679,29 @@ def add_copy_diff_check(mut ctx: DeviceContext) raises:
     var diff_add = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), na)
     if diff_add != 0.0:
         raise Error("add: diff=" + String(diff_add) + " (zero tolerance)")
+    # add_into：原地残差（dst 即源之一）。dst 从 a 的副本出发，加 b，比 dst_cpu。
+    var hsum = ctx.enqueue_create_host_buffer[DT](na)
+    ctx.synchronize()
+    for i in range(na):
+        hsum[i] = f32_data(a)[unsafe_offset=i]
+    var dsum = ctx.enqueue_create_buffer[DT](na)
+    ctx.enqueue_copy(dst_buf=dsum, src_buf=hsum)
+    ctx.synchronize()
+    ctx.enqueue_function[add_into_gpu](
+        dsum.unsafe_ptr(), db.unsafe_ptr(), Int32(EW_N),
+        grid_dim=(ceildiv(na, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    var hsum2 = ctx.enqueue_create_host_buffer[DT](na)
+    ctx.enqueue_copy(dst_buf=hsum2, src_buf=dsum)
+    ctx.synchronize()
+    var diff_into = max_abs_diff(hsum2.unsafe_ptr(), f32_data(dst_cpu), na)
+    if diff_into != 0.0:
+        raise Error("add_into: diff=" + String(diff_into) + " (zero tolerance)")
     var diff_cp = max_abs_diff(he.unsafe_ptr(), pcp, nc)
     if diff_cp != 0.0:
         raise Error("copy: diff=" + String(diff_cp) + " (zero tolerance)")
     arena.keep_alive()
-    print("*** ADD/COPY GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)")
+    print("*** ADD/ADD_INTO/COPY GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)")
 
 
 def swiglu_diff_check(mut ctx: DeviceContext) raises:

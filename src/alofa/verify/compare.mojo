@@ -14,7 +14,7 @@ Run:
     pixi run mojo run -I src tests/unit/test_layer0_parity.mojo
 """
 
-from std.math import sqrt
+from std.math import inf, sqrt
 
 from alofa.core.tensor import F32Ptr
 
@@ -32,10 +32,17 @@ def max_abs(values: F32Ptr, n: Int) -> Float64:
 
 
 def max_abs_diff(a: F32Ptr, b: F32Ptr, n: Int) -> Float64:
-    """Largest element-wise gap between two arrays of the same length."""
+    """Largest element-wise gap between two arrays of the same length.
+
+    NaN 拒收（账本六十三）：任何一侧出现 NaN 都返回 +inf —— NaN 的比较恒为
+    False，不带这条规则时全 NaN 的输出会以 diff=0.0 "通过" 差分检查（GPU
+    decode 端到端假绿的直接机制）。
+    """
     var worst = Float64(0)
     for i in range(n):
         var d = Float64(a[unsafe_offset=i]) - Float64(b[unsafe_offset=i])
+        if d != d:
+            return inf[DType.float64]()
         if d < 0:
             d = -d
         if d > worst:

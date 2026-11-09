@@ -115,3 +115,21 @@ def gather_gpu(
     var c = i % Int(cols)
     var token = Int(ids[unsafe_offset=t])
     dst[unsafe_offset=i] = table[unsafe_offset=token * Int(cols) + c]
+
+
+def add_into_gpu(
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    b: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """`dst[i] = dst[i] + b[i]`，原地残差累加。
+
+    与 `add_gpu` 的区别是目标就是源之一 —— 解_ALLOC aliasing 检查的约束
+    （同一缓冲不能同时以两个 mutable 参数进 kernel 发射，账本六十三）；
+    逐元素同下标读写，每线程先读后写自己那一份，语义与 `dst = a + b`
+    （a 即 dst）完全一致。
+    """
+    var i = Int(global_idx.x)
+    if i >= Int(n):
+        return
+    dst[unsafe_offset=i] = dst[unsafe_offset=i] + b[unsafe_offset=i]
