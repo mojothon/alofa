@@ -280,6 +280,47 @@ def _bench_shape[inner: Int, out_cols: Int](
     ctx.synchronize()
     diff_s32 = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
 
+    @parameter
+    for threads in range(64, 129, 64):
+        var best_t = Float64(1e30)
+        var diff_t = Float64(-1)
+        for i in range(WARMUP):
+            ctx.enqueue_function[q4_matmul_smem_gpu[threads, inner]](
+                dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+                Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(threads, 1, 1),
+            )
+        ctx.synchronize()
+        for r in range(ROUNDS):
+            var t0 = monotonic_ns()
+            for i in range(ITERS):
+                ctx.enqueue_function[q4_matmul_smem_gpu[threads, inner]](
+                    dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+                    Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(threads, 1, 1),
+                )
+            ctx.synchronize()
+            var ms = Float64(monotonic_ns() - t0) / 1e6
+            if ms < best_t:
+                best_t = ms
+        ctx.enqueue_function[q4_matmul_smem_gpu[threads, inner]](
+            dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+            Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(threads, 1, 1),
+        )
+        ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+        ctx.synchronize()
+        diff_t = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
+        var us_t = best_t * Float64(1000) / Float64(ITERS)
+        var gb_t = Float64(bytes_q4) * Float64(ITERS) / (best_t / 1e3) / 1e9
+        print(
+            "  q4_smem"
+            + String(threads)
+            + "   "
+            + String(us_t)
+            + " µs/iter  "
+            + String(gb_t)
+            + " GB/s  diff="
+            + String(diff_t)
+        )
+
     var best_b128 = Float64(1e30)
     var diff_b128 = Float64(-1)
     for i in range(WARMUP):
@@ -393,6 +434,74 @@ def _bench_shape[inner: Int, out_cols: Int](
         + String(diff_s32)
     )
     print("  launch_floor " + String(us_null) + " µs/iter (空 kernel)")
+
+    # ---- rows=32 批形状：首次真正走 block_idx.y 维度 ----
+    var nrows = 32
+    var n_x32 = nrows * inner
+    var x32 = arena.alloc(n_x32 * 4)
+    var px32 = x32.unsafe_bitcast[Float32]()
+    for i in range(n_x32):
+        px32[unsafe_offset=i] = Float32((i * 31 + 7) % 211 - 105) * Float32(0.021)
+    # CPU 参照：整批 linear（一次调用，不做逐行）
+    var ref32_raw = arena.alloc(nrows * out_cols * 4)
+    var x32_view = _view(x32, nrows, inner)
+    linear(_view(ref32_raw, nrows, out_cols), x32_view, _view(wf_raw, out_cols, inner))
+
+    var hx32 = ctx.enqueue_create_host_buffer[DT](n_x32)
+    var hd32 = ctx.enqueue_create_host_buffer[DT](nrows * out_cols)
+    ctx.synchronize()
+    for i in range(n_x32):
+        hx32[i] = px32[unsafe_offset=i]
+    var dx32 = ctx.enqueue_create_buffer[DT](n_x32)
+    var dd32 = ctx.enqueue_create_buffer[DT](nrows * out_cols)
+    ctx.enqueue_copy(dst_buf=dx32, src_buf=hx32)
+    ctx.synchronize()
+
+    # 正确性
+    ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+        dx32.unsafe_ptr(), dw.unsafe_ptr(), dd32.unsafe_ptr(),
+        Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), Int(nrows), 1), block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd32, src_buf=dd32)
+    ctx.synchronize()
+    var n32 = nrows * out_cols
+    var diff32 = max_abs_diff(hd32.unsafe_ptr(), f32_data(_view(ref32_raw, nrows, out_cols)), n32)
+    var scale32 = max_abs(f32_data(_view(ref32_raw, nrows, out_cols)), n32)
+    if scale32 <= 0.0:
+        raise Error("batch reference all zeros")
+    if diff32 > REL_TOLERANCE * scale32:
+        raise Error("rows=32: diff=" + String(diff32))
+
+    # 吞吐
+    var bytes_b32 = w_bytes + n_x32 * 4 + n32 * 4
+    var best_batch = Float64(1e30)
+    for i in range(WARMUP):
+        ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+            dx32.unsafe_ptr(), dw.unsafe_ptr(), dd32.unsafe_ptr(),
+            Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), Int(nrows), 1), block_dim=(32, 1, 1),
+        )
+    ctx.synchronize()
+    for r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+                dx32.unsafe_ptr(), dw.unsafe_ptr(), dd32.unsafe_ptr(),
+                Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), Int(nrows), 1), block_dim=(32, 1, 1),
+            )
+        ctx.synchronize()
+        var ms = Float64(monotonic_ns() - t0) / 1e6
+        if ms < best_batch:
+            best_batch = ms
+    var us_batch = best_batch * Float64(1000) / Float64(ITERS)
+    var gb_batch = Float64(bytes_b32) * Float64(ITERS) / (best_batch / 1e3) / 1e9
+    print(
+        "  rows=32 smem32  "
+        + String(us_batch)
+        + " µs/iter  "
+        + String(gb_batch)
+        + " GB/s  diff="
+        + String(diff32)
+    )
 
 
 def null_gpu(dst: Pointer[Float32, MutUntrackedOrigin]) -> None:
