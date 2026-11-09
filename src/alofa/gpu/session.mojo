@@ -615,13 +615,21 @@ struct GpuSession:
 
     # ---- 整步入口 ----
 
-    def decode_step[inner: Int, inner_ff: Int](
+    def decode_step[
+        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4
+    ](
         mut self, token: Int
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t=1 的完整前向：返回 host logits 指针（下次调用前有效）。
 
         算子序与 `run` 逐步对应；KV 追加在 device 侧 store 上，`kv_pos` 是
         会话内的绝对位置。中间零 host 往返（token id 一次 4 字节上传）。
+
+        dual_t/dual_o（账本七十五）：dual 形状 comptime 参（默认 =
+        六十九微基准冠军）。⚠️ 真链重扫一度示 T128/O8 快 0.39ms，被
+        交错 A/B（bench_dual_ab）证伪 —— 本机是共享 GPU，顺序扫型的
+        形状窗口落在不同负载时段，排名是漂移假象；交错下两形状逐位
+        打平（2.9575 vs 2.9526）。参数保留作扫型基建，默认不动。
         """
         if Int(inner) != self.hidden or Int(inner_ff) != self.inter:
             raise AlofaError(
@@ -731,7 +739,9 @@ struct GpuSession:
             var w_up = self.d_w16_up[layer].unsafe_ptr()
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
-            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False, True, True]](
+            self.ctx.enqueue_function[
+                f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
+            ](
                 self.d_x.unsafe_ptr(),
                 w_gate,
                 w_up,
@@ -744,8 +754,8 @@ struct GpuSession:
                 self.eps,
                 Int32(inner),
                 Int32(self.inter),
-                grid_dim=(ceildiv(self.inter, 4), 1, 1),
-                block_dim=(64, 1, 1),
+                grid_dim=(ceildiv(self.inter, dual_o), 1, 1),
+                block_dim=(dual_t, 1, 1),
             )
             # down f16 fat O2 + ACC（账本六十八/七十）。
             var w_down = self.d_w16_down[layer].unsafe_ptr()
