@@ -2896,3 +2896,33 @@
     "0.12 µs/iter = 20 TB/s"物理上不可能，靠量纲自检抓出来的。已修。
   - **下一步**：q4 block-规约内核（判据从"逐位"换"相对容差 + 与一行一线程版
     对照"，规约顺序是新增变量）；attention/QK 和 softmax 还没碰。
+
+- **2026-11-09（第五十三条）** —— 📈 **P5 CUDA：block 规约版 q4 matmul —— down 形状 8.8×，仍卡字节级加载**
+  - **`q4_matmul_block_gpu[THREADS]`**（`kernels/cuda/matmul.mojo`）：一个 (行,输出列)
+    分一个 CUDA block，线程按 q4 块 stride 分工，`Float64` 部分和写共享内存做
+    树规约。规约顺序与串行版不同 ⇒ 判据换成相对容差 —— 但实测对 CPU 参照
+    仍然 **diff=0.0**（f64 精度下两种顺序舍入一致）。
+  - **A100 实测（rows=1，best-of-3 × 500）**：
+    | 臂 | 896→4864 | 4864→896 |
+    |---|---|---|
+    | q4_row（五十二） | 87.4 µs / 28.3 GB/s | 345.8 µs / 7.2 GB/s |
+    | fp32_row | 89.3 µs / 195.5 GB/s | 469.1 µs / 37.2 GB/s |
+    | **q4_blk32** | **41.6 µs / 59.4 GB/s** | **39.2 µs / 63.5 GB/s** |
+    | q4_blk128 | 44.1 µs / 56.1 GB/s | 39.5 µs / 62.7 GB/s |
+    | 空 kernel 地板 | 2.2 µs | 2.2 µs |
+    四臂 diff 全 0.0。**down 形状 8.8×**（345.8→39.2µs）、gate/up 2.1×。
+  - **发射地板 2.2µs** —— 40µs 是真实执行时间，不是调度开销；`THREADS=32`
+    与 128 几乎无差（分工粒度不是瓶颈），两形状统一用 32 即可。
+  - **下一个瓶颈（诊断）**：~40µs 对 2.45MB 还是慢 10×+。每个线程**逐字节**
+    读自己的 18B 块 —— warp 内 32 线程的 byte load 各落 18B 远的地址，一条
+    指令打 32 个 32B 扇区，**读放大 ~32×**。下一版：每线程认领一个块、
+    16B 数据用一次向量加载（uint4）+ 2B scale，加载事务数降一个量级。
+  - **模型级量级（更新）**：28 层 × (gate/up 41.6 + down 39.2)µs ≈ **2.3ms/token**
+    权重时间（还没算 attention/lm_head，也还没算重叠）。GPU 单流解码从
+    "比 CPU 慢"进入"与 CPU 同量级"。
+  - **GPU API 踩坑（MAX 26.5 实测）**：裸 `gpu` 包不存在；块索引/线程索引/
+    屏障在 `std.gpu`（`block_idx`/`thread_idx`）与 `max.gpu`（`barrier`/
+    `AddressSpace`）两处；共享内存用 `std.memory.stack_allocation[…,
+    address_space=AddressSpace.SHARED]`。mojoc 是编译产物、strings 抓不到
+    符号 —— 靠逐个 import 试错 + 本地语义编译验证（本地能过语义、只卡 ptxas
+    正好当 API 探针）。

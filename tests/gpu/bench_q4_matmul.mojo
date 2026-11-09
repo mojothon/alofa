@@ -27,7 +27,7 @@ from alofa.core.tensor import Shape, TensorView, f32_data
 from alofa.kernels.cpu.quant import Q4_BYTES, dequant_q4_0, quantize_q4_0
 from alofa.kernels.cpu.scalar import linear
 from alofa.kernels.cuda.basic import linear_gpu
-from alofa.kernels.cuda.matmul import q4_matmul_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_block_gpu, q4_matmul_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 
@@ -195,26 +195,133 @@ def _bench_shape[inner: Int, out_cols: Int](
             best_f32 = ms
 
     # best 是 ms；换算成 µs/iter（此前按 µs 直打，差了 1000 倍 —— 账本五十二记坑）。
+    # ---- 性能 + 正确性：block 规约臂（THREADS=32 与 128）----
+    # 规约顺序与串行版不同 ⇒ 判据是相对容差（对 CPU 参照），不是逐位。
+    var best_b32 = Float64(1e30)
+    var diff_b32 = Float64(-1)
+    for i in range(WARMUP):
+        ctx.enqueue_function[q4_matmul_block_gpu[32]](
+            dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+            Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+        )
+    ctx.synchronize()
+    for r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[q4_matmul_block_gpu[32]](
+                dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+                Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+            )
+        ctx.synchronize()
+        var ms = Float64(monotonic_ns() - t0) / 1e6
+        if ms < best_b32:
+            best_b32 = ms
+    ctx.enqueue_function[q4_matmul_block_gpu[32]](
+        dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+        Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+    diff_b32 = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
+
+    var best_b128 = Float64(1e30)
+    var diff_b128 = Float64(-1)
+    for i in range(WARMUP):
+        ctx.enqueue_function[q4_matmul_block_gpu[128]](
+            dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+            Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(128, 1, 1),
+        )
+    ctx.synchronize()
+    for r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[q4_matmul_block_gpu[128]](
+                dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+                Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(128, 1, 1),
+            )
+        ctx.synchronize()
+        var ms = Float64(monotonic_ns() - t0) / 1e6
+        if ms < best_b128:
+            best_b128 = ms
+    ctx.enqueue_function[q4_matmul_block_gpu[128]](
+        dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+        Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(128, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+    diff_b128 = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
+
     var us_q4 = best_q4 * Float64(1000) / Float64(ITERS)
     var us_f32 = best_f32 * Float64(1000) / Float64(ITERS)
     var gb_q4 = Float64(bytes_q4) * Float64(ITERS) / (best_q4 / 1e3) / 1e9
     var gb_f32 = Float64(bytes_f32) * Float64(ITERS) / (best_f32 / 1e3) / 1e9
+    # ---- 发射地板：空 kernel，同一发射节奏 ----
+    var hdn = ctx.enqueue_create_host_buffer[DT](1)
+    var dn = ctx.enqueue_create_buffer[DT](1)
+    ctx.synchronize()
+    var best_null = Float64(1e30)
+    for r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[null_gpu](
+                dn.unsafe_ptr(), grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
+            )
+        ctx.synchronize()
+        var ms = Float64(monotonic_ns() - t0) / 1e6
+        if ms < best_null:
+            best_null = ms
+    var us_null = best_null * Float64(1000) / Float64(ITERS)
+
+    var us_b32 = best_b32 * Float64(1000) / Float64(ITERS)
+    var us_b128 = best_b128 * Float64(1000) / Float64(ITERS)
+    var gb_b32 = Float64(bytes_q4) * Float64(ITERS) / (best_b32 / 1e3) / 1e9
+    var gb_b128 = Float64(bytes_q4) * Float64(ITERS) / (best_b128 / 1e3) / 1e9
     print(
         "shape inner="
         + String(inner)
         + " out="
         + String(out_cols)
-        + " rows=1  |  q4: "
+        + " rows=1"
+    )
+    print(
+        "  q4_row     "
         + String(us_q4)
         + " µs/iter  "
         + String(gb_q4)
-        + " GB/s  |  fp32: "
+        + " GB/s"
+    )
+    print(
+        "  fp32_row   "
         + String(us_f32)
         + " µs/iter  "
         + String(gb_f32)
-        + " GB/s  |  字节比 "
-        + String(us_f32 / us_q4)
+        + " GB/s"
     )
+    print(
+        "  q4_blk32   "
+        + String(us_b32)
+        + " µs/iter  "
+        + String(gb_b32)
+        + " GB/s  diff="
+        + String(diff_b32)
+        + " (tol "
+        + String(REL_TOLERANCE * scale)
+        + ")"
+    )
+    print(
+        "  q4_blk128  "
+        + String(us_b128)
+        + " µs/iter  "
+        + String(gb_b128)
+        + " GB/s  diff="
+        + String(diff_b128)
+    )
+    print("  launch_floor " + String(us_null) + " µs/iter (空 kernel)")
+
+
+def null_gpu(dst: Pointer[Float32, MutUntrackedOrigin]) -> None:
+    """空 kernel：只碰一个字节，量发射+调度地板。"""
+    dst[unsafe_offset=0] = Float32(0)
 
 
 def main() raises:

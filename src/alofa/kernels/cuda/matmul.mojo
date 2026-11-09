@@ -12,7 +12,10 @@
 （GB/s）作为基线记录在账本里，优化的空间留给下一版。
 """
 
-from std.gpu import global_idx
+from std.gpu import global_idx, block_idx, thread_idx
+from std.memory import stack_allocation
+
+from max.gpu import AddressSpace, barrier
 
 from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, Q4_SCALE_BYTES
 from alofa.kernels.cuda.basic import _fp16_bits_to_f32_device
@@ -55,3 +58,63 @@ def q4_matmul_gpu(
                 x[unsafe_offset=x_base + kb + j + 16]
             )
     dst[unsafe_offset=row * Int(out_cols) + o] = Float32(acc)
+
+
+def q4_matmul_block_gpu[THREADS: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """`q4_matmul_gpu` 的 **block 规约版**：一个输出元素由 `THREADS` 个线程算。
+
+    五十二的账说清了瓶颈：一行一线程在 rows=1 下只有 out_cols 个线程（A100
+    容量的 ~2%），延迟主导 —— q4 读 7× 少的字节却比 fp32 慢，因为每线程串行
+    解包 16 轮 nibble。这里把占用率提 `THREADS` 倍：每个 (行, 输出列) 分一个
+    CUDA block，线程按块 stride 分工，`Float64` 部分和写共享内存做树规约。
+
+    **规约顺序因此与串行版不同** —— 判据从"逐位一致"换成相对容差 1e-5（与
+    AVX2 门同一个数）；确定性仍在：分工是静态的、树规约是固定形状，同输入
+    重跑同一个结果。
+
+    `THREADS` 必须是 2 的幂（树规约要求）。取值与形状有关：gate/up（inner=
+    896 → 28 块）用 32；down（inner=4864 → 152 块）用 32 或 128 都能铺开。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    if o >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var x_base = row * Int(inner)
+    var nblk = Int(inner) // Q4_BLOCK
+    var w_row = o * nblk
+    var acc = Float64(0)
+    var b = tid
+    while b < nblk:
+        var base = (w_row + b) * Q4_BYTES
+        var low = Int(w_blocks[unsafe_offset=base])
+        var high = Int(w_blocks[unsafe_offset=base + 1])
+        var d = _fp16_bits_to_f32_device(low | (high << 8))
+        var kb = b * Q4_BLOCK
+        for j in range(16):
+            var byte = Int(w_blocks[unsafe_offset=base + Q4_SCALE_BYTES + j])
+            acc += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(
+                x[unsafe_offset=x_base + kb + j]
+            )
+            acc += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(
+                x[unsafe_offset=x_base + kb + j + 16]
+            )
+        b += THREADS
+
+    var smem = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    smem[tid] = acc
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            smem[tid] += smem[tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
