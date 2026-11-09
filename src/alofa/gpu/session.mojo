@@ -41,6 +41,7 @@ from alofa.kernels.cuda.elementwise import (
     f32_to_f16_gpu,
     q4_dequant_f16_gpu,
     gather_gpu,
+    noop_gpu,
 )
 from alofa.kernels.cuda.matmul import (
     f16_matmul_dual_gpu,
@@ -53,6 +54,17 @@ from alofa.kernels.cuda.matmul import (
 )
 
 # f16 预反量化构建开关（账本六十八二分用）
+# decode_step 的骨架测量位掩码（账本七十六）：置位 = 该类 kernel 换成
+# noop（1 块 32 线程零工作）。运行时参数、主机分支零成本；skip=0 时
+# GPU 序列与原路径逐指令相同。骨架分解 bench（bench_decode_span）用。
+comptime SKIP_TRI = 1
+comptime SKIP_ATTN = 2
+comptime SKIP_O = 4
+comptime SKIP_DUAL = 8
+comptime SKIP_DOWN = 16
+comptime SKIP_HEAD = 32  # 终 norm + lm_head
+comptime SKIP_GATHER = 64
+
 comptime F16_BUILD = True
 from alofa.model.arch.qwen import (
     FINAL_NORM,
@@ -618,7 +630,7 @@ struct GpuSession:
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4
     ](
-        mut self, token: Int
+        mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t=1 的完整前向：返回 host logits 指针（下次调用前有效）。
 
@@ -630,6 +642,12 @@ struct GpuSession:
         交错 A/B（bench_dual_ab）证伪 —— 本机是共享 GPU，顺序扫型的
         形状窗口落在不同负载时段，排名是漂移假象；交错下两形状逐位
         打平（2.9575 vs 2.9526）。参数保留作扫型基建，默认不动。
+
+        skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
+        路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
+        拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令
+        相同。配 bench_decode_span 做链上时间分解（发射间隙 vs
+        kernel 本体），不做正确性用途。
         """
         if Int(inner) != self.hidden or Int(inner_ff) != self.inter:
             raise AlofaError(
@@ -653,15 +671,20 @@ struct GpuSession:
         self.ctx.synchronize()
         ht[0] = Int32(token)
         self.ctx.enqueue_copy(dst_buf=self.d_token, src_buf=ht)
-        self.ctx.enqueue_function[gather_gpu](
-            self.d_x.unsafe_ptr(),
-            self.d_embed.unsafe_ptr(),
-            self.d_token.unsafe_ptr(),
-            Int32(self.hidden),
-            Int32(1),
-            grid_dim=(ceildiv(self.hidden, 64), 1, 1),
-            block_dim=(64, 1, 1),
-        )
+        if skip & SKIP_GATHER == 0:
+            self.ctx.enqueue_function[gather_gpu](
+                self.d_x.unsafe_ptr(),
+                self.d_embed.unsafe_ptr(),
+                self.d_token.unsafe_ptr(),
+                Int32(self.hidden),
+                Int32(1),
+                grid_dim=(ceildiv(self.hidden, 64), 1, 1),
+                block_dim=(64, 1, 1),
+            )
+        else:
+            self.ctx.enqueue_function[noop_gpu](
+                grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+            )
 
         for layer in range(self.n_layers):
             var base = layer * Q4_SLOTS_PER_LAYER
@@ -670,25 +693,30 @@ struct GpuSession:
             var dst_qkv_q = self._dst(0)
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
-            self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True, True]](
-                self.d_x.unsafe_ptr(),
-                self.d_w16_q[layer].unsafe_ptr(),
-                self.d_w16_k[layer].unsafe_ptr(),
-                self.d_w16_v[layer].unsafe_ptr(),
-                dst_qkv_q.unsafe_ptr(),
-                dst_qkv_k.unsafe_ptr(),
-                dst_qkv_v.unsafe_ptr(),
-                self.d_bias_q[layer].unsafe_ptr(),
-                self.d_bias_k[layer].unsafe_ptr(),
-                self.d_bias_v[layer].unsafe_ptr(),
-                self.d_norms[2 * layer].unsafe_ptr(),
-                self.eps,
-                Int32(inner),
-                Int32(self.q_out),
-                Int32(self.kv_dim),
-                grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
-                block_dim=(32, 1, 1),
-            )
+            if skip & SKIP_TRI == 0:
+                self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True, True]](
+                    self.d_x.unsafe_ptr(),
+                    self.d_w16_q[layer].unsafe_ptr(),
+                    self.d_w16_k[layer].unsafe_ptr(),
+                    self.d_w16_v[layer].unsafe_ptr(),
+                    dst_qkv_q.unsafe_ptr(),
+                    dst_qkv_k.unsafe_ptr(),
+                    dst_qkv_v.unsafe_ptr(),
+                    self.d_bias_q[layer].unsafe_ptr(),
+                    self.d_bias_k[layer].unsafe_ptr(),
+                    self.d_bias_v[layer].unsafe_ptr(),
+                    self.d_norms[2 * layer].unsafe_ptr(),
+                    self.eps,
+                    Int32(inner),
+                    Int32(self.q_out),
+                    Int32(self.kv_dim),
+                    grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
+                    block_dim=(32, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[noop_gpu](
+                    grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+                )
             # attention + rope 四合一（账本七十三）：rope_kv 的活折进
             # attention 头部（q rope / k rope 直写本 token store 行 / v
             # 拷贝），当前 token 的 k/v 经块内 smem 中转 —— 同 launch 内
@@ -700,37 +728,47 @@ struct GpuSession:
             # 直接进发射会被 aliasing 检查当成潜在同源（账本六十三）。
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
-            self.ctx.enqueue_function[attn_rope_gpu[128]](
-                self.d_attn.unsafe_ptr(),
-                self.d_q_rot.unsafe_ptr(),
-                self.d_q.unsafe_ptr(),
-                self.d_k.unsafe_ptr(),
-                self.d_v.unsafe_ptr(),
-                pk,
-                pv,
-                cos_row,
-                sin_row,
-                self.d_scores.unsafe_ptr(),
-                Int32(self.n_heads),
-                Int32(self.n_kv_heads),
-                Int32(self.head_dim),
-                Int32(kv_len),
-                grid_dim=(self.n_heads, 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            if skip & SKIP_ATTN == 0:
+                self.ctx.enqueue_function[attn_rope_gpu[128]](
+                    self.d_attn.unsafe_ptr(),
+                    self.d_q_rot.unsafe_ptr(),
+                    self.d_q.unsafe_ptr(),
+                    self.d_k.unsafe_ptr(),
+                    self.d_v.unsafe_ptr(),
+                    pk,
+                    pv,
+                    cos_row,
+                    sin_row,
+                    self.d_scores.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(kv_len),
+                    grid_dim=(self.n_heads, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[noop_gpu](
+                    grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+                )
             # o 走 f16 fat O2 + ACC（账本七十）：直接累加进 d_x，省残差
             # 发射；舍入顺序与"写 proj 再 add_into"逐位一致。
             var x_o = self._src(1)
-            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False, True]](
-                x_o.unsafe_ptr(),
-                self.d_w16_o[layer].unsafe_ptr(),
-                self.d_x.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                Int32(inner),
-                Int32(self.hidden),
-                grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            if skip & SKIP_O == 0:
+                self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False, True]](
+                    x_o.unsafe_ptr(),
+                    self.d_w16_o[layer].unsafe_ptr(),
+                    self.d_x.unsafe_ptr(),
+                    self.d_ws.unsafe_ptr(),
+                    Int32(inner),
+                    Int32(self.hidden),
+                    grid_dim=(ceildiv(self.hidden, 2), 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[noop_gpu](
+                    grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+                )
             # gate/up dual f16 + swiglu 尾缀 + NORM 就地归一化（账本
             # 六十八/七十/七十一）：直接吃 d_x；T64/O4；act 在写回后
             # 顺带算。bias 槽是占位（HAS_BIAS=False 不解引用），但发射
@@ -739,53 +777,68 @@ struct GpuSession:
             var w_up = self.d_w16_up[layer].unsafe_ptr()
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
-            self.ctx.enqueue_function[
-                f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
-            ](
-                self.d_x.unsafe_ptr(),
-                w_gate,
-                w_up,
-                dst_gate.unsafe_ptr(),
-                dst_up.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                self.d_proj.unsafe_ptr(),
-                self.d_act.unsafe_ptr(),
-                self.d_norms[2 * layer + 1].unsafe_ptr(),
-                self.eps,
-                Int32(inner),
-                Int32(self.inter),
-                grid_dim=(ceildiv(self.inter, dual_o), 1, 1),
-                block_dim=(dual_t, 1, 1),
-            )
+            if skip & SKIP_DUAL == 0:
+                self.ctx.enqueue_function[
+                    f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
+                ](
+                    self.d_x.unsafe_ptr(),
+                    w_gate,
+                    w_up,
+                    dst_gate.unsafe_ptr(),
+                    dst_up.unsafe_ptr(),
+                    self.d_ws.unsafe_ptr(),
+                    self.d_proj.unsafe_ptr(),
+                    self.d_act.unsafe_ptr(),
+                    self.d_norms[2 * layer + 1].unsafe_ptr(),
+                    self.eps,
+                    Int32(inner),
+                    Int32(self.inter),
+                    grid_dim=(ceildiv(self.inter, dual_o), 1, 1),
+                    block_dim=(dual_t, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[noop_gpu](
+                    grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+                )
             # down f16 fat O2 + ACC（账本六十八/七十）。
             var w_down = self.d_w16_down[layer].unsafe_ptr()
             var x_down = self._src(2)
             # 六十九扫型：T128/O2 冠军（15.6 vs T256 15.8us）。
-            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False, True]](
-                x_down.unsafe_ptr(),
-                w_down,
-                self.d_x.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                Int32(inner_ff),
-                Int32(self.hidden),
-                grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            if skip & SKIP_DOWN == 0:
+                self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False, True]](
+                    x_down.unsafe_ptr(),
+                    w_down,
+                    self.d_x.unsafe_ptr(),
+                    self.d_ws.unsafe_ptr(),
+                    Int32(inner_ff),
+                    Int32(self.hidden),
+                    grid_dim=(ceildiv(self.hidden, 2), 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[noop_gpu](
+                    grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+                )
 
-        self._norm(2 * self.n_layers)
-        # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
-        # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
-        # norm 单发更慢，头部保持分离发射。
-        self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
-            self.d_normed.unsafe_ptr(),
-            self.d_embed16.unsafe_ptr(),
-            self.d_logits.unsafe_ptr(),
-            self.d_ws.unsafe_ptr(),
-            self.eps,
-            Int32(self.vocab),
-            grid_dim=(ceildiv(self.vocab, 8), 1, 1),
-            block_dim=(256, 1, 1),
-        )
+        if skip & SKIP_HEAD == 0:
+            self._norm(2 * self.n_layers)
+            # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
+            # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
+            # norm 单发更慢，头部保持分离发射。
+            self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
+                self.d_normed.unsafe_ptr(),
+                self.d_embed16.unsafe_ptr(),
+                self.d_logits.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                self.eps,
+                Int32(self.vocab),
+                grid_dim=(ceildiv(self.vocab, 8), 1, 1),
+                block_dim=(256, 1, 1),
+            )
+        else:
+            self.ctx.enqueue_function[noop_gpu](
+                grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
+            )
         self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         self.ctx.synchronize()
         self.kv_pos = kv_len

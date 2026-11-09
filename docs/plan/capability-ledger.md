@@ -3236,3 +3236,12 @@
   - **基建**：`bench_dual_ab.mojo`（交错 A/B，可复用的形状/变体裁决工具）；`bench_dual_shape.mojo` 留作方法论陷阱存证（头部警示）；`decode_step` 的 dual_t/dual_o comptime 参保留（默认回 64/4，调用点零改动）。
   - **复验**：门 21/21、argmax 287 逐位不变、bench_decode 2.961（与基线同窗漂移带内）。
   - **到 2ms 剩余**：~0.96ms 不变。下一轮候选：真 CPU 派发结构（发射间隙 ~0.6ms 是现在唯一没被诚实测量过的池子 —— 用交错法先量）或 attention 相位数（同法）。
+
+- **2026-11-10（第七十六条）** —— 📊 **P5 步骤 4 续（链上分解轮）：零性能变化；发射间隙估算被砍半；tri 138GB/s 现形为最大杠杆**
+  - **基建**：`decode_step` 加 `skip` 运行时掩码（7 个 SKIP_* 位，默认 0 = 与原路径逐指令相同）+ `noop_gpu`（elementwise，1 块 32 线程零工作）+ `bench_decode_span`（八模式逐 token 交错：full / 单跳×6 / skeleton）。七十五的交错方法论直接复用；总步数压在 MAXT<368 安全区。
+  - **实测分解**（两轮×两run，同窗口交错差值）：skeleton 地板 **0.31ms**（123 发射 × ~2.3µs 主机 enqueue + 2 sync + H2D/D2H，两轮两次 run 稳定）；tri **0.44**（18.3µs/层）/ attn **0.4-0.66**（r1 的 no-attn 恒 2.13 疑落负载低谷，取区间）/ o **0.15**（5-7µs ✓ prof）/ dual **0.70**（27-33µs ✓）/ down **0.40**（14-20µs ✓ prof）/ head+norm **0.35**（✓ prof）。和 ≈ 2.9 ≈ full ✓ 自洽。
+  - **修正**：七十三以来"发射间隙 ~0.6ms"的估算**砍半以上** —— 纯空闲间隙池只有 ~0.1ms 量级（0.31 地板大半与 kernel 时间重叠），**减发射/融合路线接近见顶**。剩余路线必须是 kernel 本体。
+  - **BW 表（真链口径，本轮最重要产出）**：tri **138GB/s**（2.52MB/18.3µs，最低效大户——896 块 × 32 线程只装 13% 线程槽 + 3 链顺序，正是 dual 重排前的病）< o 268 < down ~512 < dual ~550 < head **755**（272MB/0.36ms，接近流读上限）。**tri 提到 ~500GB/s ≈ 省 0.3ms**，是下一个最大杠杆；head 余量仅 ~0.1ms。
+  - **坑在案（两个回归网都接住了）**：① python 脚本批量 wrap 丢基准缩进 —— head 块滑进 `for layer` 体内，norm+head 每步跑 24 次（+8.7ms，bench_decode 2.96→10.4 当场抓住）；② `replace(count=1)` 命中文件里第一处同文 —— gather 包装落进 `debug_gather`（sections 编译错误 `skip` 未定义抓住）。**批量文本操作后必须全量回归，缩进敏感的编辑用精确工具**。
+  - **复验全绿**：门 21/21、argmax 287 逐位不变、layer0 零容差、probe COMPLETE、prof 21 行、sections 61、bench_decode 2.960（基线带内）。
+  - **到 2ms 剩余**：~0.96ms。构成修正：kernel 本体 ~2.6（tri 0.44 + dual 0.70 + down 0.40 + head 0.35 + attn 0.5 + o 0.15）+ 地板 0.31。下一轮：tri 真链形状/结构交错扫（decode_step 加 tri_t comptime 参同法）。

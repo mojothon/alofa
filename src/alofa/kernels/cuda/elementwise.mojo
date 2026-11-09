@@ -325,3 +325,9 @@ def f32_to_f16_gpu(
     var i = Int(global_idx.x)
     if i < Int(n):
         dst[unsafe_offset=i] = Float16(src[unsafe_offset=i])
+
+
+def noop_gpu() -> None:
+    """空 kernel（账本七十六骨架测量专用）：零参数零工作，1 块 32 线程
+    发射 —— 骨架模式下顶替真实 kernel，保留发射结构、剥离 GPU 工作。"""
+    pass
