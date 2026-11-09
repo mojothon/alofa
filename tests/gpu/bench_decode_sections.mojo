@@ -103,6 +103,7 @@ def main() raises:
     session.ctx.enqueue_function[linear_fat_f16_gpu[256, 896, 8]](
         session.d_normed.unsafe_ptr(), session.d_embed16.unsafe_ptr(),
         session.d_logits.unsafe_ptr(),
+        session.d_ws.unsafe_ptr(), Float32(0.0),
         Int32(session.vocab),
         grid_dim=(session.vocab // 8, 1, 1), block_dim=(256, 1, 1),
     )
@@ -173,6 +174,7 @@ def main() raises:
             session.ctx.enqueue_function[linear_fat_f16_gpu[256, 896, 8]](
                 session.d_normed.unsafe_ptr(), session.d_embed16.unsafe_ptr(),
                 session.d_logits.unsafe_ptr(),
+                session.d_ws.unsafe_ptr(), Float32(0.0),
                 Int32(session.vocab),
                 grid_dim=(session.vocab // 8, 1, 1), block_dim=(256, 1, 1),
             )

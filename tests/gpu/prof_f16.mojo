@@ -118,6 +118,7 @@ def _bench_dual[T: Int, O: Int](
     mut db1: DeviceBuffer[DType.float32],
     mut db2: DeviceBuffer[DType.float32],
     mut dact: DeviceBuffer[DType.float32],
+    mut dnm: DeviceBuffer[DType.float32],
 ) raises -> Float64:
     var x = dx.unsafe_ptr()
     var wa = dwa.unsafe_ptr()
@@ -127,9 +128,10 @@ def _bench_dual[T: Int, O: Int](
     var b1 = db1.unsafe_ptr()
     var b2 = db2.unsafe_ptr()
     var act = dact.unsafe_ptr()
+    var nm = dnm.unsafe_ptr()
     for i in range(WARMUP):
-        ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False]](
-            x, wa, wb, d1, d2, b1, b2, act,
+        ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False, False]](
+            x, wa, wb, d1, d2, b1, b2, act, nm, Float32(0.0),
             Int32(896), Int32(4864),
             grid_dim=(4864 // O, 1, 1), block_dim=(T, 1, 1),
         )
@@ -138,8 +140,8 @@ def _bench_dual[T: Int, O: Int](
     for r in range(ROUNDS):
         var t0 = monotonic_ns()
         for i in range(ITERS):
-            ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False]](
-                x, wa, wb, d1, d2, b1, b2, act,
+            ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False, False]](
+                x, wa, wb, d1, d2, b1, b2, act, nm, Float32(0.0),
                 Int32(896), Int32(4864),
                 grid_dim=(4864 // O, 1, 1), block_dim=(T, 1, 1),
             )
@@ -195,6 +197,7 @@ def _bench_head[T: Int, INNER: Int, O: Int](
     mut dx: DeviceBuffer[DType.float32],
     mut dw: DeviceBuffer[DType.float16],
     mut dd: DeviceBuffer[DType.float32],
+    mut dnm: DeviceBuffer[DType.float32],
 ) raises -> Float64:
     var x = dx.unsafe_ptr()
     var w = dw.unsafe_ptr()
@@ -239,9 +242,10 @@ def main() raises:
     var dd3 = ctx.enqueue_create_buffer[DType.float32](4864)
     var dd4 = ctx.enqueue_create_buffer[DType.float32](4864)
     var dd5 = ctx.enqueue_create_buffer[DType.float32](4864)
+    var dd6 = ctx.enqueue_create_buffer[DType.float32](4864)
     ctx.synchronize()
     _bench_q4_dual(ctx, "q4 dual T64 O4:", dx, dq_ga, dq_gb, dd, dd2, dd3, dd4)
-    _bench_dual[64, 4](ctx, "f16 dual T64 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5)
+    _bench_dual[64, 4](ctx, "f16 dual T64 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
     _bench_dual[128, 4](ctx, "f16 dual T128 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
     _bench_dual[64, 8](ctx, "f16 dual T64 O8:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
     _bench_dual[32, 4](ctx, "f16 dual T32 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
@@ -295,6 +299,7 @@ def main() raises:
     comptime N_VOCAB = 151936
     var dxh = ctx.enqueue_create_buffer[DType.float32](896)
     var ddh = ctx.enqueue_create_buffer[DType.float32](N_VOCAB)
+    var dnmh = ctx.enqueue_create_buffer[DType.float32](896)
     ctx.synchronize()
     # 大权重直接 host 填 pattern 上传（f16 字节流本身即可，无需真实反量化）
     var host16 = ctx.enqueue_create_host_buffer[DType.float16](N_VOCAB * 896)
@@ -304,10 +309,10 @@ def main() raises:
     var dwh = ctx.enqueue_create_buffer[DType.float16](N_VOCAB * 896)
     ctx.enqueue_copy(dst_buf=dwh, src_buf=host16)
     ctx.synchronize()
-    _bench_head[256, 896, 8](ctx, "head T256 O8:", N_VOCAB, dxh, dwh, ddh)
-    _bench_head[512, 896, 8](ctx, "head T512 O8:", N_VOCAB, dxh, dwh, ddh)
-    _bench_head[256, 896, 16](ctx, "head T256 O16:", N_VOCAB, dxh, dwh, ddh)
-    _bench_head[256, 896, 4](ctx, "head T256 O4:", N_VOCAB, dxh, dwh, ddh)
-    _bench_head[128, 896, 8](ctx, "head T128 O8:", N_VOCAB, dxh, dwh, ddh)
+    _bench_head[256, 896, 8](ctx, "head T256 O8:", N_VOCAB, dxh, dwh, ddh, dnmh)
+    _bench_head[512, 896, 8](ctx, "head T512 O8:", N_VOCAB, dxh, dwh, ddh, dnmh)
+    _bench_head[256, 896, 16](ctx, "head T256 O16:", N_VOCAB, dxh, dwh, ddh, dnmh)
+    _bench_head[256, 896, 4](ctx, "head T256 O4:", N_VOCAB, dxh, dwh, ddh, dnmh)
+    _bench_head[128, 896, 8](ctx, "head T128 O8:", N_VOCAB, dxh, dwh, ddh, dnmh)
 
     arena.keep_alive()

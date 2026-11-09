@@ -1416,15 +1416,16 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
     var wb = ctx.enqueue_create_buffer[DType.float16](n_wg)
     var dum1 = ctx.enqueue_create_buffer[DT](4)
     var dum2 = ctx.enqueue_create_buffer[DT](4)
+    var dum7 = ctx.enqueue_create_buffer[DT](4)
     ctx.enqueue_copy(dst_buf=xg, src_buf=hx)
     ctx.enqueue_copy(dst_buf=wa, src_buf=hf16g_a)
     ctx.enqueue_copy(dst_buf=wb, src_buf=hf16g_b)
     ctx.synchronize()
     # HAS_ACT=True（账本七十）：swiglu 尾缀与 gate/up 同发射。
-    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False, True]](
+    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False, True, False]](
         xg.unsafe_ptr(), wa.unsafe_ptr(), wb.unsafe_ptr(),
         da.unsafe_ptr(), db.unsafe_ptr(), dum1.unsafe_ptr(), dum2.unsafe_ptr(),
-        dact.unsafe_ptr(),
+        dact.unsafe_ptr(), dum7.unsafe_ptr(), Float32(0.0),
         Int32(896), Int32(4864),
         grid_dim=(ceildiv(4864, 4), 1, 1), block_dim=(64, 1, 1),
     )
@@ -1466,6 +1467,40 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
             + String(F16_REL * scale_act)
         )
     print("[f16_dual_act] rel=", diff_act / scale_act)
+    # NORM 判据（账本七十一）：同一 dual 核 NORM=True 直接吃未归一化 x，
+    # 参照 = 标量 rmsnorm（同一 eps）→ 标量 linear（同一权重 a）。
+    var nw = scratch(arena, 1, n_x)
+    fill(nw, 91)
+    var normed_ref = scratch(arena, 1, n_x)
+    rmsnorm(normed_ref, x, nw, Float32(1e-5))
+    var ref_n = arena.alloc(4864 * 4)
+    linear(rows_view(ref_n, 1, 4864), normed_ref, rows_view(wraw_a, 4864, 896))
+    var hnwm = ctx.enqueue_create_host_buffer[DT](n_x)
+    ctx.synchronize()
+    for i in range(n_x):
+        hnwm[i] = f32_data(nw)[unsafe_offset=i]
+    var dnw = ctx.enqueue_create_buffer[DT](n_x)
+    ctx.enqueue_copy(dst_buf=dnw, src_buf=hnwm)
+    ctx.synchronize()
+    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False, False, True]](
+        xg.unsafe_ptr(), wa.unsafe_ptr(), wb.unsafe_ptr(),
+        da.unsafe_ptr(), db.unsafe_ptr(), dum1.unsafe_ptr(), dum2.unsafe_ptr(),
+        dact.unsafe_ptr(), dnw.unsafe_ptr(), Float32(1e-5),
+        Int32(896), Int32(4864),
+        grid_dim=(ceildiv(4864, 4), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd_a, src_buf=da)
+    ctx.enqueue_copy(dst_buf=hd_b, src_buf=db)
+    ctx.synchronize()
+    var diff_n = max_abs_diff(hd_a.unsafe_ptr(), f32_data(rows_view(ref_n, 1, 4864)), 4864)
+    var scale_n = max_abs(f32_data(rows_view(ref_n, 1, 4864)), 4864)
+    if scale_n <= 0.0:
+        raise Error("f16_dual_norm: the reference tensor is all zeros")
+    if diff_n > F16_REL * scale_n:
+        raise Error(
+            "f16_dual_norm: diff=" + String(diff_n) + " tol=" + String(F16_REL * scale_n)
+        )
+    print("[f16_dual_norm] rel=", diff_n / scale_n)
 
     # ---- tri：q 16 出 / kv 12 出，同 x ----
     var n_wq = 16 * 896
@@ -1516,14 +1551,16 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
     var dum3 = ctx.enqueue_create_buffer[DT](4)
     var dum4 = ctx.enqueue_create_buffer[DT](4)
     var dum5 = ctx.enqueue_create_buffer[DT](4)
+    var dum6 = ctx.enqueue_create_buffer[DT](4)
     ctx.enqueue_copy(dst_buf=wq, src_buf=hf16q)
     ctx.enqueue_copy(dst_buf=wk, src_buf=hf16k)
     ctx.enqueue_copy(dst_buf=wv, src_buf=hf16v)
     ctx.synchronize()
-    ctx.enqueue_function[f16_matmul_qkv_gpu[32, 896, False]](
+    ctx.enqueue_function[f16_matmul_qkv_gpu[32, 896, False, False]](
         xg.unsafe_ptr(), wq.unsafe_ptr(), wk.unsafe_ptr(), wv.unsafe_ptr(),
         dq.unsafe_ptr(), dk.unsafe_ptr(), dv.unsafe_ptr(),
         dum3.unsafe_ptr(), dum4.unsafe_ptr(), dum5.unsafe_ptr(),
+        dum6.unsafe_ptr(), Float32(0.0),
         Int32(896), Int32(16), Int32(12),
         grid_dim=(16, 1, 1), block_dim=(32, 1, 1),
     )
@@ -1562,7 +1599,8 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
     ctx.enqueue_copy(dst_buf=wh, src_buf=hf16h)
     ctx.synchronize()
     ctx.enqueue_function[linear_fat_f16_gpu[128, 896, 8]](
-        xg.unsafe_ptr(), wh.unsafe_ptr(), dh.unsafe_ptr(), Int32(16),
+        xg.unsafe_ptr(), wh.unsafe_ptr(), dh.unsafe_ptr(),
+        dum6.unsafe_ptr(), Float32(0.0), Int32(16),
         grid_dim=(2, 1, 1), block_dim=(128, 1, 1),
     )
     ctx.enqueue_copy(dst_buf=hd_h, src_buf=dh)

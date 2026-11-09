@@ -658,15 +658,13 @@ struct GpuSession:
 
         for layer in range(self.n_layers):
             var base = layer * Q4_SLOTS_PER_LAYER
-            self._norm(2 * layer)
-            # q/k/v 三融合走 f16（账本六十八）：同一 normed 行一次发射；
-            # 结构同六十七 q4 版，内层换对齐 f16 向量读（门 F16 判据）。
-            var x_qkv = self._src(0)
+            # q/k/v 三融合走 f16 + NORM 就地归一化（账本六十八/七十一）：
+            # 直接吃残差流 d_x，norm 单发整个省掉。
             var dst_qkv_q = self._dst(0)
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
-            self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True]](
-                x_qkv.unsafe_ptr(),
+            self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True, True]](
+                self.d_x.unsafe_ptr(),
                 self.d_w16_q[layer].unsafe_ptr(),
                 self.d_w16_k[layer].unsafe_ptr(),
                 self.d_w16_v[layer].unsafe_ptr(),
@@ -676,6 +674,8 @@ struct GpuSession:
                 self.d_bias_q[layer].unsafe_ptr(),
                 self.d_bias_k[layer].unsafe_ptr(),
                 self.d_bias_v[layer].unsafe_ptr(),
+                self.d_norms[2 * layer].unsafe_ptr(),
+                self.eps,
                 Int32(inner),
                 Int32(self.q_out),
                 Int32(self.kv_dim),
@@ -738,18 +738,16 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.hidden, 2), 1, 1),
                 block_dim=(128, 1, 1),
             )
-            self._norm(2 * layer + 1)
-            # gate/up dual f16 + swiglu 尾缀（账本六十八/七十）：同一
-            # normed 行 x smem 只载一次；T64/O4；act 在写回后顺带算。
-            # bias 槽是占位（HAS_BIAS=False 不解引用），但发射 aliasing
-            # 检查要求两两不同 —— 用 d_proj 占位。
+            # gate/up dual f16 + swiglu 尾缀 + NORM 就地归一化（账本
+            # 六十八/七十/七十一）：直接吃 d_x；T64/O4；act 在写回后
+            # 顺带算。bias 槽是占位（HAS_BIAS=False 不解引用），但发射
+            # aliasing 检查要求两两不同 —— 用 d_proj 占位。
             var w_gate = self.d_w16_gate[layer].unsafe_ptr()
             var w_up = self.d_w16_up[layer].unsafe_ptr()
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
-            var x_gu = self._src(0)
-            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False, True]](
-                x_gu.unsafe_ptr(),
+            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False, True, True]](
+                self.d_x.unsafe_ptr(),
                 w_gate,
                 w_up,
                 dst_gate.unsafe_ptr(),
@@ -757,6 +755,8 @@ struct GpuSession:
                 self.d_ws.unsafe_ptr(),
                 self.d_proj.unsafe_ptr(),
                 self.d_act.unsafe_ptr(),
+                self.d_norms[2 * layer + 1].unsafe_ptr(),
+                self.eps,
                 Int32(inner),
                 Int32(self.inter),
                 grid_dim=(ceildiv(self.inter, 4), 1, 1),
@@ -778,12 +778,15 @@ struct GpuSession:
             )
 
         self._norm(2 * self.n_layers)
-        # lm_head 走 fat 版（账本六十六扫型 T256/O8：0.459 vs block 0.501ms；
-        # x 只载一次，L2 流量降 8 倍。INNER 用 comptime hidden）。
+        # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
+        # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
+        # norm 单发更慢，头部保持分离发射。
         self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
             self.d_normed.unsafe_ptr(),
             self.d_embed16.unsafe_ptr(),
             self.d_logits.unsafe_ptr(),
+            self.d_ws.unsafe_ptr(),
+            self.eps,
             Int32(self.vocab),
             grid_dim=(ceildiv(self.vocab, 8), 1, 1),
             block_dim=(256, 1, 1),

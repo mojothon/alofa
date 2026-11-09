@@ -299,10 +299,12 @@ def linear_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int](
                 dst[unsafe_offset=row * Int(out_cols) + o] = Float32(sacc[unsafe_offset=oo * THREADS])
 
 
-def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int](
+def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float16, MutUntrackedOrigin],
     dst: Pointer[Float32, MutUntrackedOrigin],
+    rms_w: Pointer[Float32, MutUntrackedOrigin],
+    eps: Float32,
     out_cols: Int32,
 ) -> None:
     """lm_head 的 f16 版（账本六十八）：权重 f16 使字节流量减半。
@@ -311,6 +313,11 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int](
     `load[8]` f16（行基址 o*INNER*2B 16B 对齐，INNER 为 8 的倍数）。
     数值：权重 f16 舍入 + f64 累加，f16 专用容差覆盖（与 matmul f16
     同一判据族）。
+
+    NORM（账本七十一）：x 载入 smem 后就地 rmsnorm —— 反正每块都载整行，
+    归一化系数各块冗余算一遍，换掉单独的 rmsnorm 发射。f64 累加 + 树形
+    归约同 `rmsnorm_gpu`，分块顺序随 THREADS 不同（合法重组差，容差门
+    覆盖；rmsnorm 单发的零容差判据仍由 session 原语路径保住）。
     """
     var o0 = Int(block_idx.x) * OUTS
     var row = Int(block_idx.y)
@@ -324,6 +331,36 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int](
         sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
         k += THREADS
     barrier()
+    comptime if NORM:
+        var nlocal = Float64(0)
+        var nk = tid
+        while nk < Int(INNER):
+            var nv = Float64(sx[unsafe_offset=nk])
+            nlocal += nv * nv
+            nk += THREADS
+        var sred = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+        sred[unsafe_offset=tid] = nlocal
+        barrier()
+        var nstride = THREADS // 2
+        while nstride > 0:
+            if tid < nstride:
+                sred[unsafe_offset=tid] = (
+                    sred[unsafe_offset=tid] + sred[unsafe_offset=tid + nstride]
+                )
+            barrier()
+            nstride //= 2
+        var nscale = Float64(1.0) / sqrt(
+            sred[unsafe_offset=0] / Float64(INNER) + Float64(eps)
+        )
+        nk = tid
+        while nk < Int(INNER):
+            sx[unsafe_offset=nk] = Float32(
+                Float64(sx[unsafe_offset=nk])
+                * nscale
+                * Float64(rms_w[unsafe_offset=nk])
+            )
+            nk += THREADS
+        barrier()
     var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
     @parameter
     for oo in range(OUTS):

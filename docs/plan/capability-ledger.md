@@ -3194,3 +3194,11 @@
   - **预算表兑现**：预期 ~96 发射 × ~2.8µs ≈ 0.27ms，实测 -0.21ms —— 发射间隙模型得到验证。剩余间隙 ~0.65ms（192 发射 × ~3.4µs）。8 发射/层 = norm、tri、rope_kv、attention、o+ACC、norm、dual+act、down+ACC。
   - **复验全绿**：门 20/20（+rope_kv 零容差；fat_acc rel 3.0e-5、dual_act rel 0.0）；decode PASS（argmax 287 两侧同）；layer0 normed 0.0；probe 净；prof/sections 健全。
   - **到 2ms 剩余**：3.046 → 2 差 1.05ms。构成：发射间隙 ~0.65ms（再融合空间：norm 进 dual/tri 尾缀？attention 后处理？）、attention ~0.23ms、kernel 本体 ~2.4ms（dual 492GB/s 距峰值仍 4×）。下一轮候选：norm 融合进 matmul 头部（读 x 前先归一化，省 2 发射/层）或 CUDA graph 类批量派发。
+
+- **2026-11-09（第七十一条）** —— 🔄 **P5 步骤 4 续（norm 就地融合轮）：3.046 → 3.013ms/token（-1%）；head-NORM 融合实测净亏被对照实验否决**
+  - **tri/dual + NORM 就地归一化**（`NORM: Bool = False` 默认参 + `rms_w/eps` 参数）：三个 smem matmul（tri/dual/head）反正每块都载整行 x —— 载入后就地 rmsnorm（f64 累加 + 树形归约同 `rmsnorm_gpu`，分块顺序随 THREADS 不同 = 合法重组差）。层链前两发直接吃残差流 `d_x`，2 norm 发射/层省掉（48/步）。
+  - **head-NORM 融合被否决（对照实验）**：head 是 18688 块 × 256 线程，每块冗余归约 896 元素 + 9 道屏障 —— 实测比 norm 单发**更慢**（3.094 vs 3.013）。教训：**融合收益 = 省的发射间隙 − 冗余计算 × 块数**，块数多的 kernel 不适用。头部保持分离发射。
+  - **收益小于模型的原因在案**：预算模型预测 48 发射 × ~3.4µs ≈ 0.16ms，实测净赚仅 ~0.03ms —— 融合核自身增加 ~2.7µs/发（屏障链 + 冗余 f64 归约），且被替掉的 norm 是 grid=1 块的小发射（间隙可能低于均值）。发射间隙不是常数，"每发 ~3µs" 是粗均值，别外推。
+  - **数值等价的强证据**：decode parity diff **0.008679389953613281 与融合前逐位相同**、argmax 287 两侧同 —— 融合 norm 在 decode 全链路上 bit-exact（T32/T64 的树形归约与 rmsnorm 的 T256 恰好同序或差被 f32 收尾吸收）。dual-NORM 门 rel 2.3e-4（容差内）。
+  - **复验全绿**：门 20/20（+dual_norm 判据）；decode PASS；layer0 normed 零容差仍保（session 原语路径未动）；probe 净；sections/prof 健全。
+  - **到 2ms 剩余**：3.013 → 2 差 1.01ms。norm 融合这条路已收割完毕。下一轮候选：attention 0.23ms（kv 长度增长会涨）或发射间隙的根治（批量派发/graph）；dual 492GB/s 距峰值 4× 的结构性差仍在。

@@ -13,7 +13,7 @@
 """
 
 from std.gpu import global_idx, block_idx, thread_idx
-from std.math import exp
+from std.math import exp, sqrt
 from std.memory import stack_allocation
 
 from max.gpu import AddressSpace, barrier
@@ -528,7 +528,9 @@ def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, ACC:
                     dst[unsafe_offset=row * Int(out_cols) + o] = v
 
 
-def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS_ACT: Bool = False](
+def f16_matmul_dual_gpu[
+    THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS_ACT: Bool = False, NORM: Bool = False
+](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_a: Pointer[Float16, MutUntrackedOrigin],
     w_b: Pointer[Float16, MutUntrackedOrigin],
@@ -537,6 +539,8 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS
     bias_a: Pointer[Float32, MutUntrackedOrigin],
     bias_b: Pointer[Float32, MutUntrackedOrigin],
     dst_act: Pointer[Float32, MutUntrackedOrigin],
+    rms_w: Pointer[Float32, MutUntrackedOrigin],
+    eps: Float32,
     inner: Int32,
     out_cols: Int32,
 ) -> None:
@@ -545,7 +549,10 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS
 
     HAS_ACT（账本七十）：tid==0 写回后顺带算 `act = silu(gate)*up` ——
     与 `swiglu_gpu` 同序（f64 中间量、`v/(1+exp(-v))`、乘 up、一次
-    Float32 收尾），省一次发射。`dst_act` 在 HAS_ACT=False 时不用。"""
+    Float32 收尾），省一次发射。`dst_act` 在 HAS_ACT=False 时不用。
+
+    NORM（账本七十一）：x 载入 smem 后就地 rmsnorm（同 tri/head 的 NORM
+    块）—— 第二个 norm 发射也省掉。"""
     var o0 = Int(block_idx.x) * OUTS
     var row = Int(block_idx.y)
     if o0 >= Int(out_cols):
@@ -558,6 +565,36 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS
         sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
         k += THREADS
     barrier()
+    comptime if NORM:
+        var nlocal = Float64(0)
+        var nk = tid
+        while nk < Int(INNER):
+            var nv = Float64(sx[unsafe_offset=nk])
+            nlocal += nv * nv
+            nk += THREADS
+        var sred = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+        sred[unsafe_offset=tid] = nlocal
+        barrier()
+        var nstride = THREADS // 2
+        while nstride > 0:
+            if tid < nstride:
+                sred[unsafe_offset=tid] = (
+                    sred[unsafe_offset=tid] + sred[unsafe_offset=tid + nstride]
+                )
+            barrier()
+            nstride //= 2
+        var nscale = Float64(1.0) / sqrt(
+            sred[unsafe_offset=0] / Float64(INNER) + Float64(eps)
+        )
+        nk = tid
+        while nk < Int(INNER):
+            sx[unsafe_offset=nk] = Float32(
+                Float64(sx[unsafe_offset=nk])
+                * nscale
+                * Float64(rms_w[unsafe_offset=nk])
+            )
+            nk += THREADS
+        barrier()
     var sacc = stack_allocation[2 * OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
     @parameter
     for half in range(2):
@@ -608,7 +645,7 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS
                     )
 
 
-def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
+def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool, NORM: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_q: Pointer[Float16, MutUntrackedOrigin],
     w_k: Pointer[Float16, MutUntrackedOrigin],
@@ -619,12 +656,18 @@ def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
     bias_q: Pointer[Float32, MutUntrackedOrigin],
     bias_k: Pointer[Float32, MutUntrackedOrigin],
     bias_v: Pointer[Float32, MutUntrackedOrigin],
+    rms_w: Pointer[Float32, MutUntrackedOrigin],
+    eps: Float32,
     inner: Int32,
     q_out: Int32,
     kv_out: Int32,
 ) -> None:
     """q/k/v 的 f16 三融合（账本六十八）：结构同 q4_matmul_qkv_gpu，
-    内层换成对齐 f16 向量读。INNER 是 8 的倍数。"""
+    内层换成对齐 f16 向量读。INNER 是 8 的倍数。
+
+    NORM（账本七十一）：x 载入 smem 后就地 rmsnorm（同 `linear_fat_f16_gpu`
+    的 NORM 块，账本七十一）—— 解码层链的第一发直接吃残差流 d_x，
+    `rmsnorm` 单发整个省掉。"""
     var o = Int(block_idx.x)
     var row = Int(block_idx.y)
     var tid = Int(thread_idx.x)
@@ -635,6 +678,36 @@ def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
         sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
         k += THREADS
     barrier()
+    comptime if NORM:
+        var nlocal = Float64(0)
+        var nk = tid
+        while nk < Int(INNER):
+            var nv = Float64(sx[unsafe_offset=nk])
+            nlocal += nv * nv
+            nk += THREADS
+        var sred = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+        sred[unsafe_offset=tid] = nlocal
+        barrier()
+        var nstride = THREADS // 2
+        while nstride > 0:
+            if tid < nstride:
+                sred[unsafe_offset=tid] = (
+                    sred[unsafe_offset=tid] + sred[unsafe_offset=tid + nstride]
+                )
+            barrier()
+            nstride //= 2
+        var nscale = Float64(1.0) / sqrt(
+            sred[unsafe_offset=0] / Float64(INNER) + Float64(eps)
+        )
+        nk = tid
+        while nk < Int(INNER):
+            sx[unsafe_offset=nk] = Float32(
+                Float64(sx[unsafe_offset=nk])
+                * nscale
+                * Float64(rms_w[unsafe_offset=nk])
+            )
+            nk += THREADS
+        barrier()
     var sacc = stack_allocation[3 * THREADS, Float64, address_space = AddressSpace.SHARED]()
     @parameter
     for seg in range(3):
