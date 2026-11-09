@@ -3151,3 +3151,11 @@
   - **aliasing 新坑**：同一指针在同一次发射里出现两次（哪怕语义上是"不读的占位"）必被拒；占位得传一个真正不同的缓冲（d_ws）。
   - **复验全绿**：门 15/15；decode 对数 diff=1.48e-5、argmax 287 两侧一致（fused 尾缀位级等价的端到端证据）；layer0 normed 0.0 / q 9.5e-7；probe 全净。
   - **到 2ms 剩余**：大 matmul ~60µs/层 vs 内存下限 4µs（仍 15×，需要真正的 GEMV 重构）；lm_head 1.02ms（待查读放大）；attention 0.23ms。下一步：matmul 结构性重写或接受现状修订判据。
+
+- **2026-11-09（第六十六条）** —— ⚡ **P5 步骤 4 续（kernel 优化第二轮）：4.26 → 3.95ms/token（253 tok/s）；fat-CTA 三处接入；同 List 双下标 aliasing 的新形态**
+  - **fat-CTA 扫型**（`prof_fat.mojo`：OUTS 输出/CTA 共享 x smem，`[OUTS][THREADS]` 归约布局每轮一次 barrier）：gate **-14%**（T64/O4 23.0 vs 26.9µs）、down **-12%**（T128/O2 26.9）、lm_head **-8%**（T256/O8 0.459 vs 0.501ms）；q 反而变差（输出太少，CTA 数降太多伤占据率）—— 按形状择优，q/k/v 留冠军。
+  - **gate/up dual-fat 融合**（新 kernel `q4_matmul_dual_fat_gpu`）：两者读同一 normed 行，一个 CTA 出 gate 4 个 + up 4 个输出，x 相位再摊一倍；每输出累加序与冠军逐位同构，门项 diff=0.0（门 15→16）。
+  - **aliasing 新形态**：同一 List 的两个下标（d_q4[gate]、d_q4[up]）**提取局部变量也救不了** —— origin 记在 List 字段上，两指针同源被拒。解法：init 时把 gate/up 句柄零拷贝分流到两个独立 List（d_q4_gate/d_q4_up），不同字段不同 origin —— 与六十三 d_k_store/d_v_store 的可用形态同族。
+  - **mut=False 临时量坑再现**：`self._src(2).unsafe_ptr()` 内联进发射参数是 mut=False（六十二同款），存 `var x = self._src(2)` 再取即过。
+  - **复验全绿**：门 16/16；decode 对数 diff=1.478e-5 与改前**逐位一致**（argmax 287 两侧同）；layer0/probe 净。
+  - **到 2ms 剩余**：大 matmul 仍 ~10× 内存下限（fat 只啃了 12-14%，结构性上限还在：18B 块的字节加载链）；lm_head ~0.46ms；attention 0.23ms。下一轮候选：q/k/v 三融合（同 List 问题同解法）、权重 f16 预反量化（大改，需重立数值判据）、或修订判据。

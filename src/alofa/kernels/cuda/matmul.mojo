@@ -180,6 +180,184 @@ def q4_matmul_fused_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
         dst[unsafe_offset=row * Int(out_cols) + o] = v
 
 
+def q4_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """fat-CTA：一个 block 处理 OUTS 个输出，x smem 与 x 载入相位摊薄（账本六十六）。
+
+    六十五的证据：冠军每 CTA 只做 1 个输出，x 载入相位（28 次标量读 +
+    barrier）摊不薄，SM 上并发 CTA 数撑不满。这里 OUTS 个输出共享同一份
+    x smem：CTA 数降 OUTS 倍，每线程权重工作量升 OUTS 倍，载入相位的
+    代价被 OUTS 个输出分摊。
+
+    归约布局 `[OUTS][THREADS]`（sacc[oo*THREADS+tid]）：树归约每轮一次
+    barrier 同时归约全部 OUTS 个部分和 —— barrier 数仍是 log2(THREADS)
+    而不是 OUTS 倍。每输出的累加序与冠军逐位同构（线程按块跨步、树形
+    归约），差分预期与 q4_matmul 检查一致。
+
+    发射约定：`grid_dim=(ceildiv(out_cols, OUTS), rows)`、
+    `block_dim=(THREADS,1,1)`；HAS_BIAS 语义同 fused（False 时 bias 占位
+    须传不同源指针，六十五的 aliasing 规）。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var nblk = Int(inner) // Q4_BLOCK
+    var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_row = o * nblk
+            var b = tid
+            while b < nblk:
+                var base = (w_row + b) * Q4_BYTES
+                var low = Int(w_blocks[unsafe_offset=base])
+                var high = Int(w_blocks[unsafe_offset=base + 1])
+                var d = _fp16_bits_to_f32_device(low | (high << 8))
+                var kb = b * Q4_BLOCK
+                for j in range(16):
+                    var byte = Int(w_blocks[unsafe_offset=base + Q4_SCALE_BYTES + j])
+                    a += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j])
+                    a += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j + 16])
+                b += THREADS
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                if HAS_BIAS:
+                    v = v + bias[unsafe_offset=o]
+                dst[unsafe_offset=row * Int(out_cols) + o] = v
+
+
+def q4_matmul_dual_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[UInt8, MutUntrackedOrigin],
+    w_b: Pointer[UInt8, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    bias_a: Pointer[Float32, MutUntrackedOrigin],
+    bias_b: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """gate/up 双矩阵 fat-CTA（账本六十六）：两 matmul 共享同一行 x。
+
+    gate 和 up 的输入是同一个 normed 行 —— 分开跑就是两份 x smem 载入
+    相位 + 两份 L2 x 流量。这里一个 CTA 处理 w_a 的 OUTS 个输出和 w_b
+    的 OUTS 个输出，x 只载一次。每输出累加序与冠军逐位同构。
+
+    发射约定：`grid_dim=(ceildiv(out_cols, OUTS), rows)`（两个矩阵输出
+    数相同，各出 OUTS 个）、`block_dim=(THREADS,1,1)`。HAS_BIAS=False 时
+    两个 bias 指针不读，但 aliasing 规要求全部指针两两不同源（六十五）。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var nblk = Int(inner) // Q4_BLOCK
+    var sacc = stack_allocation[2 * OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_row = o * nblk
+            var b = tid
+            while b < nblk:
+                var base = (w_row + b) * Q4_BYTES
+                var low = Int(w_a[unsafe_offset=base])
+                var high = Int(w_a[unsafe_offset=base + 1])
+                var d = _fp16_bits_to_f32_device(low | (high << 8))
+                var kb = b * Q4_BLOCK
+                for j in range(16):
+                    var byte = Int(w_a[unsafe_offset=base + Q4_SCALE_BYTES + j])
+                    a += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j])
+                    a += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j + 16])
+                b += THREADS
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_row = o * nblk
+            var b = tid
+            while b < nblk:
+                var base = (w_row + b) * Q4_BYTES
+                var low = Int(w_b[unsafe_offset=base])
+                var high = Int(w_b[unsafe_offset=base + 1])
+                var d = _fp16_bits_to_f32_device(low | (high << 8))
+                var kb = b * Q4_BLOCK
+                for j in range(16):
+                    var byte = Int(w_b[unsafe_offset=base + Q4_SCALE_BYTES + j])
+                    a += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j])
+                    a += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j + 16])
+                b += THREADS
+        sacc[unsafe_offset=(OUTS + oo) * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(2 * OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                if HAS_BIAS:
+                    v = v + bias_a[unsafe_offset=o]
+                dst_a[unsafe_offset=row * Int(out_cols) + o] = v
+                var v2 = Float32(sacc[unsafe_offset=(OUTS + oo) * THREADS])
+                if HAS_BIAS:
+                    v2 = v2 + bias_b[unsafe_offset=o]
+                dst_b[unsafe_offset=row * Int(out_cols) + o] = v2
+
+
 def q4_matmul_smem_gpu[THREADS: Int, INNER: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_blocks: Pointer[UInt8, MutUntrackedOrigin],

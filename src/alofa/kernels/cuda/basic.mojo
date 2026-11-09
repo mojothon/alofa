@@ -236,3 +236,64 @@ def linear_block_gpu[THREADS: Int](
         stride //= 2
     if tid == 0:
         dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[unsafe_offset=0])
+
+
+def linear_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+) -> None:
+    """lm_head 的 fat-CTA 版（账本六十六）。
+
+    linear_block（六十五）一行一 block：151936 个 CTA 各自重读同一 x 行
+    （896x4B），x 经 L2 的总流量与权重同量级 —— 1.02ms 里约一半是它。
+    这里一个 block 处理 OUTS 个输出：x 只读一次（进 smem），L2 流量降
+    OUTS 倍。INNER comptime（smem 容量需要；本架构 hidden=896 固定）。
+    累加序：线程按 inner 跨步、树形归约 —— 与 linear_block 同构，重组差
+    由门的相对容差覆盖（同一判据逻辑）。
+
+    发射约定：`grid_dim=(ceildiv(out_cols, OUTS), rows)`、
+    `block_dim=(THREADS,1,1)`。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(INNER)
+    var k = tid
+    while k < Int(INNER):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            k = tid
+            while k < Int(INNER):
+                a += Float64(sx[unsafe_offset=k]) * Float64(w[unsafe_offset=w_base + k])
+                k += THREADS
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                dst[unsafe_offset=row * Int(out_cols) + o] = Float32(sacc[unsafe_offset=oo * THREADS])

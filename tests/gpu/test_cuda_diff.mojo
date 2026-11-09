@@ -80,7 +80,7 @@ from alofa.kernels.cuda.elementwise import (
     rope_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_fused_gpu, q4_matmul_smem_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -887,6 +887,106 @@ def linear_block_diff_check(mut ctx: DeviceContext) raises:
     print("*** LINEAR_BLOCK GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
 
 
+
+def q4_dual_fat_diff_check(mut ctx: DeviceContext) raises:
+    """dual-fat（gate/up 双矩阵融合）的组合参照差分。
+
+    参照 = 两份独立的 quantize -> dequant -> 标量 linear（同一 x 行）。
+    kernel 每 CTA 出 a/b 各 OUTS 个输出，累加序与冠军逐位同构；差分预期
+    与 q4_matmul 检查同级（实测 0.0）。
+    """
+    var arena = Arena(1 << 21)
+    var n_w = Int(Q4MM_OUT) * Int(Q4MM_INNER)
+    var n_x = Int(Q4MM_ROWS) * Int(Q4MM_INNER)
+    var n_d = Int(Q4MM_ROWS) * Int(Q4MM_OUT)
+    var n_blocks = n_w // 32
+    var n_bytes = n_blocks * 18
+    var wa_flat = scratch(arena, 1, n_w)
+    var wb_flat = scratch(arena, 1, n_w)
+    var x = scratch(arena, Int(Q4MM_ROWS), Int(Q4MM_INNER))
+    fill(wa_flat, 21)
+    fill(wb_flat, 23)
+    fill(x, 22)
+    var blocks_a = arena.alloc(n_bytes)
+    var blocks_b = arena.alloc(n_bytes)
+    var wa_raw = arena.alloc(n_w * 4)
+    var wb_raw = arena.alloc(n_w * 4)
+    quantize_q4_0(blocks_a, f32_data(wa_flat), n_w)
+    quantize_q4_0(blocks_b, f32_data(wb_flat), n_w)
+    dequant_q4_0(wa_raw.unsafe_bitcast[Float32](), blocks_a, n_w)
+    dequant_q4_0(wb_raw.unsafe_bitcast[Float32](), blocks_b, n_w)
+    var ref_a = arena.alloc(n_d * 4)
+    var ref_b = arena.alloc(n_d * 4)
+    linear(
+        rows_view(ref_a, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        rows_view(wa_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
+    )
+    linear(
+        rows_view(ref_b, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        rows_view(wb_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
+    )
+
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hwa = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    var hwb = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    var hda = ctx.enqueue_create_host_buffer[DT](n_d)
+    var hdb = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    for i in range(n_bytes):
+        hwa[i] = blocks_a[unsafe_offset=i]
+        hwb[i] = blocks_b[unsafe_offset=i]
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dwa = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    var dwb = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    var dda = ctx.enqueue_create_buffer[DT](n_d)
+    var ddb = ctx.enqueue_create_buffer[DT](n_d)
+    # 占位 bias 指针：HAS_BIAS=False 不读，但全部指针须两两不同源（六十五）
+    var dum_a = ctx.enqueue_create_buffer[DT](4)
+    var dum_b = ctx.enqueue_create_buffer[DT](4)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dwa, src_buf=hwa)
+    ctx.enqueue_copy(dst_buf=dwb, src_buf=hwb)
+    ctx.synchronize()
+    ctx.enqueue_function[q4_matmul_dual_fat_gpu[32, Q4MM_INNER, 4, False]](
+        dx.unsafe_ptr(),
+        dwa.unsafe_ptr(),
+        dwb.unsafe_ptr(),
+        dda.unsafe_ptr(),
+        ddb.unsafe_ptr(),
+        dum_a.unsafe_ptr(),
+        dum_b.unsafe_ptr(),
+        Int32(Q4MM_INNER),
+        Int32(Q4MM_OUT),
+        grid_dim=(ceildiv(Int(Q4MM_OUT), 4), Int(Q4MM_ROWS), 1),
+        block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hda, src_buf=dda)
+    ctx.enqueue_copy(dst_buf=hdb, src_buf=ddb)
+    ctx.synchronize()
+
+    var diff_a = max_abs_diff(hda.unsafe_ptr(), f32_data(rows_view(ref_a, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    var diff_b = max_abs_diff(hdb.unsafe_ptr(), f32_data(rows_view(ref_b, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    var scale = max_abs(f32_data(rows_view(ref_a, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    if scale <= 0.0:
+        raise Error("q4_dual_fat: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff_a > tol or diff_b > tol:
+        raise Error(
+            "q4_dual_fat: gpu vs reference max_abs_diff a="
+            + String(diff_a)
+            + " b="
+            + String(diff_b)
+            + " tolerance="
+            + String(tol)
+        )
+    print("*** Q4_DUAL_FAT GPU/REFERENCE DIFF PASS *** diff_a=", diff_a, " diff_b=", diff_b, " tol=", tol)
+
+
 def add_copy_diff_check(mut ctx: DeviceContext) raises:
     """add 与 copy 的零容差差分 —— 纯 f32 加法/搬运，差值即读错内存。
 
@@ -1170,3 +1270,4 @@ def main() raises:
     gather_diff_check(ctx)
     q4_fused_diff_check(ctx)
     linear_block_diff_check(ctx)
+    q4_dual_fat_diff_check(ctx)
