@@ -358,6 +358,100 @@ def q4_matmul_dual_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
                 dst_b[unsafe_offset=row * Int(out_cols) + o] = v2
 
 
+def q4_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_q: Pointer[UInt8, MutUntrackedOrigin],
+    w_k: Pointer[UInt8, MutUntrackedOrigin],
+    w_v: Pointer[UInt8, MutUntrackedOrigin],
+    dst_q: Pointer[Float32, MutUntrackedOrigin],
+    dst_k: Pointer[Float32, MutUntrackedOrigin],
+    dst_v: Pointer[Float32, MutUntrackedOrigin],
+    bias_q: Pointer[Float32, MutUntrackedOrigin],
+    bias_k: Pointer[Float32, MutUntrackedOrigin],
+    bias_v: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    q_out: Int32,
+    kv_out: Int32,
+) -> None:
+    """q/k/v 三 matmul 融合（账本六十七）：三者读同一 normed 行。
+
+    一个 CTA 负责输出列 o，最多出三个输出：q（o < q_out）、k、v（o <
+    kv_out，k/v 形状相同）。三分支显式展开 —— 不用指针三元选择（账本
+    六十五：GPU 代码里会静默不写）。每输出累加序与冠军逐位同构，差分
+    预期 0.0。x smem 只载一次，三次发射并一次。
+
+    发射约定：`grid_dim=(max(q_out, kv_out), rows)`、
+    `block_dim=(THREADS,1,1)`。HAS_BIAS=False 时三个 bias 不读，但
+    aliasing 规要求全部指针两两不同源（六十五/六十六）。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var nblk = Int(inner) // Q4_BLOCK
+    var sacc = stack_allocation[3 * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for seg in range(3):
+        var a = Float64(0)
+        var active = False
+        var w = w_q
+        comptime if seg == 0:
+            active = o < Int(q_out)
+            w = w_q
+        elif seg == 1:
+            active = o < Int(kv_out)
+            w = w_k
+        else:
+            active = o < Int(kv_out)
+            w = w_v
+        if active:
+            var w_row = o * nblk
+            var b = tid
+            while b < nblk:
+                var base = (w_row + b) * Q4_BYTES
+                var low = Int(w[unsafe_offset=base])
+                var high = Int(w[unsafe_offset=base + 1])
+                var d = _fp16_bits_to_f32_device(low | (high << 8))
+                var kb = b * Q4_BLOCK
+                for j in range(16):
+                    var byte = Int(w[unsafe_offset=base + Q4_SCALE_BYTES + j])
+                    a += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j])
+                    a += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j + 16])
+                b += THREADS
+        sacc[unsafe_offset=seg * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for seg in range(3):
+                sacc[unsafe_offset=seg * THREADS + tid] += sacc[
+                    unsafe_offset=seg * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        if o < Int(q_out):
+            var v = Float32(sacc[unsafe_offset=tid])
+            if HAS_BIAS:
+                v = v + bias_q[unsafe_offset=o]
+            dst_q[unsafe_offset=row * Int(q_out) + o] = v
+        if o < Int(kv_out):
+            var vk = Float32(sacc[unsafe_offset=THREADS + tid])
+            var vv = Float32(sacc[unsafe_offset=2 * THREADS + tid])
+            if HAS_BIAS:
+                vk = vk + bias_k[unsafe_offset=o]
+                vv = vv + bias_v[unsafe_offset=o]
+            dst_k[unsafe_offset=row * Int(kv_out) + o] = vk
+            dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
+
+
 def q4_matmul_smem_gpu[THREADS: Int, INNER: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_blocks: Pointer[UInt8, MutUntrackedOrigin],

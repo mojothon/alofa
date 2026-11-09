@@ -80,7 +80,7 @@ from alofa.kernels.cuda.elementwise import (
     rope_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_smem_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu, q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -987,6 +987,140 @@ def q4_dual_fat_diff_check(mut ctx: DeviceContext) raises:
     print("*** Q4_DUAL_FAT GPU/REFERENCE DIFF PASS *** diff_a=", diff_a, " diff_b=", diff_b, " tol=", tol)
 
 
+
+def qkv_tri_diff_check(mut ctx: DeviceContext) raises:
+    """qkv 三融合（gate/up dual 的三矩阵版）的组合参照差分。
+
+    参照 = 三份独立的 quantize -> dequant -> 标量 linear（同一 x 行）。
+    kernel 每 CTA 出 q/k/v 各一个输出（k/v 输出数小于 q 时尾部 CTA 只出
+    部分），累加序与冠军逐位同构；差分预期 0.0。bias 走 HAS_BIAS=False +
+    三个互不相同的 dummy 占位（aliasing 规）。
+    """
+    var arena = Arena(1 << 22)
+    var n_wq = Int(Q4MM_OUT) * Int(Q4MM_INNER)
+    var kv_out = 8
+    var n_wkv = kv_out * Int(Q4MM_INNER)
+    var n_x = Int(Q4MM_ROWS) * Int(Q4MM_INNER)
+    var n_xb = n_x * 4
+    var x = scratch(arena, Int(Q4MM_ROWS), Int(Q4MM_INNER))
+    fill(x, 25)
+    var nb_q = n_wq // 32
+    var nb_kv = n_wkv // 32
+    var n_dq = Int(Q4MM_ROWS) * Int(Q4MM_OUT)
+    var n_dkv = Int(Q4MM_ROWS) * kv_out
+    ctx.synchronize()
+    # 参照侧：三份权重分别量化、反量化、标量 linear
+    var dq_blocks = arena.alloc(nb_q * 18)
+    var dk_blocks = arena.alloc(nb_kv * 18)
+    var dv_blocks = arena.alloc(nb_kv * 18)
+    var wq_raw = arena.alloc(n_wq * 4)
+    var wk_raw = arena.alloc(n_wkv * 4)
+    var wv_raw = arena.alloc(n_wkv * 4)
+    var ref_q = arena.alloc(n_dq * 4)
+    var ref_k = arena.alloc(n_dkv * 4)
+    var ref_v = arena.alloc(n_dkv * 4)
+    var wq_flat = scratch(arena, 1, n_wq)
+    var wk_flat = scratch(arena, 1, n_wkv)
+    var wv_flat = scratch(arena, 1, n_wkv)
+    fill(wq_flat, 41)
+    fill(wk_flat, 43)
+    fill(wv_flat, 45)
+    quantize_q4_0(dq_blocks, f32_data(wq_flat), n_wq)
+    quantize_q4_0(dk_blocks, f32_data(wk_flat), n_wkv)
+    quantize_q4_0(dv_blocks, f32_data(wv_flat), n_wkv)
+    dequant_q4_0(wq_raw.unsafe_bitcast[Float32](), dq_blocks, n_wq)
+    dequant_q4_0(wk_raw.unsafe_bitcast[Float32](), dk_blocks, n_wkv)
+    dequant_q4_0(wv_raw.unsafe_bitcast[Float32](), dv_blocks, n_wkv)
+    linear(
+        rows_view(ref_q, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        rows_view(wq_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
+    )
+    linear(
+        rows_view(ref_k, Int(Q4MM_ROWS), kv_out),
+        x,
+        rows_view(wk_raw, kv_out, Int(Q4MM_INNER)),
+    )
+    linear(
+        rows_view(ref_v, Int(Q4MM_ROWS), kv_out),
+        x,
+        rows_view(wv_raw, kv_out, Int(Q4MM_INNER)),
+    )
+
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hwq = ctx.enqueue_create_host_buffer[DType.uint8](nb_q * 18)
+    var hwk = ctx.enqueue_create_host_buffer[DType.uint8](nb_kv * 18)
+    var hwv = ctx.enqueue_create_host_buffer[DType.uint8](nb_kv * 18)
+    var hdq = ctx.enqueue_create_host_buffer[DT](n_dq)
+    var hdk = ctx.enqueue_create_host_buffer[DT](n_dkv)
+    var hdv = ctx.enqueue_create_host_buffer[DT](n_dkv)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    for i in range(nb_q * 18):
+        hwq[i] = dq_blocks[unsafe_offset=i]
+    for i in range(nb_kv * 18):
+        hwk[i] = dk_blocks[unsafe_offset=i]
+        hwv[i] = dv_blocks[unsafe_offset=i]
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dwq = ctx.enqueue_create_buffer[DType.uint8](nb_q * 18)
+    var dwk = ctx.enqueue_create_buffer[DType.uint8](nb_kv * 18)
+    var dwv = ctx.enqueue_create_buffer[DType.uint8](nb_kv * 18)
+    var ddq = ctx.enqueue_create_buffer[DT](n_dq)
+    var ddk = ctx.enqueue_create_buffer[DT](n_dkv)
+    var ddv = ctx.enqueue_create_buffer[DT](n_dkv)
+    var dum_q = ctx.enqueue_create_buffer[DT](4)
+    var dum_k = ctx.enqueue_create_buffer[DT](4)
+    var dum_v = ctx.enqueue_create_buffer[DT](4)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dwq, src_buf=hwq)
+    ctx.enqueue_copy(dst_buf=dwk, src_buf=hwk)
+    ctx.enqueue_copy(dst_buf=dwv, src_buf=hwv)
+    ctx.synchronize()
+    ctx.enqueue_function[q4_matmul_qkv_gpu[32, Q4MM_INNER, False]](
+        dx.unsafe_ptr(),
+        dwq.unsafe_ptr(),
+        dwk.unsafe_ptr(),
+        dwv.unsafe_ptr(),
+        ddq.unsafe_ptr(),
+        ddk.unsafe_ptr(),
+        ddv.unsafe_ptr(),
+        dum_q.unsafe_ptr(),
+        dum_k.unsafe_ptr(),
+        dum_v.unsafe_ptr(),
+        Int32(Q4MM_INNER),
+        Int32(Q4MM_OUT),
+        Int32(kv_out),
+        grid_dim=(Int(Q4MM_OUT), Int(Q4MM_ROWS), 1),
+        block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hdq, src_buf=ddq)
+    ctx.enqueue_copy(dst_buf=hdk, src_buf=ddk)
+    ctx.enqueue_copy(dst_buf=hdv, src_buf=ddv)
+    ctx.synchronize()
+
+    var diff_q = max_abs_diff(hdq.unsafe_ptr(), f32_data(rows_view(ref_q, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_dq)
+    var diff_k = max_abs_diff(hdk.unsafe_ptr(), f32_data(rows_view(ref_k, Int(Q4MM_ROWS), kv_out)), n_dkv)
+    var diff_v = max_abs_diff(hdv.unsafe_ptr(), f32_data(rows_view(ref_v, Int(Q4MM_ROWS), kv_out)), n_dkv)
+    var scale = max_abs(f32_data(rows_view(ref_q, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_dq)
+    if scale <= 0.0:
+        raise Error("qkv_tri: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff_q > tol or diff_k > tol or diff_v > tol:
+        raise Error(
+            "qkv_tri: gpu vs reference diff q="
+            + String(diff_q)
+            + " k="
+            + String(diff_k)
+            + " v="
+            + String(diff_v)
+            + " tolerance="
+            + String(tol)
+        )
+    print("*** QKV_TRI GPU/REFERENCE DIFF PASS *** diff_q=", diff_q, " diff_k=", diff_k, " diff_v=", diff_v, " tol=", tol)
+
+
 def add_copy_diff_check(mut ctx: DeviceContext) raises:
     """add 与 copy 的零容差差分 —— 纯 f32 加法/搬运，差值即读错内存。
 
@@ -1271,3 +1405,4 @@ def main() raises:
     q4_fused_diff_check(ctx)
     linear_block_diff_check(ctx)
     q4_dual_fat_diff_check(ctx)
+    qkv_tri_diff_check(ctx)

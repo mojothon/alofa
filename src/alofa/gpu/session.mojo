@@ -43,7 +43,7 @@ from alofa.kernels.cuda.elementwise import (
     gather_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fat_gpu, q4_matmul_fused_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -118,6 +118,14 @@ struct GpuSession:
     # gate/up 的重复句柄（零拷贝，dual-fat 发射的 origin 拆分用，账本六十六）
     var d_q4_gate: List[DeviceBuffer[DType.uint8]]
     var d_q4_up: List[DeviceBuffer[DType.uint8]]
+    # q/k/v 同理（qkv 三融合发射的 origin 拆分用，账本六十七）
+    var d_q4_q: List[DeviceBuffer[DType.uint8]]
+    var d_q4_k: List[DeviceBuffer[DType.uint8]]
+    var d_q4_v: List[DeviceBuffer[DType.uint8]]
+    # q/k/v 偏置的分流句柄（同 List 多下标同病同治）
+    var d_bias_q: List[DeviceBuffer[DType.float32]]
+    var d_bias_k: List[DeviceBuffer[DType.float32]]
+    var d_bias_v: List[DeviceBuffer[DType.float32]]
     var d_norms: List[DeviceBuffer[DType.float32]]
     var d_biases: List[DeviceBuffer[DType.float32]]
     var d_embed: DeviceBuffer[DType.float32]
@@ -160,6 +168,12 @@ struct GpuSession:
         # 局部变量也带着同一 origin，被 aliasing 检查拒（账本六十六）。
         self.d_q4_gate = List[DeviceBuffer[DType.uint8]]()
         self.d_q4_up = List[DeviceBuffer[DType.uint8]]()
+        self.d_q4_q = List[DeviceBuffer[DType.uint8]]()
+        self.d_q4_k = List[DeviceBuffer[DType.uint8]]()
+        self.d_q4_v = List[DeviceBuffer[DType.uint8]]()
+        self.d_bias_q = List[DeviceBuffer[DType.float32]]()
+        self.d_bias_k = List[DeviceBuffer[DType.float32]]()
+        self.d_bias_v = List[DeviceBuffer[DType.float32]]()
         self.d_norms = List[DeviceBuffer[DType.float32]]()
         self.d_biases = List[DeviceBuffer[DType.float32]]()
         self.d_k_store = List[DeviceBuffer[DType.float32]]()
@@ -214,6 +228,12 @@ struct GpuSession:
                     self.d_q4_gate.append(slot_buf)
                 if slot == Q4_SLOT_UP:
                     self.d_q4_up.append(slot_buf)
+                if slot == Q4_SLOT_Q:
+                    self.d_q4_q.append(slot_buf)
+                if slot == Q4_SLOT_K:
+                    self.d_q4_k.append(slot_buf)
+                if slot == Q4_SLOT_V:
+                    self.d_q4_v.append(slot_buf)
 
         # ---- fp32 小权重：norms（每层两个 + 终 norm）、q/k/v 偏置 ----
         for layer in range(self.n_layers):
@@ -226,15 +246,15 @@ struct GpuSession:
                     self.ctx, model.params.view(p + "post_attention_layernorm.weight")
                 )
             )
-            self.d_biases.append(
-                _upload_f32(self.ctx, model.params.view(p + "self_attn.q_proj.bias"))
-            )
-            self.d_biases.append(
-                _upload_f32(self.ctx, model.params.view(p + "self_attn.k_proj.bias"))
-            )
-            self.d_biases.append(
-                _upload_f32(self.ctx, model.params.view(p + "self_attn.v_proj.bias"))
-            )
+            var bq = _upload_f32(self.ctx, model.params.view(p + "self_attn.q_proj.bias"))
+            var bk = _upload_f32(self.ctx, model.params.view(p + "self_attn.k_proj.bias"))
+            var bv = _upload_f32(self.ctx, model.params.view(p + "self_attn.v_proj.bias"))
+            self.d_biases.append(bq)
+            self.d_biases.append(bk)
+            self.d_biases.append(bv)
+            self.d_bias_q.append(bq)
+            self.d_bias_k.append(bk)
+            self.d_bias_v.append(bv)
         self.d_norms.append(_upload_f32(self.ctx, model.params.view(FINAL_NORM)))
 
         # ---- rope 表与 embedding（tied 输出投影）----
@@ -564,9 +584,29 @@ struct GpuSession:
         for layer in range(self.n_layers):
             var base = layer * Q4_SLOTS_PER_LAYER
             self._norm(2 * layer)
-            self._mm_bias[inner](base + Q4_SLOT_Q, self.q_out, 3 * layer, 0, 0)
-            self._mm_bias[inner](base + Q4_SLOT_K, self.kv_dim, 3 * layer + 1, 0, 1)
-            self._mm_bias[inner](base + Q4_SLOT_V, self.kv_dim, 3 * layer + 2, 0, 2)
+            # q/k/v 三融合（账本六十七）：同一 normed 行一次发射；每输出
+            # 累加序与冠军逐位同构。bias 尾缀 f32 加（同 CPU 通路）。
+            var x_qkv = self._src(0)
+            var dst_qkv_q = self._dst(0)
+            var dst_qkv_k = self._dst(1)
+            var dst_qkv_v = self._dst(2)
+            self.ctx.enqueue_function[q4_matmul_qkv_gpu[32, inner, True]](
+                x_qkv.unsafe_ptr(),
+                self.d_q4_q[layer].unsafe_ptr(),
+                self.d_q4_k[layer].unsafe_ptr(),
+                self.d_q4_v[layer].unsafe_ptr(),
+                dst_qkv_q.unsafe_ptr(),
+                dst_qkv_k.unsafe_ptr(),
+                dst_qkv_v.unsafe_ptr(),
+                self.d_bias_q[layer].unsafe_ptr(),
+                self.d_bias_k[layer].unsafe_ptr(),
+                self.d_bias_v[layer].unsafe_ptr(),
+                Int32(inner),
+                Int32(self.q_out),
+                Int32(self.kv_dim),
+                grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
+                block_dim=(32, 1, 1),
+            )
             # rope：表行 = 绝对位置 pos（指针偏移进第 pos 行）。q 转到
             # d_q_rot，k 转到 d_k_rot。
             # rope q+k 合成一次发射（账本六十五）；表行 = 绝对位置 pos。

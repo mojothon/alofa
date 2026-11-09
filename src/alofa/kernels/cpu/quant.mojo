@@ -66,6 +66,9 @@ comptime U8Ptr = Pointer[UInt8, MutUntrackedOrigin]
 comptime Q4_BLOCK = quant_block_size[QUANT_Q4_0]()
 comptime Q4_BYTES = quant_bytes_per_block[QUANT_Q4_0]()
 comptime Q4_SCALE_BYTES = quant_scale_bytes[QUANT_Q4_0]()
+# GPU 对齐布局（账本六十七）：每块 32B —— [0..15] 16 个 nibble 字节（16B
+# 对齐，kernel 可一次 load[16]），[16..17] fp16 scale（2B 对齐），[18..31] 填充。
+# 纯重排，反量化值与标准布局逐位相同。
 
 
 def fp16_bits_to_f32(half: Int) raises AlofaError -> Float32:
@@ -577,3 +580,5 @@ def matmul_q8_f32_bias(
 ) raises AlofaError:
     """`dst = W · x + bias`。"""
     _matmul_q8(dst, x, blocks, rows, cols, bias, True)
+
+
