@@ -51,7 +51,7 @@ from alofa.kernels.cpu.quant import (
     quantize_q8_0,
 )
 from alofa.kernels.cpu.scalar import attention, linear, rmsnorm
-from alofa.kernels.cuda.attention import attention_gpu
+from alofa.kernels.cuda.attention import attention_gpu, attention_par_gpu
 from alofa.kernels.cuda.basic import (
     dequant_q4_0_gpu,
     dequant_q8_0_gpu,
@@ -431,9 +431,92 @@ def attention_diff_check() raises:
     print("*** ATTENTION GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
+def attention_par_diff_check() raises:
+    """attention 并行版（块内规约）对产品标量 `attention` 的差分。
+
+    顺序变量清单（相对串行版/标量）：scores 逐位一致（单 j 内 d 升序同序）；
+    max 规约无舍入、顺序自由；total 树规约是唯一新增舍入变量；V 累加每线程
+    一个 d、j 升序同序。加上已知的 expf 1 ulp，预期差值仍在个位 ulp 量级。
+    """
+    var arena = Arena(1 << 20)
+    var q_cols = Int(ATTN_HEADS) * Int(ATTN_HEAD_DIM)
+    var kv_cols = Int(ATTN_KV_HEADS) * Int(ATTN_HEAD_DIM)
+    var q = scratch(arena, Int(ATTN_Q_LEN), q_cols)
+    var k = scratch(arena, Int(ATTN_KV_LEN), kv_cols)
+    var v = scratch(arena, Int(ATTN_KV_LEN), kv_cols)
+    var scores = scratch(arena, Int(ATTN_Q_LEN), Int(ATTN_KV_LEN))
+    var dst_cpu = scratch(arena, Int(ATTN_Q_LEN), q_cols)
+    fill(q, 11)
+    fill(k, 12)
+    fill(v, 13)
+    attention(
+        dst_cpu, q, k, v, scores, Int(ATTN_HEADS), Int(ATTN_KV_HEADS), Int(ATTN_HEAD_DIM)
+    )
+
+    var ctx = DeviceContext()
+    var n_q = Int(ATTN_Q_LEN) * q_cols
+    var n_kv = Int(ATTN_KV_LEN) * kv_cols
+    var n_s = Int(ATTN_Q_LEN) * Int(ATTN_KV_LEN)
+    var hq = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hk = ctx.enqueue_create_host_buffer[DT](n_kv)
+    var hv = ctx.enqueue_create_host_buffer[DT](n_kv)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_q)
+    ctx.synchronize()
+    for i in range(n_q):
+        hq[i] = f32_data(q)[unsafe_offset=i]
+    for i in range(n_kv):
+        hk[i] = f32_data(k)[unsafe_offset=i]
+        hv[i] = f32_data(v)[unsafe_offset=i]
+
+    var dq = ctx.enqueue_create_buffer[DT](n_q)
+    var dk = ctx.enqueue_create_buffer[DT](n_kv)
+    var dv = ctx.enqueue_create_buffer[DT](n_kv)
+    var ds = ctx.enqueue_create_buffer[DT](n_s)
+    var dd = ctx.enqueue_create_buffer[DT](n_q)
+    ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+    ctx.enqueue_copy(dst_buf=dk, src_buf=hk)
+    ctx.enqueue_copy(dst_buf=dv, src_buf=hv)
+    ctx.synchronize()
+    ctx.enqueue_function[attention_par_gpu[32]](
+        dd.unsafe_ptr(),
+        dq.unsafe_ptr(),
+        dk.unsafe_ptr(),
+        dv.unsafe_ptr(),
+        ds.unsafe_ptr(),
+        Int32(ATTN_HEADS),
+        Int32(ATTN_KV_HEADS),
+        Int32(ATTN_HEAD_DIM),
+        Int32(ATTN_Q_LEN),
+        Int32(ATTN_KV_LEN),
+        grid_dim=(Int(ATTN_HEADS), Int(ATTN_Q_LEN), 1),
+        block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var n = n_q
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), n)
+    var scale = max_abs(f32_data(dst_cpu), n)
+    if scale <= 0.0:
+        raise Error("attention_par: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "attention_par: gpu vs scalar max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
+
+
 def main() raises:
     rmsnorm_diff_check()
     dequant_q4_diff_check()
     dequant_q8_diff_check()
     linear_diff_check()
     attention_diff_check()
+    attention_par_diff_check()

@@ -3032,3 +3032,35 @@
   - **下一步**：attention 性能版（一线程一 (head,t) 在 decode 形状
     q_len=1、kv_len≥512 时每个线程串行几百次 exp+dot，需要块内并行）；lm_head
     就是 linear/q4 matmul 已覆盖；DeviceContext 穿 model 层设计笔记。
+
+- **2026-11-09（第五十八条）** —— ⚡ **P5 CUDA：attention 并行版 + 一个真 bug（scores 共享行竞态）—— decode 形状 58×**
+  - **`attention_par_gpu[THREADS]`**（`kernels/cuda/attention.mojo`）：一个
+    `(head, t)` 一个 CUDA block。顺序变量的账：scores 点积单 j 内 d 升序
+    （与标量同序 ⇒ 逐位一致）；max 规约无舍入、顺序自由；**total 树规约是
+    唯一新增舍入变量**；V 累加每线程一个 d、j 升序同序（要求
+    `head_dim ≤ THREADS`）。门实测与串行版同样恰好 **1 ulp** —— 树规约的
+    total 在此数据下没有新增可见舍入。
+  - **真 bug：scores 行被所有 head 共享**。标量串行复用同一行（其文档明说
+    "a row of scores would do"—— 写→读两遍→下一个头覆盖），GPU 头并行时
+    互相覆写。**小形状差分门没逮住**（每 CTA 工作量 ~1µs，CTA 近似串行，
+    竞态窗口关着），bench 的 decode 形状（14 头 × kv_len=512）把它揪出来：
+    par 版 diff=0.0516（17%）。修复：scores 改为按 (head, t) 私有
+    （`n_heads × q_len × kv_len`，行偏移 `(head*q_len+t)*kv_len`）。
+  - **教训（进门规）**：差分门的小形状验证不了**并行结构本身** —— 需要
+    至少一个"每 CTA 工作量大到 CTA 真正重叠"的形状。decode 形状进了性能
+    基准的差分检查，正好补了这个位。另一个诚实的注记：修复前串行版在
+    gate 与 bench 都"通过"了同一竞态 —— 机制未查明（疑似 CTA 调度时序的
+    良性巧合），修复后问题整体消失，但"竞态碰巧通过"本身就是教训：
+    **通过不等于无竞态，只是竞态没被触发**。
+  - **decode 性能（14:2 头，hd=64，q_len=1，diff 全部 1.49e-8）**：
+    | kv_len | 串行 | par[64] | par[128] |
+    |---|---|---|---|
+    | 512 | 2387.8 µs | 76.0 µs（31×） | **60.4 µs（40×）** |
+    | 2048 | 13219.6 µs | 291.2 µs（45×） | **226.1 µs（58×）** |
+  - **模型级**：decode 一步 ≈ matmul 1.12ms + attention 0.23ms + rmsnorm 等
+    ≈ **1.4ms/token**。attention 有效带宽只有 9.8 GB/s —— 14 个 block × 128
+    线程 = 1792 线程（0.8% 占用率），**并行度被头数封顶**；kv 跨 block 拆分
+    （两阶段规约）是下一步的性能杠杆，但 attention 目前只占步时 ~17%，
+    不是瓶颈，先不动。
+  - **下一步**：DeviceContext 穿 model 层设计笔记（把 kernel 接上服务路径）；
+    q4 matmul 正式进差分门（从 bench 的检查升格为门的一项）。
