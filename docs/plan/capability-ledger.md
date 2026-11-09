@@ -3083,3 +3083,10 @@
   - **下一步**：DeviceContext 穿 model 层设计笔记（勘察已完成：分发是编译期
     `[backend]` 参数、QwenForward not thread-safe、并发在 runtime 层孪生体、
     q4 权重 SharedRegion + List[RawPtr] 槽位）。
+
+- **2026-11-09（第六十条）** —— 📐 **P5 接线设计定稿：`docs/plan/06-device-context.md` —— 不是"DeviceContext 穿进 model 层"，是"平行的 GpuSession"**
+  - **勘察结论**（code-explorer 全仓勘察 + 亲手核对）：分发是编译期 `[backend]` Int 参数 + `comptime if`（无 trait、无运行期上下文先例）；`run[backend]` 是唯一前向路径、每层中间量全是 host RawPtr 视图；`QwenForward` not thread-safe，并发在 runtime 层孪生体（借原型只读字节）；q4 权重 = SharedRegion + `List[RawPtr]` 槽位。
+  - **两条被否决的路**（都有硬理由）：① DeviceContext 进 `QwenForward` 字段 —— 违背"后端是方法参数"哲学且技术上矛盾（原型共享 vs device 资源 per-会话）；② `run[BACKEND_GPU=2]` 硬套 host 视图链 —— 每层两次 PCIe 往返，把 132 GB/s 的 kernel 全淹没。**关键论断：GPU 与 CPU 的数据驻留差异是本质的，不是实现偶然** —— 硬塞同一条 run 链是架构级错误。
+  - **设计核心**：`GpuSession`（ctx + device 只读权重副本 + device 常驻激活/KV/logits 缓冲），由 spawn_twin 方构造、生命周期 ≤ 原型；**`QwenForward` 一行不改**，gpu 路径只读它的权重与形状；自由函数 `gpu_step(session, model, ids)` 与 `run[backend]` 平行（不是同链），内部 prefill/decode 仍一条路；每 token 只有 token id 进、logits（~608KB）出，中间零 host 往返。
+  - **判据与步骤**（有序、每步可独立验证）：小 kernel 补齐（rope/swiglu/add/gather/kv-append，逐个进门）→ 单层对数 → 全层 decode 端到端 logits 差分（vs AVX2，1e-5）→ 计时 ≤2ms/token → prefill → 批量留白。风险清单：借用时序、异步错误暴露（逐层对数是对冲）、AsyncRT 线程安全（1:1 保守）、q8 KV 留槽位。
+  - **下一步（照 §5 步骤 1）**：rope/swiglu/add/gather/kv-append 五个小 kernel + 进门。
