@@ -782,7 +782,8 @@ struct GpuSession:
             var w_down = self.d_w16_down[layer].unsafe_ptr()
             var dst_down = self._dst(3)
             var x_down = self._src(2)
-            self.ctx.enqueue_function[f16_matmul_fat_gpu[256, inner_ff, 2, False]](
+            # 六十九扫型：T128/O2 冠军（15.6 vs T256 15.8us）。
+            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False]](
                 x_down.unsafe_ptr(),
                 w_down,
                 dst_down.unsafe_ptr(),
@@ -790,7 +791,7 @@ struct GpuSession:
                 Int32(inner_ff),
                 Int32(self.hidden),
                 grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                block_dim=(256, 1, 1),
+                block_dim=(128, 1, 1),
             )
             self._residual()
 

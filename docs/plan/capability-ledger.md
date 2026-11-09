@@ -3175,3 +3175,12 @@
   - **代码清理**：bisect 临时件（d_q4_gate_bisect/up_bisect）、六十七的 q4 句柄分流 List（d_q4_q/k/v/gate/up，f16 后 decode_step 不再需要）、f16 构建循环的 hq4 死重填，均已撤销；`prof_f16.mojo` 留作 sweep 证据。
   - **复验全绿**：门 19/19；decode PASS（argmax 287 两侧同）；layer0 normed 0.0 / q 9.5e-7；probe 全净。
   - **到 2ms 剩余**：3.258 → 2 差 1.26ms。f16 后 gate matmul 有效带宽 ~462GB/s（8.7MB/2.6µs 下限），离 3.3TB/s 峰值仍 7×——瓶颈已从解包算力转到占据率/发射结构；`bench_decode_sections` 的分段数字还是 q4 时代口径（未更新 f16），下轮先校准再定位。下一轮候选：f16 matmul 吞吐结构（OUTS/THREADS 重扫 + fused 尾缀）、attention 0.23ms、或 lm_head 单独压。
+
+- **2026-11-09（第六十九条）** —— 📏 **P5 步骤 4 续（f16 口径校准轮）：bench_decode_sections 校准 + prof_f16 对称重扫；lm_head 假瓶颈证伪（1.02→0.34ms）；3.26ms 的预算表立起来**
+  - **prof_f16 重写为 session 核口径**：六十八的探针不对称（f16 臂用单矩阵 fat、q4 基线用 dual），本轮全部换成 session 在用的核同窗对比。结果：gate/up **f16 dual T64/O4 = 35.5µs（492GB/s）** vs 同窗 q4 dual 49.3µs；down **f16 T128/O2 = 15.6µs（560GB/s）**（session 原 T256/O2 15.8 → 切换，模型级 ±0.8% 在噪声地板）；o 6.7µs（240GB/s）；**head T256/O8 = 334µs（817GB/s，全模型最高带宽）**。session 配置除 down 外已是冠军，无进一步调参空间。
+  - **lm_head 0.46ms“余量 28%”是假议题**：bench_decode_sections 的 B 段一直用六十四的 `linear_gpu`（一线程一输出，533GB/s 时代的过渡品）——session 实际跑的 `linear_fat_f16_gpu` 实测 **0.344ms（817GB/s，与 prof 一致）**。旧口径的 1.02ms 假瓶颈悬案（账本六十五“2× 未解释，待查”）就此了结：不是 kernel 慢，是 bench 测错了核。
+  - **3.26ms 预算表**（f16 口径首立）：层链 kernel 和 ~86µs/层 ×24 ≈ 2.06ms + head 0.344 + token/d2h 0.045 + sync ≈ **2.45ms 实做 vs 3.26 实测 ⇒ ~0.8ms 是 288 次/步发射的间隙开销**（12 发射/层 ×24 + 头部）。下一个杠杆是**发射数/派发结构**（fuse rope2+copy2、swiglu 进 dual 尾缀、残差进 matmul 尾缀），不是再调 kernel 形参。
+  - **新假错形态在案**：一次发射的实例化失败（head kernel 传了 5 参，签名只收 4）让 main 里**所有** enqueue 以 "no matching method in call to 'enqueue_function'" 报错——真错误 "Wrong number of arguments to enqueue" 埋在 note 链最深处。与账本六十一的 keep_alive 段错误同族：**Mojo 编译器的错误归因会跨语句级联，第一个错误未必是第一个报错**。程序性防御：新文件先发一个最简 launch 编译过再加臂。
+  - **bench_decode_sections 半更新**：B 段换 f16 并校准；A/E/F/G 仍为 q4 kernel 口径（E 已标注 "(q4)"，f16 单核数字以 prof_f16 为准）——完整镜像 decode_step 的 12 发射层链留待下轮与发射融合一起做。
+  - **复验全绿**：门 19/19；decode PASS（argmax 287 两侧同）；layer0/probe 净；bench 3.283ms/token（与六十八的 3.258 同噪声带）。
+  - **到 2ms 剩余**：~0.8ms 发射间隙 + attention 0.23ms（kv 长度增长会涨）+ dual 492GB/s 距峰值的结构性差。下一轮候选：发射融合三件套（目标 12→8 发射/层）或 CUDA graph 类批量派发。

@@ -20,7 +20,7 @@ from alofa.model.arch.qwen import (
 )
 from alofa.gpu.session import GpuSession
 from alofa.kernels.cuda.attention import attention_par_gpu
-from alofa.kernels.cuda.basic import linear_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_gpu
 from alofa.kernels.cuda.elementwise import copy_gpu, rope_gpu, swiglu_gpu
 
 comptime WEIGHTS = "tests/fixtures/qwen2.5-0.5b/weights"
@@ -100,11 +100,11 @@ def main() raises:
     session._mm[INNER_FF](Q4_SLOT_DOWN, h, 2, 3)
     session._residual()
     session._norm(2 * session.n_layers)
-    session.ctx.enqueue_function[linear_gpu](
-        session.d_normed.unsafe_ptr(), session.d_embed.unsafe_ptr(),
+    session.ctx.enqueue_function[linear_fat_f16_gpu[256, 896, 8]](
+        session.d_normed.unsafe_ptr(), session.d_embed16.unsafe_ptr(),
         session.d_logits.unsafe_ptr(),
-        Int32(h), Int32(session.vocab),
-        grid_dim=(session.vocab, 1, 1), block_dim=(64, 1, 1),
+        Int32(session.vocab),
+        grid_dim=(session.vocab // 8, 1, 1), block_dim=(256, 1, 1),
     )
     session.ctx.synchronize()
 
@@ -170,11 +170,11 @@ def main() raises:
         var t0 = monotonic_ns()
         for i in range(ITERS):
             session._norm(2 * session.n_layers)
-            session.ctx.enqueue_function[linear_gpu](
-                session.d_normed.unsafe_ptr(), session.d_embed.unsafe_ptr(),
+            session.ctx.enqueue_function[linear_fat_f16_gpu[256, 896, 8]](
+                session.d_normed.unsafe_ptr(), session.d_embed16.unsafe_ptr(),
                 session.d_logits.unsafe_ptr(),
-                Int32(h), Int32(session.vocab),
-                grid_dim=(session.vocab, 1, 1), block_dim=(64, 1, 1),
+                Int32(session.vocab),
+                grid_dim=(session.vocab // 8, 1, 1), block_dim=(256, 1, 1),
             )
         session.ctx.synchronize()
         var ms = Float64(monotonic_ns() - t0) / 1e6 / Float64(ITERS)
@@ -211,13 +211,13 @@ def main() raises:
     var shapes = List[String]()
     var slots = List[Int]()
     var outs = List[Int]()
-    shapes.append("E q    896x896 ")
+    shapes.append("E q    896x896 (q4)")
     slots.append(Q4_SLOT_Q)
     outs.append(q_out)
-    shapes.append("E gate 4864x896 ")
+    shapes.append("E gate 4864x896 (q4)")
     slots.append(Q4_SLOT_GATE)
     outs.append(inter)
-    shapes.append("E down 896x4864 ")
+    shapes.append("E down 896x4864 (q4)")
     slots.append(Q4_SLOT_DOWN)
     outs.append(h)
     for si in range(3):
