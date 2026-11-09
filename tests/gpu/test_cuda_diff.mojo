@@ -6,16 +6,22 @@
     ./scripts/a100.sh gpu                          # 先挑一张空闲卡（共享机）
     ./scripts/a100.sh run 4 tests/gpu/test_cuda_diff.mojo
 
-覆盖两个 kernel：`rmsnorm`（相对容差 1e-5）与 `dequant_q4_0`（**零容差**）。
+覆盖四个 kernel：`rmsnorm` 与 `linear`（相对容差 1e-5）、`dequant_q4_0` 与
+`dequant_q8_0`（**零容差**）。
 
 本门**只验正确性、不报性能**（账本 §4 给这条路线定的解锁条件③）：GPU 与标量后端算
 **同一个**输入，逐值比 fp32 **相对**容差 1e-5 —— 与 AVX2 门同一个数，不是「GPU 可以
 宽一点」。
 
 2026-11-09 实测结果（A100，卡 0，`mojo run -I src`）：
-    *** RMSNORM GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 5.0350770950317384e-05
-    （diff=0.0：GPU 与标量**逐位一致**，比容差要求还干净。注意远程直跑必须带
-    `-I src`，否则 `alofa.verify` 会报 "does not refer to a nested package"。）
+    *** RMSNORM   GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 5.0350770950317384e-05
+    *** DEQUANT Q4_0 GPU/SCALAR DIFF PASS *** diff= 0.0
+    *** DEQUANT Q8_0 GPU/SCALAR DIFF PASS *** diff= 0.0
+    *** LINEAR    GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 0.024
+    （四个 kernel 全部与标量**逐位一致**，比容差要求还干净 —— linear 也 diff=0.0
+    说明 GPU 编译器没把乘加折叠成改变舍入的 FMA。注意远程直跑必须带 `-I src`，
+    否则 `alofa.verify` 会报 "does not refer to a nested package"。另外 `ref` 是
+    Mojo 关键字，变量名避开。）
 
 为什么 kernel 里一个线程要独立算完一整行（看起来很浪费）：本门只想让「GPU 算的数与
 CPU 算的数是同一个」这句话成立。写成块内规约会引入**共享内存**和**浮点累加顺序**
@@ -30,9 +36,23 @@ from max.gpu.host import DeviceContext
 from alofa.core.dtype import DT_FP32
 from alofa.core.memory import Arena
 from alofa.core.tensor import Shape, TensorView, f32_data
-from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, dequant_q4_0, quantize_q4_0
-from alofa.kernels.cpu.scalar import rmsnorm
-from alofa.kernels.cuda.basic import dequant_q4_0_gpu, rmsnorm_gpu
+from alofa.kernels.cpu.quant import (
+    Q4_BLOCK,
+    Q4_BYTES,
+    Q8_BLOCK,
+    Q8_BYTES,
+    dequant_q4_0,
+    dequant_q8_0,
+    quantize_q4_0,
+    quantize_q8_0,
+)
+from alofa.kernels.cpu.scalar import linear, rmsnorm
+from alofa.kernels.cuda.basic import (
+    dequant_q4_0_gpu,
+    dequant_q8_0_gpu,
+    linear_gpu,
+    rmsnorm_gpu,
+)
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -41,6 +61,13 @@ comptime COLS = 896
 # q4_0 反量化差分的规模：8 个块（256 个值），块结构与 `kernels/cpu/quant.mojo` 一致。
 comptime Q4_BLOCKS = 8
 comptime Q4_N = Q4_BLOCKS * Q4_BLOCK
+# q8_0 差分：同样 8 个块（256 个值）。
+comptime Q8_BLOCKS = 8
+comptime Q8_N = Q8_BLOCKS * Q8_BLOCK
+# linear 差分的规模：Qwen 0.5B 的 hidden=896，输出列取 16（差分门不追规模）。
+comptime LM_ROWS = 4
+comptime LM_INNER = 896
+comptime LM_OUT = 16
 comptime EPS = Float32(1e-6)
 comptime BLOCK = 64
 # 与 AVX2 门**同一个**容差。
@@ -191,6 +218,124 @@ def dequant_q4_diff_check() raises:
     print("*** DEQUANT Q4_0 GPU/SCALAR DIFF PASS *** diff=", diff)
 
 
+def dequant_q8_diff_check() raises:
+    """q8_0 反量化的 GPU/标量差分，判据与 q4_0 一样是**零容差**。"""
+    var arena = Arena(1 << 20)
+    var n_values = Int(Q8_BLOCKS) * Int(Q8_BLOCK)
+    var n_bytes = Int(Q8_BLOCKS) * Int(Q8_BYTES)
+    var src_view = scratch(arena, 1, n_values)
+    fill(src_view, 6)
+    var blocks = arena.alloc(n_bytes)
+    var ref_out = arena.alloc(n_values * 4).unsafe_bitcast[Float32]()
+    quantize_q8_0(blocks, f32_data(src_view), n_values)
+    dequant_q8_0(ref_out, blocks, n_values)
+
+    var ctx = DeviceContext()
+    var hb = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_values)
+    ctx.synchronize()
+    for i in range(n_bytes):
+        hb[i] = blocks[unsafe_offset=i]
+    var db = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    var dd = ctx.enqueue_create_buffer[DT](n_values)
+    ctx.enqueue_copy(dst_buf=db, src_buf=hb)
+    ctx.enqueue_function[dequant_q8_0_gpu](
+        db.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        Int32(Q8_BLOCKS),
+        grid_dim=(Int(Q8_BLOCKS), 1, 1),
+        block_dim=(Int(Q8_BLOCK),),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var diff = Float64(0)
+    for i in range(n_values):
+        var d = Float64(hd[i]) - Float64(ref_out[unsafe_offset=i])
+        if d < 0.0:
+            d = -d
+        if d > diff:
+            diff = d
+    arena.keep_alive()
+    if diff != 0.0:
+        raise Error(
+            "dequant_q8_0: gpu vs scalar diff=" + String(diff) + " (zero tolerance)"
+        )
+    print("*** DEQUANT Q8_0 GPU/SCALAR DIFF PASS *** diff=", diff)
+
+
+def linear_diff_check() raises:
+    """linear（无偏置 GEMM）的 GPU/标量差分，相对容差与 rmsnorm 同一个数。
+
+    kernel 与 `_gemm` 同一个累加顺序（Float64、k 升序、末尾一次 Float32），预期
+    也是逐位一致；判据仍用 1e-5 相对容差 —— 它是「同一算法」的门，不是「同一
+    指令序列」的门，若某天 GPU 编译器把乘加折叠成 FMA 使差分变非零，门会把
+    差值打出来让人看，而不是默默放行。
+    """
+    var arena = Arena(1 << 21)
+    var x = scratch(arena, LM_ROWS, LM_INNER)
+    var w = scratch(arena, LM_OUT, LM_INNER)
+    var dst_cpu = scratch(arena, LM_ROWS, LM_OUT)
+    fill(x, 4)
+    fill(w, 5)
+    # 参照：CPU 标量 `linear`（产品代码本身，`w` 按 [out, in] 存）。
+    linear(dst_cpu, x, w)
+
+    var ctx = DeviceContext()
+    var n_x = Int(LM_ROWS) * Int(LM_INNER)
+    var n_w = Int(LM_OUT) * Int(LM_INNER)
+    var n_d = Int(LM_ROWS) * Int(LM_OUT)
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hw = ctx.enqueue_create_host_buffer[DT](n_w)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    var px = f32_data(x)
+    var pw = f32_data(w)
+    for i in range(n_x):
+        hx[i] = px[unsafe_offset=i]
+    for i in range(n_w):
+        hw[i] = pw[unsafe_offset=i]
+
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dw = ctx.enqueue_create_buffer[DT](n_w)
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
+    ctx.enqueue_function[linear_gpu](
+        dx.unsafe_ptr(),
+        dw.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        Int32(LM_INNER),
+        Int32(LM_OUT),
+        grid_dim=(Int(LM_OUT), Int(LM_ROWS), 1),
+        block_dim=(1, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var n = n_d
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), n)
+    var scale = max_abs(f32_data(dst_cpu), n)
+    if scale < 1.0:
+        scale = 1.0
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "linear: gpu vs scalar max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    if scale <= 0.0:
+        raise Error("linear: the reference tensor is all zeros")
+    print("*** LINEAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
+
+
 def main() raises:
     rmsnorm_diff_check()
     dequant_q4_diff_check()
+    dequant_q8_diff_check()
+    linear_diff_check()

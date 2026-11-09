@@ -14,6 +14,7 @@ from std.math import sqrt
 from std.memory import bitcast
 
 from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, Q4_SCALE_BYTES
+from alofa.kernels.cpu.quant import Q8_BLOCK, Q8_BYTES, Q8_SCALE_BYTES
 
 
 def rmsnorm_gpu(
@@ -105,3 +106,59 @@ def dequant_q4_0_gpu(
         dst[unsafe_offset=b * Q4_BLOCK + j + 16] = Float32(
             ((byte >> 4) & 0x0F) - 8
         ) * d
+
+
+def dequant_q8_0_gpu(
+    blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    n_blocks: Int32,
+) -> None:
+    """q8_0 反量化，一个块（32 个值）一个线程。
+
+    与 `dequant_q4_0_gpu` 同一条差分理由：8 位码与 fp16 缩放都是精确的，判据
+    可以是零容差。与 q4_0 的一个差别不能漏：q8_0 存的是**有符号**码（补码），
+    `>= 128` 要减 256 做符号扩展 —— 漏了这步所有负权重整体跳到 +128 那侧，
+    零容差门会立刻红（`kernels/cpu/quant.mojo` 的 `_int8_from_byte` 原话）。
+    """
+    var b = Int(global_idx.x)
+    if b >= Int(n_blocks):
+        return
+    var base = b * Q8_BYTES
+    var low = Int(blocks[unsafe_offset=base])
+    var high = Int(blocks[unsafe_offset=base + 1])
+    var d = _fp16_bits_to_f32_device(low | (high << 8))
+    for j in range(Int(Q8_BLOCK)):
+        var q = Int(blocks[unsafe_offset=base + Q8_SCALE_BYTES + j])
+        if q >= 128:
+            q = q - 256
+        dst[unsafe_offset=b * Q8_BLOCK + j] = Float32(q) * d
+
+
+def linear_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """`dst[row, o] = Σ_k x[row, k] * w[o, k]`，一个 (行, 输出列) 一个线程。
+
+    与 `kernels/cpu/scalar.mojo` 的 `_gemm` 逐句对应：`w` 按 `[out, in]` 存
+    （一行 `w` 连续），累加 `Float64`、`k` 升序、最后一次性 `Float32(acc)` ——
+    差分门要的正是同一个顺序，任何重排都会把真差异藏进舍入里。
+
+    grid 取 `(out_cols, rows)` 正好铺满，不空转；边界判断照写（与 rmsnorm
+    同一个习惯，防以后 grid 复用时的越界）。
+    """
+    var o = Int(global_idx.x)
+    var row = Int(global_idx.y)
+    if o >= Int(out_cols):
+        return
+    var x_base = row * Int(inner)
+    var w_base = o * Int(inner)
+    var acc = Float64(0)
+    for k in range(Int(inner)):
+        acc += Float64(x[unsafe_offset=x_base + k]) * Float64(
+            w[unsafe_offset=w_base + k]
+        )
+    dst[unsafe_offset=row * Int(out_cols) + o] = Float32(acc)
