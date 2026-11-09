@@ -13,6 +13,7 @@
 """
 
 from std.gpu import global_idx, block_idx, thread_idx
+from std.math import exp
 from std.memory import stack_allocation
 
 from max.gpu import AddressSpace, barrier
@@ -452,7 +453,7 @@ def q4_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
             dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
 
 
-def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, ACC: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float16, MutUntrackedOrigin],
     dst: Pointer[Float32, MutUntrackedOrigin],
@@ -517,10 +518,17 @@ def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
                 var v = Float32(sacc[unsafe_offset=oo * THREADS])
                 if HAS_BIAS:
                     v = v + bias[unsafe_offset=o]
-                dst[unsafe_offset=row * Int(out_cols) + o] = v
+                # ACC（账本七十）：残差累加进 dst（o/down 直接写 d_x，省
+                # 一次 add_into 发射）。舍入顺序与"先写 f32 proj 再
+                # f32+f32 相加"逐位一致。
+                if ACC:
+                    var acc0 = dst[unsafe_offset=row * Int(out_cols) + o]
+                    dst[unsafe_offset=row * Int(out_cols) + o] = acc0 + v
+                else:
+                    dst[unsafe_offset=row * Int(out_cols) + o] = v
 
 
-def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, HAS_ACT: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_a: Pointer[Float16, MutUntrackedOrigin],
     w_b: Pointer[Float16, MutUntrackedOrigin],
@@ -528,11 +536,16 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
     dst_b: Pointer[Float32, MutUntrackedOrigin],
     bias_a: Pointer[Float32, MutUntrackedOrigin],
     bias_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
     inner: Int32,
     out_cols: Int32,
 ) -> None:
     """gate/up 的 f16 dual-fat（账本六十八）：两矩阵共享 x smem，结构同
-    q4_matmul_dual_fat，内层换成对齐 f16 向量读。"""
+    q4_matmul_dual_fat，内层换成对齐 f16 向量读。
+
+    HAS_ACT（账本七十）：tid==0 写回后顺带算 `act = silu(gate)*up` ——
+    与 `swiglu_gpu` 同序（f64 中间量、`v/(1+exp(-v))`、乘 up、一次
+    Float32 收尾），省一次发射。`dst_act` 在 HAS_ACT=False 时不用。"""
     var o0 = Int(block_idx.x) * OUTS
     var row = Int(block_idx.y)
     if o0 >= Int(out_cols):
@@ -588,6 +601,11 @@ def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
                     v2 = v2 + bias_b[unsafe_offset=o]
                 dst_a[unsafe_offset=row * Int(out_cols) + o] = v
                 dst_b[unsafe_offset=row * Int(out_cols) + o] = v2
+                comptime if HAS_ACT:
+                    var g = Float64(v)
+                    dst_act[unsafe_offset=row * Int(out_cols) + o] = Float32(
+                        g / (Float64(1) + exp(-g)) * Float64(v2)
+                    )
 
 
 def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](

@@ -3184,3 +3184,13 @@
   - **bench_decode_sections 半更新**：B 段换 f16 并校准；A/E/F/G 仍为 q4 kernel 口径（E 已标注 "(q4)"，f16 单核数字以 prof_f16 为准）——完整镜像 decode_step 的 12 发射层链留待下轮与发射融合一起做。
   - **复验全绿**：门 19/19；decode PASS（argmax 287 两侧同）；layer0/probe 净；bench 3.283ms/token（与六十八的 3.258 同噪声带）。
   - **到 2ms 剩余**：~0.8ms 发射间隙 + attention 0.23ms（kv 长度增长会涨）+ dual 492GB/s 距峰值的结构性差。下一轮候选：发射融合三件套（目标 12→8 发射/层）或 CUDA graph 类批量派发。
+
+- **2026-11-09（第七十条）** —— ⚡ **P5 步骤 4 续（发射融合轮）：3.258 → 3.046ms/token（328 tok/s，-6.5%）；层发射 12 → 8；判据零松动**
+  - **融合三件套**（按六十九预算表打 ~0.8ms 发射间隙）：
+    - **`rope_kv_gpu`**（rope2+copy2 合一）：decode 里 `d_k_rot` 只喂 copy2 —— rope 后的 k **直写本 token 的 KV store 行**，中转缓冲整个省掉；三段平铺（q rope / k rope / v 拷贝）输出互不重叠无竞态。零容差门（+1 → 门 20）。
+    - **dual + swiglu 尾缀**（`HAS_ACT`）：tid==0 写回 gate/up 后顺带算 `act = silu(gate)*up`，与 `swiglu_gpu` 同序（f64 中间量、一次 Float32 收尾）—— 门实测 **rel=0.0 精确同序**。
+    - **fat + ACC 累加模式**（`ACC: Bool = False` 默认参，旧调用点零改动）：o/down 直接累加进 `d_x`，省两次 `add_into` 发射；舍入顺序与"写 proj 再 add_into"逐位一致（decode diff 0.00868 与 argmax 287 端到端逐位不变是等价性的最终证据）。
+  - **坑在案**：dual 加 `dst_act` 形参后，session 原 bias 占位 `d_act` 与 act 输出撞同一缓冲 —— aliasing 检查要求**占位指针也两两不同**，bias_b 换 `d_proj` 占位。默认 comptime 参（`ACC: Bool = False`）在设备核模板里工作正常，9 个旧调用点零改动。
+  - **预算表兑现**：预期 ~96 发射 × ~2.8µs ≈ 0.27ms，实测 -0.21ms —— 发射间隙模型得到验证。剩余间隙 ~0.65ms（192 发射 × ~3.4µs）。8 发射/层 = norm、tri、rope_kv、attention、o+ACC、norm、dual+act、down+ACC。
+  - **复验全绿**：门 20/20（+rope_kv 零容差；fat_acc rel 3.0e-5、dual_act rel 0.0）；decode PASS（argmax 287 两侧同）；layer0 normed 0.0；probe 净；prof/sections 健全。
+  - **到 2ms 剩余**：3.046 → 2 差 1.05ms。构成：发射间隙 ~0.65ms（再融合空间：norm 进 dual/tri 尾缀？attention 后处理？）、attention ~0.23ms、kernel 本体 ~2.4ms（dual 492GB/s 距峰值仍 4×）。下一轮候选：norm 融合进 matmul 头部（读 x 前先归一化，省 2 发射/层）或 CUDA graph 类批量派发。

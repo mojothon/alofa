@@ -220,6 +220,72 @@ def copy2_gpu(
         v_dst[unsafe_offset=j] = v_src[unsafe_offset=j]
 
 
+def rope_kv_gpu(
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_row: Pointer[Float32, MutUntrackedOrigin],
+    v_row: Pointer[Float32, MutUntrackedOrigin],
+    cos_row: Pointer[Float32, MutUntrackedOrigin],
+    sin_row: Pointer[Float32, MutUntrackedOrigin],
+    q_cols: Int32,
+    kv_cols: Int32,
+    head_dim: Int32,
+    tokens: Int32,
+) -> None:
+    """rope(q) + rope(k 直写 KV store 行) + v 拷贝，三合一发射（账本七十）。
+
+    decode 里 `d_k_rot` 只喂 copy2 —— rope 后的 k 直接写进本 token 的
+    store 行（k_row/v_row 由调用方偏移到 pos 行），中转缓冲整个省掉。
+    平铺索引三段：q rope（与 rope2 逐元素同算术，含表两半分开读）、
+    k rope（同上，目标换 store 行）、v 拷贝。三段输出互不重叠，无竞态。
+    """
+    var i = Int(global_idx.x)
+    var half = Int(head_dim) // 2
+    var q_heads = Int(q_cols) // Int(head_dim)
+    var k_heads = Int(kv_cols) // Int(head_dim)
+    var q_pairs = Int(tokens) * q_heads * half
+    var k_pairs = Int(tokens) * k_heads * half
+    if i >= q_pairs + k_pairs + Int(tokens) * Int(kv_cols):
+        return
+    if i < q_pairs:
+        var j = i
+        var d = j % half
+        var head = (j // half) % q_heads
+        var t = j // (half * q_heads)
+        var table = t * Int(head_dim)
+        var base = t * Int(q_cols) + head * Int(head_dim)
+        var a = q_src[unsafe_offset=base + d]
+        var b = q_src[unsafe_offset=base + d + half]
+        q_rot[unsafe_offset=base + d] = a * cos_row[
+            unsafe_offset=table + d
+        ] - b * sin_row[unsafe_offset=table + d]
+        q_rot[unsafe_offset=base + d + half] = (
+            b * cos_row[unsafe_offset=table + d + half]
+            + a * sin_row[unsafe_offset=table + d + half]
+        )
+    elif i < q_pairs + k_pairs:
+        var j = i - q_pairs
+        var d = j % half
+        var head = (j // half) % k_heads
+        var t = j // (half * k_heads)
+        var table = t * Int(head_dim)
+        var base = t * Int(kv_cols) + head * Int(head_dim)
+        var a = k_src[unsafe_offset=base + d]
+        var b = k_src[unsafe_offset=base + d + half]
+        k_row[unsafe_offset=base + d] = a * cos_row[
+            unsafe_offset=table + d
+        ] - b * sin_row[unsafe_offset=table + d]
+        k_row[unsafe_offset=base + d + half] = (
+            b * cos_row[unsafe_offset=table + d + half]
+            + a * sin_row[unsafe_offset=table + d + half]
+        )
+    else:
+        var j = i - q_pairs - k_pairs
+        v_row[unsafe_offset=j] = v_src[unsafe_offset=j]
+
+
 def q4_dequant_f16_gpu(
     blocks: Pointer[UInt8, MutUntrackedOrigin],
     dst: Pointer[Float16, MutUntrackedOrigin],

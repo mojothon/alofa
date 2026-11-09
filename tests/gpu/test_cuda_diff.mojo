@@ -80,9 +80,11 @@ from alofa.kernels.cuda.elementwise import (
     gather_gpu,
     rope2_gpu,
     rope_gpu,
+    rope_kv_gpu,
     swiglu_gpu,
 )
 from alofa.kernels.cuda.matmul import f16_matmul_dual_gpu, f16_matmul_fat_gpu, f16_matmul_qkv_gpu, q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu, q4_matmul_smem_gpu
+from std.math import abs, exp
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -741,6 +743,92 @@ def copy2_diff_check(mut ctx: DeviceContext) raises:
     print("*** COPY2 GPU/REFERENCE DIFF PASS *** diff= 0.0 (zero tolerance)")
 
 
+def rope_kv_diff_check(mut ctx: DeviceContext) raises:
+    """rope_kv（rope q + rope k 直写 store 行 + v 拷贝，三合一）的零容差差分。
+
+    参照 = 标量 rope 的 q/k 输出 + v 逐位拷贝。k 段目标不是中转缓冲而是
+    store 行（本 kernel 的存在理由，账本七十）；q 段与 rope2 逐元素同算术。
+    """
+    var arena = Arena(1 << 18)
+    var q = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var k = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    var v = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    var cos = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var sin = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var oq_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var ok_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    fill(q, 51)
+    fill(k, 52)
+    fill(v, 53)
+    fill(cos, 54)
+    fill(sin, 55)
+    rope(oq_cpu, ok_cpu, q, k, cos, sin, Int(ROPE_HEAD_DIM))
+
+    var n_q = Int(ROPE_TOKENS) * Int(ROPE_Q_COLS)
+    var n_k = Int(ROPE_TOKENS) * Int(ROPE_K_COLS)
+    var n_t = Int(ROPE_TOKENS) * Int(ROPE_HEAD_DIM)
+    var hq = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hk = ctx.enqueue_create_host_buffer[DT](n_k)
+    var hv = ctx.enqueue_create_host_buffer[DT](n_k)
+    var hc = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hs = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hqo = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hko = ctx.enqueue_create_host_buffer[DT](n_k)
+    var hvo = ctx.enqueue_create_host_buffer[DT](n_k)
+    ctx.synchronize()
+    for i in range(n_q):
+        hq[i] = f32_data(q)[unsafe_offset=i]
+    for i in range(n_k):
+        hk[i] = f32_data(k)[unsafe_offset=i]
+        hv[i] = f32_data(v)[unsafe_offset=i]
+    for i in range(n_t):
+        hc[i] = f32_data(cos)[unsafe_offset=i]
+        hs[i] = f32_data(sin)[unsafe_offset=i]
+    var dq = ctx.enqueue_create_buffer[DT](n_q)
+    var dk = ctx.enqueue_create_buffer[DT](n_k)
+    var dv = ctx.enqueue_create_buffer[DT](n_k)
+    var dc = ctx.enqueue_create_buffer[DT](n_t)
+    var ds = ctx.enqueue_create_buffer[DT](n_t)
+    var dqo = ctx.enqueue_create_buffer[DT](n_q)
+    var dkr = ctx.enqueue_create_buffer[DT](n_k)
+    var dvr = ctx.enqueue_create_buffer[DT](n_k)
+    ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+    ctx.enqueue_copy(dst_buf=dk, src_buf=hk)
+    ctx.enqueue_copy(dst_buf=dv, src_buf=hv)
+    ctx.enqueue_copy(dst_buf=dc, src_buf=hc)
+    ctx.enqueue_copy(dst_buf=ds, src_buf=hs)
+    ctx.synchronize()
+    var q_pairs = Int(ROPE_TOKENS) * (Int(ROPE_Q_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    var k_pairs = Int(ROPE_TOKENS) * (Int(ROPE_K_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    ctx.enqueue_function[rope_kv_gpu](
+        dqo.unsafe_ptr(), dq.unsafe_ptr(), dk.unsafe_ptr(), dv.unsafe_ptr(),
+        dkr.unsafe_ptr(), dvr.unsafe_ptr(), dc.unsafe_ptr(), ds.unsafe_ptr(),
+        Int32(ROPE_Q_COLS), Int32(ROPE_K_COLS), Int32(ROPE_HEAD_DIM), Int32(ROPE_TOKENS),
+        grid_dim=(ceildiv(q_pairs + k_pairs + n_k, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hqo, src_buf=dqo)
+    ctx.enqueue_copy(dst_buf=hko, src_buf=dkr)
+    ctx.enqueue_copy(dst_buf=hvo, src_buf=dvr)
+    ctx.synchronize()
+
+    for i in range(n_q):
+        if hqo[i] != f32_data(oq_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope_kv(q): element " + String(i) + " gpu=" + String(hqo[i])
+                + " cpu=" + String(f32_data(oq_cpu)[unsafe_offset=i])
+            )
+    for i in range(n_k):
+        if hko[i] != f32_data(ok_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope_kv(k): element " + String(i) + " gpu=" + String(hko[i])
+                + " cpu=" + String(f32_data(ok_cpu)[unsafe_offset=i])
+            )
+        if hvo[i] != hv[i]:
+            raise Error("rope_kv(v): element " + String(i))
+    arena.keep_alive()
+    print("*** ROPE_KV GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)")
+
+
 def q4_fused_diff_check(mut ctx: DeviceContext) raises:
     """fused q4 matmul（bias 尾缀）的组合参照差分。
 
@@ -1244,6 +1332,39 @@ def f16_fat_diff_check(mut ctx: DeviceContext) raises:
     var rel = diff / scale
     print("[f16_fat] diff=", diff, " scale=", scale, " rel=", rel)
     var tol = F16_REL * scale
+    # ACC 判据（账本七十）：dst 预填已知图案，ACC=True 后应为
+    # "图案 + 参照"（f32 加法顺序与 add_into 通路逐位一致）。
+    var hpre = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_d):
+        hpre[i] = Float32((i % 17) - 8) * Float32(0.031)
+    ctx.enqueue_copy(dst_buf=dd, src_buf=hpre)
+    ctx.synchronize()
+    ctx.enqueue_function[f16_matmul_fat_gpu[256, FF_IN, 2, False, True]](
+        xg.unsafe_ptr(), w16.unsafe_ptr(), dd.unsafe_ptr(), dd2.unsafe_ptr(),
+        Int32(FF_IN), Int32(FF_OUT),
+        grid_dim=(ceildiv(Int(FF_OUT), 2), 1, 1), block_dim=(256, 1, 1),
+    )
+    var hd_acc = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=hd_acc, src_buf=dd)
+    ctx.synchronize()
+    var diff_acc = Float64(0)
+    var scale_acc = Float64(0)
+    for i in range(n_d):
+        var expect = Float64(hpre[i]) + Float64(f32_data(rows_view(ref_raw, 1, Int(FF_OUT)))[unsafe_offset=i])
+        var d = abs(Float64(hd_acc[i]) - expect)
+        if d > diff_acc:
+            diff_acc = d
+        var s = abs(expect)
+        if s > scale_acc:
+            scale_acc = s
+    if scale_acc <= 0.0:
+        raise Error("f16_fat_acc: the reference tensor is all zeros")
+    if diff_acc > F16_REL * scale_acc:
+        raise Error(
+            "f16_fat_acc: diff=" + String(diff_acc) + " tol=" + String(F16_REL * scale_acc)
+        )
+    print("[f16_fat_acc] rel=", diff_acc / scale_acc)
     arena.keep_alive()
     if diff > tol:
         raise Error(
@@ -1283,12 +1404,14 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
     var hx = ctx.enqueue_create_host_buffer[DT](n_x)
     var hd_a = ctx.enqueue_create_host_buffer[DT](4864)
     var hd_b = ctx.enqueue_create_host_buffer[DT](4864)
+    var hd_act = ctx.enqueue_create_host_buffer[DT](4864)
     ctx.synchronize()
     for i in range(n_x):
         hx[i] = f32_data(x)[unsafe_offset=i]
     var xg = ctx.enqueue_create_buffer[DT](n_x)
     var da = ctx.enqueue_create_buffer[DT](4864)
     var db = ctx.enqueue_create_buffer[DT](4864)
+    var dact = ctx.enqueue_create_buffer[DT](4864)
     var wa = ctx.enqueue_create_buffer[DType.float16](n_wg)
     var wb = ctx.enqueue_create_buffer[DType.float16](n_wg)
     var dum1 = ctx.enqueue_create_buffer[DT](4)
@@ -1297,14 +1420,17 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
     ctx.enqueue_copy(dst_buf=wa, src_buf=hf16g_a)
     ctx.enqueue_copy(dst_buf=wb, src_buf=hf16g_b)
     ctx.synchronize()
-    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False]](
+    # HAS_ACT=True（账本七十）：swiglu 尾缀与 gate/up 同发射。
+    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False, True]](
         xg.unsafe_ptr(), wa.unsafe_ptr(), wb.unsafe_ptr(),
         da.unsafe_ptr(), db.unsafe_ptr(), dum1.unsafe_ptr(), dum2.unsafe_ptr(),
+        dact.unsafe_ptr(),
         Int32(896), Int32(4864),
         grid_dim=(ceildiv(4864, 4), 1, 1), block_dim=(64, 1, 1),
     )
     ctx.enqueue_copy(dst_buf=hd_a, src_buf=da)
     ctx.enqueue_copy(dst_buf=hd_b, src_buf=db)
+    ctx.enqueue_copy(dst_buf=hd_act, src_buf=dact)
     ctx.synchronize()
     var diff_a = max_abs_diff(hd_a.unsafe_ptr(), f32_data(rows_view(ref_a, 1, 4864)), 4864)
     var scale_a = max_abs(f32_data(rows_view(ref_a, 1, 4864)), 4864)
@@ -1315,6 +1441,31 @@ def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
             "f16_dual: diff=" + String(diff_a) + " tol=" + String(F16_REL * scale_a)
         )
     print("[f16_dual] rel=", diff_a / scale_a)
+    # act 尾缀判据：silu(gate)*up 以 GPU 自身的 gate/up 输出为输入（两者
+    # 已过参照门），f64 同序重算 —— 钉的是尾缀的算术与舍入顺序。
+    var diff_act = Float64(0)
+    var scale_act = Float64(0)
+    for i in range(4864):
+        var g = Float64(hd_a[i])
+        var expect = Float32(
+            g / (Float64(1) + exp(-g)) * Float64(hd_b[i])
+        )
+        var d = abs(Float64(hd_act[i]) - Float64(expect))
+        if d > diff_act:
+            diff_act = d
+        var s = abs(Float64(expect))
+        if s > scale_act:
+            scale_act = s
+    if scale_act <= 0.0:
+        raise Error("f16_dual_act: the reference tensor is all zeros")
+    if diff_act > F16_REL * scale_act:
+        raise Error(
+            "f16_dual_act: diff="
+            + String(diff_act)
+            + " tol="
+            + String(F16_REL * scale_act)
+        )
+    print("[f16_dual_act] rel=", diff_act / scale_act)
 
     # ---- tri：q 16 出 / kv 12 出，同 x ----
     var n_wq = 16 * 896
@@ -1711,6 +1862,7 @@ def main() raises:
     swiglu_diff_check(ctx)
     rope_diff_check(ctx)
     copy2_diff_check(ctx)
+    rope_kv_diff_check(ctx)
     gather_diff_check(ctx)
     q4_fused_diff_check(ctx)
     linear_block_diff_check(ctx)

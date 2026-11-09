@@ -117,6 +117,7 @@ def _bench_dual[T: Int, O: Int](
     mut dd2: DeviceBuffer[DType.float32],
     mut db1: DeviceBuffer[DType.float32],
     mut db2: DeviceBuffer[DType.float32],
+    mut dact: DeviceBuffer[DType.float32],
 ) raises -> Float64:
     var x = dx.unsafe_ptr()
     var wa = dwa.unsafe_ptr()
@@ -125,9 +126,10 @@ def _bench_dual[T: Int, O: Int](
     var d2 = dd2.unsafe_ptr()
     var b1 = db1.unsafe_ptr()
     var b2 = db2.unsafe_ptr()
+    var act = dact.unsafe_ptr()
     for i in range(WARMUP):
-        ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False]](
-            x, wa, wb, d1, d2, b1, b2,
+        ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False]](
+            x, wa, wb, d1, d2, b1, b2, act,
             Int32(896), Int32(4864),
             grid_dim=(4864 // O, 1, 1), block_dim=(T, 1, 1),
         )
@@ -136,8 +138,8 @@ def _bench_dual[T: Int, O: Int](
     for r in range(ROUNDS):
         var t0 = monotonic_ns()
         for i in range(ITERS):
-            ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False]](
-                x, wa, wb, d1, d2, b1, b2,
+            ctx.enqueue_function[f16_matmul_dual_gpu[T, 896, O, False, False]](
+                x, wa, wb, d1, d2, b1, b2, act,
                 Int32(896), Int32(4864),
                 grid_dim=(4864 // O, 1, 1), block_dim=(T, 1, 1),
             )
@@ -236,9 +238,10 @@ def main() raises:
     var dd2 = ctx.enqueue_create_buffer[DType.float32](4864)
     var dd3 = ctx.enqueue_create_buffer[DType.float32](4864)
     var dd4 = ctx.enqueue_create_buffer[DType.float32](4864)
+    var dd5 = ctx.enqueue_create_buffer[DType.float32](4864)
     ctx.synchronize()
     _bench_q4_dual(ctx, "q4 dual T64 O4:", dx, dq_ga, dq_gb, dd, dd2, dd3, dd4)
-    _bench_dual[64, 4](ctx, "f16 dual T64 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
+    _bench_dual[64, 4](ctx, "f16 dual T64 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5)
     _bench_dual[128, 4](ctx, "f16 dual T128 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
     _bench_dual[64, 8](ctx, "f16 dual T64 O8:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
     _bench_dual[32, 4](ctx, "f16 dual T32 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)

@@ -38,12 +38,10 @@ from alofa.kernels.cuda.attention import attention_par_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
-    copy2_gpu,
     f32_to_f16_gpu,
     q4_dequant_f16_gpu,
-    rope2_gpu,
+    rope_kv_gpu,
     gather_gpu,
-    swiglu_gpu,
 )
 from alofa.kernels.cuda.matmul import (
     f16_matmul_dual_gpu,
@@ -684,36 +682,28 @@ struct GpuSession:
                 grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
                 block_dim=(32, 1, 1),
             )
-            # rope：表行 = 绝对位置 pos（指针偏移进第 pos 行）。q 转到
-            # d_q_rot，k 转到 d_k_rot。
-            # rope q+k 合成一次发射（账本六十五）；表行 = 绝对位置 pos。
+            # rope + KV append 三合一（账本七十）：q rope → d_q_rot，k rope
+            # 直写本 token 的 store 行（decode 的 d_k_rot 只喂 copy2，中转
+            # 整个省掉），v 直拷。表行/store 行 = 绝对位置 pos（指针偏移）。
             var cos_row = self.d_cos.unsafe_ptr() + pos * self.head_dim
             var sin_row = self.d_sin.unsafe_ptr() + pos * self.head_dim
-            self.ctx.enqueue_function[rope2_gpu](
+            var pk_row = self.d_k_store[layer].unsafe_ptr() + pos * self.kv_dim
+            var pv_row = self.d_v_store[layer].unsafe_ptr() + pos * self.kv_dim
+            var n_pairs = (self.q_out + self.kv_dim) // 2 + self.kv_dim
+            self.ctx.enqueue_function[rope_kv_gpu](
                 self.d_q_rot.unsafe_ptr(),
-                self.d_k_rot.unsafe_ptr(),
                 self.d_q.unsafe_ptr(),
                 self.d_k.unsafe_ptr(),
+                self.d_v.unsafe_ptr(),
+                pk_row,
+                pv_row,
                 cos_row,
                 sin_row,
                 Int32(self.q_out),
                 Int32(self.kv_dim),
                 Int32(self.head_dim),
                 Int32(1),
-                grid_dim=(ceildiv((self.q_out + self.kv_dim) // 2, 64), 1, 1),
-                block_dim=(64, 1, 1),
-            )
-            # KV append（store 行 = pos）。
-            # KV append k/v 合成一次发射（账本六十五）；store 行 = pos。
-            var pk_row = self.d_k_store[layer].unsafe_ptr() + pos * self.kv_dim
-            var pv_row = self.d_v_store[layer].unsafe_ptr() + pos * self.kv_dim
-            self.ctx.enqueue_function[copy2_gpu](
-                pk_row,
-                pv_row,
-                self.d_k_rot.unsafe_ptr(),
-                self.d_v.unsafe_ptr(),
-                Int32(self.kv_dim),
-                grid_dim=(ceildiv(self.kv_dim * 2, 64), 1, 1),
+                grid_dim=(ceildiv(n_pairs, 64), 1, 1),
                 block_dim=(64, 1, 1),
             )
             # attention（decode 性能版：一 (head,t) 一个 block）。两个 store
@@ -735,65 +725,57 @@ struct GpuSession:
                 grid_dim=(self.n_heads, 1, 1),
                 block_dim=(128, 1, 1),
             )
-            # o 走 f16 fat O2（账本六十八）。
-            var dst_o = self._dst(3)
+            # o 走 f16 fat O2 + ACC（账本七十）：直接累加进 d_x，省残差
+            # 发射；舍入顺序与"写 proj 再 add_into"逐位一致。
             var x_o = self._src(1)
-            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False]](
+            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False, True]](
                 x_o.unsafe_ptr(),
                 self.d_w16_o[layer].unsafe_ptr(),
-                dst_o.unsafe_ptr(),
+                self.d_x.unsafe_ptr(),
                 self.d_ws.unsafe_ptr(),
                 Int32(inner),
                 Int32(self.hidden),
                 grid_dim=(ceildiv(self.hidden, 2), 1, 1),
                 block_dim=(128, 1, 1),
             )
-            self._residual()
             self._norm(2 * layer + 1)
-            # gate/up dual f16（账本六十八）：同一 normed 行，x smem 只载
-            # 一次；T64/O4。
+            # gate/up dual f16 + swiglu 尾缀（账本六十八/七十）：同一
+            # normed 行 x smem 只载一次；T64/O4；act 在写回后顺带算。
+            # bias 槽是占位（HAS_BIAS=False 不解引用），但发射 aliasing
+            # 检查要求两两不同 —— 用 d_proj 占位。
             var w_gate = self.d_w16_gate[layer].unsafe_ptr()
             var w_up = self.d_w16_up[layer].unsafe_ptr()
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
             var x_gu = self._src(0)
-            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False]](
+            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False, True]](
                 x_gu.unsafe_ptr(),
                 w_gate,
                 w_up,
                 dst_gate.unsafe_ptr(),
                 dst_up.unsafe_ptr(),
                 self.d_ws.unsafe_ptr(),
+                self.d_proj.unsafe_ptr(),
                 self.d_act.unsafe_ptr(),
                 Int32(inner),
                 Int32(self.inter),
                 grid_dim=(ceildiv(self.inter, 4), 1, 1),
                 block_dim=(64, 1, 1),
             )
-            self.ctx.enqueue_function[swiglu_gpu](
-                self.d_act.unsafe_ptr(),
-                self.d_gate.unsafe_ptr(),
-                self.d_up.unsafe_ptr(),
-                Int32(self.inter),
-                grid_dim=(ceildiv(self.inter, 64), 1, 1),
-                block_dim=(64, 1, 1),
-            )
-            # down f16 fat O2（账本六十八）。
+            # down f16 fat O2 + ACC（账本六十八/七十）。
             var w_down = self.d_w16_down[layer].unsafe_ptr()
-            var dst_down = self._dst(3)
             var x_down = self._src(2)
             # 六十九扫型：T128/O2 冠军（15.6 vs T256 15.8us）。
-            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False]](
+            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False, True]](
                 x_down.unsafe_ptr(),
                 w_down,
-                dst_down.unsafe_ptr(),
+                self.d_x.unsafe_ptr(),
                 self.d_ws.unsafe_ptr(),
                 Int32(inner_ff),
                 Int32(self.hidden),
                 grid_dim=(ceildiv(self.hidden, 2), 1, 1),
                 block_dim=(128, 1, 1),
             )
-            self._residual()
 
         self._norm(2 * self.n_layers)
         # lm_head 走 fat 版（账本六十六扫型 T256/O8：0.459 vs block 0.501ms；
