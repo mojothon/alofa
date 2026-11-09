@@ -78,6 +78,7 @@ from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.loop import MAX_CONNS, Loop
 from alofa.srv.master import run_workers
 from alofa.core.ffi.mem import raise_stack_limit
+from alofa.core.ffi.posix import monotonic_ns
 from alofa.core.memory import Arena
 from alofa.engine.core import MAX_PROMPT, EngineCore
 from alofa.engine.executor import MAX_BATCH, MAX_GEN, NO_TOKEN, int_map
@@ -106,6 +107,9 @@ comptime BATCH_MAX_WAIT = 8
 # 为什么是 256：正常每 token 一拍（批满时加上 prefill 分块也不过十几拍），256 是
 # 一个数量级的余量 —— 上界只用来兜住"永远不前进"，不该在正常的排队等待时先跳出来。
 comptime MAX_PROGRESS_TICKS = 256
+# 老路（单流）的所有权在**静默**多久之后可以收走。取值只需大于最慢的一拍
+# （一拍 = 一次 prefill/step，本机最大 ~10 s），远小于"永远堵住"的代价。
+comptime STREAM_TAKEOVER_NS = 30_000_000_000
 
 
 def load_weights(weights_file: String, config_path: String, max_tokens: Int, weight_bits: Int) raises -> QwenForward:
@@ -207,6 +211,11 @@ struct ModelService(Service, Twinable):
     # 生成"。它服务的是下面那条**单流老路**（采样，或装不进引擎的请求）；
     # 批路的状态在 `b_*` 那几张表里。
     var stream_request: Int
+
+    # 上面那条流**最后一次被推进**的时刻（`monotonic_ns`）。它只服务一件事：
+    # 区分"还活着的老路流"（不许顶掉）与"对端消失、循环没通知到"的僵尸流
+    # （静默超过 `STREAM_TAKEOVER_NS` 才允许收走）。
+    var stream_touched: Int
 
     # 批路的开关。**默认开**。
     #
@@ -315,6 +324,7 @@ struct ModelService(Service, Twinable):
         self.stream_temp = 0.0
         self.stream_started = False
         self.stream_request = NO_REQUEST
+        self.stream_touched = 0
         self.batch_enabled = batch_default()
         self.batch_stat_on = getenv("ALOFA_BATCH_STATS", "") == "1"
         self.batch_ticks = 0
@@ -471,11 +481,17 @@ struct ModelService(Service, Twinable):
         前向留在第一次 `stream_next`（惰性），因为这里是唯一还能把请求的错回成
         400 的地方 —— 响应头一旦发出去，退路就只剩下"给流一个终点"。
         """
-        # 上一条流没被收尾（对端断了 → 不一定有人通知）就先收掉它：这一整块状态
-        # 是**一整份**，不收就只是被下面覆盖掉（今天看不出来），接了批调度之后占
-        # 的是表里一个位置。
+        # 上一条老路流还挂着时，**只有它已经静默很久**才收掉（对端消失、循环那边
+        # 不一定通知得到）；还活着的必须由下面那段**指名拒绝**。
+        #
+        # ⚠️ 这里曾经是无条件清所有权。代价是实测到的：8 条 `max_tokens > MAX_GEN`
+        # 的流并发，7 条各出 1 个 token 就 EOF —— 每条新的 begin 都把前一条的号从
+        # `stream_request` 上抹掉，前一条下一拍就成了"拿别人的号来问这一步"而被
+        # 打断（日志 `already streaming another request [asked=0 streaming=7]`）。
+        # "别把状态漏在表里"和"别把活流顶掉"是两件事，超时才是它们的分界。
         if self.stream_request != NO_REQUEST and self.stream_request != request:
-            self.stream_request = NO_REQUEST
+            if monotonic_ns() - self.stream_touched > STREAM_TAKEOVER_NS:
+                self.stream_request = NO_REQUEST
         var ids = self.tokenizer.encode(prompt)
         if len(ids) == 0:
             raise AlofaError(
@@ -553,6 +569,7 @@ struct ModelService(Service, Twinable):
         self.rng = Rng(UInt64(self.seed))
         self.stream_out.clear()
         self.stream_request = request
+        self.stream_touched = monotonic_ns()
 
     def stream_next(mut self, request: Int) raises -> StreamToken:
         """走一步，返回这一步**新增**的文本。
@@ -563,6 +580,7 @@ struct ModelService(Service, Twinable):
         # 有空位就先把排队的放进来：槽位是在别人走完的那一刻空出来的，而"轮到谁"
         # 不该由调用方记着 —— 否则排在第 9 位的那条要等有人恰好问它，才知道自己
         # 已经能进了。
+        self.stream_touched = monotonic_ns()
         self._admit()
         if self._waiting_of(request) >= 0:
             # 还在等：它排着队，可引擎里没有它的位置。这一帧**必须**说"在等"而不

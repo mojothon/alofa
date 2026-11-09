@@ -273,5 +273,39 @@ def test_the_two_paths_really_are_two_paths() raises:
     svc.stream_end(0)
 
 
+def test_a_live_old_path_stream_is_not_stolen() raises:
+    """老路一次只握一条：第二条必须**在 begin 时指名拒绝**，不许顶掉活流。
+
+    现场（2026-11-06 实测）：`max_tokens > MAX_GEN` 的请求走老路，8 条并发里
+    7 条各出 1 个 token 就 EOF，服务日志是 `this service is already streaming
+    another request [asked=0 streaming=7]`。根因是 `stream_begin` 里那把"先收掉
+    上一条没走完的流"——它连**正在服务**的流也收，所有权被最后一条抢走，前面
+    几条在下一拍全成了"别人的号"。
+
+    判据三条：① 第二条 begin 必须抛（指名拒绝）；② 第一条被打断之后必须还能
+    继续出 token（所有权没被顶掉）；③ 第一条 `stream_end` 之后，第二条必须能
+    进（拒绝不是永久的）。
+    """
+    var svc = ModelService.load(ServeConfig.from_env())
+    var long_steps = MAX_GEN + 8
+    svc.stream_begin(PROMPT_A, long_steps, 0.0, 0)
+    assert_true(svc._slot_of(0) < 0, "超过 MAX_GEN 的请求必须走老路（却进了引擎）")
+    var first = svc.stream_next(0)
+    assert_true(not first.done, "第一条流第一步就结束了")
+    var rejected = False
+    try:
+        svc.stream_begin(PROMPT_B, long_steps, 0.0, 1)
+    except err:
+        rejected = True
+    assert_true(rejected, "第二条老路流没有被拒绝（它顶掉了活流的所有权）")
+    var still_mine = svc.stream_next(0)
+    assert_true(not still_mine.done, "活流被别人的 begin 打断（下一拍被当成别人的号）")
+    assert_true(still_mine.text.byte_length() > 0, "活流这一步没有产出")
+    svc.stream_end(0)
+    svc.stream_begin(PROMPT_B, long_steps, 0.0, 1)
+    assert_true(svc.stream_request == 1, "第一条收尾之后第二条还是进不来")
+    svc.stream_end(1)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
