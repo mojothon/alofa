@@ -629,7 +629,7 @@ struct GpuSession:
 
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
-        tri_t: Int = 128,
+        tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -651,6 +651,9 @@ struct GpuSession:
         T 提升直接提高占据率。交错 A/B（bench_tri_ab）裁决，⚠️ NORM
         融合的跨线程归约序随 T 变，与默认非逐位同 —— 以门容差与
         argmax 不变为判据。
+        down_t/o_t（账本七十八）：down/o 发射的线程数 comptime 参
+        （默认 128）。fat 核 grid=ceildiv(hidden,2)=448 块 —— T128 只有
+        26% 线程槽（tri 同款占据率病）；交错 A/B 裁决后定默认。
         skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
         路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
         拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令
@@ -765,7 +768,9 @@ struct GpuSession:
             # 发射；舍入顺序与"写 proj 再 add_into"逐位一致。
             var x_o = self._src(1)
             if skip & SKIP_O == 0:
-                self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False, True]](
+                self.ctx.enqueue_function[
+                    f16_matmul_fat_gpu[o_t, inner, 2, False, True]
+                ](
                     x_o.unsafe_ptr(),
                     self.d_w16_o[layer].unsafe_ptr(),
                     self.d_x.unsafe_ptr(),
@@ -773,7 +778,7 @@ struct GpuSession:
                     Int32(inner),
                     Int32(self.hidden),
                     grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                    block_dim=(128, 1, 1),
+                    block_dim=(o_t, 1, 1),
                 )
             else:
                 self.ctx.enqueue_function[noop_gpu](
@@ -815,7 +820,9 @@ struct GpuSession:
             var x_down = self._src(2)
             # 六十九扫型：T128/O2 冠军（15.6 vs T256 15.8us）。
             if skip & SKIP_DOWN == 0:
-                self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner_ff, 2, False, True]](
+                self.ctx.enqueue_function[
+                    f16_matmul_fat_gpu[down_t, inner_ff, 2, False, True]
+                ](
                     x_down.unsafe_ptr(),
                     w_down,
                     self.d_x.unsafe_ptr(),
@@ -823,7 +830,7 @@ struct GpuSession:
                     Int32(inner_ff),
                     Int32(self.hidden),
                     grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                    block_dim=(128, 1, 1),
+                    block_dim=(down_t, 1, 1),
                 )
             else:
                 self.ctx.enqueue_function[noop_gpu](
