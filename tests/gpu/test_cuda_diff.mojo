@@ -6,8 +6,8 @@
     ./scripts/a100.sh gpu                          # 先挑一张空闲卡（共享机）
     ./scripts/a100.sh run 4 tests/gpu/test_cuda_diff.mojo
 
-覆盖五个 kernel：`rmsnorm`、`linear`、`attention`（相对容差 1e-5）、`dequant_q4_0` 与
-`dequant_q8_0`（**零容差**）。attention 的差分只面对一个新变量：exp 的 ulp 差
+覆盖七项：`rmsnorm`、`linear`、`attention`、`attention_par`、`q4_matmul`（相对容差
+1e-5）、`dequant_q4_0` 与 `dequant_q8_0`（**零容差**）。attention 的差分只面对一个新变量：exp 的 ulp 差
 （libdevice vs libm），门把实际差值打出来记录量级。
 
 本门**只验正确性、不报性能**（账本 §4 给这条路线定的解锁条件③）：GPU 与标量后端算
@@ -20,6 +20,8 @@
     *** DEQUANT Q8_0 GPU/SCALAR DIFF PASS *** diff= 0.0
     *** LINEAR    GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 0.024
     *** ATTENTION GPU/SCALAR DIFF PASS *** diff= 1.1920928955078125e-07  tol= 2.0e-05
+    *** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff= 1.1920928955078125e-07  tol= 2.0e-05
+    *** Q4_MATMUL GPU/REFERENCE DIFF PASS *** diff= 0.0  tol= 0.026
     （前四个与标量**逐位一致** —— linear 的 diff=0.0 说明 GPU 编译器没把乘加
     折叠成改变舍入的 FMA。attention 的 diff = 1.19e-7 = 恰好 1 个 fp32 ulp：
     kernel 与标量逐句同构，唯一下游差异是 exp（libdevice vs libm）—— 这是门里
@@ -39,7 +41,7 @@ from std.math import ceildiv, sqrt
 from max.gpu.host import DeviceContext
 from alofa.core.dtype import DT_FP32
 from alofa.core.memory import Arena
-from alofa.core.tensor import Shape, TensorView, f32_data
+from alofa.core.tensor import Shape, TensorView, f32_data, rows_view
 from alofa.kernels.cpu.quant import (
     Q4_BLOCK,
     Q4_BYTES,
@@ -58,6 +60,7 @@ from alofa.kernels.cuda.basic import (
     linear_gpu,
     rmsnorm_gpu,
 )
+from alofa.kernels.cuda.matmul import q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -80,6 +83,12 @@ comptime ATTN_KV_HEADS = 1
 comptime ATTN_HEAD_DIM = 16
 comptime ATTN_Q_LEN = 3
 comptime ATTN_KV_LEN = 5
+# q4 matmul 差分：产品冠军 kernel（smem 版）vs 产品 dequant + 产品 linear 的
+# 组合参照（AVX2 的 SIMD 通道序会影响舍入，不作参照）。inner 取 896 对齐
+# Qwen 形状且是 32 的倍数（块永不跨行，平铺量化即行主块流）。
+comptime Q4MM_ROWS = 2
+comptime Q4MM_INNER = 896
+comptime Q4MM_OUT = 16
 comptime EPS = Float32(1e-6)
 comptime BLOCK = 64
 # 与 AVX2 门**同一个**容差。
@@ -513,6 +522,80 @@ def attention_par_diff_check() raises:
     print("*** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
+def q4_matmul_diff_check() raises:
+    """产品 q4 matmul 冠军 kernel（smem 版）的组合参照差分。
+
+    参照 = `quantize_q4_0` → `dequant_q4_0`（产品量化往返）→ 标量 `linear`。
+    不用 AVX2 当参照：SIMD 通道序影响舍入顺序，浮点逐位对不上；组合参照与
+    GPU kernel 共享同一套 dequant 语义，差值只面对「融合 matmul 的累加」。
+    bench（A100）里此检查长期 diff=0.0，门沿用同一判据。
+    """
+    var arena = Arena(1 << 21)
+    var n_w = Int(Q4MM_OUT) * Int(Q4MM_INNER)
+    var n_x = Int(Q4MM_ROWS) * Int(Q4MM_INNER)
+    var n_d = Int(Q4MM_ROWS) * Int(Q4MM_OUT)
+    var n_blocks = n_w // 32
+    var n_bytes = n_blocks * 18
+    var w_flat = scratch(arena, 1, n_w)
+    var x = scratch(arena, Int(Q4MM_ROWS), Int(Q4MM_INNER))
+    fill(w_flat, 21)
+    fill(x, 22)
+    var blocks = arena.alloc(n_bytes)
+    var wf_raw = arena.alloc(n_w * 4)
+    quantize_q4_0(blocks, f32_data(w_flat), n_w)
+    dequant_q4_0(wf_raw.unsafe_bitcast[Float32](), blocks, n_w)
+    var ref_raw = arena.alloc(n_d * 4)
+    linear(
+        rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        rows_view(wf_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
+    )
+
+    var ctx = DeviceContext()
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hw = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    for i in range(n_bytes):
+        hw[i] = blocks[unsafe_offset=i]
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dw = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
+    ctx.synchronize()
+    ctx.enqueue_function[q4_matmul_smem_gpu[32, Q4MM_INNER]](
+        dx.unsafe_ptr(),
+        dw.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        Int32(Q4MM_INNER),
+        Int32(Q4MM_OUT),
+        grid_dim=(Int(Q4MM_OUT), Int(Q4MM_ROWS), 1),
+        block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    var scale = max_abs(f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    if scale <= 0.0:
+        raise Error("q4_matmul: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "q4_matmul: gpu vs reference max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** Q4_MATMUL GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
+
+
 def main() raises:
     rmsnorm_diff_check()
     dequant_q4_diff_check()
@@ -520,3 +603,4 @@ def main() raises:
     linear_diff_check()
     attention_diff_check()
     attention_par_diff_check()
+    q4_matmul_diff_check()

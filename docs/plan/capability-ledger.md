@@ -3064,3 +3064,22 @@
     不是瓶颈，先不动。
   - **下一步**：DeviceContext 穿 model 层设计笔记（把 kernel 接上服务路径）；
     q4 matmul 正式进差分门（从 bench 的检查升格为门的一项）。
+
+- **2026-11-09（第五十九条）** —— 🚪 **P5 CUDA：差分门第七项 —— q4 matmul 冠军 kernel 升格进门，diff=0.0**
+  - **`q4_matmul_diff_check`**：产品冠军 `q4_matmul_smem_gpu[32, 896]` 对
+    **组合参照**（`quantize_q4_0` → `dequant_q4_0` 产品量化往返 → 标量
+    `linear`）。不用 AVX2 当参照：SIMD 通道序影响舍入顺序，浮点逐位对不上；
+    组合参照与 kernel 共享同一套 dequant 语义，差值只面对「融合 matmul 的
+    累加」这一件事。bench 里此检查长期 diff=0.0，门沿用同一判据。
+  - **首跑就红**（diff=ref_max=2601.8）—— 又是门抓 bug，这次抓的是**门自己
+    的调用**：grid 写成 `(out, 1)` 而参照有 2 行，第 1 行从未被算，差分比到
+    未初始化内存。补 `grid_dim=(out, rows, 1)` 后 **diff=0.0**。（讽刺但健康：
+    五十八说"通过不等于无竞态"，本轮补一句"**失败不一定是 kernel 错，参照
+    侧的调用也要过一遍同样的怀疑**"。）
+  - **门现状（七项，A100 全绿）**：rmsnorm / linear / attention /
+    attention_par / q4_matmul（相对容差 1e-5）+ dequant_q4_0 / dequant_q8_0
+    （零容差）。两个非零差分都是 1 ulp（expf）。**GPU 后端的算子正确性记录
+    从此有单一入口** —— 后续每加一个 kernel 先进这个门再谈性能。
+  - **下一步**：DeviceContext 穿 model 层设计笔记（勘察已完成：分发是编译期
+    `[backend]` 参数、QwenForward not thread-safe、并发在 runtime 层孪生体、
+    q4 权重 SharedRegion + List[RawPtr] 槽位）。
