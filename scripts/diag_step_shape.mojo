@@ -48,6 +48,32 @@ def _row(mut model: QwenForward, shards: Int, t: Int) raises:
     model.prof.dump()
 
 
+def _row_probe(mut model: QwenForward, shards: Int, t: Int) raises:
+    """一步的屏障账：热身一步，再跑一步并 dump（缓冲只装 1.5 步）。"""
+    model.reset()
+    model.set_shards(shards)
+    var ids = List[Int]()
+    for _ in range(t):
+        ids.append(100)
+    _ = model.run[BACKEND_AVX2](ids)
+    model.reset()
+    model.reset_barrier()
+    var t0 = monotonic_ns()
+    _ = model.run[BACKEND_AVX2](ids)
+    print(
+        "   [probe 步] shards=",
+        String(shards),
+        " t=",
+        String(t),
+        ": ",
+        String(Int((monotonic_ns() - t0) // 100000)),
+        " (0.1ms)",
+    )
+    model.dump_barrier()
+    model.trace_barrier(0, 6)
+    model.trace_barrier(24, 3)
+
+
 def main() raises:
     var model1 = QwenForward(
         FIXTURE + "/weights", FIXTURE + "/config.tsv", MAX_TOK, True
@@ -59,6 +85,7 @@ def main() raises:
     )
     model8.enable_q8_output()
     _row(model8, 8, 8)
+    _row_probe(model8, 8, 8)
     var model32 = QwenForward(
         FIXTURE + "/weights", FIXTURE + "/config.tsv", MAX_TOK, True
     )

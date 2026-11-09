@@ -46,6 +46,19 @@ from alofa.core.error import (
     AlofaError,
 )
 from alofa.core.ffi.mem import RawPtr
+from alofa.model.probe_barrier import (
+    PROBE_KIND_BIAS,
+    PROBE_KIND_HEAD,
+    PROBE_KIND_ROWS,
+    probe_alloc,
+    probe_dispatch,
+    probe_dump,
+    probe_mark_end,
+    probe_reset,
+    probe_trace,
+    probe_mark_start,
+    probe_wait_done,
+)
 from alofa.core.memory import Arena, SharedRegion
 from alofa.core.tensor import (
     MAX_RANK,
@@ -661,17 +674,32 @@ def q8_matmul_k[backend: Int](
 
 
 async def _q8_shard[backend: Int](
-    d: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int
+    d: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    rows: Int,
+    cols: Int,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
+    rec: Int = -1,
+    k: Int = 0,
 ):
     """同上，q8_0 通路：一片输出行，配上它在块流里那一段。"""
+    probe_mark_start(probe, rec, k)
     try:
         q8_matmul_k[backend](d, x, blocks, rows, cols)
     except err:
         _ = err
+    probe_mark_end(probe, rec, k)
 
 
 def q8_matmul_k_shards[backend: Int](
-    dst: F32Ptr, x: F32Ptr, blocks: RawPtr, rows: Int, cols: Int, shards: Int
+    dst: F32Ptr,
+    x: F32Ptr,
+    blocks: RawPtr,
+    rows: Int,
+    cols: Int,
+    shards: Int,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
 ) raises AlofaError:
     """输出投影的 q8_0 通路：按输出行切 `shards` 片并发。
 
@@ -690,6 +718,7 @@ def q8_matmul_k_shards[backend: Int](
         return
     var row_bytes = cols // Q8_BLOCK * Q8_BYTES
     var tg = TaskGroup()
+    var rec = probe_dispatch(probe, PROBE_KIND_HEAD, n)
     var per = rows // n
     var rem = rows - per * n
     var c0 = 0
@@ -702,10 +731,14 @@ def q8_matmul_k_shards[backend: Int](
                 blocks.unsafe_offset(c0 * row_bytes),
                 cnt,
                 cols,
+                probe,
+                rec,
+                k,
             )
         )
         c0 += cnt
     tg.wait()
+    probe_wait_done(probe, rec)
 
 
 def q8_matmul_rows_k[backend: Int](
@@ -753,12 +786,17 @@ async def _q8_rows_shard[backend: Int](
     rows: Int,
     cols: Int,
     dst_stride: Int,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
+    rec: Int = -1,
+    k: Int = 0,
 ):
     """同上，但这一片拿到的是**整个 token 批**（切法同 `q4_matmul_rows_k_shards`）。"""
+    probe_mark_start(probe, rec, k)
     try:
         q8_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride)
     except err:
         _ = err
+    probe_mark_end(probe, rec, k)
 
 
 def q8_matmul_rows_k_shards[backend: Int](
@@ -770,6 +808,7 @@ def q8_matmul_rows_k_shards[backend: Int](
     cols: Int,
     dst_stride: Int,
     shards: Int,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
 ) raises AlofaError:
     """整批 q8_0 投影：按输出行切 `shards` 片，每片做完整个 token 批。
 
@@ -782,6 +821,7 @@ def q8_matmul_rows_k_shards[backend: Int](
         return
     var row_bytes = cols // Q8_BLOCK * Q8_BYTES
     var tg = TaskGroup()
+    var rec = probe_dispatch(probe, PROBE_KIND_HEAD, n)
     var per = rows // n
     var rem = rows - per * n
     var c0 = 0
@@ -796,10 +836,14 @@ def q8_matmul_rows_k_shards[backend: Int](
                 cnt,
                 cols,
                 dst_stride,
+                probe,
+                rec,
+                k,
             )
         )
         c0 += cnt
     tg.wait()
+    probe_wait_done(probe, rec)
 
 
 def q4_matmul_rows_k[backend: Int](
@@ -928,12 +972,20 @@ async def _q4_rows_shard[backend: Int](
     cols: Int,
     dst_stride: Int,
     junk: Int = 0,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
+    rec: Int = -1,
+    k: Int = 0,
 ):
-    """同上，但这一片拿到的是**整个 token 批**（顺序见 `q4_matmul_rows_k_shards` 的注释）。"""
+    """同上，但这一片拿到的是**整个 token 批**（顺序见 `q4_matmul_rows_k_shards` 的注释）。
+
+    `probe`/`rec`/`k` 只服务屏障探针（`alofa/model/probe_barrier.mojo`），默认不挂。
+    """
+    probe_mark_start(probe, rec, k)
     try:
         q4_matmul_rows_k[backend](d, x, blocks, n_tok, rows, cols, dst_stride, junk)
     except err:
         _ = err
+    probe_mark_end(probe, rec, k)
 
 
 async def _q4_bias_rows_shard[backend: Int](
@@ -946,14 +998,19 @@ async def _q4_bias_rows_shard[backend: Int](
     bias: F32Ptr,
     dst_stride: Int,
     junk: Int = 0,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
+    rec: Int = -1,
+    k: Int = 0,
 ):
     """带偏置的分片：同一个输出行带 × 整个 token 批。"""
+    probe_mark_start(probe, rec, k)
     try:
         q4_matmul_bias_rows_k[backend](
             d, x, blocks, n_tok, rows, cols, bias, dst_stride, junk
         )
     except err:
         _ = err
+    probe_mark_end(probe, rec, k)
 
 
 def q4_matmul_bias_rows_k_shards[backend: Int](
@@ -967,6 +1024,7 @@ def q4_matmul_bias_rows_k_shards[backend: Int](
     dst_stride: Int,
     shards: Int,
     junk: Int = 0,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
 ) raises AlofaError:
     """同上，带偏置版：按输出行切 `shards` 片，每片做完整个 token 批。"""
     var n = shard_count(rows, shards)
@@ -977,6 +1035,7 @@ def q4_matmul_bias_rows_k_shards[backend: Int](
         return
     var row_bytes = cols // Q4_BLOCK * Q4_BYTES
     var tg = TaskGroup()
+    var rec = probe_dispatch(probe, PROBE_KIND_BIAS, n)
     var per = rows // n
     var rem = rows - per * n
     var c0 = 0
@@ -993,10 +1052,14 @@ def q4_matmul_bias_rows_k_shards[backend: Int](
                 bias.unsafe_offset(c0),
                 dst_stride,
                 junk,
+                probe,
+                rec,
+                k,
             )
         )
         c0 += cnt
     tg.wait()
+    probe_wait_done(probe, rec)
 
 
 def q4_matmul_rows_k_shards[backend: Int](
@@ -1009,6 +1072,7 @@ def q4_matmul_rows_k_shards[backend: Int](
     dst_stride: Int,
     shards: Int,
     junk: Int = 0,
+    probe: RawPtr = RawPtr(unsafe_from_address=Int(0)),
 ) raises AlofaError:
     """整批 q4_0 投影：先按输出行切 `shards` 片，**每片一口气做完整个 token 批**。
 
@@ -1029,6 +1093,7 @@ def q4_matmul_rows_k_shards[backend: Int](
         return
     var row_bytes = cols // Q4_BLOCK * Q4_BYTES
     var tg = TaskGroup()
+    var rec = probe_dispatch(probe, PROBE_KIND_ROWS, n)
     var per = rows // n
     var rem = rows - per * n
     var c0 = 0
@@ -1044,10 +1109,14 @@ def q4_matmul_rows_k_shards[backend: Int](
                 cols,
                 dst_stride,
                 junk,
+                probe,
+                rec,
+                k,
             )
         )
         c0 += cnt
     tg.wait()
+    probe_wait_done(probe, rec)
 
 
 def q4_matmul_bias_k_shards[backend: Int](
@@ -1546,6 +1615,9 @@ struct QwenForward(Movable):
     # 它是**实例**的属性而不是方法的参数：一次前向里有 169 次投影，让调用方每
     # 次都把这个数传一遍，只是给了 169 个把它传错的机会。
     var shards: Int
+    # 屏障探针的样本缓冲（`alofa/model/probe_barrier.mojo`）。开关是那里的
+    # 编译期常量：关着时这块只是几十 KB 的匿名映射，写点全被折掉。
+    var probe: RawPtr
 
     def __init__(
         out self,
@@ -1569,6 +1641,7 @@ struct QwenForward(Movable):
         # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
         # 想退回不切就显式 `set_shards(1)` —— 那条路与分片之前逐位相同。
         self.shards = default_shards()
+        self.probe = probe_alloc()
         self.prof = ForwardProf()
         self.junk_arm = 0
 
@@ -1737,6 +1810,9 @@ struct QwenForward(Movable):
         self.max_tokens = max_tokens
         self.kv_len = 0
         self.shards = proto.shards
+        # 探针缓冲每个孪生体自己一份：记录是**按步**写的，两条线程共用一份会互相
+        # 踩游标（孪生体各跑各的前向）。
+        self.probe = probe_alloc()
         self.prof = ForwardProf()
         self.junk_arm = 0
         self.head = proto.head
@@ -1924,13 +2000,14 @@ struct QwenForward(Movable):
                 out,
                 self.shards,
                 self.junk_arm,
+                self.probe,
             )
             _ = self.prof.tick(K_GEMM, _t_q)
         else:
             _t_q = self.prof.tick(K_PREP, _t_q)
             q4_matmul_rows_k_shards[backend](
                 dst_p, x_p, blocks, t_rows, out, cols, out, self.shards,
-                self.junk_arm,
+                self.junk_arm, self.probe,
             )
             _ = self.prof.tick(K_GEMM, _t_q)
         return
@@ -1963,6 +2040,7 @@ struct QwenForward(Movable):
                 cols,
                 out,
                 self.shards,
+                self.probe,
             )
         else:
             var head_name = self.head
@@ -2235,6 +2313,7 @@ struct QwenForward(Movable):
                 self.cfg.vocab,
                 h,
                 self.shards,
+                self.probe,
             )
         else:
             self.project[backend](logits, last_normed, head_name, Q4_NO_SLOT, logits, False)
@@ -2260,6 +2339,19 @@ struct QwenForward(Movable):
     def dump_profile(imm self):
         """打印每 token 各阶段的毫秒。打印逻辑在 `ForwardProf.dump`。"""
         self.prof.dump()
+
+    def reset_barrier(imm self):
+        """清空屏障探针的样本游标（只探针用）。"""
+        probe_reset(self.probe)
+
+    def trace_barrier(imm self, first: Int = 0, count: Int = 6):
+        """逐条打印探针记录（只探针用）。"""
+        probe_trace(self.probe, first, count)
+
+    def dump_barrier(imm self):
+        """打印屏障探针的三条账（唤醒/掉队/收尾）。打印逻辑在
+        `alofa/model/probe_barrier.mojo` 的 `probe_dump`。"""
+        probe_dump(self.probe)
     def argmax(self, logits: F32Ptr) -> Int:
         """Index of the largest logit; ties go to the lowest index.
 
