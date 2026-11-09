@@ -59,3 +59,8 @@ def main() raises:
     )
     model8.enable_q8_output()
     _row(model8, 8, 8)
+    var model32 = QwenForward(
+        FIXTURE + "/weights", FIXTURE + "/config.tsv", MAX_TOK, True
+    )
+    model32.enable_q8_output()
+    _row(model32, 8, 32)
