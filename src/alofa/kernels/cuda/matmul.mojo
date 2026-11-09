@@ -118,3 +118,64 @@ def q4_matmul_block_gpu[THREADS: Int](
         stride //= 2
     if tid == 0:
         dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
+
+
+def q4_matmul_vec_gpu[THREADS: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """`q4_matmul_block_gpu` 的**向量加载版**：块数据一次 128-bit 读。
+
+    五十三的诊断：块规约版 ~40µs 全是执行时间，瓶颈是每线程逐字节读 18B 块
+    —— warp 内 32 线程的 byte load 各落 18B 远，一条指令打 32 个散射 32B
+    扇区，读放大 ~32×。这里每线程认领整块：2B scale 拆两次字节读、16B 数据
+    用 `load[16]` 一次进寄存器，同一 warp 的向量加载只覆盖 ~18 个扇区
+    （读放大降到 ~2×，L2 吸收）。
+
+    累加结构与 block 版完全一致（线程内按块升序串行 + 树规约），正确性判据
+    同 block 版：相对容差，预期依旧 diff=0.0。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    if o >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var x_base = row * Int(inner)
+    var nblk = Int(inner) // Q4_BLOCK
+    var w_row = o * nblk
+    var acc = Float64(0)
+    var b = tid
+    while b < nblk:
+        var base = (w_row + b) * Q4_BYTES
+        var low = Int(w_blocks[unsafe_offset=base])
+        var high = Int(w_blocks[unsafe_offset=base + 1])
+        var d = _fp16_bits_to_f32_device(low | (high << 8))
+        var nib = w_blocks.load[16](base + Q4_SCALE_BYTES)
+        var kb = b * Q4_BLOCK
+        # `nib[j]` 是对 SIMD 寄存器的动态索引 —— 循环不展开就会被抖到 local
+        # memory（首测比 byte 版还慢 1.6×，就是栽在这里）。@parameter 展开后
+        # 索引静态化，16 个 nibble 全在寄存器里。
+        @parameter
+        for j in range(16):
+            acc += Float64(Float32(Int(nib[j] & UInt8(0x0F)) - 8) * d) * Float64(
+                x[unsafe_offset=x_base + kb + j]
+            )
+            acc += Float64(Float32(Int(nib[j] >> 4) - 8) * d) * Float64(
+                x[unsafe_offset=x_base + kb + j + 16]
+            )
+        b += THREADS
+
+    var smem = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    smem[tid] = acc
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            smem[tid] += smem[tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])

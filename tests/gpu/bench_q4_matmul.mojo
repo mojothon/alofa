@@ -27,7 +27,7 @@ from alofa.core.tensor import Shape, TensorView, f32_data
 from alofa.kernels.cpu.quant import Q4_BYTES, dequant_q4_0, quantize_q4_0
 from alofa.kernels.cpu.scalar import linear
 from alofa.kernels.cuda.basic import linear_gpu
-from alofa.kernels.cuda.matmul import q4_matmul_block_gpu, q4_matmul_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_block_gpu, q4_matmul_gpu, q4_matmul_vec_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 
@@ -224,6 +224,34 @@ def _bench_shape[inner: Int, out_cols: Int](
     ctx.synchronize()
     diff_b32 = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
 
+    # ---- vec 臂：每线程一块 + 16B 向量加载（THREADS=32）----
+    var best_v32 = Float64(1e30)
+    var diff_v32 = Float64(-1)
+    for i in range(WARMUP):
+        ctx.enqueue_function[q4_matmul_vec_gpu[32]](
+            dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+            Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+        )
+    ctx.synchronize()
+    for r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[q4_matmul_vec_gpu[32]](
+                dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+                Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+            )
+        ctx.synchronize()
+        var ms = Float64(monotonic_ns() - t0) / 1e6
+        if ms < best_v32:
+            best_v32 = ms
+    ctx.enqueue_function[q4_matmul_vec_gpu[32]](
+        dx.unsafe_ptr(), dw.unsafe_ptr(), dd.unsafe_ptr(),
+        Int32(inner), Int32(out_cols), grid_dim=(Int(out_cols), 1, 1), block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+    diff_v32 = max_abs_diff(hd.unsafe_ptr(), f32_data(_view(ref_raw, 1, out_cols)), n)
+
     var best_b128 = Float64(1e30)
     var diff_b128 = Float64(-1)
     for i in range(WARMUP):
@@ -315,6 +343,16 @@ def _bench_shape[inner: Int, out_cols: Int](
         + String(gb_b128)
         + " GB/s  diff="
         + String(diff_b128)
+    )
+    var us_v32 = best_v32 * Float64(1000) / Float64(ITERS)
+    var gb_v32 = Float64(bytes_q4) * Float64(ITERS) / (best_v32 / 1e3) / 1e9
+    print(
+        "  q4_vec32   "
+        + String(us_v32)
+        + " µs/iter  "
+        + String(gb_v32)
+        + " GB/s  diff="
+        + String(diff_v32)
     )
     print("  launch_floor " + String(us_null) + " µs/iter (空 kernel)")
 

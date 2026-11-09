@@ -2926,3 +2926,32 @@
     address_space=AddressSpace.SHARED]`。mojoc 是编译产物、strings 抓不到
     符号 —— 靠逐个 import 试错 + 本地语义编译验证（本地能过语义、只卡 ptxas
     正好当 API 探针）。
+
+- **2026-11-09（第五十四条）** —— 🔬 **P5 CUDA：向量加载实验被否决 —— "读放大"理论错了，L1 在兜底**
+  - **动机**：五十三把 40µs 归因于"warp 内 byte load 32 路散射 ⇒ 读放大 32×"。
+    写了 `q4_matmul_vec_gpu[32]`（每线程认领一整块，16B 数据一次 `load[16]`
+    128-bit 读）验证。
+  - **实测（rows=1）**：
+    | 版本 | 896→4864 | 4864→896 |
+    |---|---|---|
+    | blk32（byte load） | **41.6 µs / 59.4 GB/s** | **39.0 µs / 63.5 GB/s** |
+    | vec32 首版（动态索引） | 68.5 µs / 36.1 GB/s | 68.1 µs / 36.3 GB/s |
+    | vec32 `@parameter for` 展开后 | 59.0 µs / 41.9 GB/s | 57.3 µs / 43.2 GB/s |
+    四版本 diff 全 0.0。
+  - **两个教训**：
+    1. **byte load 的散射被 L1 吸收了** —— 一个 warp 的 32 条 byte load 落在
+       邻接的 18B 块上，总共就 ~600B，第一笔之后全在 L1。"读放大"是字节
+       计数上的假象，不是真正的内存系统瓶颈；
+    2. **对 SIMD 寄存器做动态索引（`nib[j]`，j 是运行期循环变量）会被抖到
+       local memory** —— 首版比 byte 版还慢 1.6×；`@parameter for` 强制展开、
+       索引静态化后挽回 15–20%，但仍输给朴素的 byte load 版。向量化的
+       收益 < 寄存器压力的代价。
+  - **处置**：`q4_matmul_vec_gpu` 保留在代码里（正确、有完整注释的**反例**
+    与数据），blk32 仍是冠军（~60 GB/s）。追查 40µs 的真凶改用**profiler**
+    （ncu on A100），不再猜。
+  - **API 笔记**：`Pointer.load[width](offset)` 是向量加载的正确姿势
+    （`SIMD.load` 在这个版本不存在）；`@parameter for` 是循环体含动态索引
+    SIMD 元素时的必需品。
+  - **下一步**：ncu profile q4_blk32（若远端有 ncu）定位 40µs；或者接受
+    ~60 GB/s 转进 attention 差分 / DeviceContext 穿 model 层 —— 60 GB/s
+    已经把单流解码权重时间压到 ~4.6ms，接近"可用"。
