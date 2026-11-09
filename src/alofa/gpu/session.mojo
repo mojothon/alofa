@@ -628,7 +628,8 @@ struct GpuSession:
     # ---- 整步入口 ----
 
     def decode_step[
-        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4
+        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
+        tri_t: Int = 128,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -643,6 +644,13 @@ struct GpuSession:
         形状窗口落在不同负载时段，排名是漂移假象；交错下两形状逐位
         打平（2.9575 vs 2.9526）。参数保留作扫型基建，默认不动。
 
+        tri_t（账本七十七）：tri 发射的线程数 comptime 参。交错 A/B
+        （bench_tri_ab，三轮同序）冠军 T128：省 ~0.19ms（tri 18.3 →
+        ~10.3µs/层 ≈ 245GB/s），默认随之切换。
+        七十六实测 tri 138GB/s —— 896 块 × 32 线程只装 13% 线程槽；
+        T 提升直接提高占据率。交错 A/B（bench_tri_ab）裁决，⚠️ NORM
+        融合的跨线程归约序随 T 变，与默认非逐位同 —— 以门容差与
+        argmax 不变为判据。
         skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
         路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
         拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令
@@ -694,7 +702,9 @@ struct GpuSession:
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
             if skip & SKIP_TRI == 0:
-                self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True, True]](
+                self.ctx.enqueue_function[
+                    f16_matmul_qkv_gpu[tri_t, inner, True, True]
+                ](
                     self.d_x.unsafe_ptr(),
                     self.d_w16_q[layer].unsafe_ptr(),
                     self.d_w16_k[layer].unsafe_ptr(),
@@ -711,7 +721,7 @@ struct GpuSession:
                     Int32(self.q_out),
                     Int32(self.kv_dim),
                     grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
-                    block_dim=(32, 1, 1),
+                    block_dim=(tri_t, 1, 1),
                 )
             else:
                 self.ctx.enqueue_function[noop_gpu](

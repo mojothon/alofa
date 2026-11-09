@@ -3245,3 +3245,11 @@
   - **坑在案（两个回归网都接住了）**：① python 脚本批量 wrap 丢基准缩进 —— head 块滑进 `for layer` 体内，norm+head 每步跑 24 次（+8.7ms，bench_decode 2.96→10.4 当场抓住）；② `replace(count=1)` 命中文件里第一处同文 —— gather 包装落进 `debug_gather`（sections 编译错误 `skip` 未定义抓住）。**批量文本操作后必须全量回归，缩进敏感的编辑用精确工具**。
   - **复验全绿**：门 21/21、argmax 287 逐位不变、layer0 零容差、probe COMPLETE、prof 21 行、sections 61、bench_decode 2.960（基线带内）。
   - **到 2ms 剩余**：~0.96ms。构成修正：kernel 本体 ~2.6（tri 0.44 + dual 0.70 + down 0.40 + head 0.35 + attn 0.5 + o 0.15）+ 地板 0.31。下一轮：tri 真链形状/结构交错扫（decode_step 加 tri_t comptime 参同法）。
+
+- **2026-11-10（第七十七条）** —— ⚡ **P5 步骤 4 续（tri 占据率轮）：2.960 → 2.778ms/token（360 tok/s，-0.18ms/-6.2%）；七十六的 BW 表直接兑现**
+  - **刀法**：`tri_t` comptime 参（默认原 32）+ `bench_tri_ab` 交错 A/B（T32/T128/T256 三形状同会话逐 token 交替，PAIRS=38×ROUNDS=3 压在 MAXT<368 崩线下）。**三轮同序**：T128 一致省 0.18-0.20ms（T256 中间省 ~0.09）——同窗交错 + standalone 复跑（2.778/2.780）双确认，本次声明落在方法论内。
+  - **机理**：七十六 BW 表命中——tri 896 块 × 32 线程 = 28672 线程只装 13% 线程槽（108 SM × 2048）；T128 → 每块 1024 线程、2 块/SM 打满 2048 槽，tri 18.3 → ~10.3µs/层 ≈ **245GB/s**。与 dual 重排轮"重排救不了"对照：tri 的病是占据率不是链内 MLP，**换 T 一刀就中**。
+  - **数值**：tri 是 NORM 融合核，跨线程归约序随 T 变——门 21/21 仍全绿、decode argmax 287 逐位不变、layer0 零容差 normed diff=**0.0** 仍保（x 归约序实际未变）。
+  - **坑在案**：bench_tri_ab 初版 PAIRS=60×3 形状×3 轮 = 552 步 > 368 崩线 —— **多模式交错 bench 的步数预算 = WARMUP + 模式数×PAIRS×ROUNDS**，模式翻倍步数翻倍。
+  - **到 2ms 剩余**：0.78ms。更新后的池子：tri 0.25（245GB/s 仍低于 dual/down 的 500+，T256/双列结构可再试）+ dual 0.70（600GB/s，真链口径见顶）+ down 0.40（512GB/s）+ head 0.35（755GB/s 近饱和）+ attn 0.5（相位候选）+ o 0.15 + 地板 0.31。下一轮候选：attention 相位数（5→3，交错法量）或 down/dual 的 O 结构真链扫（交错法）。
+  - **复验全绿**：门 21/21、argmax 287 逐位、layer0 normed 0.0、probe COMPLETE、prof 21 行、sections 61、bench_decode 2.778/2.780。
