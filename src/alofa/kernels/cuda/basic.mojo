@@ -9,9 +9,11 @@
 Float64 累加、先 rsqrt 再乘。任何自己发明的顺序都会把真正的差异藏进舍入里。
 """
 
-from std.gpu import global_idx
+from std.gpu import global_idx, thread_idx, block_idx
 from std.math import sqrt
-from std.memory import bitcast
+from std.memory import bitcast, stack_allocation
+
+from max.gpu import AddressSpace, barrier
 
 from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, Q4_SCALE_BYTES
 from alofa.kernels.cpu.quant import Q8_BLOCK, Q8_BYTES, Q8_SCALE_BYTES
@@ -25,24 +27,53 @@ def rmsnorm_gpu(
     rows: Int32,
     eps: Float32,
 ) -> None:
-    """`dst = x / sqrt(mean(x²) + eps) * w`，一行一个线程。
+    """`dst = x / sqrt(mean(x²) + eps) * w`，一行一个 block、块内 256 线程。
 
-    与 `kernels/cpu/scalar.mojo` 的 `rmsnorm` 同一个算法与同一个顺序：求和用
-    `Float64`、每行算一次 `1/sqrt` 再乘 —— 差分门要的正是「两者应当逐位接近」。
+    历史：最初是"一行一个线程"——当时唯一判据是差分门，块内规约会引入共享
+    内存与浮点累加顺序两个正确性变量。decode 计时（账本六十四）抓到了代价：
+    单线程串行读 896 个 f64 ≈ 100µs/次，57 次 norm 占 5.8ms/token。
+
+    现在的实现：一行一个 block，256 线程分块累加（`Float64`）+ 共享内存树形
+    归约求 `sum_sq`，`1/sqrt` 每行一次，写回阶段全线程分条。**累加顺序变量**：
+    树形归约与标量的顺序求和有合法重组差（与 q4 champion 同一性质），门的
+    相对容差 1e-5 覆盖余量巨大。发射约定：`grid_dim=(rows,1,1)`、
+    `block_dim=(256,1,1)`。
     """
-    var row = Int(global_idx.x)
+    var row = Int(block_idx.x)
     if row >= Int(rows):
         return
+    var tid = Int(thread_idx.x)
     var base = row * Int(cols)
-    var sum_sq = Float64(0)
-    for i in range(Int(cols)):
+    var n = Int(cols)
+
+    var local = Float64(0)
+    var i = tid
+    while i < n:
         var v = Float64(x[unsafe_offset=base + i])
-        sum_sq += v * v
-    var scale = Float64(1.0) / sqrt(sum_sq / Float64(Int(cols)) + Float64(eps))
-    for i in range(Int(cols)):
+        local += v * v
+        i += 256
+
+    var smem = stack_allocation[256, Float64, address_space = AddressSpace.SHARED]()
+    smem[unsafe_offset=tid] = local
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            smem[unsafe_offset=tid] = (
+                smem[unsafe_offset=tid] + smem[unsafe_offset=tid + stride]
+            )
+        barrier()
+        stride //= 2
+
+    var scale = Float64(1.0) / sqrt(
+        smem[unsafe_offset=0] / Float64(n) + Float64(eps)
+    )
+    i = tid
+    while i < n:
         dst[unsafe_offset=base + i] = Float32(
             Float64(x[unsafe_offset=base + i]) * scale * Float64(w[unsafe_offset=i])
         )
+        i += 256
 
 
 def _fp16_bits_to_f32_device(half: Int) -> Float32:

@@ -177,8 +177,10 @@ def rmsnorm_diff_check(mut ctx: DeviceContext) raises:
         Int32(COLS),
         Int32(ROWS),
         EPS,
-        grid_dim=(ceildiv(ROWS, BLOCK), 1, 1),
-        block_dim=(BLOCK,),
+        # 块内规约版（账本六十四）：一行一个 block、256 线程。树形归约与
+        # 标量的顺序求和有合法重组差 —— 本检查本就是相对容差，覆盖。
+        grid_dim=(ROWS, 1, 1),
+        block_dim=(256,),
     )
     ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
     ctx.synchronize()

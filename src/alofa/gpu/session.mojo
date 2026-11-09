@@ -320,7 +320,7 @@ struct GpuSession:
             Int32(1),
             self.eps,
             grid_dim=(1, 1, 1),
-            block_dim=(32, 1, 1),
+            block_dim=(256, 1, 1),
         )
 
     def _residual(mut self) raises:
@@ -418,7 +418,7 @@ struct GpuSession:
             Int32(1),
             self.eps,
             grid_dim=(1, 1, 1),
-            block_dim=(32, 1, 1),
+            block_dim=(256, 1, 1),
         )
 
     def enqueue_qproj[inner: Int](

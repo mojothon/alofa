@@ -3131,3 +3131,13 @@
   - **aliasing 规则的完整版（账本六十二的坑展开）**：① `mut self` 与 self 派生缓冲不能同时 mutable 传 ⇒ 私有发射函数只收**选择子索引**；② 方法**内部**发射 self 派生指针没问题，方法**外部**混用 `session.ctx`+字段必被拒 ⇒ 诊断原语（`debug_gather`/`debug_read`）长在 session 上；③ 同一 List 的两个下标算同源 ⇒ `d_kv` 拆 `d_k_store`/`d_v_store`；④ `__init__` 半初始化状态调不了 self 的方法 ⇒ 槽位宽度内联、`_upload_*` 改模块级自由函数收 `ctx`。
   - **探针转正**：`test_session_probe.mojo` = 层 0 重放常驻回归（15 个检查点每步对照产品通路）。判据教训：**链式重放的零容差必须算继承差** —— q 的重组差被 rope/store 原样继承（q_rot diff == q diff 恰是 rope 干净的证据）；探针自己的 copy grid 也漏了 ceildiv（半个 store 是垃圾）—— "重放代码与被测代码一样要过同样的怀疑"。
   - **下一步（设计 §5 步骤 4）**：decode step 计时（对照 1.4ms 模型级估计与 2ms 判据）；随后 prefill（步骤 5）。
+
+- **2026-11-09（第六十四条）** —— ⏱️ **P5 步骤 4（decode 计时）：判据未过（5.1ms vs 2ms），但把"为什么"全部查清；顺手修掉一个 100µs 级 kernel 与一个构造期 arena bug**
+  - **基准**：`tests/gpu/bench_decode.mojo`（WARMUP→3 轮×100 步取最小；口径 = decode_step 整步，含 token 上传、每步 2 次 sync、logits 回传 —— 设计内的步进成本）。**首轮 10.2ms/token，修完 norm 后 5.1ms**（196 tok/s）。
+  - **发现 1（估计错误，最值钱）**：账本五十八的"1.4ms/token"只算了 matmul+attention——**norm 被假设可忽略、lm_head 与每步 2 次 sync/发射开销根本没进模型**。估计错不丢人，拿判据当真前不实测才丢人。
+  - **发现 2（真 kernel bug）**：`rmsnorm_gpu` 是"一行一个线程"——basic.mojo 的 docstring 自己写着这是门时代的 deliberate 选择（"性能内核是之后的事"）。decode 时 grid(1)×block(32)，实际单线程串行读 896 个 f64 ≈ **100µs/次，57 次 norm = 5.8ms/token**。修：一行一个 block、256 线程分块 + 共享内存树形归约。门里 rmsnorm 检查本就是相对容差（1e-5），树形归约的合法重组差直接覆盖，判据不用动。**10.2 → 5.1ms**；端到端对数复验仍过（3 步 diff=1.48e-5，argmax 一致），门 11 项全绿。
+  - **构造期 bug（bench 顺手抓的）**：`act_arena` 容量公式没算 `Arena.alloc` 的 64 字节对齐 padding——max_tokens 是 64 倍数时所有 alloc 天然对齐（padding=0）从不暴露；max_tokens=313 时 padding(180) 超容量 60 字节，**构造即崩**。两处构造分支各补 1024 字节余量。
+  - **分段方法论**（`bench_decode_sections.mojo`，可复用）：A 整层链 / B lm_head / C token 路径（0.01ms）/ D logits d2h（0.03ms）/ E 单 kernel / F,G 大小分组。结论数字：大 5 matmul ≈74µs/层、小发射组 ≈38µs/层（修 norm 前 F 曾是 244µs）、**lm_head 1.14ms**（544MB 读 = 3× 内存下限）、发射开销 2.3µs（bench_launch）～4µs（异构交替/轮转，bench_launch_alt）。
+  - **aliasing 新规（比六十三更细）**：循环外取的 `List` 元素内部引用（`unsafe_ptr()`），循环体内任何 `session` 可变借用都使其失效——**内部引用必须紧贴使用点提取**。
+  - **到 2ms 的剩余路径**（下一步）：① 大 matmul 74µs/层 vs 内存下限 ~4µs（q4 块流 5.8MB/层 ÷ 1.5TB/s）——19× 差距是最大头；② lm_head 1.14ms → 向 0.4ms（向量化/f32 通道）；③ 发射数 20/层 → 融合（bias 进 matmul、rope q+k 合一、KV append 合一、残差进 matmul epilogue）≈ 2ms 里 launch 占 ~2ms。
+  - **下一步（步骤 4 续）**：kernel 级优化三连，目标 2ms 判据。

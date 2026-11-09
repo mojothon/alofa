@@ -1701,7 +1701,13 @@ struct QwenForward(Movable):
         # 而不是运行时的越界，所以这里写死成显式倍数而不是"差不多"。
         var act_bytes = max_tokens * (h * 6 + inter * 3 + self.cfg.kv_dim() * 3) * 4
         var logits_bytes = self.cfg.vocab * 4
-        self.act_arena = Arena(act_bytes + logits_bytes + max_tokens * max_tokens * 4)
+        # 对齐余量：`Arena.alloc` 按 64 字节对齐，每个 alloc 最多补 63 字节
+        # padding，十二个 alloc 最多 ~756。max_tokens 是 64 的倍数时所有
+        # alloc 天然对齐、padding 为零，这个 bug 不暴露；max_tokens=313 时
+        # padding(180) 超出容量 60 字节，构造即崩（账本六十四）。
+        self.act_arena = Arena(
+            act_bytes + logits_bytes + max_tokens * max_tokens * 4 + 1024
+        )
         self.hidden_ptr = self.act_arena.alloc(max_tokens * h * 4)
         self.normed_ptr = self.act_arena.alloc(max_tokens * h * 4)
         self.q_ptr = self.act_arena.alloc(max_tokens * h * 4)
@@ -1845,8 +1851,9 @@ struct QwenForward(Movable):
         var inter = self.cfg.intermediate
         var act_bytes = max_tokens * (h * 6 + inter * 3 + self.cfg.kv_dim() * 3) * 4
         var logits_bytes = self.cfg.vocab * 4
+        # 对齐余量同上（账本六十四：两处构造分支都要补）。
         self.act_arena = Arena(
-            act_bytes + logits_bytes + max_tokens * max_tokens * 4
+            act_bytes + logits_bytes + max_tokens * max_tokens * 4 + 1024
         )
         self.hidden_ptr = self.act_arena.alloc(max_tokens * h * 4)
         self.normed_ptr = self.act_arena.alloc(max_tokens * h * 4)
