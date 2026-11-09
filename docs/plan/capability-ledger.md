@@ -3090,3 +3090,29 @@
   - **设计核心**：`GpuSession`（ctx + device 只读权重副本 + device 常驻激活/KV/logits 缓冲），由 spawn_twin 方构造、生命周期 ≤ 原型；**`QwenForward` 一行不改**，gpu 路径只读它的权重与形状；自由函数 `gpu_step(session, model, ids)` 与 `run[backend]` 平行（不是同链），内部 prefill/decode 仍一条路；每 token 只有 token id 进、logits（~608KB）出，中间零 host 往返。
   - **判据与步骤**（有序、每步可独立验证）：小 kernel 补齐（rope/swiglu/add/gather/kv-append，逐个进门）→ 单层对数 → 全层 decode 端到端 logits 差分（vs AVX2，1e-5）→ 计时 ≤2ms/token → prefill → 批量留白。风险清单：借用时序、异步错误暴露（逐层对数是对冲）、AsyncRT 线程安全（1:1 保守）、q8 KV 留槽位。
   - **下一步（照 §5 步骤 1）**：rope/swiglu/add/gather/kv-append 五个小 kernel + 进门。
+
+- **2026-11-09（第六十一条）** —— 🧩 **P5 接线步骤 1 完成：五个逐元素 kernel 进门，门十一项全绿；两个工程教训（共享 DeviceContext、keep_alive 生命周期标记）**
+  - **`kernels/cuda/elementwise.mojo`**（全部一线程一元素平铺、与标量逐句同构）：
+    `add_gpu`（残差）、`copy_gpu`（KV append，对应 `copy_into`）、`swiglu_gpu`
+    （f64 中间量 + exp 同序）、`rope_gpu`（半旋转，一线程一个
+    `(token, head, d)`，q/k 各启动一次，cos/sin 两半分开读）、`gather_gpu`
+    （embedding 行拷贝，对应 `run` 里的行复制）。
+  - **门十一项全绿（A100）**：rope **零容差站住** —— `a*c - b*s` 这个经典
+    FMA 折叠模式**没有被折叠**（linear 的点积模式之外，第二个被验证的表达式
+    形态）；swiglu diff=0.0（exp 路径在此数据上逐位一致 —— 与 attention 的
+    1 ulp 并不矛盾：expf 的实现差是数据相关的，两个数据点都记录在案）。
+  - **坑 1：每 check 各建一个 DeviceContext 会崩**（~10 个上下文处 AsyncRT
+    crash，栈在 syscall 上）。整门改成共享一个 ctx（main 创建、check 签名收
+    `mut ctx`）后消失。机制未查明，结论按经验规则记：**AsyncRT 上下文要复用，
+    不要按检查粒度建**。
+  - **坑 2（本场最有价值的）：`arena.keep_alive()` 是生命周期标记，不是
+    防御调用**。它是 `pass` 空函数，唯一作用是当 arena 的"最后使用点" ——
+    放在 arena 读取**之前**，之后的读取就是 use-after-free。症状极具误导性：
+    段错误落在 AsyncRT 栈或比较代码里，两次把嫌疑引向"上下文数量"和"拷贝
+    交错"（都是冤案）。定位靠 -debug-level=line-tables 符号化栈 + 指针分离
+    探针（cpu0/gpu0 都能读、keep_alive 后才崩）。**进门规：keep_alive 必须
+    是函数体里对 arena 的最后一次触碰**。
+  - **P5 进度**：`06-device-context.md` §3.4 清单还剩 5/12 → kernel 侧全部
+    就位（rmsnorm/linear/q4/attention/rope/swiglu/add/copy/gather/q4 matmul
+    + 两个 dequant）。**下一步：GpuSession 骨架（设计 §5 步骤 2）** ——
+    构造、权重上传、单层 rmsnorm→q_proj 在 device 跑通并与 `run` 对数。

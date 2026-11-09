@@ -6,7 +6,7 @@
     ./scripts/a100.sh gpu                          # 先挑一张空闲卡（共享机）
     ./scripts/a100.sh run 4 tests/gpu/test_cuda_diff.mojo
 
-覆盖七项：`rmsnorm`、`linear`、`attention`、`attention_par`、`q4_matmul`（相对容差
+覆盖十二项：`rmsnorm`、`linear`、`attention`、`attention_par`、`q4_matmul`（相对容差
 1e-5）、`dequant_q4_0` 与 `dequant_q8_0`（**零容差**）。attention 的差分只面对一个新变量：exp 的 ulp 差
 （libdevice vs libm），门把实际差值打出来记录量级。
 
@@ -22,6 +22,15 @@
     *** ATTENTION GPU/SCALAR DIFF PASS *** diff= 1.1920928955078125e-07  tol= 2.0e-05
     *** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff= 1.1920928955078125e-07  tol= 2.0e-05
     *** Q4_MATMUL GPU/REFERENCE DIFF PASS *** diff= 0.0  tol= 0.026
+    *** ADD/COPY   GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)
+    *** SWIGLU     GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 1.3e-05
+    *** ROPE       GPU/SCALAR DIFF PASS *** diff= 0.0 (zero, no FMA contraction)
+    *** GATHER     GPU/REFERENCE DIFF PASS *** diff= 0.0 (zero tolerance)
+    （rope 的 `a*c - b*s` 没有被 FMA 折叠 —— 零容差站住了；swiglu 的 exp 路径
+    在此数据上逐位一致。两个工程教训记在账本六十一：整门共享一个
+    DeviceContext（每 check 各建会在 ~10 个上下文处崩）；`arena.keep_alive()`
+    是生命周期标记，放在读取之前 = use-after-free，症状是 AsyncRT 栈里的
+    段错误，极具误导性。）
     （前四个与标量**逐位一致** —— linear 的 diff=0.0 说明 GPU 编译器没把乘加
     折叠成改变舍入的 FMA。attention 的 diff = 1.19e-7 = 恰好 1 个 fp32 ulp：
     kernel 与标量逐句同构，唯一下游差异是 exp（libdevice vs libm）—— 这是门里
@@ -52,7 +61,7 @@ from alofa.kernels.cpu.quant import (
     quantize_q4_0,
     quantize_q8_0,
 )
-from alofa.kernels.cpu.scalar import attention, linear, rmsnorm
+from alofa.kernels.cpu.scalar import add, attention, linear, rmsnorm, rope, swiglu
 from alofa.kernels.cuda.attention import attention_gpu, attention_par_gpu
 from alofa.kernels.cuda.basic import (
     dequant_q4_0_gpu,
@@ -60,6 +69,7 @@ from alofa.kernels.cuda.basic import (
     linear_gpu,
     rmsnorm_gpu,
 )
+from alofa.kernels.cuda.elementwise import add_gpu, copy_gpu, gather_gpu, rope_gpu, swiglu_gpu
 from alofa.kernels.cuda.matmul import q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
@@ -89,6 +99,16 @@ comptime ATTN_KV_LEN = 5
 comptime Q4MM_ROWS = 2
 comptime Q4MM_INNER = 896
 comptime Q4MM_OUT = 16
+# 逐元素小算子差分的规模：小向量即可（判据是零容差/1e-5，不追规模）。
+comptime EW_N = 64
+comptime COPY_N = 100
+comptime ROPE_TOKENS = 2
+comptime ROPE_Q_COLS = 32
+comptime ROPE_K_COLS = 16
+comptime ROPE_HEAD_DIM = 16
+comptime GATHER_TOKENS = 3
+comptime GATHER_COLS = 32
+comptime GATHER_VOCAB = 7
 comptime EPS = Float32(1e-6)
 comptime BLOCK = 64
 # 与 AVX2 门**同一个**容差。
@@ -115,7 +135,7 @@ def fill(t: TensorView, seed: Int) raises -> None:
         p[unsafe_offset=i] = Float32((k % 251) - 125) * Float32(0.023)
 
 
-def rmsnorm_diff_check() raises:
+def rmsnorm_diff_check(mut ctx: DeviceContext) raises:
     var arena = Arena(1 << 20)
     var x = scratch(arena, ROWS, COLS)
     var w = scratch(arena, 1, COLS)
@@ -126,7 +146,6 @@ def rmsnorm_diff_check() raises:
     # 参照：CPU 标量后端（不是另写一份，是产品代码本身）
     rmsnorm(dst_cpu, x, w, EPS)
 
-    var ctx = DeviceContext()
     var hx = ctx.enqueue_create_host_buffer[DT](ROWS * COLS)
     var hw = ctx.enqueue_create_host_buffer[DT](COLS)
     var hd = ctx.enqueue_create_host_buffer[DT](ROWS * COLS)
@@ -183,7 +202,7 @@ def rmsnorm_diff_check() raises:
     print("*** RMSNORM GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
-def dequant_q4_diff_check() raises:
+def dequant_q4_diff_check(mut ctx: DeviceContext) raises:
     """q4_0 反量化的 GPU/标量差分，判据是**零容差**。
 
     为什么与 rmsnorm 不同：反量化结果只由 nibble 与缩放因子决定，两者都是精确
@@ -202,7 +221,6 @@ def dequant_q4_diff_check() raises:
     # 参照：CPU 标量反量化（不是另写一份，是产品代码本身）。
     dequant_q4_0(ref_out, blocks, n_values)
 
-    var ctx = DeviceContext()
     var hb = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
     var hd = ctx.enqueue_create_host_buffer[DT](n_values)
     ctx.synchronize()
@@ -239,7 +257,7 @@ def dequant_q4_diff_check() raises:
     print("*** DEQUANT Q4_0 GPU/SCALAR DIFF PASS *** diff=", diff)
 
 
-def dequant_q8_diff_check() raises:
+def dequant_q8_diff_check(mut ctx: DeviceContext) raises:
     """q8_0 反量化的 GPU/标量差分，判据与 q4_0 一样是**零容差**。"""
     var arena = Arena(1 << 20)
     var n_values = Int(Q8_BLOCKS) * Int(Q8_BLOCK)
@@ -251,7 +269,6 @@ def dequant_q8_diff_check() raises:
     quantize_q8_0(blocks, f32_data(src_view), n_values)
     dequant_q8_0(ref_out, blocks, n_values)
 
-    var ctx = DeviceContext()
     var hb = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
     var hd = ctx.enqueue_create_host_buffer[DT](n_values)
     ctx.synchronize()
@@ -285,7 +302,7 @@ def dequant_q8_diff_check() raises:
     print("*** DEQUANT Q8_0 GPU/SCALAR DIFF PASS *** diff=", diff)
 
 
-def linear_diff_check() raises:
+def linear_diff_check(mut ctx: DeviceContext) raises:
     """linear（无偏置 GEMM）的 GPU/标量差分，相对容差与 rmsnorm 同一个数。
 
     kernel 与 `_gemm` 同一个累加顺序（Float64、k 升序、末尾一次 Float32），预期
@@ -302,7 +319,6 @@ def linear_diff_check() raises:
     # 参照：CPU 标量 `linear`（产品代码本身，`w` 按 [out, in] 存）。
     linear(dst_cpu, x, w)
 
-    var ctx = DeviceContext()
     var n_x = Int(LM_ROWS) * Int(LM_INNER)
     var n_w = Int(LM_OUT) * Int(LM_INNER)
     var n_d = Int(LM_ROWS) * Int(LM_OUT)
@@ -355,7 +371,7 @@ def linear_diff_check() raises:
     print("*** LINEAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
-def attention_diff_check() raises:
+def attention_diff_check(mut ctx: DeviceContext) raises:
     """因果 GQA attention 全函数的 GPU/标量差分。
 
     参照是产品 `attention`（不是拆出来的 softmax）—— 差分对象与要接进模型的
@@ -379,7 +395,6 @@ def attention_diff_check() raises:
         dst_cpu, q, k, v, scores, Int(ATTN_HEADS), Int(ATTN_KV_HEADS), Int(ATTN_HEAD_DIM)
     )
 
-    var ctx = DeviceContext()
     var n_q = Int(ATTN_Q_LEN) * q_cols
     var n_kv = Int(ATTN_KV_LEN) * kv_cols
     var n_s = Int(ATTN_Q_LEN) * Int(ATTN_KV_LEN)
@@ -440,7 +455,7 @@ def attention_diff_check() raises:
     print("*** ATTENTION GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
-def attention_par_diff_check() raises:
+def attention_par_diff_check(mut ctx: DeviceContext) raises:
     """attention 并行版（块内规约）对产品标量 `attention` 的差分。
 
     顺序变量清单（相对串行版/标量）：scores 逐位一致（单 j 内 d 升序同序）；
@@ -462,7 +477,6 @@ def attention_par_diff_check() raises:
         dst_cpu, q, k, v, scores, Int(ATTN_HEADS), Int(ATTN_KV_HEADS), Int(ATTN_HEAD_DIM)
     )
 
-    var ctx = DeviceContext()
     var n_q = Int(ATTN_Q_LEN) * q_cols
     var n_kv = Int(ATTN_KV_LEN) * kv_cols
     var n_s = Int(ATTN_Q_LEN) * Int(ATTN_KV_LEN)
@@ -522,7 +536,7 @@ def attention_par_diff_check() raises:
     print("*** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
-def q4_matmul_diff_check() raises:
+def q4_matmul_diff_check(mut ctx: DeviceContext) raises:
     """产品 q4 matmul 冠军 kernel（smem 版）的组合参照差分。
 
     参照 = `quantize_q4_0` → `dequant_q4_0`（产品量化往返）→ 标量 `linear`。
@@ -551,7 +565,6 @@ def q4_matmul_diff_check() raises:
         rows_view(wf_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
     )
 
-    var ctx = DeviceContext()
     var hx = ctx.enqueue_create_host_buffer[DT](n_x)
     var hw = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
     var hd = ctx.enqueue_create_host_buffer[DT](n_d)
@@ -596,11 +609,265 @@ def q4_matmul_diff_check() raises:
     print("*** Q4_MATMUL GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
 
 
+
+def add_copy_diff_check(mut ctx: DeviceContext) raises:
+    """add 与 copy 的零容差差分 —— 纯 f32 加法/搬运，差值即读错内存。
+
+    注意 `arena.keep_alive()` 的位置：它是**生命周期标记**（"内存用到这里"），
+    之后的 arena 读取就是 use-after-free（本次调试实测：放在 helper 读取之前
+    会段错误在 AsyncRT/比较代码里，症状极具误导性）。必须放在所有 arena 读取
+    之后、函数末尾。
+    """
+    var arena = Arena(1 << 18)
+    var a = scratch(arena, 1, Int(EW_N))
+    var b = scratch(arena, 1, Int(EW_N))
+    var dst_cpu = scratch(arena, 1, Int(EW_N))
+    fill(a, 31)
+    fill(b, 32)
+    add(dst_cpu, a, b)
+
+    var src_cpu = scratch(arena, 1, Int(COPY_N))
+    fill(src_cpu, 33)
+    var cp_ref = arena.alloc(Int(COPY_N) * 4)
+    var pcp = cp_ref.unsafe_bitcast[Float32]()
+    var psrc = f32_data(src_cpu)
+    for i in range(Int(COPY_N)):
+        pcp[unsafe_offset=i] = psrc[unsafe_offset=i]
+
+    var na = Int(EW_N)
+    var nc = Int(COPY_N)
+    var ha = ctx.enqueue_create_host_buffer[DT](na)
+    var hb = ctx.enqueue_create_host_buffer[DT](na)
+    var hc = ctx.enqueue_create_host_buffer[DT](nc)
+    var hd = ctx.enqueue_create_host_buffer[DT](na)
+    var he = ctx.enqueue_create_host_buffer[DT](nc)
+    ctx.synchronize()
+    for i in range(na):
+        ha[i] = f32_data(a)[unsafe_offset=i]
+        hb[i] = f32_data(b)[unsafe_offset=i]
+    for i in range(nc):
+        hc[i] = psrc[unsafe_offset=i]
+
+    var da = ctx.enqueue_create_buffer[DT](na)
+    var db = ctx.enqueue_create_buffer[DT](na)
+    var dc = ctx.enqueue_create_buffer[DT](nc)
+    var dd = ctx.enqueue_create_buffer[DT](na)
+    var de = ctx.enqueue_create_buffer[DT](nc)
+    ctx.enqueue_copy(dst_buf=da, src_buf=ha)
+    ctx.enqueue_copy(dst_buf=db, src_buf=hb)
+    ctx.enqueue_copy(dst_buf=dc, src_buf=hc)
+    ctx.synchronize()
+    ctx.enqueue_function[add_gpu](
+        dd.unsafe_ptr(), da.unsafe_ptr(), db.unsafe_ptr(), Int32(EW_N),
+        grid_dim=(ceildiv(na, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_function[copy_gpu](
+        de.unsafe_ptr(), dc.unsafe_ptr(), Int32(COPY_N),
+        grid_dim=(ceildiv(nc, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.enqueue_copy(dst_buf=he, src_buf=de)
+    ctx.synchronize()
+
+    var diff_add = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), na)
+    if diff_add != 0.0:
+        raise Error("add: diff=" + String(diff_add) + " (zero tolerance)")
+    var diff_cp = max_abs_diff(he.unsafe_ptr(), pcp, nc)
+    if diff_cp != 0.0:
+        raise Error("copy: diff=" + String(diff_cp) + " (zero tolerance)")
+    arena.keep_alive()
+    print("*** ADD/COPY GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)")
+
+
+def swiglu_diff_check(mut ctx: DeviceContext) raises:
+    """swiglu 的相对容差差分 —— f64 中间量 + exp，exp 已知 1 ulp。"""
+    var arena = Arena(1 << 18)
+    var gate = scratch(arena, 1, Int(EW_N))
+    var up = scratch(arena, 1, Int(EW_N))
+    var dst_cpu = scratch(arena, 1, Int(EW_N))
+    fill(gate, 34)
+    fill(up, 35)
+    swiglu(dst_cpu, gate, up)
+
+    var n = Int(EW_N)
+    var hg = ctx.enqueue_create_host_buffer[DT](n)
+    var hu = ctx.enqueue_create_host_buffer[DT](n)
+    var hd = ctx.enqueue_create_host_buffer[DT](n)
+    ctx.synchronize()
+    for i in range(n):
+        hg[i] = f32_data(gate)[unsafe_offset=i]
+        hu[i] = f32_data(up)[unsafe_offset=i]
+    var dg = ctx.enqueue_create_buffer[DT](n)
+    var du = ctx.enqueue_create_buffer[DT](n)
+    var dd = ctx.enqueue_create_buffer[DT](n)
+    ctx.enqueue_copy(dst_buf=dg, src_buf=hg)
+    ctx.enqueue_copy(dst_buf=du, src_buf=hu)
+    ctx.synchronize()
+    ctx.enqueue_function[swiglu_gpu](
+        dd.unsafe_ptr(), dg.unsafe_ptr(), du.unsafe_ptr(), Int32(EW_N),
+        grid_dim=(ceildiv(Int(EW_N), 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), n)
+    var scale = max_abs(f32_data(dst_cpu), n)
+    if scale <= 0.0:
+        raise Error("swiglu: the reference tensor is all zeros")
+    arena.keep_alive()
+    if diff > REL_TOLERANCE * scale:
+        raise Error("swiglu: diff=" + String(diff) + " tol=" + String(REL_TOLERANCE * scale))
+    print("*** SWIGLU GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", REL_TOLERANCE * scale)
+
+
+def rope_diff_check(mut ctx: DeviceContext) raises:
+    """rope 的零容差差分 —— 纯 f32 乘加，同时是 FMA 折叠的观察点。
+
+    `a*c - b*s` 是经典折叠模式：若门红在个位 ulp，就是编译器做了 FMA 契约
+    （linear 的 diff=0.0 说明点积模式没折叠，这个模式此前没被测过）。红则把
+    实际差值记录进账本，判据换相对容差 —— 那是合法结论，不是门失效。
+    """
+    var arena = Arena(1 << 18)
+    var q = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var k = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    var cos = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var sin = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var oq_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var ok_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    fill(q, 41)
+    fill(k, 42)
+    fill(cos, 43)
+    fill(sin, 44)
+    rope(oq_cpu, ok_cpu, q, k, cos, sin, Int(ROPE_HEAD_DIM))
+
+    var n_q = Int(ROPE_TOKENS) * Int(ROPE_Q_COLS)
+    var n_k = Int(ROPE_TOKENS) * Int(ROPE_K_COLS)
+    var n_t = Int(ROPE_TOKENS) * Int(ROPE_HEAD_DIM)
+    var hq = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hk = ctx.enqueue_create_host_buffer[DT](n_k)
+    var hc = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hs = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hqo = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hko = ctx.enqueue_create_host_buffer[DT](n_k)
+    ctx.synchronize()
+    for i in range(n_q):
+        hq[i] = f32_data(q)[unsafe_offset=i]
+    for i in range(n_k):
+        hk[i] = f32_data(k)[unsafe_offset=i]
+    for i in range(n_t):
+        hc[i] = f32_data(cos)[unsafe_offset=i]
+        hs[i] = f32_data(sin)[unsafe_offset=i]
+    var dq = ctx.enqueue_create_buffer[DT](n_q)
+    var dk = ctx.enqueue_create_buffer[DT](n_k)
+    var dc = ctx.enqueue_create_buffer[DT](n_t)
+    var ds = ctx.enqueue_create_buffer[DT](n_t)
+    var dqo = ctx.enqueue_create_buffer[DT](n_q)
+    var dko = ctx.enqueue_create_buffer[DT](n_k)
+    ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+    ctx.enqueue_copy(dst_buf=dk, src_buf=hk)
+    ctx.enqueue_copy(dst_buf=dc, src_buf=hc)
+    ctx.enqueue_copy(dst_buf=ds, src_buf=hs)
+    ctx.synchronize()
+    var q_pairs = Int(ROPE_TOKENS) * (Int(ROPE_Q_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    var k_pairs = Int(ROPE_TOKENS) * (Int(ROPE_K_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    ctx.enqueue_function[rope_gpu](
+        dqo.unsafe_ptr(), dq.unsafe_ptr(), dc.unsafe_ptr(), ds.unsafe_ptr(),
+        Int32(ROPE_Q_COLS), Int32(ROPE_HEAD_DIM), Int32(ROPE_TOKENS),
+        grid_dim=(ceildiv(q_pairs, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_function[rope_gpu](
+        dko.unsafe_ptr(), dk.unsafe_ptr(), dc.unsafe_ptr(), ds.unsafe_ptr(),
+        Int32(ROPE_K_COLS), Int32(ROPE_HEAD_DIM), Int32(ROPE_TOKENS),
+        grid_dim=(ceildiv(k_pairs, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hqo, src_buf=dqo)
+    ctx.enqueue_copy(dst_buf=hko, src_buf=dko)
+    ctx.synchronize()
+
+    for i in range(n_q):
+        if hqo[i] != f32_data(oq_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope(q): element " + String(i) + " gpu=" + String(hqo[i])
+                + " cpu=" + String(f32_data(oq_cpu)[unsafe_offset=i])
+                + " (suspect FMA contraction - record and switch to relative)"
+            )
+    for i in range(n_k):
+        if hko[i] != f32_data(ok_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope(k): element " + String(i) + " gpu=" + String(hko[i])
+                + " cpu=" + String(f32_data(ok_cpu)[unsafe_offset=i])
+            )
+    arena.keep_alive()
+    print("*** ROPE GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance, no FMA contraction)")
+
+
+def gather_diff_check(mut ctx: DeviceContext) raises:
+    """embedding gather 的零容差差分。参照是 run 里 fp32 行拷贝的同构循环
+    （run 无独立 gather 函数；q8 路由已被 dequant_q8_0 门覆盖）。"""
+    var arena = Arena(1 << 18)
+    var table = scratch(arena, Int(GATHER_VOCAB), Int(GATHER_COLS))
+    fill(table, 45)
+    var ids = List[Int]()
+    ids.append(3)
+    ids.append(0)
+    ids.append(2)
+    var dst_ref = arena.alloc(Int(GATHER_TOKENS) * Int(GATHER_COLS) * 4)
+    var pd = dst_ref.unsafe_bitcast[Float32]()
+    var pt = f32_data(table)
+    for t in range(Int(GATHER_TOKENS)):
+        var tok = ids[t]
+        for c in range(Int(GATHER_COLS)):
+            pd[unsafe_offset=t * Int(GATHER_COLS) + c] = pt[
+                unsafe_offset=tok * Int(GATHER_COLS) + c
+            ]
+
+    var n_tab = Int(GATHER_VOCAB) * Int(GATHER_COLS)
+    var n_d = Int(GATHER_TOKENS) * Int(GATHER_COLS)
+    var ht = ctx.enqueue_create_host_buffer[DT](n_tab)
+    var hi = ctx.enqueue_create_host_buffer[DType.int32](Int(GATHER_TOKENS))
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_tab):
+        ht[i] = pt[unsafe_offset=i]
+    for i in range(Int(GATHER_TOKENS)):
+        hi[i] = Int32(ids[i])
+    var dt = ctx.enqueue_create_buffer[DT](n_tab)
+    var di = ctx.enqueue_create_buffer[DType.int32](Int(GATHER_TOKENS))
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=dt, src_buf=ht)
+    ctx.enqueue_copy(dst_buf=di, src_buf=hi)
+    ctx.synchronize()
+    ctx.enqueue_function[gather_gpu](
+        dd.unsafe_ptr(), dt.unsafe_ptr(), di.unsafe_ptr(),
+        Int32(GATHER_COLS), Int32(GATHER_TOKENS),
+        grid_dim=(ceildiv(n_d, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    for i in range(n_d):
+        if hd[i] != pd[unsafe_offset=i]:
+            raise Error(
+                "gather: element " + String(i) + " gpu=" + String(hd[i])
+                + " ref=" + String(pd[unsafe_offset=i])
+            )
+    arena.keep_alive()
+    print("*** GATHER GPU/REFERENCE DIFF PASS *** diff= 0.0 (zero tolerance)")
+
+
 def main() raises:
-    rmsnorm_diff_check()
-    dequant_q4_diff_check()
-    dequant_q8_diff_check()
-    linear_diff_check()
-    attention_diff_check()
-    attention_par_diff_check()
-    q4_matmul_diff_check()
+    # 整门共享一个 DeviceContext：每个 check 各建一个会在第 ~10 个上下文处把
+    # AsyncRT 拖崩（实测 crash，栈在 libAsyncRTMojoBindings 的 syscall 上）。
+    # 上下文生命周期与门同长，check 之间顺序复用。
+    var ctx = DeviceContext()
+    rmsnorm_diff_check(ctx)
+    dequant_q4_diff_check(ctx)
+    dequant_q8_diff_check(ctx)
+    linear_diff_check(ctx)
+    attention_diff_check(ctx)
+    attention_par_diff_check(ctx)
+    q4_matmul_diff_check(ctx)
+    add_copy_diff_check(ctx)
+    swiglu_diff_check(ctx)
+    rope_diff_check(ctx)
+    gather_diff_check(ctx)
