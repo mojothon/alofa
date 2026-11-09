@@ -193,3 +193,46 @@ def linear_gpu(
             w[unsafe_offset=w_base + k]
         )
     dst[unsafe_offset=row * Int(out_cols) + o] = Float32(acc)
+
+
+def linear_block_gpu[THREADS: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """lm_head 专用的**块内合并读** linear（账本六十五）。
+
+    `linear_gpu` 是一个 (行, 输出) 一个线程 —— warp 内 32 线程各读 w 的
+    不同行，零合并，lm_head（151936x896，544MB）实测 1.14ms = 3× 内存
+    下限。这里一行一个 block：线程按 k 分条**合并**读 x 与 w 的同一行，
+    共享内存树形归约（与 rmsnorm 重写同一形态）。代价：累加从串行变树形
+    —— 合法重组差，门的相对容差覆盖（rmsnorm 重写的同一判据逻辑）。
+
+    发射约定：`grid_dim=(out_cols, rows)`、`block_dim=(THREADS,1,1)`，
+    THREADS=256（896/256 = 3.5 → 每线程 3-4 个元素）。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    if o >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var x_base = row * Int(inner)
+    var w_base = o * Int(inner)
+    var local = Float64(0)
+    var k = tid
+    while k < Int(inner):
+        local += Float64(x[unsafe_offset=x_base + k]) * Float64(w[unsafe_offset=w_base + k])
+        k += THREADS
+    var smem = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    smem[unsafe_offset=tid] = local
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            smem[unsafe_offset=tid] += smem[unsafe_offset=tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[unsafe_offset=0])

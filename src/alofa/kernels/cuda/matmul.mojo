@@ -120,6 +120,66 @@ def q4_matmul_block_gpu[THREADS: Int](
         dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
 
 
+def q4_matmul_fused_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """smem 冠军 + **bias 尾缀融合**（账本六十五）。
+
+    decode 每层 21 次发射里 3 次是 q/k/v 的 bias 加——把加法挪进 matmul 的
+    写回（`tid==0` 处），省 3 次发射/层。数值顺序与 CPU 通路**逐句一致**：
+    标量侧是 `linear` 写回 f32(acc) 之后再 f32 加 bias，这里同样是
+    `Float32(smem[0]) + bias[o]` 的 f32 加法 —— 差分预期 diff=0.0。
+    `bias` 参数在 HAS_BIAS=False 的实例化里不读（传什么都行，约定传 dst）。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    if o >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var nblk = Int(inner) // Q4_BLOCK
+    var w_row = o * nblk
+    var acc = Float64(0)
+    var b = tid
+    while b < nblk:
+        var base = (w_row + b) * Q4_BYTES
+        var low = Int(w_blocks[unsafe_offset=base])
+        var high = Int(w_blocks[unsafe_offset=base + 1])
+        var d = _fp16_bits_to_f32_device(low | (high << 8))
+        var kb = b * Q4_BLOCK
+        for j in range(16):
+            var byte = Int(w_blocks[unsafe_offset=base + Q4_SCALE_BYTES + j])
+            acc += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j])
+            acc += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[unsafe_offset=kb + j + 16])
+        b += THREADS
+
+    var smem = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    smem[unsafe_offset=tid] = acc
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            smem[unsafe_offset=tid] += smem[unsafe_offset=tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        var v = Float32(smem[unsafe_offset=0])
+        if HAS_BIAS:
+            v = v + bias[unsafe_offset=o]
+        dst[unsafe_offset=row * Int(out_cols) + o] = v
+
+
 def q4_matmul_smem_gpu[THREADS: Int, INNER: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_blocks: Pointer[UInt8, MutUntrackedOrigin],

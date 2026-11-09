@@ -133,3 +133,86 @@ def add_into_gpu(
     if i >= Int(n):
         return
     dst[unsafe_offset=i] = dst[unsafe_offset=i] + b[unsafe_offset=i]
+
+
+def rope2_gpu(
+    q_dst: Pointer[Float32, MutUntrackedOrigin],
+    k_dst: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    cos_table: Pointer[Float32, MutUntrackedOrigin],
+    sin_table: Pointer[Float32, MutUntrackedOrigin],
+    q_cols: Int32,
+    k_cols: Int32,
+    head_dim: Int32,
+    tokens: Int32,
+) -> None:
+    """q 和 k 的 rope 合成一次发射（账本六十五：省 1 发射/层）。
+
+    平铺索引跨两段：前 `tokens*q_heads*half` 个是 q，其余是 k。每元素的
+    算术与 `rope_gpu`/标量逐句相同 —— 包括**表的两半分开读**（第二半的
+    写回用 `table + d + half`，不假设表在两半间重复；初版漏了这一点，
+    差分门抓出，账本六十五）。
+    """
+    var i = Int(global_idx.x)
+    var half = Int(head_dim) // 2
+    var q_heads = Int(q_cols) // Int(head_dim)
+    var k_heads = Int(k_cols) // Int(head_dim)
+    var q_pairs = Int(tokens) * q_heads * half
+    var k_pairs = Int(tokens) * k_heads * half
+    if i >= q_pairs + k_pairs:
+        return
+    # 注意：不要用「指针三元选择」写这个分支 —— 本版 Mojo 的 GPU 代码里
+    # `ptr_a if cond else ptr_b` 误编译成静默不写（账本六十五：standalone
+    # 复现，输出全零、无 fault）。两个分支各自完整展开。
+    if i < q_pairs:
+        var j = i
+        var d = j % half
+        var head = (j // half) % q_heads
+        var t = j // (half * q_heads)
+        var table = t * Int(head_dim)
+        var base = t * Int(q_cols) + head * Int(head_dim)
+        var a = q_src[unsafe_offset=base + d]
+        var b = q_src[unsafe_offset=base + d + half]
+        q_dst[unsafe_offset=base + d] = a * cos_table[
+            unsafe_offset=table + d
+        ] - b * sin_table[unsafe_offset=table + d]
+        q_dst[unsafe_offset=base + d + half] = (
+            b * cos_table[unsafe_offset=table + d + half]
+            + a * sin_table[unsafe_offset=table + d + half]
+        )
+    else:
+        var j = i - q_pairs
+        var d = j % half
+        var head = (j // half) % k_heads
+        var t = j // (half * k_heads)
+        var table = t * Int(head_dim)
+        var base = t * Int(k_cols) + head * Int(head_dim)
+        var a = k_src[unsafe_offset=base + d]
+        var b = k_src[unsafe_offset=base + d + half]
+        k_dst[unsafe_offset=base + d] = a * cos_table[
+            unsafe_offset=table + d
+        ] - b * sin_table[unsafe_offset=table + d]
+        k_dst[unsafe_offset=base + d + half] = (
+            b * cos_table[unsafe_offset=table + d + half]
+            + a * sin_table[unsafe_offset=table + d + half]
+        )
+
+
+def copy2_gpu(
+    k_dst: Pointer[Float32, MutUntrackedOrigin],
+    v_dst: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """KV append 的 k/v 两笔拷贝合成一次发射（账本六十五：省 1 发射/层）。
+
+    前 `n` 个元素走 k，其余走 v —— 与两次 `copy_gpu` 逐位一致。
+    """
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        k_dst[unsafe_offset=i] = k_src[unsafe_offset=i]
+    elif i < Int(n) * 2:
+        var j = i - Int(n)
+        v_dst[unsafe_offset=j] = v_src[unsafe_offset=j]

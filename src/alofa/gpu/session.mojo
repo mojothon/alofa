@@ -35,16 +35,15 @@ from alofa.core.error import (
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attention_par_gpu
-from alofa.kernels.cuda.basic import linear_gpu, rmsnorm_gpu
+from alofa.kernels.cuda.basic import linear_block_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
-    add_gpu,
     add_into_gpu,
-    copy_gpu,
+    copy2_gpu,
+    rope2_gpu,
     gather_gpu,
-    rope_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_smem_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_fused_gpu
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -343,24 +342,30 @@ struct GpuSession:
         """无偏置 q4 matmul（o/gate/up/down），直接写目标缓冲。
 
         THREADS 按账本五十六的每形状最优：inner ≤ 1024 用 32，否则 128。
+        账本六十五起走 fused kernel（HAS_BIAS=False；bias 参数传 dst 占位，
+        尾缀不读）。
         """
         var src = self._src(src_sel)
         var dst = self._dst(dst_sel)
+        # HAS_BIAS=False 的 bias 参数不读，但 aliasing 检查不允许同一指针
+        # 传两次 —— 占位传 d_ws（真缓冲、该实例化不读；同一指针出现两次必被拒，账本六十五）。
         comptime if inner <= 1024:
-            self.ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, False]](
                 src.unsafe_ptr(),
                 self.d_q4[slot].unsafe_ptr(),
                 dst.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
                 Int32(inner),
                 Int32(n_out),
                 grid_dim=(n_out, 1, 1),
                 block_dim=(32, 1, 1),
             )
         else:
-            self.ctx.enqueue_function[q4_matmul_smem_gpu[128, inner]](
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[128, inner, False]](
                 src.unsafe_ptr(),
                 self.d_q4[slot].unsafe_ptr(),
                 dst.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
                 Int32(inner),
                 Int32(n_out),
                 grid_dim=(n_out, 1, 1),
@@ -370,37 +375,33 @@ struct GpuSession:
     def _mm_bias[inner: Int](
         mut self, slot: Int, n_out: Int, bias_idx: Int, src_sel: Int, dst_sel: Int
     ) raises:
-        """带偏置 q4 matmul（q/k/v）：matmul 进 `d_ws`，`add_gpu` 加偏置。"""
+        """带偏置 q4 matmul（q/k/v）：bias 融合在写回尾缀（账本六十五），
+        一次发射直写目标缓冲 —— 原 matmul 进 `d_ws` 再 `add_gpu` 的两步撤销。
+        """
         var src = self._src(src_sel)
         var dst = self._dst(dst_sel)
         comptime if inner <= 1024:
-            self.ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
                 src.unsafe_ptr(),
                 self.d_q4[slot].unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
+                dst.unsafe_ptr(),
+                self.d_biases[bias_idx].unsafe_ptr(),
                 Int32(inner),
                 Int32(n_out),
                 grid_dim=(n_out, 1, 1),
                 block_dim=(32, 1, 1),
             )
         else:
-            self.ctx.enqueue_function[q4_matmul_smem_gpu[128, inner]](
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[128, inner, True]](
                 src.unsafe_ptr(),
                 self.d_q4[slot].unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
+                dst.unsafe_ptr(),
+                self.d_biases[bias_idx].unsafe_ptr(),
                 Int32(inner),
                 Int32(n_out),
                 grid_dim=(n_out, 1, 1),
                 block_dim=(128, 1, 1),
             )
-        self.ctx.enqueue_function[add_gpu](
-            dst.unsafe_ptr(),
-            self.d_ws.unsafe_ptr(),
-            self.d_biases[bias_idx].unsafe_ptr(),
-            Int32(n_out),
-            grid_dim=(ceildiv(n_out, 64), 1, 1),
-            block_dim=(64, 1, 1),
-        )
 
     # ---- 公开原语（单层差分用；layer 0 / q 槽；收调用方缓冲）----
 
@@ -433,22 +434,16 @@ struct GpuSession:
                 "comptime inner does not match the model's hidden width",
                 "inner=" + String(inner) + " hidden=" + String(self.hidden),
             )
-        self.ctx.enqueue_function[q4_matmul_smem_gpu[32, inner]](
+        # 与 decode 同一 fused 路径（账本六十五）：单发射直写 dq。
+        self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
             dnormed.unsafe_ptr(),
             self.d_q4[Q4_SLOT_Q].unsafe_ptr(),
-            self.d_ws.unsafe_ptr(),
+            dq.unsafe_ptr(),
+            self.d_biases[0].unsafe_ptr(),
             Int32(inner),
             Int32(self.q_out),
             grid_dim=(self.q_out, 1, 1),
             block_dim=(32, 1, 1),
-        )
-        self.ctx.enqueue_function[add_gpu](
-            dq.unsafe_ptr(),
-            self.d_ws.unsafe_ptr(),
-            self.d_biases[0].unsafe_ptr(),
-            Int32(self.q_out),
-            grid_dim=(ceildiv(self.q_out, 64), 1, 1),
-            block_dim=(64, 1, 1),
         )
 
     # ---- 诊断原语（探针用；方法内部发射绕开外部 aliasing）----
@@ -561,41 +556,34 @@ struct GpuSession:
             self._mm_bias[inner](base + Q4_SLOT_V, self.kv_dim, 3 * layer + 2, 0, 2)
             # rope：表行 = 绝对位置 pos（指针偏移进第 pos 行）。q 转到
             # d_q_rot，k 转到 d_k_rot。
-            self.ctx.enqueue_function[rope_gpu](
+            # rope q+k 合成一次发射（账本六十五）；表行 = 绝对位置 pos。
+            var cos_row = self.d_cos.unsafe_ptr() + pos * self.head_dim
+            var sin_row = self.d_sin.unsafe_ptr() + pos * self.head_dim
+            self.ctx.enqueue_function[rope2_gpu](
                 self.d_q_rot.unsafe_ptr(),
-                self.d_q.unsafe_ptr(),
-                self.d_cos.unsafe_ptr() + pos * self.head_dim,
-                self.d_sin.unsafe_ptr() + pos * self.head_dim,
-                Int32(self.q_out),
-                Int32(self.head_dim),
-                Int32(1),
-                grid_dim=(ceildiv(self.q_out // 2, 64), 1, 1),
-                block_dim=(64, 1, 1),
-            )
-            self.ctx.enqueue_function[rope_gpu](
                 self.d_k_rot.unsafe_ptr(),
+                self.d_q.unsafe_ptr(),
                 self.d_k.unsafe_ptr(),
-                self.d_cos.unsafe_ptr() + pos * self.head_dim,
-                self.d_sin.unsafe_ptr() + pos * self.head_dim,
+                cos_row,
+                sin_row,
+                Int32(self.q_out),
                 Int32(self.kv_dim),
                 Int32(self.head_dim),
                 Int32(1),
-                grid_dim=(ceildiv(self.kv_dim // 2, 64), 1, 1),
+                grid_dim=(ceildiv((self.q_out + self.kv_dim) // 2, 64), 1, 1),
                 block_dim=(64, 1, 1),
             )
             # KV append（store 行 = pos）。
-            self.ctx.enqueue_function[copy_gpu](
-                self.d_k_store[layer].unsafe_ptr() + pos * self.kv_dim,
+            # KV append k/v 合成一次发射（账本六十五）；store 行 = pos。
+            var pk_row = self.d_k_store[layer].unsafe_ptr() + pos * self.kv_dim
+            var pv_row = self.d_v_store[layer].unsafe_ptr() + pos * self.kv_dim
+            self.ctx.enqueue_function[copy2_gpu](
+                pk_row,
+                pv_row,
                 self.d_k_rot.unsafe_ptr(),
-                Int32(self.kv_dim),
-                grid_dim=(ceildiv(self.kv_dim, 64), 1, 1),
-                block_dim=(64, 1, 1),
-            )
-            self.ctx.enqueue_function[copy_gpu](
-                self.d_v_store[layer].unsafe_ptr() + pos * self.kv_dim,
                 self.d_v.unsafe_ptr(),
                 Int32(self.kv_dim),
-                grid_dim=(ceildiv(self.kv_dim, 64), 1, 1),
+                grid_dim=(ceildiv(self.kv_dim * 2, 64), 1, 1),
                 block_dim=(64, 1, 1),
             )
             # attention（decode 性能版：一 (head,t) 一个 block）。两个 store
@@ -634,14 +622,16 @@ struct GpuSession:
             self._residual()
 
         self._norm(2 * self.n_layers)
-        self.ctx.enqueue_function[linear_gpu](
+        # lm_head 走块内合并读版（账本六十五：linear_gpu 每 warp 读 32 个
+        # 不同 w 行零合并，1.14ms = 3x 内存下限；重组差由门的相对容差覆盖）。
+        self.ctx.enqueue_function[linear_block_gpu[256]](
             self.d_normed.unsafe_ptr(),
             self.d_embed.unsafe_ptr(),
             self.d_logits.unsafe_ptr(),
             Int32(self.hidden),
             Int32(self.vocab),
             grid_dim=(self.vocab, 1, 1),
-            block_dim=(64, 1, 1),
+            block_dim=(256, 1, 1),
         )
         self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         self.ctx.synchronize()

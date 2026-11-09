@@ -3141,3 +3141,13 @@
   - **aliasing 新规（比六十三更细）**：循环外取的 `List` 元素内部引用（`unsafe_ptr()`），循环体内任何 `session` 可变借用都使其失效——**内部引用必须紧贴使用点提取**。
   - **到 2ms 的剩余路径**（下一步）：① 大 matmul 74µs/层 vs 内存下限 ~4µs（q4 块流 5.8MB/层 ÷ 1.5TB/s）——19× 差距是最大头；② lm_head 1.14ms → 向 0.4ms（向量化/f32 通道）；③ 发射数 20/层 → 融合（bias 进 matmul、rope q+k 合一、KV append 合一、残差进 matmul epilogue）≈ 2ms 里 launch 占 ~2ms。
   - **下一步（步骤 4 续）**：kernel 级优化三连，目标 2ms 判据。
+
+- **2026-11-09（第六十五条）** —— ⚡ **P5 步骤 4 续（kernel 优化第一轮）：5.1 → 4.26ms/token（235 tok/s）；融合三件套进门（门 15 项）；rope2 抄错公式被差分抓出**
+  - **THREADS 重扫非杠杆**：三真实形状 × {32,64,128,256}（`prof_mm_threads.mojo`），最优组合只快 ~5%（q T128 12.0µs、gate T32 31.9、down T128 22.8）——五十六的配置没过时，瓶颈在结构不在线程数。
+  - **svec 负结果**：smem x + `load[16]` 权重的组合变体比冠军慢 1.1-2×（gate 39.6 vs 31.9µs；down 43.9 vs 21.1）——`@parameter` 展开 16 nibble 的寄存器压力压过了合并收益。撤销。负结果也记账。
+  - **融合三件套（进门，门 11→15）**：① `q4_matmul_fused_gpu`（bias 挪进写回尾缀，`Float32(acc)+bias[o]` 与 CPU project 顺序逐句一致 → diff=0.0；省 3 发射/层）；② `rope2_gpu`（q/k 合一）；③ `copy2_gpu`（KV append 合一）。每层 21→17 发射。
+  - **rope2 公式 bug（门抓的）**：初版第二半写回用 `table + d`——标量与 rope_gpu 都是**表的两半分开读**（`table + d + half`）。定位过程自身贡献了新教训：我的 standalone 隔离 harness **忘了把数据传进 host 缓冲**，全零输入下"写入全零"与"没写"不可区分，白绕两轮——**差分 harness 的输入必须非零**，与"全零输入让相对容差退化"是同一条纪律的另一半。
+  - **`linear_block_gpu`（lm_head）**：块内合并读（warp 32 线程各读不同 w 行零合并 → 一行一 block 256 线程分条）。实测只拿到 1.14→1.02ms（533GB/s，远未到 0.4ms 下限）——合并读只解决一半，待查（TLB/行缓冲/f64 转换）。
+  - **aliasing 新坑**：同一指针在同一次发射里出现两次（哪怕语义上是"不读的占位"）必被拒；占位得传一个真正不同的缓冲（d_ws）。
+  - **复验全绿**：门 15/15；decode 对数 diff=1.48e-5、argmax 287 两侧一致（fused 尾缀位级等价的端到端证据）；layer0 normed 0.0 / q 9.5e-7；probe 全净。
+  - **到 2ms 剩余**：大 matmul ~60µs/层 vs 内存下限 4µs（仍 15×，需要真正的 GEMV 重构）；lm_head 1.02ms（待查读放大）；attention 0.23ms。下一步：matmul 结构性重写或接受现状修订判据。

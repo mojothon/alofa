@@ -67,17 +67,20 @@ from alofa.kernels.cuda.basic import (
     dequant_q4_0_gpu,
     dequant_q8_0_gpu,
     linear_gpu,
+    linear_block_gpu,
     rmsnorm_gpu,
 )
 from alofa.kernels.cuda.elementwise import (
     add_gpu,
     add_into_gpu,
+    copy2_gpu,
     copy_gpu,
     gather_gpu,
+    rope2_gpu,
     rope_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_smem_gpu
+from alofa.kernels.cuda.matmul import q4_matmul_fused_gpu, q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -619,6 +622,271 @@ def q4_matmul_diff_check(mut ctx: DeviceContext) raises:
 
 
 
+
+def rope2_diff_check(mut ctx: DeviceContext) raises:
+    """rope2（q/k 合一发射）的零容差差分 —— 与 rope_gpu 逐元素同算术。
+
+    覆盖两段平铺索引的分支：q 段与 k 段各自对照标量 rope 的输出。
+    """
+    var arena = Arena(1 << 18)
+    var q = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var k = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    var cos = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var sin = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_HEAD_DIM))
+    var oq_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_Q_COLS))
+    var ok_cpu = scratch(arena, Int(ROPE_TOKENS), Int(ROPE_K_COLS))
+    fill(q, 41)
+    fill(k, 42)
+    fill(cos, 43)
+    fill(sin, 44)
+    rope(oq_cpu, ok_cpu, q, k, cos, sin, Int(ROPE_HEAD_DIM))
+
+    var n_q = Int(ROPE_TOKENS) * Int(ROPE_Q_COLS)
+    var n_k = Int(ROPE_TOKENS) * Int(ROPE_K_COLS)
+    var n_t = Int(ROPE_TOKENS) * Int(ROPE_HEAD_DIM)
+    var hq = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hk = ctx.enqueue_create_host_buffer[DT](n_k)
+    var hc = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hs = ctx.enqueue_create_host_buffer[DT](n_t)
+    var hqo = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hko = ctx.enqueue_create_host_buffer[DT](n_k)
+    ctx.synchronize()
+    for i in range(n_q):
+        hq[i] = f32_data(q)[unsafe_offset=i]
+    for i in range(n_k):
+        hk[i] = f32_data(k)[unsafe_offset=i]
+    for i in range(n_t):
+        hc[i] = f32_data(cos)[unsafe_offset=i]
+        hs[i] = f32_data(sin)[unsafe_offset=i]
+    var dq = ctx.enqueue_create_buffer[DT](n_q)
+    var dk = ctx.enqueue_create_buffer[DT](n_k)
+    var dc = ctx.enqueue_create_buffer[DT](n_t)
+    var ds = ctx.enqueue_create_buffer[DT](n_t)
+    var dqo = ctx.enqueue_create_buffer[DT](n_q)
+    var dko = ctx.enqueue_create_buffer[DT](n_k)
+    ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+    ctx.enqueue_copy(dst_buf=dk, src_buf=hk)
+    ctx.enqueue_copy(dst_buf=dc, src_buf=hc)
+    ctx.enqueue_copy(dst_buf=ds, src_buf=hs)
+    ctx.synchronize()
+    var q_pairs = Int(ROPE_TOKENS) * (Int(ROPE_Q_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    var k_pairs = Int(ROPE_TOKENS) * (Int(ROPE_K_COLS) // Int(ROPE_HEAD_DIM)) * (Int(ROPE_HEAD_DIM) // 2)
+    ctx.enqueue_function[rope2_gpu](
+        dqo.unsafe_ptr(), dko.unsafe_ptr(), dq.unsafe_ptr(), dk.unsafe_ptr(),
+        dc.unsafe_ptr(), ds.unsafe_ptr(),
+        Int32(ROPE_Q_COLS), Int32(ROPE_K_COLS), Int32(ROPE_HEAD_DIM), Int32(ROPE_TOKENS),
+        grid_dim=(ceildiv(q_pairs + k_pairs, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hqo, src_buf=dqo)
+    ctx.enqueue_copy(dst_buf=hko, src_buf=dko)
+    ctx.synchronize()
+
+    for i in range(n_q):
+        if hqo[i] != f32_data(oq_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope2(q): element " + String(i) + " gpu=" + String(hqo[i])
+                + " cpu=" + String(f32_data(oq_cpu)[unsafe_offset=i])
+            )
+    for i in range(n_k):
+        if hko[i] != f32_data(ok_cpu)[unsafe_offset=i]:
+            raise Error(
+                "rope2(k): element " + String(i) + " gpu=" + String(hko[i])
+                + " cpu=" + String(f32_data(ok_cpu)[unsafe_offset=i])
+            )
+    arena.keep_alive()
+    print("*** ROPE2 GPU/SCALAR DIFF PASS *** diff= 0.0 (zero tolerance)")
+
+
+def copy2_diff_check(mut ctx: DeviceContext) raises:
+    """copy2（KV append k/v 合一发射）的零容差差分。"""
+    var arena = Arena(1 << 16)
+    var n = 512
+    var ks = scratch(arena, 1, n)
+    var vs = scratch(arena, 1, n)
+    fill(ks, 7)
+    fill(vs, 9)
+    var hks = ctx.enqueue_create_host_buffer[DT](n)
+    var hvs = ctx.enqueue_create_host_buffer[DT](n)
+    var hkd = ctx.enqueue_create_host_buffer[DT](n)
+    var hvd = ctx.enqueue_create_host_buffer[DT](n)
+    ctx.synchronize()
+    for i in range(n):
+        hks[i] = f32_data(ks)[unsafe_offset=i]
+        hvs[i] = f32_data(vs)[unsafe_offset=i]
+    var dks = ctx.enqueue_create_buffer[DT](n)
+    var dvs = ctx.enqueue_create_buffer[DT](n)
+    var dkd = ctx.enqueue_create_buffer[DT](n)
+    var dvd = ctx.enqueue_create_buffer[DT](n)
+    ctx.enqueue_copy(dst_buf=dks, src_buf=hks)
+    ctx.enqueue_copy(dst_buf=dvs, src_buf=hvs)
+    ctx.synchronize()
+    ctx.enqueue_function[copy2_gpu](
+        dkd.unsafe_ptr(), dvd.unsafe_ptr(), dks.unsafe_ptr(), dvs.unsafe_ptr(),
+        Int32(n), grid_dim=(ceildiv(n * 2, 64), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hkd, src_buf=dkd)
+    ctx.enqueue_copy(dst_buf=hvd, src_buf=dvd)
+    ctx.synchronize()
+    for i in range(n):
+        if hkd[i] != hks[i]:
+            raise Error("copy2(k): element " + String(i))
+        if hvd[i] != hvs[i]:
+            raise Error("copy2(v): element " + String(i))
+    arena.keep_alive()
+    print("*** COPY2 GPU/REFERENCE DIFF PASS *** diff= 0.0 (zero tolerance)")
+
+
+def q4_fused_diff_check(mut ctx: DeviceContext) raises:
+    """fused q4 matmul（bias 尾缀）的组合参照差分。
+
+    参照 = quantize → dequant → 标量 linear → f32 加 bias（与 CPU 通路
+    project 的顺序一致：linear 先写回 f32，bias 是其后的 f32 加法）。
+    kernel 尾缀同序（Float32(smem[0]) + bias[o]），差分预期 diff=0.0；
+    无偏置实例化（HAS_BIAS=False）与 smem 冠军同构，由 q4_matmul 检查
+    的语义覆盖，这里只测 bias 路径。
+    """
+    var arena = Arena(1 << 21)
+    var n_w = Int(Q4MM_OUT) * Int(Q4MM_INNER)
+    var n_x = Int(Q4MM_ROWS) * Int(Q4MM_INNER)
+    var n_d = Int(Q4MM_ROWS) * Int(Q4MM_OUT)
+    var n_blocks = n_w // 32
+    var n_bytes = n_blocks * 18
+    var w_flat = scratch(arena, 1, n_w)
+    var x = scratch(arena, Int(Q4MM_ROWS), Int(Q4MM_INNER))
+    var bias = scratch(arena, 1, Int(Q4MM_OUT))
+    fill(w_flat, 21)
+    fill(x, 22)
+    fill(bias, 5)
+    var blocks = arena.alloc(n_bytes)
+    var wf_raw = arena.alloc(n_w * 4)
+    quantize_q4_0(blocks, f32_data(w_flat), n_w)
+    dequant_q4_0(wf_raw.unsafe_bitcast[Float32](), blocks, n_w)
+    var ref_raw = arena.alloc(n_d * 4)
+    linear(
+        rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        rows_view(wf_raw, Int(Q4MM_OUT), Int(Q4MM_INNER)),
+    )
+    # CPU 侧的 bias 加法（f32，逐元素）—— 与 project 的顺序一致
+    for i in range(n_d):
+        var o = i % Int(Q4MM_OUT)
+        f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT)))[unsafe_offset=i] += f32_data(bias)[unsafe_offset=o]
+
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hw = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    var hb = ctx.enqueue_create_host_buffer[DT](Int(Q4MM_OUT))
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    for i in range(n_bytes):
+        hw[i] = blocks[unsafe_offset=i]
+    for i in range(Int(Q4MM_OUT)):
+        hb[i] = f32_data(bias)[unsafe_offset=i]
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dw = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    var db = ctx.enqueue_create_buffer[DT](Int(Q4MM_OUT))
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
+    ctx.enqueue_copy(dst_buf=db, src_buf=hb)
+    ctx.synchronize()
+    ctx.enqueue_function[q4_matmul_fused_gpu[32, Q4MM_INNER, True]](
+        dx.unsafe_ptr(),
+        dw.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        db.unsafe_ptr(),
+        Int32(Q4MM_INNER),
+        Int32(Q4MM_OUT),
+        grid_dim=(Int(Q4MM_OUT), Int(Q4MM_ROWS), 1),
+        block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    var scale = max_abs(f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    if scale <= 0.0:
+        raise Error("q4_fused: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "q4_fused: gpu vs reference max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** Q4_FUSED GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
+
+
+def linear_block_diff_check(mut ctx: DeviceContext) raises:
+    """linear_block（lm_head 块内合并读）的相对容差差分。
+
+    树形归约与标量串行累加是合法重组差（rmsnorm 重写、q4 champion 同一
+    性质）；判据相对容差 1e-5。
+    """
+    var arena = Arena(1 << 22)
+    var n_w = Int(Q4MM_OUT) * Int(Q4MM_INNER)
+    var n_x = Int(Q4MM_ROWS) * Int(Q4MM_INNER)
+    var n_d = Int(Q4MM_ROWS) * Int(Q4MM_OUT)
+    var w_view = rows_view(arena.alloc(n_w * 4), Int(Q4MM_OUT), Int(Q4MM_INNER))
+    var x = scratch(arena, Int(Q4MM_ROWS), Int(Q4MM_INNER))
+    fill(w_view, 31)
+    fill(x, 32)
+    var ref_raw = arena.alloc(n_d * 4)
+    linear(
+        rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT)),
+        x,
+        w_view,
+    )
+
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hw = ctx.enqueue_create_host_buffer[DT](n_w)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    for i in range(n_w):
+        hw[i] = f32_data(w_view)[unsafe_offset=i]
+    var dx = ctx.enqueue_create_buffer[DT](n_x)
+    var dw = ctx.enqueue_create_buffer[DT](n_w)
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
+    ctx.synchronize()
+    ctx.enqueue_function[linear_block_gpu[256]](
+        dx.unsafe_ptr(),
+        dw.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        Int32(Q4MM_INNER),
+        Int32(Q4MM_OUT),
+        grid_dim=(Int(Q4MM_OUT), Int(Q4MM_ROWS), 1),
+        block_dim=(256, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    var scale = max_abs(f32_data(rows_view(ref_raw, Int(Q4MM_ROWS), Int(Q4MM_OUT))), n_d)
+    if scale <= 0.0:
+        raise Error("linear_block: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "linear_block: gpu vs reference max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** LINEAR_BLOCK GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
+
+
 def add_copy_diff_check(mut ctx: DeviceContext) raises:
     """add 与 copy 的零容差差分 —— 纯 f32 加法/搬运，差值即读错内存。
 
@@ -887,6 +1155,7 @@ def main() raises:
     # AsyncRT 拖崩（实测 crash，栈在 libAsyncRTMojoBindings 的 syscall 上）。
     # 上下文生命周期与门同长，check 之间顺序复用。
     var ctx = DeviceContext()
+    rope2_diff_check(ctx)
     rmsnorm_diff_check(ctx)
     dequant_q4_diff_check(ctx)
     dequant_q8_diff_check(ctx)
@@ -897,4 +1166,7 @@ def main() raises:
     add_copy_diff_check(ctx)
     swiglu_diff_check(ctx)
     rope_diff_check(ctx)
+    copy2_diff_check(ctx)
     gather_diff_check(ctx)
+    q4_fused_diff_check(ctx)
+    linear_block_diff_check(ctx)
