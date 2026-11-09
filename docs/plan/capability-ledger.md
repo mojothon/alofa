@@ -3116,3 +3116,9 @@
     就位（rmsnorm/linear/q4/attention/rope/swiglu/add/copy/gather/q4 matmul
     + 两个 dequant）。**下一步：GpuSession 骨架（设计 §5 步骤 2）** ——
     构造、权重上传、单层 rmsnorm→q_proj 在 device 跑通并与 `run` 对数。
+
+- **2026-11-09（第六十二条）** —— 🔌 **P5 接线步骤 2 完成：`GpuSession` 骨架落地，单层 rmsnorm→q_proj 与产品通路对数通过（`61c7a06` 之后）**
+  - **`src/alofa/gpu/session.mojo`（新模块）**：设计 §3.2 的落点 —— device 权重副本与 `DeviceContext` 的宿主，与孪生体同构（1 session 1 ctx、生命周期 ≤ 原型）。构造即上传（一次同步）：第 `layer` 层 rmsnorm 权重、q_proj 偏置（fp32，`params.view` mmap）+ q 槽位 q4 块流（`q4_blocks[layer*7+0]`，SharedRegion）。计算原语 `enqueue_rmsnorm`（t=1 一行一线程）与 `enqueue_qproj[inner]`（冠军 smem matmul → `add_gpu` 加 bias，与 `project` bias 路同语义）。**`QwenForward` 一行未改**，session 只读它的 `params`/`q4_blocks`/`cfg`。
+  - **对数（A100，真实权重）**：模型 `quantize=True` 构造（q4 化 2GB 权重 ~20s）；输入 = 真实 embedding 表第 42 行；CPU 参照 = `scalar.rmsnorm` + **`model.project[BACKEND_SCALAR]`**（run 逐层调用的同一个函数，非自写算术）。结果：**normed diff=0.0（零容差）**；**q diff=9.5e-07，tol=7.9e-04**。非零差有明确出处：参照侧 `project` 走 shards 核（f64 通道累加，RB=2），GPU 走冠军 smem 核（f32 累加）—— **第一次对比两种不同累加序**，差值是合法重组，比门的组合参照（共享 dequant 语义）宽一个数量级。结论：接线正确，"与 run 对数"成立。
+  - **Mojo 坑（新）**：结构体方法的 buffer 参数默认**借用**（mut=False），`unsafe_ptr()` 给出只读指针，而 kernel 声明 `Pointer[..., mut=True]` ⇒ 发射时约束失败（错误信息藏在实例化链最底层的 "constraint failed"）。**经 kernel 指针的 DeviceBuffer 参数必须标 `mut`**。另一个小坑：kernel 不能像普通函数一样直接调用，必须 `ctx.enqueue_function[kernel](...)`。
+  - **下一步（设计 §5 步骤 3）**：全层 decode 单流 —— 补齐 session 的 k/v/o/gate/up/down 槽位上传与 rope/attention/swiglu/add 原语，`gpu_step` 逐层跑通，端到端 logits 对数（判据 1e-5）。
