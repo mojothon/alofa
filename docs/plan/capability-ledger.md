@@ -3009,3 +3009,26 @@
   - **下一步**：attention/QK 差分（softmax 的 exp/max，最后一块算子空白）；
     DeviceContext 穿 model 层（把 116 GB/s 的 kernel 接上服务路径）；
     tiled GEMM 批形状（按真实 batch 分布设计）。
+
+- **2026-11-09（第五十七条）** —— 🎯 **P5 CUDA：attention 差分入门 —— 第一个非零差分，且恰好 1 ulp；最后一块算子空白补上**
+  - **`kernels/cuda/attention.mojo`**：因果 GQA attention 串行版，一个线程算一个
+    `(head, t)`，三遍循环（scores → max → exp+sum → V 累加 / total）与标量
+    `attention` **逐句同构** —— 同一个 `Float64` 累加位宽、同一个因果掩码
+    （`upto = kv_len - q_len + t`）、同一个 GQA 分组（`h // group`，不物化重复
+    kv）。没有 `head_lo/head_hi` 分片参数：GPU 的并行单位就是 head×t。
+  - **差分结果（A100）**：`diff = 1.1920928955078125e-07 = 恰好 1 个 fp32 ulp`
+    （2⁻²³），门通过（容差 1e-5 相对）。**这是差分门第一次出现非零差分**，
+    而且变量被完全隔离：kernel 与标量除 exp 外逐句一致，差值只能来自
+    **expf 的实现差（libdevice vs libm）**。量级记录：1 ulp，远低于容差。
+  - **判据设计生效**：门用"同算法"容差而非"同指令序列"零容差 —— 如果当初
+    对 attention 也用零容差，这个门会永远红；而 1 ulp 的证据链（其余全逐位
+    + 差值恰好 2⁻²³）反而比"碰巧 0.0"更有信息量。
+  - **transformer 层算子齐了**：rmsnorm / linear / q4 / q8 / **attention**
+    （softmax 的 exp/max、因果掩码、GQA 分组全在内）。GPU 后端在算子覆盖上
+    与 CPU 后端等价；剩下的是性能版（attention 的块内并行规约，串行版就是
+    对照臂）与接线。
+  - **规模说明**：门用小形状（2 头 : 1 kv 头、head_dim=16、q_len=3、
+    kv_len=5 —— q_len<kv_len 同时覆盖 decode 位置公式与掩码）。
+  - **下一步**：attention 性能版（一线程一 (head,t) 在 decode 形状
+    q_len=1、kv_len≥512 时每个线程串行几百次 exp+dot，需要块内并行）；lm_head
+    就是 linear/q4 matmul 已覆盖；DeviceContext 穿 model 层设计笔记。

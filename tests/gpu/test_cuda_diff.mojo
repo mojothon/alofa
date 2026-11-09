@@ -6,8 +6,9 @@
     ./scripts/a100.sh gpu                          # 先挑一张空闲卡（共享机）
     ./scripts/a100.sh run 4 tests/gpu/test_cuda_diff.mojo
 
-覆盖四个 kernel：`rmsnorm` 与 `linear`（相对容差 1e-5）、`dequant_q4_0` 与
-`dequant_q8_0`（**零容差**）。
+覆盖五个 kernel：`rmsnorm`、`linear`、`attention`（相对容差 1e-5）、`dequant_q4_0` 与
+`dequant_q8_0`（**零容差**）。attention 的差分只面对一个新变量：exp 的 ulp 差
+（libdevice vs libm），门把实际差值打出来记录量级。
 
 本门**只验正确性、不报性能**（账本 §4 给这条路线定的解锁条件③）：GPU 与标量后端算
 **同一个**输入，逐值比 fp32 **相对**容差 1e-5 —— 与 AVX2 门同一个数，不是「GPU 可以
@@ -18,10 +19,13 @@
     *** DEQUANT Q4_0 GPU/SCALAR DIFF PASS *** diff= 0.0
     *** DEQUANT Q8_0 GPU/SCALAR DIFF PASS *** diff= 0.0
     *** LINEAR    GPU/SCALAR DIFF PASS *** diff= 0.0  tol= 0.024
-    （四个 kernel 全部与标量**逐位一致**，比容差要求还干净 —— linear 也 diff=0.0
-    说明 GPU 编译器没把乘加折叠成改变舍入的 FMA。注意远程直跑必须带 `-I src`，
-    否则 `alofa.verify` 会报 "does not refer to a nested package"。另外 `ref` 是
-    Mojo 关键字，变量名避开。）
+    *** ATTENTION GPU/SCALAR DIFF PASS *** diff= 1.1920928955078125e-07  tol= 2.0e-05
+    （前四个与标量**逐位一致** —— linear 的 diff=0.0 说明 GPU 编译器没把乘加
+    折叠成改变舍入的 FMA。attention 的 diff = 1.19e-7 = 恰好 1 个 fp32 ulp：
+    kernel 与标量逐句同构，唯一下游差异是 exp（libdevice vs libm）—— 这是门里
+    第一个非零差分，量级 1 ulp，远低于 1e-5 容差。注意远程直跑必须带 `-I src`，
+    否则 `alofa.verify` 会报 "does not refer to a nested package"。另外 `ref`
+    是 Mojo 关键字，变量名避开。）
 
 为什么 kernel 里一个线程要独立算完一整行（看起来很浪费）：本门只想让「GPU 算的数与
 CPU 算的数是同一个」这句话成立。写成块内规约会引入**共享内存**和**浮点累加顺序**
@@ -46,7 +50,8 @@ from alofa.kernels.cpu.quant import (
     quantize_q4_0,
     quantize_q8_0,
 )
-from alofa.kernels.cpu.scalar import linear, rmsnorm
+from alofa.kernels.cpu.scalar import attention, linear, rmsnorm
+from alofa.kernels.cuda.attention import attention_gpu
 from alofa.kernels.cuda.basic import (
     dequant_q4_0_gpu,
     dequant_q8_0_gpu,
@@ -68,6 +73,13 @@ comptime Q8_N = Q8_BLOCKS * Q8_BLOCK
 comptime LM_ROWS = 4
 comptime LM_INNER = 896
 comptime LM_OUT = 16
+# attention 差分：小而全 —— GQA 分组（2 查询头 : 1 kv 头）、q_len < kv_len
+#（覆盖因果掩码与 decode 位置公式）、head_dim 取 16 让点积链够长。
+comptime ATTN_HEADS = 2
+comptime ATTN_KV_HEADS = 1
+comptime ATTN_HEAD_DIM = 16
+comptime ATTN_Q_LEN = 3
+comptime ATTN_KV_LEN = 5
 comptime EPS = Float32(1e-6)
 comptime BLOCK = 64
 # 与 AVX2 门**同一个**容差。
@@ -334,8 +346,94 @@ def linear_diff_check() raises:
     print("*** LINEAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
 
 
+def attention_diff_check() raises:
+    """因果 GQA attention 全函数的 GPU/标量差分。
+
+    参照是产品 `attention`（不是拆出来的 softmax）—— 差分对象与要接进模型的
+    函数是同一个。kernel 与标量逐句同构（串行三遍、Float64 累加、同一掩码），
+    所以差值只能来自 exp 的实现差：门把实际差值打出来，若是 0.0 则连 exp 都
+    逐位一致，若非零则这个数字就是 libdevice vs libm 的量级记录。
+    """
+    var arena = Arena(1 << 20)
+    var q_cols = Int(ATTN_HEADS) * Int(ATTN_HEAD_DIM)
+    var kv_cols = Int(ATTN_KV_HEADS) * Int(ATTN_HEAD_DIM)
+    var q = scratch(arena, Int(ATTN_Q_LEN), q_cols)
+    var k = scratch(arena, Int(ATTN_KV_LEN), kv_cols)
+    var v = scratch(arena, Int(ATTN_KV_LEN), kv_cols)
+    var scores = scratch(arena, Int(ATTN_Q_LEN), Int(ATTN_KV_LEN))
+    var dst_cpu = scratch(arena, Int(ATTN_Q_LEN), q_cols)
+    fill(q, 11)
+    fill(k, 12)
+    fill(v, 13)
+    # 参照：产品 scalar attention（无偏置、全头、因果掩码、GQA 分组）。
+    attention(
+        dst_cpu, q, k, v, scores, Int(ATTN_HEADS), Int(ATTN_KV_HEADS), Int(ATTN_HEAD_DIM)
+    )
+
+    var ctx = DeviceContext()
+    var n_q = Int(ATTN_Q_LEN) * q_cols
+    var n_kv = Int(ATTN_KV_LEN) * kv_cols
+    var n_s = Int(ATTN_Q_LEN) * Int(ATTN_KV_LEN)
+    var hq = ctx.enqueue_create_host_buffer[DT](n_q)
+    var hk = ctx.enqueue_create_host_buffer[DT](n_kv)
+    var hv = ctx.enqueue_create_host_buffer[DT](n_kv)
+    var hs = ctx.enqueue_create_host_buffer[DT](n_s)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_q)
+    ctx.synchronize()
+    for i in range(n_q):
+        hq[i] = f32_data(q)[unsafe_offset=i]
+    for i in range(n_kv):
+        hk[i] = f32_data(k)[unsafe_offset=i]
+        hv[i] = f32_data(v)[unsafe_offset=i]
+
+    var dq = ctx.enqueue_create_buffer[DT](n_q)
+    var dk = ctx.enqueue_create_buffer[DT](n_kv)
+    var dv = ctx.enqueue_create_buffer[DT](n_kv)
+    var ds = ctx.enqueue_create_buffer[DT](n_s)
+    var dd = ctx.enqueue_create_buffer[DT](n_q)
+    ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+    ctx.enqueue_copy(dst_buf=dk, src_buf=hk)
+    ctx.enqueue_copy(dst_buf=dv, src_buf=hv)
+    ctx.synchronize()
+    ctx.enqueue_function[attention_gpu](
+        dd.unsafe_ptr(),
+        dq.unsafe_ptr(),
+        dk.unsafe_ptr(),
+        dv.unsafe_ptr(),
+        ds.unsafe_ptr(),
+        Int32(ATTN_HEADS),
+        Int32(ATTN_KV_HEADS),
+        Int32(ATTN_HEAD_DIM),
+        Int32(ATTN_Q_LEN),
+        Int32(ATTN_KV_LEN),
+        grid_dim=(Int(ATTN_HEADS), Int(ATTN_Q_LEN), 1),
+        block_dim=(1, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var n = n_q
+    var diff = max_abs_diff(hd.unsafe_ptr(), f32_data(dst_cpu), n)
+    var scale = max_abs(f32_data(dst_cpu), n)
+    if scale <= 0.0:
+        raise Error("attention: the reference tensor is all zeros")
+    var tol = REL_TOLERANCE * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "attention: gpu vs scalar max_abs_diff="
+            + String(diff)
+            + " tolerance="
+            + String(tol)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** ATTENTION GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
+
+
 def main() raises:
     rmsnorm_diff_check()
     dequant_q4_diff_check()
     dequant_q8_diff_check()
     linear_diff_check()
+    attention_diff_check()
