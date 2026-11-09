@@ -596,25 +596,41 @@ def f16_matmul_dual_gpu[
             nk += THREADS
         barrier()
     var sacc = stack_allocation[2 * OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    # k 外层、行内层（账本七十四）：旧结构 8 条 (half,oo) 链顺序执行，
+    # 每链 while 内同时只有 1 个 16B load 在飞 —— 访存延迟主导
+    # （480GB/s，round 72 已排除占据率）。改为每步 8 个 load 背靠背
+    # 发射、f64 链交错。每行链内求和序不变（k 升序、j 升序，操作数
+    # 逐一同旧）⇒ 与旧结构逐位一致。
+    var acc = InlineArray[Float64, 2 * OUTS](fill=Float64(0))
+    var wrow = InlineArray[Pointer[Float16, MutUntrackedOrigin], 2 * OUTS](fill=w_a)
+    var wbase = InlineArray[Int, 2 * OUTS](fill=0)
+    var valid = InlineArray[Bool, 2 * OUTS](fill=False)
     @parameter
     for half in range(2):
         @parameter
         for oo in range(OUTS):
             var o = o0 + oo
-            var a = Float64(0)
-            if o < Int(out_cols):
-                var w = w_a
-                comptime if half == 1:
-                    w = w_b
-                var w_base = o * Int(INNER)
-                k = tid * 8
-                while k < Int(INNER):
-                    var wv = w.load[8](w_base + k)
-                    @parameter
-                    for j in range(8):
-                        a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
-                    k += THREADS * 8
-            sacc[unsafe_offset=(half * OUTS + oo) * THREADS + tid] = a
+            valid[half * OUTS + oo] = o < Int(out_cols)
+            comptime if half == 1:
+                wrow[half * OUTS + oo] = w_b
+            wbase[half * OUTS + oo] = o * Int(INNER)
+    k = tid * 8
+    while k < Int(INNER):
+        var xv = InlineArray[Float64, 8](fill=Float64(0))
+        @parameter
+        for j in range(8):
+            xv[j] = Float64(sx[unsafe_offset=k + j])
+        @parameter
+        for idx in range(2 * OUTS):
+            if valid[idx]:
+                var wv = wrow[idx].load[8](wbase[idx] + k)
+                @parameter
+                for j in range(8):
+                    acc[idx] += xv[j] * Float64(Float32(wv[j]))
+        k += THREADS * 8
+    @parameter
+    for idx in range(2 * OUTS):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
     barrier()
     var stride = THREADS // 2
     while stride > 0:

@@ -3218,3 +3218,12 @@
   - **坑在案**：门的 store 读回 `enqueue_copy` 只拷了前 kv_cols 元素（第 0 行）却比对第 L-1 行 —— 读回尺寸必须覆盖要比对的行；HostBuffer 下标不支持 `unsafe_offset=`（DeviceBuffer/指针才支持）。
   - **复验全绿**：门 21/21（+ATTENTION_ROPE）；decode PASS（argmax 287 两侧同）；layer0 零容差 normed 仍保；probe 净；prof（21 结果行）/sections（61）健全。
   - **到 2ms 剩余**：0.97ms。构成：发射间隙 ~0.6ms（168 发射 × ~3.5µs，再融合空间见顶：rope_kv 已进 attention，norm 已进 tri/dual，ACC 已吃 residual）、attention 本体 ~0.2ms（14 块延迟主导）、kernel 本体 ~2.3ms（dual 480GB/s 是最大单点）。下一轮候选：attention 相位数（在线 softmax 5 相位→3）或 dual 的 ILP/访存结构。
+
+- **2026-11-10（第七十四条）** —— ⚡ **P5 步骤 4 续（f64 链重排轮）：2.966 → 2.947ms/token（339 tok/s，-0.6%）；微基准假象第三次现形（反向）**
+  - **结构分析**：dual 480GB/s 的真因不是占据率（七十二已排除）而是**访存延迟**——旧内层 8 条 (half,oo) 链顺序执行，每链 while 内同时只 1 个 16B load 在飞（~16B/线程），而 latency hiding 需要 ~11KB/SM，差 30×。
+  - **刀法**：k 外层、行内层重排——每步 8 个 load 背靠背 + f64 链交错（InlineArray 累加器）。**每行链内求和序逐一同旧（k 升序 j 升序）⇒ bit-exact**（decode diff 0.00868 与 argmax 287 逐位不变，门 21/21 全绿）。
+  - **四核分化实测**（微基准）：dual 36.4→27.2µs（641GB/s，+34%）；**down（fat INNER=4864）14.2→20.3µs 净亏**——长循环里 ptxas 本就能在单链内流水，重排的每步 prologue 反成税；o（同核 INNER=896）6.1→5.76 略好；head -7%。→ **保 dual+tri，fat/head 回退旧结构**。
+  - **真链隔离（A/B）**：dual-only 2.959（-0.007），dual+tri 2.947（-0.015）。**微基准承诺 0.22ms、真链只给 0.015ms** —— 第三次微基准假象，这次反向：新结构给相邻迭代留了重叠余地，连发计时把跨迭代重叠算进了"kernel 变快"。七十二的教训再次强化：**只有真链 bench 是判据**。
+  - **裁决**：-0.6% 小赢且 bit-exact、复杂度可控（dual/tri 两处），保留；down 的回归若留着会净亏 0.1ms+（已回退验证）。InlineArray 无需 import（Mojo prelude 内置）。
+  - **复验全绿**：门 21/21、decode PASS、layer0 零容差、probe 净、prof（21 行）/sections（61）健全。
+  - **到 2ms 剩余**：0.95ms。kernel 本体 ~2.3ms（dual 真链时间未变——微基准的 27µs 是假的，真链 dual 仍 ~36µs）、间隙 ~0.6、attention ~0.2。下一轮候选：真链分段时间基建（sections 的 f16 口径化）或 CPU 派发结构。
