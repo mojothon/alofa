@@ -3210,3 +3210,11 @@
   - **处置**：三方案全部回退（`git checkout`），session 保持七十一冠军配置（NORM 就地 tri/dual、dual T64/O4、head 分离 norm）；基线复验 3.0145ms/token；门 20/20、decode diff/argmax 逐位不变、layer0/probe/sections 全绿。prof 留存 O2/O1 臂并加"微基准流水污染"警示注释。
   - **顺带修了 HEAD 上的两处带伤**：prof 的三个 dual 旧臂缺参（helper 11 参臂传 10）+ head helper 两处发射传 4 参 —— **七十一的 "prof 16 us" 检查是 grep 松模式假阳性**（数了错误文本里的 "us"）。教训：冒烟检查必须数真实结果行（"us  bw"），不是松子串。
   - **到 2ms 剩余**：1.01ms 不变。下一轮候选：attention 0.23ms（读链上形，勿信微基准）或 CPU 派发结构。
+
+- **2026-11-10（第七十三条）** —— ⚡ **P5 步骤 4 续（attention+rope 融合轮）：3.013 → 2.966ms/token（337 tok/s）；层发射 8 → 7；判据 +1 → 门 21**
+  - **`attn_rope_gpu`**（rope_kv 并进 attention 头部，decode q_len=1 专用）：每块 rope 自己的 q；k/v 段**每块算自己 kv_head 的 smem 副本、仅组内首块（`head % group == 0`）写 store 行**。跨块竞态的解法在案：同一 launch 内读兄弟块刚写的 store 行没有可见性保证 —— 当前 token（`j == upto`）一律读 smem 副本（与 store 行值逐位相同，rope 同式同序），`j < upto` 读 store。
+  - **数值**：rope 段零容差门（q_rot/store 写回逐位）；attention rel 0.0（L=5）/ 7.8e-8（L=40，跨 THREADS 步距覆盖循环补算路径）。decode diff 0.00868 与 argmax 287 **逐位不变** = 端到端 bit-exact 铁证。
+  - **收益小于模型的原因在案**：预期 24 发射 × ~3.3µs ≈ 0.08ms，实测 -0.047ms —— 融合后的 attention 头部多了 rope 段（14 块 × 串行小相位），且被替掉的 rope_kv 是 64 线程小发射（间隙低于均值）。方向对、单价折扣。
+  - **坑在案**：门的 store 读回 `enqueue_copy` 只拷了前 kv_cols 元素（第 0 行）却比对第 L-1 行 —— 读回尺寸必须覆盖要比对的行；HostBuffer 下标不支持 `unsafe_offset=`（DeviceBuffer/指针才支持）。
+  - **复验全绿**：门 21/21（+ATTENTION_ROPE）；decode PASS（argmax 287 两侧同）；layer0 零容差 normed 仍保；probe 净；prof（21 结果行）/sections（61）健全。
+  - **到 2ms 剩余**：0.97ms。构成：发射间隙 ~0.6ms（168 发射 × ~3.5µs，再融合空间见顶：rope_kv 已进 attention，norm 已进 tri/dual，ACC 已吃 residual）、attention 本体 ~0.2ms（14 块延迟主导）、kernel 本体 ~2.3ms（dual 480GB/s 是最大单点）。下一轮候选：attention 相位数（在线 softmax 5 相位→3）或 dual 的 ILP/访存结构。

@@ -174,3 +174,158 @@ def attention_par_gpu[THREADS: Int](
                 v[unsafe_offset=jj * kv_cols + kv_head_base + tid]
             )
         dst[unsafe_offset=t * q_cols + q_head_base + tid] = Float32(acc / total)
+
+
+def attn_rope_gpu[THREADS: Int](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    cos_row: Pointer[Float32, MutUntrackedOrigin],
+    sin_row: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+) -> None:
+    """decode 专用：rope(q) + rope(k 直写 store 行) + v 拷贝 + attention
+    四合一（账本七十三）—— `rope_kv_gpu` 的活折进 attention 头部，层链
+    再省 1 发射。
+
+    跨块竞态的解法在案：当前 token 的 rope 后 k / 原 v **每块算一份
+    smem 副本**（兄弟查询块共享同一 kv_head），只有组内首块
+    （`head % group == 0`）写 store 行 —— 同一 launch 内读别的块刚写的
+    store 行没有可见性保证，直读是竞态；smem 副本与 store 行值逐位相同
+    （rope 同式同序），scores/V 相位对 `j == upto`（当前 token）读 smem、
+    `j < upto` 读 store。q 每块 rope 自己的头。
+
+    顺序账（相对 rope_kv + attention_par 分离发射）：rope 段逐元素同式
+    （t=0，表行 = cos_row/sin_row）⇒ q_rot/store 行**逐位一致**；attention
+    三相位与 `attention_par_gpu` 全同（scores 单 j 内 d 升序、max 无舍入、
+    total 树规约、V 每 d 一线程 j 升序）⇒ 差分面不变。约束：
+    `head_dim <= THREADS`（V 相位每线程一个 d，smem 行也按 THREADS 分配）。
+    发射约定：`grid_dim=(n_heads,1,1)`，q_len=1（decode）。
+    """
+    var head = Int(block_idx.x)
+    if head >= Int(n_heads):
+        return
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var q_head_base = head * Int(head_dim)
+    var kv_head_base = kv_head * Int(head_dim)
+    var q_cols = Int(n_heads) * Int(head_dim)
+    var kv_cols = Int(n_kv_heads) * Int(head_dim)
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var upto = Int(kv_len) - 1
+    var row = head * Int(kv_len)
+
+    var smax = stack_allocation[THREADS, Float32, address_space = AddressSpace.SHARED]()
+    var stot = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    var s_k = stack_allocation[THREADS, Float32, address_space = AddressSpace.SHARED]()
+    var s_v = stack_allocation[THREADS, Float32, address_space = AddressSpace.SHARED]()
+
+    # rope q（tid < half，与 rope_kv 的 q 段同式：a*cos - b*sin / b*cos + a*sin）。
+    var half = Int(head_dim) // 2
+    if tid < half:
+        var d = tid
+        var a = q_src[unsafe_offset=q_head_base + d]
+        var b = q_src[unsafe_offset=q_head_base + d + half]
+        q_rot[unsafe_offset=q_head_base + d] = a * cos_row[
+            unsafe_offset=d
+        ] - b * sin_row[unsafe_offset=d]
+        q_rot[unsafe_offset=q_head_base + d + half] = (
+            b * cos_row[unsafe_offset=d + half]
+            + a * sin_row[unsafe_offset=d + half]
+        )
+    # rope k + v 拷贝：smem 副本人人有，store 行组内首块写。
+    if tid < half:
+        var d = tid
+        var a = k_src[unsafe_offset=kv_head_base + d]
+        var b = k_src[unsafe_offset=kv_head_base + d + half]
+        var r1 = a * cos_row[unsafe_offset=d] - b * sin_row[unsafe_offset=d]
+        var r2 = b * cos_row[unsafe_offset=d + half] + a * sin_row[unsafe_offset=d + half]
+        s_k[unsafe_offset=d] = r1
+        s_k[unsafe_offset=d + half] = r2
+        if head % group == 0:
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d] = r1
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d + half] = r2
+    if tid < Int(head_dim):
+        var vv = v_src[unsafe_offset=kv_head_base + tid]
+        s_v[unsafe_offset=tid] = vv
+        if head % group == 0:
+            v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = vv
+    barrier()
+
+    # scores 相位：j < upto 读 store（旧 token，此前 launch 已写定）；
+    # j == upto（当前 token）读 smem 副本 —— 由 `tid == upto % THREADS`
+    # 的线程在循环后补算（max 无舍入，并入 best_local 的次序自由）。
+    var best_local = LOWEST_FP32
+    var j = tid
+    while j < upto:
+        var acc = Float64(0)
+        var kbase = j * kv_cols + kv_head_base
+        for d in range(Int(head_dim)):
+            acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                k_store[unsafe_offset=kbase + d]
+            )
+        var s = Float32(acc) * scale
+        scores[unsafe_offset=row + j] = s
+        if s > best_local:
+            best_local = s
+        j += THREADS
+    if tid == upto % THREADS:
+        var acc = Float64(0)
+        for d in range(Int(head_dim)):
+            acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                s_k[unsafe_offset=d]
+            )
+        var s = Float32(acc) * scale
+        scores[unsafe_offset=row + upto] = s
+        if s > best_local:
+            best_local = s
+
+    smax[tid] = best_local
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var best = smax[0]
+
+    var total_local = Float64(0)
+    j = tid
+    while j <= upto:
+        var e = Float64(exp(Float64(scores[unsafe_offset=row + j] - best)))
+        scores[unsafe_offset=row + j] = Float32(e)
+        total_local += e
+        j += THREADS
+
+    stot[tid] = total_local
+    barrier()
+    stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    var total = stot[0]
+
+    # V 相位：j < upto 读 store，当前 token 读 smem（j 升序不变）。
+    if tid < Int(head_dim):
+        var acc = Float64(0)
+        for jj in range(upto):
+            acc += Float64(scores[unsafe_offset=row + jj]) * Float64(
+                v_store[unsafe_offset=jj * kv_cols + kv_head_base + tid]
+            )
+        acc += Float64(scores[unsafe_offset=row + upto]) * Float64(
+            s_v[unsafe_offset=tid]
+        )
+        dst[unsafe_offset=q_head_base + tid] = Float32(acc / total)

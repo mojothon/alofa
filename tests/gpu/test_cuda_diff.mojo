@@ -62,7 +62,7 @@ from alofa.kernels.cpu.quant import (
     quantize_q8_0,
 )
 from alofa.kernels.cpu.scalar import add, attention, linear, rmsnorm, rope, swiglu
-from alofa.kernels.cuda.attention import attention_gpu, attention_par_gpu
+from alofa.kernels.cuda.attention import attention_gpu, attention_par_gpu, attn_rope_gpu
 from alofa.kernels.cuda.basic import (
     dequant_q4_0_gpu,
     dequant_q8_0_gpu,
@@ -553,6 +553,176 @@ def attention_par_diff_check(mut ctx: DeviceContext) raises:
             + String(scale)
         )
     print("*** ATTENTION_PAR GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
+
+
+def attention_rope_diff_check(mut ctx: DeviceContext) raises:
+    """attn_rope（rope q + rope k 直写 store 行 + v 拷贝 + attention 四合一）
+    的差分（账本七十三）。
+
+    参照构造：整表逐行标量 rope（每行用自己的 cos/sin 行）—— 旧 token 行
+    视为已入库的 rope 后行，当前行由 kernel 自己 rope（输入给 raw 行）。
+    三个判据：q_rot 与 store 行写回（k/v）**零容差**（rope 段逐元素同式
+    同序）；attention 输出对产品标量 `attention` 走 1e-5 相对容差（差分面
+    与 attention_par 相同：total 树规约 + exp ulp）。GQA group=2 使 head 1
+    走兄弟块路径（自己不写 store、k/v 全靠 smem 副本）。两个 kv 形状：
+    L=5（upto < THREADS）与 L=40（upto 跨 THREADS 步距，覆盖循环补算）。
+    """
+    var arena = Arena(1 << 20)
+    var q_cols = Int(ATTN_HEADS) * Int(ATTN_HEAD_DIM)
+    var kv_cols = Int(ATTN_KV_HEADS) * Int(ATTN_HEAD_DIM)
+    var hd = Int(ATTN_HEAD_DIM)
+    for shape in range(2):
+        var kv_len = 5
+        if shape == 1:
+            kv_len = 40
+
+        var q_raw = scratch(arena, kv_len, q_cols)
+        var k_raw = scratch(arena, kv_len, kv_cols)
+        var v_raw = scratch(arena, kv_len, kv_cols)
+        var cos_tab = scratch(arena, kv_len, hd)
+        var sin_tab = scratch(arena, kv_len, hd)
+        fill(q_raw, 11)
+        fill(k_raw, 12)
+        fill(v_raw, 13)
+        var pc = f32_data(cos_tab)
+        var ps = f32_data(sin_tab)
+        for i in range(kv_len * hd):
+            var r = i // hd
+            var d = i % hd
+            pc[unsafe_offset=i] = Float32(((r * 31 + d) % 97) - 48) * Float32(0.019)
+            ps[unsafe_offset=i] = Float32(((r * 17 + d * 3) % 89) - 44) * Float32(0.021)
+        # 整表标量 rope：ok 行 = 各位置的 rope 后 k；oq 当前位行 = rope 后 q。
+        var oq = scratch(arena, kv_len, q_cols)
+        var ok = scratch(arena, kv_len, kv_cols)
+        rope(oq, ok, q_raw, k_raw, cos_tab, sin_tab, Int(hd))
+        # 参照 attention：q = rope 后当前行（q_len=1），k = 全表 rope 后，v = raw。
+        var q_ref = scratch(arena, 1, q_cols)
+        var pq = f32_data(q_ref)
+        var poq = f32_data(oq)
+        for c in range(q_cols):
+            pq[unsafe_offset=c] = poq[unsafe_offset=(kv_len - 1) * q_cols + c]
+        var scores_ref = scratch(arena, 1, kv_len)
+        var dst_ref = scratch(arena, 1, q_cols)
+        attention(
+            dst_ref, q_ref, ok, v_raw, scores_ref, Int(ATTN_HEADS), Int(ATTN_KV_HEADS), Int(hd)
+        )
+
+        var n_kv = kv_len * kv_cols
+        var hq = ctx.enqueue_create_host_buffer[DT](q_cols)
+        var hkc = ctx.enqueue_create_host_buffer[DT](n_kv)
+        var hvk = ctx.enqueue_create_host_buffer[DT](n_kv)
+        var hkc_cur = ctx.enqueue_create_host_buffer[DT](n_kv)
+        var hvk_cur = ctx.enqueue_create_host_buffer[DT](n_kv)
+        var hk_raw = ctx.enqueue_create_host_buffer[DT](kv_cols)
+        var hv_raw = ctx.enqueue_create_host_buffer[DT](kv_cols)
+        var hc = ctx.enqueue_create_host_buffer[DT](hd)
+        var hs = ctx.enqueue_create_host_buffer[DT](hd)
+        var hd0 = ctx.enqueue_create_host_buffer[DT](q_cols)
+        var hqr = ctx.enqueue_create_host_buffer[DT](q_cols)
+        ctx.synchronize()
+        var pk_raw = f32_data(k_raw)
+        var pv_raw = f32_data(v_raw)
+        var pok = f32_data(ok)
+        # GPU 输入：raw q 当前一行；store 旧行 = rope 后表，当前行先放 raw
+        #（kernel 会覆写——读回比对的就是它写没写对）。
+        for c in range(q_cols):
+            hq[c] = f32_data(q_raw)[unsafe_offset=(kv_len - 1) * q_cols + c]
+        for r in range(kv_len):
+            for c in range(kv_cols):
+                var idx = r * kv_cols + c
+                if r < kv_len - 1:
+                    hkc[idx] = pok[unsafe_offset=idx]
+                else:
+                    hkc[idx] = pk_raw[unsafe_offset=(kv_len - 1) * kv_cols + c]
+                hvk[idx] = pv_raw[unsafe_offset=idx]
+        for c in range(kv_cols):
+            hk_raw[c] = pk_raw[unsafe_offset=(kv_len - 1) * kv_cols + c]
+            hv_raw[c] = pv_raw[unsafe_offset=(kv_len - 1) * kv_cols + c]
+        for d in range(hd):
+            hc[d] = pc[unsafe_offset=(kv_len - 1) * hd + d]
+            hs[d] = ps[unsafe_offset=(kv_len - 1) * hd + d]
+
+        var dq = ctx.enqueue_create_buffer[DT](q_cols)
+        var dq_rot = ctx.enqueue_create_buffer[DT](q_cols)
+        var dk_cur = ctx.enqueue_create_buffer[DT](kv_cols)
+        var dv_cur = ctx.enqueue_create_buffer[DT](kv_cols)
+        var dsk = ctx.enqueue_create_buffer[DT](n_kv)
+        var dsv = ctx.enqueue_create_buffer[DT](n_kv)
+        var dc = ctx.enqueue_create_buffer[DT](hd)
+        var dsn = ctx.enqueue_create_buffer[DT](hd)
+        var dscores = ctx.enqueue_create_buffer[DT](kv_len)
+        var dd = ctx.enqueue_create_buffer[DT](q_cols)
+        ctx.enqueue_copy(dst_buf=dq, src_buf=hq)
+        ctx.enqueue_copy(dst_buf=dk_cur, src_buf=hk_raw)
+        ctx.enqueue_copy(dst_buf=dv_cur, src_buf=hv_raw)
+        ctx.enqueue_copy(dst_buf=dsk, src_buf=hkc)
+        ctx.enqueue_copy(dst_buf=dsv, src_buf=hvk)
+        ctx.enqueue_copy(dst_buf=dc, src_buf=hc)
+        ctx.enqueue_copy(dst_buf=dsn, src_buf=hs)
+        ctx.synchronize()
+        ctx.enqueue_function[attn_rope_gpu[32]](
+            dd.unsafe_ptr(),
+            dq_rot.unsafe_ptr(),
+            dq.unsafe_ptr(),
+            dk_cur.unsafe_ptr(),
+            dv_cur.unsafe_ptr(),
+            dsk.unsafe_ptr(),
+            dsv.unsafe_ptr(),
+            dc.unsafe_ptr(),
+            dsn.unsafe_ptr(),
+            dscores.unsafe_ptr(),
+            Int32(ATTN_HEADS),
+            Int32(ATTN_KV_HEADS),
+            Int32(hd),
+            Int32(kv_len),
+            grid_dim=(Int(ATTN_HEADS), 1, 1),
+            block_dim=(32, 1, 1),
+        )
+        ctx.enqueue_copy(dst_buf=hd0, src_buf=dd)
+        ctx.enqueue_copy(dst_buf=hqr, src_buf=dq_rot)
+        ctx.enqueue_copy(dst_buf=hkc_cur, src_buf=dsk)
+        ctx.enqueue_copy(dst_buf=hvk_cur, src_buf=dsv)
+        ctx.synchronize()
+
+        # 1) q_rot 零容差。
+        for c in range(q_cols):
+            var expect = poq[unsafe_offset=(kv_len - 1) * q_cols + c]
+            if hqr[c] != expect:
+                raise Error(
+                    "attn_rope(q_rot): L=" + String(kv_len) + " elem " + String(c)
+                    + " gpu=" + String(hqr[c]) + " cpu=" + String(expect)
+                )
+        # 2) store 行写回零容差（k = rope 后；v = 原样拷贝）。
+        for c in range(kv_cols):
+            var off = (kv_len - 1) * kv_cols + c
+            var expect_k = pok[unsafe_offset=off]
+            if hkc_cur[off] != expect_k:
+                raise Error(
+                    "attn_rope(k_store): L=" + String(kv_len) + " elem " + String(c)
+                    + " gpu=" + String(hkc_cur[off]) + " cpu=" + String(expect_k)
+                )
+            var expect_v = pv_raw[unsafe_offset=off]
+            if hvk_cur[off] != expect_v:
+                raise Error(
+                    "attn_rope(v_store): L=" + String(kv_len) + " elem " + String(c)
+                    + " gpu=" + String(hvk_cur[off]) + " cpu=" + String(expect_v)
+                )
+        # 3) attention 输出对产品标量，1e-5 相对容差（exp ulp 面）。
+        var diff = max_abs_diff(hd0.unsafe_ptr(), f32_data(dst_ref), q_cols)
+        var scale = max_abs(f32_data(dst_ref), q_cols)
+        if scale <= 0.0:
+            raise Error("attn_rope: the reference tensor is all zeros")
+        var tol = REL_TOLERANCE * scale
+        if diff > tol:
+            raise Error(
+                "attn_rope: L=" + String(kv_len) + " diff=" + String(diff)
+                + " tol=" + String(tol)
+            )
+        print(
+            "[attn_rope L=" + String(kv_len) + "] rel=", diff / scale
+        )
+    arena.keep_alive()
+    print("*** ATTENTION_ROPE GPU/SCALAR DIFF PASS *** rope parts zero tolerance")
 
 
 def q4_matmul_diff_check(mut ctx: DeviceContext) raises:
@@ -1895,6 +2065,7 @@ def main() raises:
     linear_diff_check(ctx)
     attention_diff_check(ctx)
     attention_par_diff_check(ctx)
+    attention_rope_diff_check(ctx)
     q4_matmul_diff_check(ctx)
     add_copy_diff_check(ctx)
     swiglu_diff_check(ctx)

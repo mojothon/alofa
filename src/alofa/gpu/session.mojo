@@ -34,13 +34,12 @@ from alofa.core.error import (
 )
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
-from alofa.kernels.cuda.attention import attention_par_gpu
+from alofa.kernels.cuda.attention import attn_rope_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
     q4_dequant_f16_gpu,
-    rope_kv_gpu,
     gather_gpu,
 )
 from alofa.kernels.cuda.matmul import (
@@ -682,45 +681,31 @@ struct GpuSession:
                 grid_dim=(max(self.q_out, self.kv_dim), 1, 1),
                 block_dim=(32, 1, 1),
             )
-            # rope + KV append 三合一（账本七十）：q rope → d_q_rot，k rope
-            # 直写本 token 的 store 行（decode 的 d_k_rot 只喂 copy2，中转
-            # 整个省掉），v 直拷。表行/store 行 = 绝对位置 pos（指针偏移）。
+            # attention + rope 四合一（账本七十三）：rope_kv 的活折进
+            # attention 头部（q rope / k rope 直写本 token store 行 / v
+            # 拷贝），当前 token 的 k/v 经块内 smem 中转 —— 同 launch 内
+            # 读兄弟块刚写的 store 行是竞态。表行/store 行 = 绝对位置
+            # pos（指针偏移）；store 基指针在 kernel 内按 upto 行定位。
             var cos_row = self.d_cos.unsafe_ptr() + pos * self.head_dim
             var sin_row = self.d_sin.unsafe_ptr() + pos * self.head_dim
-            var pk_row = self.d_k_store[layer].unsafe_ptr() + pos * self.kv_dim
-            var pv_row = self.d_v_store[layer].unsafe_ptr() + pos * self.kv_dim
-            var n_pairs = (self.q_out + self.kv_dim) // 2 + self.kv_dim
-            self.ctx.enqueue_function[rope_kv_gpu](
+            # 两个 store 指针先落地局部变量 —— 同一 List 的两个下标表达式
+            # 直接进发射会被 aliasing 检查当成潜在同源（账本六十三）。
+            var pk = self.d_k_store[layer].unsafe_ptr()
+            var pv = self.d_v_store[layer].unsafe_ptr()
+            self.ctx.enqueue_function[attn_rope_gpu[128]](
+                self.d_attn.unsafe_ptr(),
                 self.d_q_rot.unsafe_ptr(),
                 self.d_q.unsafe_ptr(),
                 self.d_k.unsafe_ptr(),
                 self.d_v.unsafe_ptr(),
-                pk_row,
-                pv_row,
-                cos_row,
-                sin_row,
-                Int32(self.q_out),
-                Int32(self.kv_dim),
-                Int32(self.head_dim),
-                Int32(1),
-                grid_dim=(ceildiv(n_pairs, 64), 1, 1),
-                block_dim=(64, 1, 1),
-            )
-            # attention（decode 性能版：一 (head,t) 一个 block）。两个 store
-            # 指针先落地局部变量 —— 同一 List 的两个下标表达式直接进发射会
-            # 被 aliasing 检查当成潜在同源（账本六十三）。
-            var pk = self.d_k_store[layer].unsafe_ptr()
-            var pv = self.d_v_store[layer].unsafe_ptr()
-            self.ctx.enqueue_function[attention_par_gpu[128]](
-                self.d_attn.unsafe_ptr(),
-                self.d_q_rot.unsafe_ptr(),
                 pk,
                 pv,
+                cos_row,
+                sin_row,
                 self.d_scores.unsafe_ptr(),
                 Int32(self.n_heads),
                 Int32(self.n_kv_heads),
                 Int32(self.head_dim),
-                Int32(1),
                 Int32(kv_len),
                 grid_dim=(self.n_heads, 1, 1),
                 block_dim=(128, 1, 1),
