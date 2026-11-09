@@ -204,7 +204,7 @@ def _bench_head[T: Int, INNER: Int, O: Int](
     var d = dd.unsafe_ptr()
     for i in range(WARMUP // 2):
         ctx.enqueue_function[linear_fat_f16_gpu[T, INNER, O]](
-            x, w, d, Int32(n_vocab),
+            x, w, d, dnm.unsafe_ptr(), Float32(0.0), Int32(n_vocab),
             grid_dim=(n_vocab // O, 1, 1), block_dim=(T, 1, 1),
         )
     ctx.synchronize()
@@ -213,7 +213,7 @@ def _bench_head[T: Int, INNER: Int, O: Int](
         var t0 = monotonic_ns()
         for i in range(30):
             ctx.enqueue_function[linear_fat_f16_gpu[T, INNER, O]](
-                x, w, d, Int32(n_vocab),
+                x, w, d, dnm.unsafe_ptr(), Float32(0.0), Int32(n_vocab),
                 grid_dim=(n_vocab // O, 1, 1), block_dim=(T, 1, 1),
             )
         ctx.synchronize()
@@ -246,9 +246,15 @@ def main() raises:
     ctx.synchronize()
     _bench_q4_dual(ctx, "q4 dual T64 O4:", dx, dq_ga, dq_gb, dd, dd2, dd3, dd4)
     _bench_dual[64, 4](ctx, "f16 dual T64 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
-    _bench_dual[128, 4](ctx, "f16 dual T128 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
-    _bench_dual[64, 8](ctx, "f16 dual T64 O8:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
-    _bench_dual[32, 4](ctx, "f16 dual T32 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4)
+    _bench_dual[128, 4](ctx, "f16 dual T128 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
+    _bench_dual[64, 8](ctx, "f16 dual T64 O8:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
+    _bench_dual[32, 4](ctx, "f16 dual T32 O4:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
+    # ⚠️ 七十二：以下 O2/O1 臂的数字被同核连发的跨迭代流水污染
+    #（O1"冠军"21.7µs 在真链上反而慢 0.3ms —— 4864 块 = 1.4 波）。
+    # 留作微基准/链上背离的存证，勿据其选型；选型判据见账本七十二。
+    _bench_dual[64, 2](ctx, "f16 dual T64 O2:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
+    _bench_dual[64, 1](ctx, "f16 dual T64 O1:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
+    _bench_dual[32, 1](ctx, "f16 dual T32 O1:", dx, dw_ga, dw_gb, dd, dd2, dd3, dd4, dd5, dd6)
 
     print("== down 896x4864：q4 fat 基线 vs f16 fat ==")
     var dq_da = _upload_q4(ctx, arena, 896, 4864)
