@@ -176,7 +176,7 @@ def attention_par_gpu[THREADS: Int](
         dst[unsafe_offset=t * q_cols + q_head_base + tid] = Float32(acc / total)
 
 
-def attn_rope_gpu[THREADS: Int](
+def attn_rope_gpu[THREADS: Int, VEC: Bool = False](
     dst: Pointer[Float32, MutUntrackedOrigin],
     q_rot: Pointer[Float32, MutUntrackedOrigin],
     q_src: Pointer[Float32, MutUntrackedOrigin],
@@ -269,10 +269,28 @@ def attn_rope_gpu[THREADS: Int](
     while j < upto:
         var acc = Float64(0)
         var kbase = j * kv_cols + kv_head_base
-        for d in range(Int(head_dim)):
-            acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
-                k_store[unsafe_offset=kbase + d]
-            )
+        # VEC（账本七十九）：k 行 16B 向量读（load[8]，matmul 同款）——
+        # 每 j 16 条向量 load 替代 128 条标量 2B 读，load 相互独立可
+        # 全部在飞。求和序 d 升序不变（8 元组内 dd 升序）⇒ scores
+        # 逐位同旧，下游 bit-exact。
+        comptime if VEC:
+            var c8 = Int(head_dim) // 8
+            for c in range(c8):
+                var kv8 = k_store.load[8](kbase + c * 8)
+                @parameter
+                for dd in range(8):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_head_base + c * 8 + dd]
+                    ) * Float64(Float32(kv8[dd]))
+            for d in range(c8 * 8, Int(head_dim)):
+                acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                    k_store[unsafe_offset=kbase + d]
+                )
+        else:
+            for d in range(Int(head_dim)):
+                acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                    k_store[unsafe_offset=kbase + d]
+                )
         var s = Float32(acc) * scale
         scores[unsafe_offset=row + j] = s
         if s > best_local:

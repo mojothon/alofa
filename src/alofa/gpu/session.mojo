@@ -630,6 +630,7 @@ struct GpuSession:
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
+        attn_t: Int = 128, attn_vec: Bool = True,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -654,6 +655,11 @@ struct GpuSession:
         down_t/o_t（账本七十八）：down/o 发射的线程数 comptime 参
         （默认 128）。fat 核 grid=ceildiv(hidden,2)=448 块 —— T128 只有
         26% 线程槽（tri 同款占据率病）；交错 A/B 裁决后定默认。
+        attn_t/attn_vec（账本七十九）：attention 发射形状/向量化开关。
+        T 扫无效（T256/512 噪声内）；VEC（k 行 load[8] 向量读，求和序
+        不变 ⇒ scores 逐位同）三轮一致 -0.017ms，默认开。⚠️ attention
+        20µs/层的主导项仍未定位 —— 14 块 SM 饥饿是结构性的（j 分块
+        跨块归约是下一刀），VEC 只是零头。
         skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
         路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
         拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令
@@ -742,7 +748,7 @@ struct GpuSession:
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
-                self.ctx.enqueue_function[attn_rope_gpu[128]](
+                self.ctx.enqueue_function[attn_rope_gpu[attn_t, attn_vec]](
                     self.d_attn.unsafe_ptr(),
                     self.d_q_rot.unsafe_ptr(),
                     self.d_q.unsafe_ptr(),
@@ -758,7 +764,7 @@ struct GpuSession:
                     Int32(self.head_dim),
                     Int32(kv_len),
                     grid_dim=(self.n_heads, 1, 1),
-                    block_dim=(128, 1, 1),
+                    block_dim=(attn_t, 1, 1),
                 )
             else:
                 self.ctx.enqueue_function[noop_gpu](
