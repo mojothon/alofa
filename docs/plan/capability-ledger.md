@@ -2821,3 +2821,29 @@
   - **下一步（P5）**：测试文件里的 `rmsnorm_gpu` 提为 `src/alofa/kernels/cuda/`
     正式内核（目录尚不存在，架构图 L1 里画了）→ 后端分发接上 → 差分门扩到
     更多 kernel（先 matmul 碎片，再量化反量化）。
+
+- **2026-11-09（第五十条）** —— ✅ **P5 CUDA：`kernels/cuda/` 落地，反量化差分零容差通过**
+  - **`src/alofa/kernels/cuda/` 正式建包**（`__init__` + `basic`，账本四十九的下一步）：
+    包 docstring 写明纪律（本地不跑、每个 kernel 过差分、DevicePassable 约束）；
+    `rmsnorm_gpu` 从测试文件提为产品代码，测试改为导入 —— 「门测的必须是产品
+    代码」否则差分绿了也白绿。
+  - **新增 `dequant_q4_0_gpu`**（一个块一个线程）+ 设备端 fp16 位解码
+    `_fp16_bits_to_f32_device`：与 `kernels/cpu/quant.mojo` 逐句对应（指数/尾数
+    整数移位 + 2 的整数次幂，全程精确）。设备不能 raise，inf/NaN 缩放因子走位
+    拼接给 IEEE 语义（主机侧 `quantize_q4_0` 本来就会拒绝溢出，正常流到不了）。
+  - **差分门扩展**（`tests/gpu/test_cuda_diff.mojo`）：块从**产品量化器**
+    `quantize_q4_0` 生成 —— 顺带验了 GPU 读的块布局与量化器写的一致；参照是
+    产品 `dequant_q4_0`。判据**零容差**（这层结果只由 nibble 与缩放因子决定，
+    都是精确的，用容差是放水）。
+  - **A100 实测（卡 0）**：`*** RMSNORM GPU/SCALAR DIFF PASS *** diff= 0.0`、
+    `*** DEQUANT Q4_0 GPU/SCALAR DIFF PASS *** diff= 0.0` —— 两个 kernel 都与
+    CPU 标量**逐位一致**。
+  - **踩坑（Mojo 1.0）**：`ref` 是**关键字**（ref 绑定），`var ref = ...` 直接
+    解析错（报 "unexpected token in expression" 还指在 `=` 上，极难读）—— 变量
+    改名 `ref_out` 解决；comptime 别名做内联算术（`arena.alloc(Q4_N * 4)`）在
+    某些位置也会触发同样的假错，绕法是先落成运行时 `Int` 变量。
+  - **本地编译语义**：`kernels/cuda/` 本地能过解析与语义（import 无碍），卡在
+    codegen（本地 ptxas 不认 sm_52）—— 与 tests/gpu 同一条纪律：本地不进套件。
+  - **下一步**：GPU 端 `linear`/matmul 碎片差分（q4 核整行 Reduce，一行一线程
+    版本先过判据）；之后才是块内规约的性能内核；后端分发接进模型要等
+    `DeviceContext` 穿过 model 层的方案定稿。

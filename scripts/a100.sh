@@ -11,8 +11,9 @@
 #      → 必须 export MODULAR_NVPTX_COMPILER_PATH=/usr/local/cuda/bin/ptxas 绕过
 #   3. 这是【共享机】：GPU 0-3 常满载。务必先用 `./scripts/a100.sh gpu` 看空闲卡，
 #      再用 CUDA_VISIBLE_DEVICES=<空闲卡> 限定，不要占用他人资源。
-#   4. 【SSH 端口是 3389，不是 22】—— 22 与 2222 实测全关，只有 3389 开。
-#      2026-09-17 记下的"连接超时"就是脚本一直敲 22 端口造成的，机器本身没坏。
+#   4. 【SSH 端口】2026-09-17 时只有 3389 开（22/2222 全关），当时"连接超时"就
+#      是脚本一直敲 22 造成的。**2026-11-09 复测：22 已直通**（3389 也仍可用），
+#      默认端口因此改回 22；若哪天又被关掉，用 ALOFA_A100_PORT=3389 覆盖。
 #      （3389 通常被当作 RDP 端口，这里拿来跑 SSH，属于该机的运维约定。）
 #
 # 用法：
@@ -26,7 +27,7 @@ set -euo pipefail
 
 REMOTE_HOST="${ALOFA_A100_HOST:-lcl@10.107.6.60}"
 # ⚠️ 见文件头坑 4：该机 SSH 监听 3389，22/2222 均关闭。
-REMOTE_PORT="${ALOFA_A100_PORT:-3389}"
+REMOTE_PORT="${ALOFA_A100_PORT:-22}"
 REMOTE_ROOT="${ALOFA_A100_ROOT:-/app/lcl/mojo-projects/alofa}"
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIXI_ENV_REL=".pixi/envs/default"
