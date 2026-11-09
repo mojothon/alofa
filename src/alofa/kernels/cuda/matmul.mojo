@@ -120,6 +120,67 @@ def q4_matmul_block_gpu[THREADS: Int](
         dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
 
 
+def q4_matmul_smem_gpu[THREADS: Int, INNER: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """**x 行协作载入共享内存**的 blk32 —— 当前的性能冠军。
+
+    分解实验（tests/gpu/prof_q4_blk.mojo，账本五十五）把 ~40µs 拆开：f64
+    无辜（f32_acc 全速）、barrier 骨架 12µs、大头在加载路径。逐个排除后
+    真凶是 **x 的全局读取**：每个 CTA 重读整行 x，而线程读 `x[kb+j]` 时
+    warp 内地址间隔 128B，一条指令 32 个散射 32B 扇区，放大 ~8×。权重
+    byte load 反而是干净的（邻接块 ~600B，L1 第一笔后全命中）。
+
+    修法教科书式：CTA 开头协作把 x 行载入 smem（相邻线程读相邻地址，真
+    合并），点积全部从 smem 取。`INNER` 是 comptime（smem 大小要编译期
+    确定；Qwen 的 896 与 4864 各实例化一次，4864×4B=19.5KB，远低于 A100
+    每 CTA 上限）。累加结构与 blk32 一致 —— 差分实测 diff=0.0。
+    """
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    if o >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var nblk = Int(inner) // Q4_BLOCK
+    var w_row = o * nblk
+    var acc = Float64(0)
+    var b = tid
+    while b < nblk:
+        var base = (w_row + b) * Q4_BYTES
+        var low = Int(w_blocks[unsafe_offset=base])
+        var high = Int(w_blocks[unsafe_offset=base + 1])
+        var d = _fp16_bits_to_f32_device(low | (high << 8))
+        var kb = b * Q4_BLOCK
+        for j in range(16):
+            var byte = Int(w_blocks[unsafe_offset=base + Q4_SCALE_BYTES + j])
+            acc += Float64(Float32((byte & 0x0F) - 8) * d) * Float64(sx[kb + j])
+            acc += Float64(Float32(((byte >> 4) & 0x0F) - 8) * d) * Float64(sx[kb + j + 16])
+        b += THREADS
+
+    var smem = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    smem[tid] = acc
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            smem[tid] += smem[tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
+
+
 def q4_matmul_vec_gpu[THREADS: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_blocks: Pointer[UInt8, MutUntrackedOrigin],
