@@ -3166,3 +3166,12 @@
   - **aliasing 同族扩展**：`d_biases` 三个下标同病同治 —— 分流 d_bias_q/k/v 三个独立 List。规则至此完整：**一次发射里每个 origin 只能出现一次；同 List 多下标、提取局部变量都救不了，必须按字段分流**。
   - **复验全绿**：decode 对数 diff=1.478e-5 与改前逐位一致（argmax 287 两侧同）；layer0/probe 净。
   - **到 2ms 剩余**：大 matmul ~8× 内存下限（向量化证死后，剩余路径只有 f16 预反量化 —— 大改且需重立数值判据 —— 或修订判据）；lm_head 0.46ms（下限 0.36，余量 28%）；attention 0.23ms。
+
+- **2026-11-09（第六十八条）** —— ⚡ **P5 步骤 4 续（kernel 优化第四轮）：3.73 → 3.258ms/token（306.9 tok/s，-12.6%）；f16 预反量化全链进门（门 19 项）；混合行尾静默失配教了一大课**
+  - **f16 预反量化路线落地**：装载期一个 kernel（`q4_dequant_f16_gpu`）把显存里的 q4 块流直接反量化成 f16 副本（每层 7 槽 `d_w16_*` + lm_head 的 `d_embed16`），host 不再中转（host pinned 回传路径在第 15 次 copy 处 `CUDA_ERROR_INVALID_VALUE`，隔离探针无法复现，GPU 侧转换整体绕开）。`decode_step` 五处发射全切 f16：q/k/v 三融合 `f16_matmul_qkv_gpu`、gate/up dual `f16_matmul_dual_gpu`、o/down fat `f16_matmul_fat_gpu`、head `linear_fat_f16_gpu`。q4 本体保留 —— qproj/probe 探针路径维持 q4 精确对数，`_mm`/`_mm_bias` 因此留任。
+  - **数值判据重立**（f16 舍入 rel err ≤ 2^-11 ≈ 4.9e-4，24 层链路放大）：kernel 门 `F16_REL=0.05`（实测单 matmul rel 3-8e-5，30 倍以上余量）；decode 端到端从 1e-5 级改为 `F16_DECODE_REL=0.003` 相对（实测 rel=6.99e-4，4.3 倍余量）+ **argmax 必须与 CPU 参照一致**的功能判据。门 17→19（f16_fat、f16 dual/tri/head 组合各一项）。decode diff=0.00868、argmax 287 两侧一致。
+  - **本轮最大的坑：混合行尾 + 无 assert 的文本替换 = 静默失配**。文件里 \r\n 与 \n 区段并存，python `str.replace` 按 \n 匹配在 \r\n 区段静默不中（无 assert 无从知晓）。后果：终 norm 的 append 被误塞进层循环（每层多 append 一个 FINAL_NORM，后续层的 post-attn norm 全读到终 norm 权重），decode diff=12.37≈ref_max；而"修复"替换同样静默没打上，假象横跨 q4/f16 所有 kernel 组合，把二分误导了两轮（一度怀疑 o 槽 f16 与整个 f16 构建）。**进门规：python 批量编辑要么 assert 匹配数，要么行级操作；对文件做过行级手术的区域一律先 cat -A 验行尾**。
+  - **其余坑在案**：f16 sweep 的初版数字全在 `k=tid` 覆盖 bug 下测的（门重写后重测定标）；down 发射 block_dim(128) 配 [256] 模板 → inf（模板与块维必须成对）；f16 组合门忘 `arena.keep_alive()` → head 段崩在 AsyncRT 栈（六十一同款，进门规已记：keep_alive 必须是最后触碰）。
+  - **代码清理**：bisect 临时件（d_q4_gate_bisect/up_bisect）、六十七的 q4 句柄分流 List（d_q4_q/k/v/gate/up，f16 后 decode_step 不再需要）、f16 构建循环的 hq4 死重填，均已撤销；`prof_f16.mojo` 留作 sweep 证据。
+  - **复验全绿**：门 19/19；decode PASS（argmax 287 两侧同）；layer0 normed 0.0 / q 9.5e-7；probe 全净。
+  - **到 2ms 剩余**：3.258 → 2 差 1.26ms。f16 后 gate matmul 有效带宽 ~462GB/s（8.7MB/2.6µs 下限），离 3.3TB/s 峰值仍 7×——瓶颈已从解包算力转到占据率/发射结构；`bench_decode_sections` 的分段数字还是 q4 时代口径（未更新 f16），下轮先校准再定位。下一轮候选：f16 matmul 吞吐结构（OUTS/THREADS 重扫 + fused 尾缀）、attention 0.23ms、或 lm_head 单独压。

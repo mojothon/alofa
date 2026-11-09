@@ -22,6 +22,10 @@ comptime TOKEN = 42
 comptime INNER = 896
 comptime INNER_FF = 4864
 comptime REL_TOLERANCE = Float64(1e-5)
+# f16 权重判据（账本六十八）：session 装载期把 q4 预反量化成 f16（每权重
+# rel err ≤ 2^-11 ≈ 4.9e-4），24 层链路放大后实测 logits 相对差 6.99e-4。
+# 判据 = 4.3 倍实测余量；argmax 必须与 CPU 参照一致（功能性判据）。
+comptime F16_DECODE_REL = Float64(0.003)
 
 
 def main() raises:
@@ -46,16 +50,16 @@ def main() raises:
     var scale = max_abs(cpu_logits, n)
     if scale <= 0.0:
         raise Error("logits: the reference is all zeros")
-    if diff > REL_TOLERANCE * scale:
+    if diff > F16_DECODE_REL * scale:
         raise Error(
-            "logits: diff=" + String(diff) + " tol=" + String(REL_TOLERANCE * scale)
+            "logits: diff=" + String(diff) + " tol=" + String(F16_DECODE_REL * scale)
             + " ref_max=" + String(scale)
         )
     print(
         "*** SESSION DECODE GPU/CPU PARITY PASS *** diff=",
         diff,
         " tol=",
-        REL_TOLERANCE * scale,
+        F16_DECODE_REL * scale,
     )
     # 样本对照（防"比到自己"的假绿）：两侧各打头四个与最大值。
     var pg = gpu_logits
@@ -66,6 +70,14 @@ def main() raises:
     for i in range(1, n):
         if pc[unsafe_offset=i] > pc[unsafe_offset=best]:
             best = i
+    var gbest = 0
+    for i in range(1, n):
+        if pg[unsafe_offset=i] > pg[unsafe_offset=gbest]:
+            gbest = i
+    if gbest != best:
+        raise Error(
+            "argmax mismatch: gpu=" + String(gbest) + " cpu=" + String(best)
+        )
     print(
         "argmax=", best,
         " gpu_max=", pg[unsafe_offset=best],

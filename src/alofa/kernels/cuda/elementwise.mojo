@@ -13,7 +13,9 @@
   （libdevice vs libm）⇒ 判据相对容差。
 """
 
-from std.gpu import global_idx
+from std.gpu import global_idx, block_idx, thread_idx
+
+from alofa.kernels.cuda.basic import _fp16_bits_to_f32_device
 from std.math import exp
 
 
@@ -216,3 +218,44 @@ def copy2_gpu(
     elif i < Int(n) * 2:
         var j = i - Int(n)
         v_dst[unsafe_offset=j] = v_src[unsafe_offset=j]
+
+
+def q4_dequant_f16_gpu(
+    blocks: Pointer[UInt8, MutUntrackedOrigin],
+    dst: Pointer[Float16, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """q4_0 块流 -> f16 权重（账本六十八，装载期用）。
+
+    一线程一权重：块 b = i//32，块内 idx = i%32；字节 = 块基址 +2 +
+    (idx%16)，idx<16 取低半字节、否则取高半字节（与 CPU dequant_q4_0 的
+    布局一致）；scale 是块头的 fp16 位模式。数值 = (nib-8)*d 精确 f32
+    乘法后舍入进 f16 —— 与 host 侧 dequant + Float16() 舍入逐位相同。
+    """
+    var i = Int(global_idx.x)
+    if i >= Int(n):
+        return
+    var b = i // 32
+    var idx = i % 32
+    var base = b * 18
+    var low = Int(blocks[unsafe_offset=base])
+    var high = Int(blocks[unsafe_offset=base + 1])
+    var d = _fp16_bits_to_f32_device(low | (high << 8))
+    # 不用三元选择（六十五：GPU 代码里三元误编译前科，int 版同族风险）
+    var nib = 0
+    if idx < 16:
+        nib = Int(blocks[unsafe_offset=base + 2 + idx]) & 0x0F
+    else:
+        nib = (Int(blocks[unsafe_offset=base + 2 + idx - 16]) >> 4) & 0x0F
+    dst[unsafe_offset=i] = Float16(Float32(nib - 8) * d)
+
+
+def f32_to_f16_gpu(
+    src: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float16, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """f32 -> f16 逐元素（账本六十八，lm_head 权重装载期用）。"""
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        dst[unsafe_offset=i] = Float16(src[unsafe_offset=i])

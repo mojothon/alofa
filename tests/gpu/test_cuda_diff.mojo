@@ -47,7 +47,7 @@ CPU 算的数是同一个」这句话成立。写成块内规约会引入**共�
 from std.gpu import global_idx
 from std.math import ceildiv, sqrt
 
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer
 from alofa.core.dtype import DT_FP32
 from alofa.core.memory import Arena
 from alofa.core.tensor import Shape, TensorView, f32_data, rows_view
@@ -68,9 +68,11 @@ from alofa.kernels.cuda.basic import (
     dequant_q8_0_gpu,
     linear_gpu,
     linear_block_gpu,
+    linear_fat_f16_gpu,
     rmsnorm_gpu,
 )
 from alofa.kernels.cuda.elementwise import (
+    q4_dequant_f16_gpu,
     add_gpu,
     add_into_gpu,
     copy2_gpu,
@@ -80,7 +82,7 @@ from alofa.kernels.cuda.elementwise import (
     rope_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu, q4_matmul_smem_gpu
+from alofa.kernels.cuda.matmul import f16_matmul_dual_gpu, f16_matmul_fat_gpu, f16_matmul_qkv_gpu, q4_matmul_dual_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu, q4_matmul_smem_gpu
 from alofa.verify.compare import max_abs, max_abs_diff
 
 comptime DT = DType.float32
@@ -123,6 +125,9 @@ comptime EPS = Float32(1e-6)
 comptime BLOCK = 64
 # 与 AVX2 门**同一个**容差。
 comptime REL_TOLERANCE = Float64(1e-5)
+# f16 权重舍入判据（账本六十八）：每权重 rel err ≤ 2^-11，累积后对输出
+# 的相对界实测定标 —— 先用此初值跑，按实测调整。
+comptime F16_REL = Float64(0.05)
 
 
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
@@ -1121,6 +1126,311 @@ def qkv_tri_diff_check(mut ctx: DeviceContext) raises:
     print("*** QKV_TRI GPU/REFERENCE DIFF PASS *** diff_q=", diff_q, " diff_k=", diff_k, " diff_v=", diff_v, " tol=", tol)
 
 
+
+def f16_weight_ref(
+    mut arena: Arena,
+    mut ctx: DeviceContext,
+    seed: Int,
+    n_w: Int,
+    mut hq4: HostBuffer[DType.uint8],
+    mut hf16: HostBuffer[DType.float16],
+) raises -> None:
+    """量化一个假权重矩阵到调用方给的 host 缓冲：q4 块流 + f16 预反量化。
+
+    门共用件：q4 版喂 CPU dequant 参照，f16 版喂 GPU（模拟装载期
+    预反量化，数值 = f32 精确反量化值舍入进 f16）。
+    """
+    var n_blocks = n_w // 32
+    ctx.synchronize()
+    var v = scratch(arena, 1, n_w)
+    fill(v, seed)
+    quantize_q4_0(hq4.unsafe_ptr(), f32_data(v), n_w)
+    var dq = arena.alloc(n_w * 4)
+    dequant_q4_0(dq.unsafe_bitcast[Float32](), hq4.unsafe_ptr(), n_w)
+    var dq32 = dq.unsafe_bitcast[Float32]()
+    for i in range(n_w):
+        hf16[i] = Float16(dq32[unsafe_offset=i])
+
+
+def f16_fat_diff_check(mut ctx: DeviceContext) raises:
+    """f16 fat（down/o 形状）门项：参照 = CPU dequant（f32 精确）linear。
+
+    f16 权重舍入（每权重 rel err ≤ 2^-11）使差分下限不再是 0 —— 容差
+    F16_REL 实测定标（首次运行取实测差，加安全系数后固化）。
+    """
+    var arena = Arena(1 << 26)
+    comptime FF_IN = 4864
+    comptime FF_OUT = 896
+    var n_w = Int(FF_OUT) * Int(FF_IN)
+    var n_x = Int(FF_IN)
+    var n_d = Int(FF_OUT)
+    var x = scratch(arena, 1, Int(FF_IN))
+    fill(x, 27)
+    var hq4 = ctx.enqueue_create_host_buffer[DType.uint8](n_w // 32 * 18)
+    var hf16 = ctx.enqueue_create_host_buffer[DType.float16](n_w)
+    f16_weight_ref(arena, ctx, 29, n_w, hq4, hf16)
+    var wraw = arena.alloc(n_w * 4)
+    dequant_q4_0(wraw.unsafe_bitcast[Float32](), hq4.unsafe_ptr(), n_w)
+    var ref_raw = arena.alloc(n_d * 4)
+    linear(
+        rows_view(ref_raw, 1, Int(FF_OUT)),
+        x,
+        rows_view(wraw, Int(FF_OUT), Int(FF_IN)),
+    )
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hd = ctx.enqueue_create_host_buffer[DT](n_d)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    var n_bytes = n_w // 32 * 18
+    var dq16 = ctx.enqueue_create_buffer[DType.float16](n_w)
+    var hq4d = ctx.enqueue_create_host_buffer[DType.uint8](n_bytes)
+    ctx.synchronize()
+    for i in range(n_bytes):
+        hq4d[i] = hq4[i]
+    var dq4 = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+    ctx.enqueue_copy(dst_buf=dq16, src_buf=hf16)
+    ctx.enqueue_copy(dst_buf=dq4, src_buf=hq4d)
+    ctx.synchronize()
+    # GPU 侧预反量化（与 session 装载同路径）
+    var w16 = ctx.enqueue_create_buffer[DType.float16](n_w)
+    ctx.enqueue_function[q4_dequant_f16_gpu](
+        dq4.unsafe_ptr(), w16.unsafe_ptr(), Int32(n_w),
+        grid_dim=(ceildiv(n_w, 256), 1, 1), block_dim=(256, 1, 1),
+    )
+    ctx.synchronize()
+    var dd = ctx.enqueue_create_buffer[DT](n_d)
+    var dd2 = ctx.enqueue_create_buffer[DT](4)
+    var xg = ctx.enqueue_create_buffer[DT](n_x)
+    ctx.enqueue_copy(dst_buf=xg, src_buf=hx)
+    ctx.synchronize()
+    # 第一步：GPU 反量化 vs host 转换 —— 分离 dequant / matmul 责任
+    var hwchk = ctx.enqueue_create_host_buffer[DType.float16](n_w)
+    ctx.enqueue_copy(dst_buf=hwchk, src_buf=w16)
+    ctx.synchronize()
+    var wdiff = Float32(0.0)
+    for i in range(n_w):
+        var a = Float32(hwchk[i])
+        var b = Float32(hf16[i])
+        var d = a - b
+        if d < 0.0:
+            d = -d
+        if d > wdiff:
+            wdiff = d
+    print("[f16_fat] wdiff(gpu dequant vs host f16)=", wdiff)
+    ctx.enqueue_function[f16_matmul_fat_gpu[256, FF_IN, 2, False]](
+        xg.unsafe_ptr(), w16.unsafe_ptr(), dd.unsafe_ptr(), dd2.unsafe_ptr(),
+        Int32(FF_IN), Int32(FF_OUT),
+        grid_dim=(ceildiv(Int(FF_OUT), 2), 1, 1), block_dim=(256, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+    var diff256 = max_abs_diff(hd.unsafe_ptr(), f32_data(rows_view(ref_raw, 1, Int(FF_OUT))), n_d)
+    # 对照 1：T64（同形状）—— 分离 THREADS 因素
+    ctx.enqueue_function[f16_matmul_fat_gpu[64, FF_IN, 2, False]](
+        xg.unsafe_ptr(), w16.unsafe_ptr(), dd.unsafe_ptr(), dd2.unsafe_ptr(),
+        Int32(FF_IN), Int32(FF_OUT),
+        grid_dim=(ceildiv(Int(FF_OUT), 2), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+    var diff64 = max_abs_diff(hd.unsafe_ptr(), f32_data(rows_view(ref_raw, 1, Int(FF_OUT))), n_d)
+    # 对照 2：短 INNER（4864 换 896 形不便利，直接用同一权重前 896 列不成立 —— 跳过）
+    print("[f16_fat] diff256=", diff256, " diff64=", diff64)
+    var diff = diff256
+    var scale = max_abs(f32_data(rows_view(ref_raw, 1, Int(FF_OUT))), n_d)
+    if scale <= 0.0:
+        raise Error("f16_fat: the reference tensor is all zeros")
+    var rel = diff / scale
+    print("[f16_fat] diff=", diff, " scale=", scale, " rel=", rel)
+    var tol = F16_REL * scale
+    arena.keep_alive()
+    if diff > tol:
+        raise Error(
+            "f16_fat: gpu vs reference diff=" + String(diff) + " tolerance=" + String(tol)
+        )
+    print("*** F16_FAT GPU/REFERENCE DIFF PASS *** diff=", diff, " tol=", tol)
+
+
+
+def f16_dual_tri_head_diff_check(mut ctx: DeviceContext) raises:
+    """f16 dual（gate/up 形）/ tri（q/k/v 形）/ head 的组合参照差分。
+
+    参照 = f32 精确反量化的标量 linear（同一 x 行、同一量化权重）。
+    f16 舍入噪声由 F16_REL 覆盖（实测单 matmul rel ~3e-5，判据 1e-3 留
+    30 倍余量）。tri 的 bias 走 HAS_BIAS=False + 三个 dummy（aliasing 规）。
+    """
+    var arena = Arena(1 << 27)
+    # ---- dual：gate 形 4864x896，两份权重 ----
+    var n_wg = 4864 * 896
+    var n_x = 896
+    var hq4g_a = ctx.enqueue_create_host_buffer[DType.uint8](n_wg // 32 * 18)
+    var hf16g_a = ctx.enqueue_create_host_buffer[DType.float16](n_wg)
+    f16_weight_ref(arena, ctx, 61, n_wg, hq4g_a, hf16g_a)
+    var hq4g_b = ctx.enqueue_create_host_buffer[DType.uint8](n_wg // 32 * 18)
+    var hf16g_b = ctx.enqueue_create_host_buffer[DType.float16](n_wg)
+    f16_weight_ref(arena, ctx, 63, n_wg, hq4g_b, hf16g_b)
+    var x = scratch(arena, 1, n_x)
+    fill(x, 62)
+    var wraw_a = arena.alloc(n_wg * 4)
+    dequant_q4_0(wraw_a.unsafe_bitcast[Float32](), hq4g_a.unsafe_ptr(), n_wg)
+    var ref_a = arena.alloc(4864 * 4)
+    linear(
+        rows_view(ref_a, 1, 4864),
+        x,
+        rows_view(wraw_a, 4864, 896),
+    )
+    var hx = ctx.enqueue_create_host_buffer[DT](n_x)
+    var hd_a = ctx.enqueue_create_host_buffer[DT](4864)
+    var hd_b = ctx.enqueue_create_host_buffer[DT](4864)
+    ctx.synchronize()
+    for i in range(n_x):
+        hx[i] = f32_data(x)[unsafe_offset=i]
+    var xg = ctx.enqueue_create_buffer[DT](n_x)
+    var da = ctx.enqueue_create_buffer[DT](4864)
+    var db = ctx.enqueue_create_buffer[DT](4864)
+    var wa = ctx.enqueue_create_buffer[DType.float16](n_wg)
+    var wb = ctx.enqueue_create_buffer[DType.float16](n_wg)
+    var dum1 = ctx.enqueue_create_buffer[DT](4)
+    var dum2 = ctx.enqueue_create_buffer[DT](4)
+    ctx.enqueue_copy(dst_buf=xg, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=wa, src_buf=hf16g_a)
+    ctx.enqueue_copy(dst_buf=wb, src_buf=hf16g_b)
+    ctx.synchronize()
+    ctx.enqueue_function[f16_matmul_dual_gpu[64, 896, 4, False]](
+        xg.unsafe_ptr(), wa.unsafe_ptr(), wb.unsafe_ptr(),
+        da.unsafe_ptr(), db.unsafe_ptr(), dum1.unsafe_ptr(), dum2.unsafe_ptr(),
+        Int32(896), Int32(4864),
+        grid_dim=(ceildiv(4864, 4), 1, 1), block_dim=(64, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd_a, src_buf=da)
+    ctx.enqueue_copy(dst_buf=hd_b, src_buf=db)
+    ctx.synchronize()
+    var diff_a = max_abs_diff(hd_a.unsafe_ptr(), f32_data(rows_view(ref_a, 1, 4864)), 4864)
+    var scale_a = max_abs(f32_data(rows_view(ref_a, 1, 4864)), 4864)
+    if scale_a <= 0.0:
+        raise Error("f16_dual: the reference tensor is all zeros")
+    if diff_a > F16_REL * scale_a:
+        raise Error(
+            "f16_dual: diff=" + String(diff_a) + " tol=" + String(F16_REL * scale_a)
+        )
+    print("[f16_dual] rel=", diff_a / scale_a)
+
+    # ---- tri：q 16 出 / kv 12 出，同 x ----
+    var n_wq = 16 * 896
+    var n_wkv = 12 * 896
+    var hq4q = ctx.enqueue_create_host_buffer[DType.uint8](n_wq // 32 * 18)
+    var hf16q = ctx.enqueue_create_host_buffer[DType.float16](n_wq)
+    f16_weight_ref(arena, ctx, 71, n_wq, hq4q, hf16q)
+    var hq4k = ctx.enqueue_create_host_buffer[DType.uint8](n_wkv // 32 * 18)
+    var hf16k = ctx.enqueue_create_host_buffer[DType.float16](n_wkv)
+    f16_weight_ref(arena, ctx, 73, n_wkv, hq4k, hf16k)
+    var hq4v = ctx.enqueue_create_host_buffer[DType.uint8](n_wkv // 32 * 18)
+    var hf16v = ctx.enqueue_create_host_buffer[DType.float16](n_wkv)
+    f16_weight_ref(arena, ctx, 75, n_wkv, hq4v, hf16v)
+    var wraw_q = arena.alloc(n_wq * 4)
+    var wraw_k = arena.alloc(n_wkv * 4)
+    var wraw_v = arena.alloc(n_wkv * 4)
+    dequant_q4_0(wraw_q.unsafe_bitcast[Float32](), hq4q.unsafe_ptr(), n_wq)
+    dequant_q4_0(wraw_k.unsafe_bitcast[Float32](), hq4k.unsafe_ptr(), n_wkv)
+    dequant_q4_0(wraw_v.unsafe_bitcast[Float32](), hq4v.unsafe_ptr(), n_wkv)
+    var ref_q = arena.alloc(16 * 4)
+    var ref_k = arena.alloc(12 * 4)
+    var ref_v = arena.alloc(12 * 4)
+    linear(
+        rows_view(ref_q, 1, 16),
+        x,
+        rows_view(wraw_q, 16, 896),
+    )
+    linear(
+        rows_view(ref_k, 1, 12),
+        x,
+        rows_view(wraw_k, 12, 896),
+    )
+    linear(
+        rows_view(ref_v, 1, 12),
+        x,
+        rows_view(wraw_v, 12, 896),
+    )
+    var hd_q = ctx.enqueue_create_host_buffer[DT](16)
+    var hd_k = ctx.enqueue_create_host_buffer[DT](12)
+    var hd_v = ctx.enqueue_create_host_buffer[DT](12)
+    ctx.synchronize()
+    var dq = ctx.enqueue_create_buffer[DT](16)
+    var dk = ctx.enqueue_create_buffer[DT](12)
+    var dv = ctx.enqueue_create_buffer[DT](12)
+    var wq = ctx.enqueue_create_buffer[DType.float16](n_wq)
+    var wk = ctx.enqueue_create_buffer[DType.float16](n_wkv)
+    var wv = ctx.enqueue_create_buffer[DType.float16](n_wkv)
+    var dum3 = ctx.enqueue_create_buffer[DT](4)
+    var dum4 = ctx.enqueue_create_buffer[DT](4)
+    var dum5 = ctx.enqueue_create_buffer[DT](4)
+    ctx.enqueue_copy(dst_buf=wq, src_buf=hf16q)
+    ctx.enqueue_copy(dst_buf=wk, src_buf=hf16k)
+    ctx.enqueue_copy(dst_buf=wv, src_buf=hf16v)
+    ctx.synchronize()
+    ctx.enqueue_function[f16_matmul_qkv_gpu[32, 896, False]](
+        xg.unsafe_ptr(), wq.unsafe_ptr(), wk.unsafe_ptr(), wv.unsafe_ptr(),
+        dq.unsafe_ptr(), dk.unsafe_ptr(), dv.unsafe_ptr(),
+        dum3.unsafe_ptr(), dum4.unsafe_ptr(), dum5.unsafe_ptr(),
+        Int32(896), Int32(16), Int32(12),
+        grid_dim=(16, 1, 1), block_dim=(32, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd_q, src_buf=dq)
+    ctx.enqueue_copy(dst_buf=hd_k, src_buf=dk)
+    ctx.enqueue_copy(dst_buf=hd_v, src_buf=dv)
+    ctx.synchronize()
+    var diff_q = max_abs_diff(hd_q.unsafe_ptr(), f32_data(rows_view(ref_q, 1, 16)), 16)
+    var scale_q = max_abs(f32_data(rows_view(ref_q, 1, 16)), 16)
+    if scale_q <= 0.0:
+        raise Error("f16_tri: the reference tensor is all zeros")
+    if diff_q > F16_REL * scale_q:
+        raise Error(
+            "f16_tri: diff=" + String(diff_q) + " tol=" + String(F16_REL * scale_q)
+        )
+    print("[f16_tri] rel=", diff_q / scale_q)
+
+    # ---- head：896 -> 16，f16 权重直接喂（模拟 embed16 转换后） ----
+    # 参照与 dual/tri 同构：量化权重 f32 精确反量化 + 标量 linear。
+    var n_wh = 16 * 896
+    var hq4h = ctx.enqueue_create_host_buffer[DType.uint8](n_wh // 32 * 18)
+    var hf16h = ctx.enqueue_create_host_buffer[DType.float16](n_wh)
+    f16_weight_ref(arena, ctx, 81, n_wh, hq4h, hf16h)
+    var wraw_h = arena.alloc(n_wh * 4)
+    dequant_q4_0(wraw_h.unsafe_bitcast[Float32](), hq4h.unsafe_ptr(), n_wh)
+    var ref_h = arena.alloc(16 * 4)
+    linear(
+        rows_view(ref_h, 1, 16),
+        x,
+        rows_view(wraw_h, 16, 896),
+    )
+    var hd_h = ctx.enqueue_create_host_buffer[DT](16)
+    var dh = ctx.enqueue_create_buffer[DT](16)
+    var wh = ctx.enqueue_create_buffer[DType.float16](n_wh)
+    ctx.synchronize()
+    ctx.enqueue_copy(dst_buf=wh, src_buf=hf16h)
+    ctx.synchronize()
+    ctx.enqueue_function[linear_fat_f16_gpu[128, 896, 8]](
+        xg.unsafe_ptr(), wh.unsafe_ptr(), dh.unsafe_ptr(), Int32(16),
+        grid_dim=(2, 1, 1), block_dim=(128, 1, 1),
+    )
+    ctx.enqueue_copy(dst_buf=hd_h, src_buf=dh)
+    ctx.synchronize()
+    var diff_h = max_abs_diff(hd_h.unsafe_ptr(), f32_data(rows_view(ref_h, 1, 16)), 16)
+    var scale_h = max_abs(f32_data(rows_view(ref_h, 1, 16)), 16)
+    if scale_h <= 0.0:
+        raise Error("f16_head: the reference tensor is all zeros")
+    if diff_h > F16_REL * scale_h:
+        raise Error(
+            "f16_head: diff=" + String(diff_h) + " tol=" + String(F16_REL * scale_h)
+        )
+    print("[f16_head] rel=", diff_h / scale_h)
+    # 与 f16_fat 同一个坑：arena 的最后一次使用在上面 alloc 处，不
+    # keep_alive 会在函数尾 munmap，之后的 GPU/读全部踩已释放映射。
+    arena.keep_alive()
+    print("*** F16 DUAL/TRI/HEAD GPU/REFERENCE DIFF PASS ***")
+
+
 def add_copy_diff_check(mut ctx: DeviceContext) raises:
     """add 与 copy 的零容差差分 —— 纯 f32 加法/搬运，差值即读错内存。
 
@@ -1406,3 +1716,5 @@ def main() raises:
     linear_block_diff_check(ctx)
     q4_dual_fat_diff_check(ctx)
     qkv_tri_diff_check(ctx)
+    f16_fat_diff_check(ctx)
+    f16_dual_tri_head_diff_check(ctx)

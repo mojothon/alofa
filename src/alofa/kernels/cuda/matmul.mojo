@@ -452,6 +452,223 @@ def q4_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
             dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
 
 
+def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """f16 预反量化 GEMV（账本六十八）：装载期把 q4 反量化成 f16。
+
+    f16 字节流量是 q4 的 3.5 倍，但实测离带宽下限还差 8 倍 —— 瓶颈是
+    18B 块的标量字节加载链而非带宽。f16 路径把内层循环简化成对齐的
+    f16 读 + FMA：`load[8]`（16B 对齐：o*INNER 与 k 跨步都是 8 的倍数）
+    一次取 8 个权重，寄存器宽度只有 load[16]-u8 的一半。
+
+    数值：权重 f16 舍入（每权重 rel err ≤ 2^-11），f64 累加；门判据用
+    f16 专用容差（账本六十八，实测定标）。INNER 必须是 8 的倍数
+    （k=tid*8 起步、THREADS*8 跨步的覆盖条件）。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8](w_base + k)
+                @parameter
+                for j in range(8):
+                    a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
+                k += THREADS * 8
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                if HAS_BIAS:
+                    v = v + bias[unsafe_offset=o]
+                dst[unsafe_offset=row * Int(out_cols) + o] = v
+
+
+def f16_matmul_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    bias_a: Pointer[Float32, MutUntrackedOrigin],
+    bias_b: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """gate/up 的 f16 dual-fat（账本六十八）：两矩阵共享 x smem，结构同
+    q4_matmul_dual_fat，内层换成对齐 f16 向量读。"""
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var sacc = stack_allocation[2 * OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for half in range(2):
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            var a = Float64(0)
+            if o < Int(out_cols):
+                var w = w_a
+                comptime if half == 1:
+                    w = w_b
+                var w_base = o * Int(INNER)
+                k = tid * 8
+                while k < Int(INNER):
+                    var wv = w.load[8](w_base + k)
+                    @parameter
+                    for j in range(8):
+                        a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
+                    k += THREADS * 8
+            sacc[unsafe_offset=(half * OUTS + oo) * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(2 * OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                var v2 = Float32(sacc[unsafe_offset=(OUTS + oo) * THREADS])
+                if HAS_BIAS:
+                    v = v + bias_a[unsafe_offset=o]
+                    v2 = v2 + bias_b[unsafe_offset=o]
+                dst_a[unsafe_offset=row * Int(out_cols) + o] = v
+                dst_b[unsafe_offset=row * Int(out_cols) + o] = v2
+
+
+def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_q: Pointer[Float16, MutUntrackedOrigin],
+    w_k: Pointer[Float16, MutUntrackedOrigin],
+    w_v: Pointer[Float16, MutUntrackedOrigin],
+    dst_q: Pointer[Float32, MutUntrackedOrigin],
+    dst_k: Pointer[Float32, MutUntrackedOrigin],
+    dst_v: Pointer[Float32, MutUntrackedOrigin],
+    bias_q: Pointer[Float32, MutUntrackedOrigin],
+    bias_k: Pointer[Float32, MutUntrackedOrigin],
+    bias_v: Pointer[Float32, MutUntrackedOrigin],
+    inner: Int32,
+    q_out: Int32,
+    kv_out: Int32,
+) -> None:
+    """q/k/v 的 f16 三融合（账本六十八）：结构同 q4_matmul_qkv_gpu，
+    内层换成对齐 f16 向量读。INNER 是 8 的倍数。"""
+    var o = Int(block_idx.x)
+    var row = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    var sacc = stack_allocation[3 * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for seg in range(3):
+        var a = Float64(0)
+        var active = False
+        var w = w_q
+        comptime if seg == 0:
+            active = o < Int(q_out)
+            w = w_q
+        elif seg == 1:
+            active = o < Int(kv_out)
+            w = w_k
+        else:
+            active = o < Int(kv_out)
+            w = w_v
+        if active:
+            var w_base = o * Int(INNER)
+            k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8](w_base + k)
+                @parameter
+                for j in range(8):
+                    a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
+                k += THREADS * 8
+        sacc[unsafe_offset=seg * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for seg in range(3):
+                sacc[unsafe_offset=seg * THREADS + tid] += sacc[
+                    unsafe_offset=seg * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        if o < Int(q_out):
+            var v = Float32(sacc[unsafe_offset=tid])
+            if HAS_BIAS:
+                v = v + bias_q[unsafe_offset=o]
+            dst_q[unsafe_offset=row * Int(q_out) + o] = v
+        if o < Int(kv_out):
+            var vk = Float32(sacc[unsafe_offset=THREADS + tid])
+            var vv = Float32(sacc[unsafe_offset=2 * THREADS + tid])
+            if HAS_BIAS:
+                vk = vk + bias_k[unsafe_offset=o]
+                vv = vv + bias_v[unsafe_offset=o]
+            dst_k[unsafe_offset=row * Int(kv_out) + o] = vk
+            dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
+
+
 def q4_matmul_smem_gpu[THREADS: Int, INNER: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_blocks: Pointer[UInt8, MutUntrackedOrigin],

@@ -35,15 +35,28 @@ from alofa.core.error import (
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attention_par_gpu
-from alofa.kernels.cuda.basic import linear_fat_gpu, rmsnorm_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     copy2_gpu,
+    f32_to_f16_gpu,
+    q4_dequant_f16_gpu,
     rope2_gpu,
     gather_gpu,
     swiglu_gpu,
 )
-from alofa.kernels.cuda.matmul import q4_matmul_dual_fat_gpu, q4_matmul_fat_gpu, q4_matmul_fused_gpu, q4_matmul_qkv_gpu
+from alofa.kernels.cuda.matmul import (
+    f16_matmul_dual_gpu,
+    q4_matmul_dual_fat_gpu,
+    f16_matmul_fat_gpu,
+    f16_matmul_qkv_gpu,
+    q4_matmul_fat_gpu,
+    q4_matmul_fused_gpu,
+    q4_matmul_qkv_gpu,
+)
+
+# f16 预反量化构建开关（账本六十八二分用）
+comptime F16_BUILD = True
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -115,17 +128,24 @@ struct GpuSession:
     var kv_pos: Int
 
     var d_q4: List[DeviceBuffer[DType.uint8]]
-    # gate/up 的重复句柄（零拷贝，dual-fat 发射的 origin 拆分用，账本六十六）
-    var d_q4_gate: List[DeviceBuffer[DType.uint8]]
-    var d_q4_up: List[DeviceBuffer[DType.uint8]]
-    # q/k/v 同理（qkv 三融合发射的 origin 拆分用，账本六十七）
-    var d_q4_q: List[DeviceBuffer[DType.uint8]]
-    var d_q4_k: List[DeviceBuffer[DType.uint8]]
-    var d_q4_v: List[DeviceBuffer[DType.uint8]]
+    # f16 权重（账本六十八：装载期 q4 -> f16 预反量化；decode 全部 matmul
+    # 走 f16 向量读，qproj 留 q4 fused 保严格对数层）。每槽一个独立 List
+    # —— 一次发射里每个 origin 只许出现一次（六十六/六十七定稿的规则）。
+    var d_w16_q: List[DeviceBuffer[DType.float16]]
+    var d_w16_k: List[DeviceBuffer[DType.float16]]
+    var d_w16_v: List[DeviceBuffer[DType.float16]]
+    var d_w16_o: List[DeviceBuffer[DType.float16]]
+    var d_w16_gate: List[DeviceBuffer[DType.float16]]
+    var d_w16_up: List[DeviceBuffer[DType.float16]]
+    var d_w16_down: List[DeviceBuffer[DType.float16]]
     # q/k/v 偏置的分流句柄（同 List 多下标同病同治）
     var d_bias_q: List[DeviceBuffer[DType.float32]]
     var d_bias_k: List[DeviceBuffer[DType.float32]]
     var d_bias_v: List[DeviceBuffer[DType.float32]]
+    # lm_head 权重的 f16 副本（d_embed 本体留给 gather）
+    var d_embed16: DeviceBuffer[DType.float16]
+    # F16_BUILD=False 时置空句柄（conservative 检查要求全字段初始化）
+
     var d_norms: List[DeviceBuffer[DType.float32]]
     var d_biases: List[DeviceBuffer[DType.float32]]
     var d_embed: DeviceBuffer[DType.float32]
@@ -166,11 +186,15 @@ struct GpuSession:
         # gate/up 单独再存一份（同一个 DeviceBuffer 句柄，零拷贝）：dual-fat
         # 发射要从两个不同 List 取权重指针 —— 同一 List 的两个下标即使提取
         # 局部变量也带着同一 origin，被 aliasing 检查拒（账本六十六）。
-        self.d_q4_gate = List[DeviceBuffer[DType.uint8]]()
-        self.d_q4_up = List[DeviceBuffer[DType.uint8]]()
-        self.d_q4_q = List[DeviceBuffer[DType.uint8]]()
-        self.d_q4_k = List[DeviceBuffer[DType.uint8]]()
-        self.d_q4_v = List[DeviceBuffer[DType.uint8]]()
+        self.d_w16_q = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_k = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_v = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_o = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_gate = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_up = List[DeviceBuffer[DType.float16]]()
+        self.d_w16_down = List[DeviceBuffer[DType.float16]]()
+        comptime if not F16_BUILD:
+            self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](1)
         self.d_bias_q = List[DeviceBuffer[DType.float32]]()
         self.d_bias_k = List[DeviceBuffer[DType.float32]]()
         self.d_bias_v = List[DeviceBuffer[DType.float32]]()
@@ -197,7 +221,8 @@ struct GpuSession:
                 "hidden=" + String(self.hidden) + " inter=" + String(self.inter),
             )
 
-        # ---- 权重：q4 全槽位（复用一块 host 暂存，最大单槽是 down）----
+        # ---- 权重：q4 全槽位 + f16 预反量化副本（账本六十八）----
+        # 复用 host 暂存（最大单槽是 down）：q4 字节流、反量化 f32、f16。
         var max_bytes = self.inter * self.hidden // 32 * 18
         var hq4 = self.ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
         self.ctx.synchronize()
@@ -224,16 +249,53 @@ struct GpuSession:
                     hq4[i] = blocks[unsafe_offset=i]
                 var slot_buf = _upload_u8(self.ctx, hq4, n_bytes)
                 self.d_q4.append(slot_buf)
-                if slot == Q4_SLOT_GATE:
-                    self.d_q4_gate.append(slot_buf)
-                if slot == Q4_SLOT_UP:
-                    self.d_q4_up.append(slot_buf)
+
+        # ---- f16 预反量化（账本六十八）：独立于 q4 上传的第二段循环。
+        # 转换 GPU 侧直读显存 d_q4，host 不再中转（数值判据见门 F16_REL）。
+        # q4 本体保留 —— qproj 探针路径维持 q4 精确对数。
+        for layer in range(self.n_layers):
+            for slot in range(Q4_SLOTS_PER_LAYER):
+                var n_out = self.hidden
+                var n_in = self.hidden
                 if slot == Q4_SLOT_Q:
-                    self.d_q4_q.append(slot_buf)
-                if slot == Q4_SLOT_K:
-                    self.d_q4_k.append(slot_buf)
-                if slot == Q4_SLOT_V:
-                    self.d_q4_v.append(slot_buf)
+                    n_out = self.q_out
+                if slot == Q4_SLOT_K or slot == Q4_SLOT_V:
+                    n_out = self.kv_dim
+                if slot == Q4_SLOT_GATE or slot == Q4_SLOT_UP:
+                    n_out = self.inter
+                if slot == Q4_SLOT_DOWN:
+                    n_in = self.inter
+                var n_elems = n_out * n_in
+                comptime if F16_BUILD:
+                    # GPU 侧转换（账本六十八）：q4 块流已在显存
+                    # （d_q4[layer*7+slot]），一个 kernel 直接反量化成
+                    # f16 —— 绕开 host dequant + pinned 回传路径
+                    # （host 路径在第 15 次 copy 处 CUDA_ERROR_INVALID_VALUE，
+                    # 隔离探针无法复现，账本在案）。
+                    var w16 = self.ctx.enqueue_create_buffer[DType.float16](n_elems)
+                    var q4buf = self.d_q4[layer * Q4_SLOTS_PER_LAYER + slot]
+                    self.ctx.enqueue_function[q4_dequant_f16_gpu](
+                        q4buf.unsafe_ptr(),
+                        w16.unsafe_ptr(),
+                        Int32(n_elems),
+                        grid_dim=(ceildiv(n_elems, 256), 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.synchronize()
+                    if slot == Q4_SLOT_Q:
+                        self.d_w16_q.append(w16)
+                    if slot == Q4_SLOT_K:
+                        self.d_w16_k.append(w16)
+                    if slot == Q4_SLOT_V:
+                        self.d_w16_v.append(w16)
+                    if slot == Q4_SLOT_O:
+                        self.d_w16_o.append(w16)
+                    if slot == Q4_SLOT_GATE:
+                        self.d_w16_gate.append(w16)
+                    if slot == Q4_SLOT_UP:
+                        self.d_w16_up.append(w16)
+                    if slot == Q4_SLOT_DOWN:
+                        self.d_w16_down.append(w16)
 
         # ---- fp32 小权重：norms（每层两个 + 终 norm）、q/k/v 偏置 ----
         for layer in range(self.n_layers):
@@ -256,7 +318,7 @@ struct GpuSession:
             self.d_bias_k.append(bk)
             self.d_bias_v.append(bv)
         self.d_norms.append(_upload_f32(self.ctx, model.params.view(FINAL_NORM)))
-
+    
         # ---- rope 表与 embedding（tied 输出投影）----
         var n_table = max_tokens * self.head_dim
         var hcos = self.ctx.enqueue_create_host_buffer[DType.float32](n_table)
@@ -277,6 +339,20 @@ struct GpuSession:
             he[i] = pem[unsafe_offset=i]
         self.d_embed = self.ctx.enqueue_create_buffer[DType.float32](n_embed)
         self.ctx.enqueue_copy(dst_buf=self.d_embed, src_buf=he)
+        self.ctx.synchronize()
+        # lm_head 的 f16 副本（账本六十八）：字节流量减半；d_embed 本体
+        # 留给 gather（f32 精确嵌入）。
+        comptime if F16_BUILD:
+            # f32 -> f16 GPU 侧转换（账本六十八，同上绕开 host 路径）
+            self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](n_embed)
+            self.ctx.enqueue_function[f32_to_f16_gpu](
+                self.d_embed.unsafe_ptr(),
+                self.d_embed16.unsafe_ptr(),
+                Int32(n_embed),
+                grid_dim=(ceildiv(n_embed, 256), 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.synchronize()
 
         # ---- KV store（device 侧，每层 k/v）与激活缓冲 ----
         var n_kv_row = max_tokens * self.kv_dim
@@ -368,7 +444,6 @@ struct GpuSession:
             grid_dim=(ceildiv(self.hidden, 64), 1, 1),
             block_dim=(64, 1, 1),
         )
-
     def _mm[inner: Int](
         mut self, slot: Int, n_out: Int, src_sel: Int, dst_sel: Int
     ) raises:
@@ -435,6 +510,8 @@ struct GpuSession:
                 grid_dim=(n_out, 1, 1),
                 block_dim=(128, 1, 1),
             )
+
+
 
     # ---- 公开原语（单层差分用；layer 0 / q 槽；收调用方缓冲）----
 
@@ -584,17 +661,17 @@ struct GpuSession:
         for layer in range(self.n_layers):
             var base = layer * Q4_SLOTS_PER_LAYER
             self._norm(2 * layer)
-            # q/k/v 三融合（账本六十七）：同一 normed 行一次发射；每输出
-            # 累加序与冠军逐位同构。bias 尾缀 f32 加（同 CPU 通路）。
+            # q/k/v 三融合走 f16（账本六十八）：同一 normed 行一次发射；
+            # 结构同六十七 q4 版，内层换对齐 f16 向量读（门 F16 判据）。
             var x_qkv = self._src(0)
             var dst_qkv_q = self._dst(0)
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
-            self.ctx.enqueue_function[q4_matmul_qkv_gpu[32, inner, True]](
+            self.ctx.enqueue_function[f16_matmul_qkv_gpu[32, inner, True]](
                 x_qkv.unsafe_ptr(),
-                self.d_q4_q[layer].unsafe_ptr(),
-                self.d_q4_k[layer].unsafe_ptr(),
-                self.d_q4_v[layer].unsafe_ptr(),
+                self.d_w16_q[layer].unsafe_ptr(),
+                self.d_w16_k[layer].unsafe_ptr(),
+                self.d_w16_v[layer].unsafe_ptr(),
                 dst_qkv_q.unsafe_ptr(),
                 dst_qkv_k.unsafe_ptr(),
                 dst_qkv_v.unsafe_ptr(),
@@ -658,17 +735,29 @@ struct GpuSession:
                 grid_dim=(self.n_heads, 1, 1),
                 block_dim=(128, 1, 1),
             )
-            self._mm[inner](base + Q4_SLOT_O, self.hidden, 1, 3)
+            # o 走 f16 fat O2（账本六十八）。
+            var dst_o = self._dst(3)
+            var x_o = self._src(1)
+            self.ctx.enqueue_function[f16_matmul_fat_gpu[128, inner, 2, False]](
+                x_o.unsafe_ptr(),
+                self.d_w16_o[layer].unsafe_ptr(),
+                dst_o.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                Int32(inner),
+                Int32(self.hidden),
+                grid_dim=(ceildiv(self.hidden, 2), 1, 1),
+                block_dim=(128, 1, 1),
+            )
             self._residual()
             self._norm(2 * layer + 1)
-            # gate/up 融合为 dual-fat（账本六十六）：同一 normed 行，x smem
-            # 只载一次；扫型 T64/O4 最优（23.0 vs 分开 2x26.9us）。
-            var w_gate = self.d_q4_gate[layer].unsafe_ptr()
-            var w_up = self.d_q4_up[layer].unsafe_ptr()
+            # gate/up dual f16（账本六十八）：同一 normed 行，x smem 只载
+            # 一次；T64/O4。
+            var w_gate = self.d_w16_gate[layer].unsafe_ptr()
+            var w_up = self.d_w16_up[layer].unsafe_ptr()
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
             var x_gu = self._src(0)
-            self.ctx.enqueue_function[q4_matmul_dual_fat_gpu[64, inner, 4, False]](
+            self.ctx.enqueue_function[f16_matmul_dual_gpu[64, inner, 4, False]](
                 x_gu.unsafe_ptr(),
                 w_gate,
                 w_up,
@@ -689,11 +778,11 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.inter, 64), 1, 1),
                 block_dim=(64, 1, 1),
             )
-            # down 走 fat O2（账本六十六扫型：26.9 vs 冠军 30.5us）。
-            var w_down = self.d_q4[base + Q4_SLOT_DOWN].unsafe_ptr()
+            # down f16 fat O2（账本六十八）。
+            var w_down = self.d_w16_down[layer].unsafe_ptr()
             var dst_down = self._dst(3)
             var x_down = self._src(2)
-            self.ctx.enqueue_function[q4_matmul_fat_gpu[128, inner_ff, 2, False]](
+            self.ctx.enqueue_function[f16_matmul_fat_gpu[256, inner_ff, 2, False]](
                 x_down.unsafe_ptr(),
                 w_down,
                 dst_down.unsafe_ptr(),
@@ -701,16 +790,16 @@ struct GpuSession:
                 Int32(inner_ff),
                 Int32(self.hidden),
                 grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                block_dim=(128, 1, 1),
+                block_dim=(256, 1, 1),
             )
             self._residual()
 
         self._norm(2 * self.n_layers)
         # lm_head 走 fat 版（账本六十六扫型 T256/O8：0.459 vs block 0.501ms；
         # x 只载一次，L2 流量降 8 倍。INNER 用 comptime hidden）。
-        self.ctx.enqueue_function[linear_fat_gpu[256, inner, 8]](
+        self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
             self.d_normed.unsafe_ptr(),
-            self.d_embed.unsafe_ptr(),
+            self.d_embed16.unsafe_ptr(),
             self.d_logits.unsafe_ptr(),
             Int32(self.vocab),
             grid_dim=(ceildiv(self.vocab, 8), 1, 1),
