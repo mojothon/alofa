@@ -2802,3 +2802,22 @@
     `diag_tg_threads`（长任务 + 外部采样）、`diag_step_shape` 的探针臂。
   - **P5 侧**：A100 验证机复验可达（6×A100，卡 0/2 空闲、7 GB 占用、0% 利用率），
     源码已 rsync 到 `/app/lcl/mojo-projects/alofa`（远端 `.pixi` 3.3 GB 在）。
+
+- **2026-11-09（第四十九条）** —— ✅ **P5 CUDA：rmsnorm 差分门在 A100 通过**；`shards` A/B 本机无结论
+  - **shards=8 vs 4 A/B**（四十八遗留，服务端 8×32 交替 4 轮）：8 路均值 41.0 tok/s、
+    4 路 44.0 —— 差 7%，在本机噪声地板（±10%）之下，**无结论**。两臂都只拿到
+    2.0–2.7 核（邻居 5.9 核，load 18+）：核都不够分，分几路都一样。要在安静机上
+    才能定 4 路是否真的不亏。
+  - **CUDA 差分门 PASS**（A100 验证机，卡 0 空闲实测 7GB/0%）：
+    - `tests/gpu/vecadd.mojo` 冒烟 PASS（`c[999]=2997` ✓）；
+    - `tests/gpu/test_cuda_diff.mojo`：rmsnorm GPU vs 标量同输入逐值比，
+      **`diff=0.0`（逐位一致），容差 5e-5** —— 比判据还干净。解锁条件③
+      （"GPU 算的数与 CPU 算的数是同一个"）成立，CUDA 后端从
+      `verified-capable` 升为 **rmsnorm `verified`**。
+  - **环境坑（新增两条）**：
+    - a100.sh 文件头说 SSH 必须走 3389 —— **已过时**，22 现在直通（脚本待改）；
+    - 远程 `mojo run` **必须带 `-I src`**，否则 `alofa.verify` 报 "does not refer
+      to a nested package"（本地惯例一直带，容易忘）。
+  - **下一步（P5）**：测试文件里的 `rmsnorm_gpu` 提为 `src/alofa/kernels/cuda/`
+    正式内核（目录尚不存在，架构图 L1 里画了）→ 后端分发接上 → 差分门扩到
+    更多 kernel（先 matmul 碎片，再量化反量化）。
