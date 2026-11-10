@@ -686,3 +686,131 @@ def attn_comb_gpu[TILES: Int = 4](
         dst[unsafe_offset=head * hd + d] = Float32(
             acc / tot[unsafe_offset=head]
         )
+
+
+def attn_vt2_gpu[
+    THREADS: Int, TILES: Int = 8,
+](
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+) -> None:
+    """K2'（账本八十三，冗余 softmax 消除）：gmax 每块冗余**只读**
+    （无 exp 无写回）；exp 只算本 tile（smem e_s 缓存，全行恰 1×），
+    tile 局部和树规约后写 tsum[head*TILES+tile]，gsum 推迟给 K3 合并
+    —— 砍掉旧 K2 的 8× exp + 8× scores 写回 + gsum 树（10 屏障）。
+    exp 值逐位同旧（同 s 同 gmax）；gsum 变 tile 和合并（重结合，
+    门 1e-5 容差判据）。空 tile（t0 >= nsc）各循环空转，exp 不触发。
+    """
+    var head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var kv_head_base = kv_head * Int(head_dim)
+    var kv_cols = Int(n_kv_heads) * Int(head_dim)
+    var upto = Int(kv_len) - 1
+    var row = head * Int(kv_len)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var t0 = tile * chunk
+    var t1 = t0 + chunk
+    if t1 > nsc:
+        t1 = nsc
+
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var stot = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var e_s = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    # gmax（冗余只读；max 无舍入序自由）
+    var best = LOWEST_FP32
+    var j = tid
+    while j <= upto:
+        var s = scores[unsafe_offset=row + j]
+        if s > best:
+            best = s
+        j += THREADS
+    smax[tid] = best
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var gmax = smax[0]
+
+    # 本 tile exp（smem 缓存：j ↔ tid = j - t0，chunk <= THREADS）+
+    # tile 局部和（独立 scratch 树规约）。
+    var tl = Float64(0)
+    var jt = t0 + tid
+    if jt < t1:
+        var e = Float64(exp(Float64(scores[unsafe_offset=row + jt] - gmax)))
+        e_s[unsafe_offset=jt - t0] = e
+        tl += e
+    stot[tid] = tl
+    barrier()
+    stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        tsum[unsafe_offset=head * TILES + tile] = stot[0]
+    barrier()
+
+    # V 部分和（tile 范围，组式；exp 复用 e_s 缓存）
+    var s_g = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var hd = Int(head_dim)
+    var groups = THREADS // hd
+    var d = tid % hd
+    var g = tid // hd
+    var acc = Float64(0)
+    var jj = t0 + g
+    while jj < t1:
+        acc += e_s[unsafe_offset=jj - t0] * Float64(
+            v_store[unsafe_offset=jj * kv_cols + kv_head_base + d]
+        )
+        jj += groups
+    s_g[tid] = acc
+    barrier()
+    if g == 0:
+        var acc2 = s_g[tid]
+        for g2 in range(1, groups):
+            acc2 += s_g[tid + g2 * hd]
+        vpart[unsafe_offset=(head * TILES + tile) * hd + d] = Float32(acc2)
+
+
+def attn_comb2_gpu[TILES: Int = 8](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    head_dim: Int32,
+) -> None:
+    """K3'：tile 部分和与 tile 和双双合并，就地归一（gsum =
+    Σ tile 和，树序重结合）。"""
+    var head = Int(block_idx.x)
+    var d = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    if d < hd:
+        var acc = Float64(0)
+        var gsum = Float64(0)
+        for t in range(TILES):
+            acc += Float64(vpart[unsafe_offset=(head * TILES + t) * hd + d])
+            gsum += tsum[unsafe_offset=head * TILES + t]
+        dst[unsafe_offset=head * hd + d] = Float32(acc / gsum)

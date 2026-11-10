@@ -35,7 +35,7 @@ from alofa.core.error import (
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
-    attn_vt_gpu, attn_comb_gpu
+    attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -773,10 +773,36 @@ struct GpuSession:
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
-                comptime if attn_tiles > 0:
-                    # 跨块 j 分块三趟（账本八十二）：K1 scores ×TILES 块
-                    # → K2 V 分块（冗余 softmax）→ K3 合并。d_vpart 容量
-                    # 按 8 tile 预留，attn_tiles <= 8。
+                comptime if attn_tiles < 0:
+                    # 负 tiles = 旧 K2/K3（八十二，8× 冗余 softmax），留 A/B 复现。
+                    self.ctx.enqueue_function[
+                        attn_vt_gpu[attn_t, -attn_tiles]
+                    ](
+                        self.d_scores.unsafe_ptr(),
+                        pv,
+                        self.d_vpart.unsafe_ptr(),
+                        self.d_attot.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        grid_dim=(self.n_heads, -attn_tiles, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                    self.ctx.enqueue_function[
+                        attn_comb_gpu[-attn_tiles]
+                    ](
+                        self.d_attn.unsafe_ptr(),
+                        self.d_vpart.unsafe_ptr(),
+                        self.d_attot.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.head_dim),
+                        grid_dim=(self.n_heads, 1, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                elif attn_tiles > 0:
+                    # 三趟（八十二 K1 + 八十三 K2'/K3'）：gmax 冗余只读、
+                    # exp 本 tile smem 缓存（全行 1×）、gsum 推迟 K3 合并。
                     self.ctx.enqueue_function[
                         attn_rs_gpu[attn_t, attn_vec, attn_tiles]
                     ](
@@ -797,7 +823,7 @@ struct GpuSession:
                         block_dim=(attn_t, 1, 1),
                     )
                     self.ctx.enqueue_function[
-                        attn_vt_gpu[attn_t, attn_tiles]
+                        attn_vt2_gpu[attn_t, attn_tiles]
                     ](
                         self.d_scores.unsafe_ptr(),
                         pv,
@@ -811,7 +837,7 @@ struct GpuSession:
                         block_dim=(attn_t, 1, 1),
                     )
                     self.ctx.enqueue_function[
-                        attn_comb_gpu[attn_tiles]
+                        attn_comb2_gpu[attn_tiles]
                     ](
                         self.d_attn.unsafe_ptr(),
                         self.d_vpart.unsafe_ptr(),
