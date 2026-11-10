@@ -453,6 +453,99 @@ def q4_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
             dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
 
 
+def f16_matmul_fat_si_gpu[THREADS: Int, INNER: Int, OUTS: Int, SPLIT: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dpart: Pointer[Float64, MutUntrackedOrigin],
+    inner: Int32,
+    out_cols: Int32,
+) -> None:
+    """split-inner fat（账本八十七）：归约维切 SPLIT 份，块数 ×SPLIT。
+
+    down 现状 448 块 × 128 线程、x smem 19KB ⇒ 驻留 ~7 块/SM，延迟
+    界（管线真值 670GB/s）。分块后每块只装 x 的 1/SPLIT chunk（smem
+    4.9KB）与 w 行的 1/SPLIT，块数 ×SPLIT；块内链序（k 升序、j 升序）
+    与树结构与旧同构，跨块加法序由 combine 的 s 升序固定 ⇒ f64 重结
+    合，走容差门。INNER 与 INNER//SPLIT 须为 8 的倍数。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var s = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var ch = INNER // SPLIT
+    var sx = stack_allocation[INNER // SPLIT, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = s * ch
+    # x chunk 向量载入（16B 对齐：s*ch 与 ch 均为 4 的倍数）
+    var k = tid * 4
+    while k < ch:
+        var xv = x.load[4](x_base + k)
+        @parameter
+        for j in range(4):
+            sx[unsafe_offset=k + j] = xv[j]
+        k += THREADS * 4
+    barrier()
+    var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER) + x_base
+            k = tid * 8
+            while k < ch:
+                var wv = w.load[8](w_base + k)
+                @parameter
+                for j in range(8):
+                    a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
+                k += THREADS * 8
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                dpart[unsafe_offset=o * SPLIT + s] = sacc[
+                    unsafe_offset=oo * THREADS
+                ]
+
+
+def fat_si_comb_gpu[OUTS: Int, SPLIT: Int, ACC: Bool](
+    dpart: Pointer[Float64, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+) -> None:
+    """split 收口微核（账本八十七）：每线程一输出，s 升序 f64 求和。
+
+    SPLIT 份部分和按 s 升序固定加法序；ACC 语义同 fat（残差累加，
+    舍入顺序与"先写 f32 再相加"逐位一致）。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var tid = Int(thread_idx.x)
+    var o = o0 + tid
+    if o < Int(out_cols):
+        var a = Float64(0)
+        @parameter
+        for s in range(SPLIT):
+            a += dpart[unsafe_offset=o * SPLIT + s]
+        var v = Float32(a)
+        if ACC:
+            dst[unsafe_offset=o] = dst[unsafe_offset=o] + v
+        else:
+            dst[unsafe_offset=o] = v
+
+
 def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, ACC: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float16, MutUntrackedOrigin],

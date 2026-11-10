@@ -47,7 +47,7 @@ from alofa.kernels.cuda.elementwise import (
 from alofa.kernels.cuda.matmul import (
     f16_matmul_dual_gpu,
     q4_matmul_dual_fat_gpu,
-    f16_matmul_fat_gpu,
+    f16_matmul_fat_gpu, f16_matmul_fat_si_gpu, fat_si_comb_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -183,6 +183,7 @@ struct GpuSession:
     var d_scores: DeviceBuffer[DType.float32]
     var d_vpart: DeviceBuffer[DType.float32]
     var d_attot: DeviceBuffer[DType.float64]
+    var d_dpart: DeviceBuffer[DType.float64]
     var d_logits: DeviceBuffer[DType.float32]
     var d_token: DeviceBuffer[DType.int32]
 
@@ -404,6 +405,10 @@ struct GpuSession:
         # 八十三起误配 n_heads，越界 784B 被分配器 slack 掩护未爆）
         self.d_attot = self.ctx.enqueue_create_buffer[DType.float64](
             self.n_heads * 8
+        )
+        # split-inner 部分和（hidden × 8 f64 上限；八十七）
+        self.d_dpart = self.ctx.enqueue_create_buffer[DType.float64](
+            self.hidden * 8
         )
         self.d_logits = self.ctx.enqueue_create_buffer[DType.float32](self.vocab)
         self.d_token = self.ctx.enqueue_create_buffer[DType.int32](1)
@@ -649,6 +654,7 @@ struct GpuSession:
         tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
         attn_smode: Int = 0, attn_tiles: Int = 8, dual_nx: Bool = False,
+        down_si: Int = 0,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -981,18 +987,42 @@ struct GpuSession:
             var x_down = self._src(2)
             # 六十九扫型：T128/O2 冠军（15.6 vs T256 15.8us）。
             if skip & SKIP_DOWN == 0:
-                self.ctx.enqueue_function[
-                    f16_matmul_fat_gpu[down_t, inner_ff, 2, False, True]
-                ](
-                    x_down.unsafe_ptr(),
-                    w_down,
-                    self.d_x.unsafe_ptr(),
-                    self.d_ws.unsafe_ptr(),
-                    Int32(inner_ff),
-                    Int32(self.hidden),
-                    grid_dim=(ceildiv(self.hidden, 2), 1, 1),
-                    block_dim=(down_t, 1, 1),
-                )
+                comptime if down_si > 0:
+                    # split-inner（八十七）：块数 ×down_si、每块 x/w 只装
+                    # 1/down_si chunk，combine 微核 s 升序收口 + 残差 ACC。
+                    self.ctx.enqueue_function[
+                        f16_matmul_fat_si_gpu[down_t, inner_ff, 2, down_si]
+                    ](
+                        x_down.unsafe_ptr(),
+                        w_down,
+                        self.d_dpart.unsafe_ptr(),
+                        Int32(inner_ff),
+                        Int32(self.hidden),
+                        grid_dim=(ceildiv(self.hidden, 2), down_si, 1),
+                        block_dim=(down_t, 1, 1),
+                    )
+                    self.ctx.enqueue_function[
+                        fat_si_comb_gpu[8, down_si, True]
+                    ](
+                        self.d_dpart.unsafe_ptr(),
+                        self.d_x.unsafe_ptr(),
+                        Int32(self.hidden),
+                        grid_dim=(ceildiv(self.hidden, 8), 1, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_matmul_fat_gpu[down_t, inner_ff, 2, False, True]
+                    ](
+                        x_down.unsafe_ptr(),
+                        w_down,
+                        self.d_x.unsafe_ptr(),
+                        self.d_ws.unsafe_ptr(),
+                        Int32(inner_ff),
+                        Int32(self.hidden),
+                        grid_dim=(ceildiv(self.hidden, 2), 1, 1),
+                        block_dim=(down_t, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[noop_gpu](
                     grid_dim=(1, 1, 1), block_dim=(32, 1, 1)

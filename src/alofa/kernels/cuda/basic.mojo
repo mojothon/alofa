@@ -9,7 +9,7 @@
 Float64 累加、先 rsqrt 再乘。任何自己发明的顺序都会把真正的差异藏进舍入里。
 """
 
-from std.gpu import global_idx, thread_idx, block_idx
+from std.gpu import global_idx, thread_idx, block_idx, grid_dim
 from std.math import sqrt
 from std.memory import bitcast, stack_allocation
 
@@ -393,3 +393,36 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
             var o = o0 + oo
             if o < Int(out_cols):
                 dst[unsafe_offset=row * Int(out_cols) + o] = Float32(sacc[unsafe_offset=oo * THREADS])
+
+
+def hbm_probe_f16_gpu[THREADS: Int](
+    src: Pointer[Float16, MutUntrackedOrigin],
+    sink: Pointer[Float64, MutUntrackedOrigin],
+    n_elem: Int32,
+) -> None:
+    """HBM 纯流式探针（账本八十七，诊断工具）：每块连续条带 f16
+    load[8] 累加，f64 树收口写 1 值防 DCE。量盒子对 f16 权值布局的
+    真实带宽上限（与 head/dual/down 的 670-800GB/s 对照）。"""
+    var bid = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var per_block = Int(n_elem) // Int(grid_dim.x)
+    var base = bid * per_block
+    var acc = Float64(0)
+    var k = tid * 8
+    while k < per_block:
+        var wv = src.load[8](base + k)
+        @parameter
+        for j in range(8):
+            acc += Float64(Float32(wv[j]))
+        k += THREADS * 8
+    var sred = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+    sred[unsafe_offset=tid] = acc
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            sred[unsafe_offset=tid] += sred[unsafe_offset=tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        sink[unsafe_offset=bid] = sred[unsafe_offset=0]
