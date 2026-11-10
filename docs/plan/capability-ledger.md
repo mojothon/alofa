@@ -3398,3 +3398,12 @@
   - **分组 host 时刻戳（lts 法）**：发射 0.43ms/层 × 12 = 12.4ms（~0.3ms/launch，AsyncRT worker 层）、tail 发射 3.3-3.9ms、GPU ~1ms——**生产 45ms ≈ 发射 12 + sync 神秘 30-70**。
   - **修复落地（门全绿）**：① kernel 特化提为方法内 alias（LMHEAD_K 等 10 个）；② prefill_step 加 `sync_tail: Bool = True` 运行时参——**流水化调用路径可跳过尾部 sync**。
   - **九十五攻击面**：① AsyncRT sync 神秘等待机制（升级 MAX/AsyncRT 版本对照 / MAX_WORKER 环境变量）；② 流水化调用语义改造（sync_tail=False 的正确性协议：读 logits 前的单次轻同步）；③ 发射 0.3ms/launch 的构成（kernel 参数 marshalling vs worker 队列）——launch 融合（norm 进 bmm）直接减少发射数；④ 重放 1.9ms/层 vs 生产 3.75ms/层 的残余 2× 差。
+
+- **2026-11-10（第九十五条）** —— 🎯 45ms 终局解剖：host 发射 0.7ms、GPU 真实 43-51ms、probe-copy 法证伪、sync_tail 真正落地
+  - **绝对时刻戳对账法（本轮方法论）**：bench 侧 tka/tkb 与函数内 lts[0]/lts[19] 打同一时钟绝对值——单次调用双口径矛盾（发射 44 vs 函数体 4.5）最终对齐。
+  - **真凶落网**：prefill 尾部有一个九十三时代遗留的**无条件裸 synchronize()**（lts[18]→lts[19] 段 48.8ms）——sync_tail 参数此前根本没包住真正的 final sync。**修复：裸 sync 包进 `if sync_tail:`（门 bit-exact 全绿）**。
+  - **修复后口径**：发射 0.69-0.74ms（123 launch × ~2.9µs，noop 标定 200 launch=0.58ms 实证消化速率）+ **sync 等待 43.4→45.8→48.7→51.4ms（随 kv_len 128→512 线性增长）**。
+  - **probe-copy 法证伪**：D2H copy 走 AsyncRT 独立 memcpy stream，其返回≠kernel stream 完成——九十四"GPU ~1ms"结论作废，"GPU 空闲下 sync 等待 44ms"重新解读为**GPU 真实执行 43-51ms**。
+  - **sync 语义恢复正常解读**：九十四的"sync 跳变"实为不同调用点 sync 时机不同；`asyncrt.await.spinning/sleeping` + `MODULAR_THREAD_BUSY_WAIT_US=10s` 实验无效——不是 worker 等待机制。
+  - **未解残余（九十六）**：生产每层 GPU ~3.6ms vs 手写重放 1.9ms/层（同参数逐字节对照仅做过 o launch；qkv/dual/down/attention 未对照）——1.9× 差在 GPU 执行本身。sync-profile 段谱（12 层重算）：tri 0.68 + o 1.25 + ff 1.28 + down 0.67 ≈ 3.9/层——o/ff 回归为最大目标。
+  - **工程红线**：session max_tokens ≤ 512（rope 表 = model.cos 仅 512 行，>512 段错误 crash）。

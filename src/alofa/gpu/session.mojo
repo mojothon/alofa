@@ -1395,7 +1395,8 @@ struct GpuSession:
             self.ctx.synchronize()
             prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
             prof_t0 = monotonic_ns()
-        self.ctx.synchronize()
+        if sync_tail:
+            self.ctx.synchronize()
         if profile:
             print("prof gather:", prof[0], "ms")
             print("prof tri:", prof[1], "ms")
