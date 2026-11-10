@@ -25,6 +25,7 @@ host 往返。
 """
 
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from alofa.core.ffi.posix import monotonic_ns
 
 from alofa.core.error import (
     ERR_INVALID_ARGUMENT,
@@ -1121,7 +1122,7 @@ struct GpuSession:
         prefill_rb: Int = 8,
         prefill_af: DType = DType.float64,
     ](
-        mut self, tokens: List[Int]
+        mut self, tokens: List[Int], profile: Bool = False
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -1151,6 +1152,10 @@ struct GpuSession:
         if kv_len > self.max_tokens:
             raise AlofaError(ERR_OUT_OF_RANGE, "kv store is full", "")
 
+        # 分段计时（profile=True 时段间 synchronize——破坏流水只看占比）
+        var prof = InlineArray[Float64, 10](fill=Float64(0))
+        var prof_t0 = monotonic_ns()
+
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
             PREFILL_MAX_BATCH
@@ -1170,6 +1175,10 @@ struct GpuSession:
             grid_dim=(ceildiv(t * self.hidden, 64), 1, 1),
             block_dim=(64, 1, 1),
         )
+        if profile:
+            self.ctx.synchronize()
+            prof[0] += Float64(monotonic_ns() - prof_t0) / 1e6
+            prof_t0 = monotonic_ns()
 
         for layer in range(self.n_layers):
             # tri：norm 前置单发（t 行一次，树序重组差在门容差内）+
@@ -1203,6 +1212,10 @@ struct GpuSession:
                 grid_dim=(max(self.q_out, self.kv_dim), ceildiv(t, prefill_rb), 1),
                 block_dim=(tri_t, 1, 1),
             )
+            if profile:
+                self.ctx.synchronize()
+                prof[1] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
             # attention 三趟 b 版：grid z = t
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
@@ -1226,6 +1239,22 @@ struct GpuSession:
                 grid_dim=(self.n_heads, 1, t),
                 block_dim=(attn_t, 1, 1),
             )
+            if profile:
+                self.ctx.synchronize()
+                prof[5] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
+            if profile:
+                self.ctx.synchronize()
+                prof[4] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
+            if profile:
+                self.ctx.synchronize()
+                prof[3] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
+            if profile:
+                self.ctx.synchronize()
+                prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
             self.ctx.enqueue_function[
                 attn_rs_b_gpu[attn_t, True, attn_tiles]
             ](
@@ -1278,6 +1307,10 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(o_t, 1, 1),
             )
+            if profile:
+                self.ctx.synchronize()
+                prof[6] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
             self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
@@ -1303,6 +1336,10 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.inter, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(dual_t, 1, 1),
             )
+            if profile:
+                self.ctx.synchronize()
+                prof[7] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
                 f16_bmm_fat_gpu[down_t, inner_ff, 2, prefill_rb, True, prefill_af]
@@ -1315,6 +1352,10 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(down_t, 1, 1),
             )
+            if profile:
+                self.ctx.synchronize()
+                prof[8] += Float64(monotonic_ns() - prof_t0) / 1e6
+                prof_t0 = monotonic_ns()
 
         # 末行终 norm + lm_head（只算末行 logits）
         self.ctx.enqueue_function[rmsnorm_gpu](
@@ -1338,6 +1379,21 @@ struct GpuSession:
             block_dim=(256, 1, 1),
         )
         self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
+        if profile:
+            self.ctx.synchronize()
+            prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
+            prof_t0 = monotonic_ns()
         self.ctx.synchronize()
+        if profile:
+            print("prof gather:", prof[0], "ms")
+            print("prof tri:", prof[1], "ms")
+            print("prof kvs:", prof[2], "ms")
+            print("prof scores:", prof[3], "ms")
+            print("prof vt2:", prof[4], "ms")
+            print("prof comb:", prof[5], "ms")
+            print("prof o:", prof[6], "ms")
+            print("prof ff:", prof[7], "ms")
+            print("prof down:", prof[8], "ms")
+            print("prof tail:", prof[9], "ms")
         self.kv_pos = kv_len
         return self.h_logits.unsafe_ptr()

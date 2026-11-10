@@ -3380,3 +3380,11 @@
   - **主战场重新定位**：down f32 单核 325µs (438 GB/s) → 全模型 prefill matmul 估 ~1-5ms，而 prefill_step 全步 45ms——**matmul 已降至个位数占比**，TTFT 瓶颈转移至 attention/kv/softmax/逐 token 核链路。MMA（九十一预案）对 TTFT 的收益上限从"10×"缩至"~2×"以内，优先级下降。
   - **tiled 系列维持全灭**（944-1571µs，含干净卡复核）；prof_bmm 全 16+ 臂数据已入档供九十三使用。
   - **九十三攻击面**：prefill_step 45ms 逐段分解（attention vs kv vs norm vs 发射开销）——先测出大头再动手；MMA 降级为 matmul 补完项（f32 档容差门下做）。
+
+- **2026-11-10（第九十三条）** —— 🔪 prefill 45ms 逐段分解：CPU 发射 5.4ms、GPU ~40ms；**真瓶颈 = INNER=896 的 qkv/o 核 k 迭代数不足**
+  - **插桩落地**：prefill_step 加 `profile: Bool = False` 运行时参（默认零开销、编译器裁剪），10 段计时（gather/tri/kvs/scores/vt2/comb/o/ff/down/tail）。门复验 bit-exact 逐位同八十八/八十三。
+  - **t=1 对照（43 launch、GPU≈0）**：无 profile 总 5.38ms → **CPU 发射+启动 ≈125µs/launch**；profile 段和 7.0ms。
+  - **t=128 对账闭合**：45.1ms ≈ CPU 5.4 + o~21 + qkv~13 + dual~6 + down~4 + attn/norm~2。**o+qkv 占 ~34ms（75%）**。
+  - **o/qkv vs down/dual 5× 的结构因子**：THREADS×8=1024 元素/迭代，INNER=896 → **单 k 迭代**——每线程仅 1 个 w load + 8 个 x load，无流水可谈，内存延迟全暴露；down/dual（INNER=4864）5 迭代流水 → 快 5×。session-env 连发 down = 518µs/launch（孤立 325，仅 1.6× 差）证明 session 环境无罪——**核结构就是原罪**。
+  - **九十四攻击面（按预期收益排序）**：① qkv/o 核 k 维重构——split-K（grid.z 拆 k-slice + 两阶段归约，f32 档容差门）或 THREADS 减半×块翻倍（总量不变但调度粒度细化）；② norm 融回 bmm 核（省 8 launch ≈ 1ms CPU + 一次 xnormb 读写）；③ CPU 发射 125µs/launch 的构成（参数打包 vs JIT 查找）——若可降至 ~50µs，43 launch 省 3ms。
+  - **工具链沉淀**：bench_prefill_profile（分段/无 profile/t=1 三口径一体）；arm_env（session-env 连发实验模板）。
