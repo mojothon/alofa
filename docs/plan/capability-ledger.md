@@ -3289,3 +3289,12 @@
   - **沉淀**：`smode` 参（默认 0）+ 两个新 bench（bench_scores_kernel 微核剥离法、bench_attn_t1024_ab）留作复裁；分相 bench 恢复 kv=300 口径。
   - **复验全绿**：门 21/21、decode diff 逐位同基线、argmax 287、layer0 PASS、bench_decode 2.534（基线带内）。
   - **到 2ms 剩余**：0.52ms。attention 下一步：j 分块跨块（grid=(14, TILES)，三趟：scores+tile max/sum → V 分块部分和 → 合并；预计 scores 15.4 → ~5µs，代价 +2 发射/层）。
+
+- **2026-11-10（第八十二条）** —— ⚡ **P5 步骤 4 续（attention 跨块分块轮）：2.523 → 2.418ms/token（414 tok/s，-0.105ms/-4.2%）；八十一的结构性判决兑现**
+  - **刀法**：三趟 kernel 替代单发 —— **K1** `attn_rs_gpu`（rope + scores 分块，grid=(14, TILES)，每块自算当前 token k 的 smem 副本免竞态，仅 tile 0 写 store 行）→ **K2** `attn_vt_gpu`（V 分块 + 块内冗余 softmax：gmax 无舍入序自由、gsum 树序与旧 total 同式 ⇒ 逐位同；exp 写回 scores 免二次 exp）→ **K3** `attn_comb_gpu`（tile 部分和合并 + 归一，微核）。SM 数 14 → 14×TILES。
+  - **裁决**：交错五轮（324 步）关键证据 —— **单 kernel 均值随 kv 单调爬升（2.40@kv102 → 2.81@kv282），tiles=4/8 平稳（~2.44）**：分块治的正是"kv 越大越亏"的 per-SM 天花板病，高 kv 段 **-0.32ms**。tiles=8 对 4 四轮小胜，默认 8。
+  - **数值**：scores 点积同 VEC 式同序、gmax 无舍入、gsum 树序同旧 ⇒ 前两趟逐位同；V 部分和按 tile×组重结合 ⇒ decode diff 0.008679390 → 0.008680582（第 6 位小数，门容差 0.037 内），argmax 287、layer0 normed 0.0、门 21/21。
+  - **发射账**：+2 发射/层（48 步 × ~2µs）被 SM×8 的收益吞掉还有余 —— 八十一"发射税吃掉收益"的担忧没发生。
+  - **坑在案**：struct 新缓冲区必须同时加字段声明 + import（`__init__` 赋值不够，编译期字段检查）。
+  - **复验全绿**：门 21/21、argmax 287、layer0 0.0、probe 1、prof 21、sections 61、bench_decode 2.418/2.419 复现。
+  - **到 2ms 剩余**：0.42ms。池子更新：attn 三趟后 ~0.3（K2 冗余 softmax 可去：gsum/gmax 存共享免逐块重算）+ dual 0.70（600GB/s 见顶）+ down 0.40 + head 0.35 + tri 0.25 + o 0.15 + 地板 0.31。下一轮候选：K2 冗余 softmax 消除（gsum 一次算三趟共享）或 down/dual 结构。

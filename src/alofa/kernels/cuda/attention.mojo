@@ -462,3 +462,227 @@ def attn_rope_gpu[
                     s_v[unsafe_offset=tid]
                 )
                 dst[unsafe_offset=q_head_base + tid] = Float32(acc / total)
+
+
+def attn_rs_gpu[
+    THREADS: Int, VEC: Bool = True, TILES: Int = 4,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    cos_row: Pointer[Float32, MutUntrackedOrigin],
+    sin_row: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+) -> None:
+    """K1（账本八十二，跨块 j 分块三趟之首趟）：rope(q/k) + scores
+    分块。grid=(n_heads, TILES) —— 八十一判决：14 块锁 per-SM 天花板
+    （scores 15.4µs@kv300），j 分块 ×TILES 倍 SM。每块自算当前 token
+    的 k rope smem 副本（七十三解法保留，免同 launch 跨块竞态），仅
+    tile 0 写 store 行（跨 kernel 可见，K2 直读 store 行无竞态）。
+    scores 点积同 VEC 式同序（d 升序）⇒ 逐位同旧。
+    """
+    var head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var q_head_base = head * Int(head_dim)
+    var kv_head_base = kv_head * Int(head_dim)
+    var kv_cols = Int(n_kv_heads) * Int(head_dim)
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var upto = Int(kv_len) - 1
+    var row = head * Int(kv_len)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var j0 = tile * chunk
+    var j1 = j0 + chunk
+    if j1 > nsc:
+        j1 = nsc
+
+    var s_k = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var half = Int(head_dim) // 2
+    if tid < half:
+        var d = tid
+        var a = q_src[unsafe_offset=q_head_base + d]
+        var b = q_src[unsafe_offset=q_head_base + d + half]
+        q_rot[unsafe_offset=q_head_base + d] = a * cos_row[
+            unsafe_offset=d
+        ] - b * sin_row[unsafe_offset=d]
+        q_rot[unsafe_offset=q_head_base + d + half] = (
+            b * cos_row[unsafe_offset=d + half]
+            + a * sin_row[unsafe_offset=d + half]
+        )
+    if tid < half:
+        var d = tid
+        var a = k_src[unsafe_offset=kv_head_base + d]
+        var b = k_src[unsafe_offset=kv_head_base + d + half]
+        var r1 = a * cos_row[unsafe_offset=d] - b * sin_row[unsafe_offset=d]
+        var r2 = b * cos_row[unsafe_offset=d + half] + a * sin_row[
+            unsafe_offset=d + half
+        ]
+        s_k[unsafe_offset=d] = r1
+        s_k[unsafe_offset=d + half] = r2
+        if tile == 0:
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d] = r1
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d + half] = r2
+    if tid < Int(head_dim):
+        if tile == 0:
+            v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = (
+                v_src[unsafe_offset=kv_head_base + tid]
+            )
+    barrier()
+
+    var jj = j0 + tid
+    while jj < j1:
+        var acc = Float64(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = jj * kv_cols + kv_head_base
+                var c8 = Int(head_dim) // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_head_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, Int(head_dim)):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_head_base + d]
+                    ) * Float64(k_store[unsafe_offset=kbase + d])
+        else:
+            for d in range(Int(head_dim)):
+                acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                    s_k[unsafe_offset=d]
+                )
+        scores[unsafe_offset=row + jj] = Float32(acc) * scale
+        jj += THREADS
+
+
+def attn_vt_gpu[
+    THREADS: Int, TILES: Int = 4,
+](
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tot: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+) -> None:
+    """K2（三趟之二）：V 相位分块 + 块内冗余 softmax。gmax 无舍入序
+    自由；gsum 树序与旧 total 相同（j=tid 步 THREADS）⇒ 逐位同；exp
+    写回 scores（旧流程同款，免二次 exp）。V 部分和按 tile×组重结合
+    （非 bit-exact，门 1e-5 容差 + argmax 判据）。j==upto 直读
+    v_store —— K1（上一 launch）已写定，跨 kernel 可见无竞态。
+    """
+    var head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var kv_head_base = kv_head * Int(head_dim)
+    var kv_cols = Int(n_kv_heads) * Int(head_dim)
+    var upto = Int(kv_len) - 1
+    var row = head * Int(kv_len)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var t0 = tile * chunk
+    var t1 = t0 + chunk
+    if t1 > nsc:
+        t1 = nsc
+
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var stot = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var best = LOWEST_FP32
+    var j = tid
+    while j <= upto:
+        var s = scores[unsafe_offset=row + j]
+        if s > best:
+            best = s
+        j += THREADS
+    smax[tid] = best
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var gmax = smax[0]
+
+    var total_local = Float64(0)
+    j = tid
+    while j <= upto:
+        var e = Float64(exp(Float64(scores[unsafe_offset=row + j] - gmax)))
+        scores[unsafe_offset=row + j] = Float32(e)
+        total_local += e
+        j += THREADS
+    stot[tid] = total_local
+    barrier()
+    stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    if tile == 0 and tid == 0:
+        tot[unsafe_offset=head] = stot[0]
+
+    var s_g = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var hd = Int(head_dim)
+    var groups = THREADS // hd
+    var d = tid % hd
+    var g = tid // hd
+    var acc = Float64(0)
+    var jj = t0 + g
+    while jj < t1:
+        acc += Float64(scores[unsafe_offset=row + jj]) * Float64(
+            v_store[unsafe_offset=jj * kv_cols + kv_head_base + d]
+        )
+        jj += groups
+    s_g[tid] = acc
+    barrier()
+    if g == 0:
+        var acc2 = s_g[tid]
+        for g2 in range(1, groups):
+            acc2 += s_g[tid + g2 * hd]
+        vpart[unsafe_offset=(head * TILES + tile) * hd + d] = Float32(acc2)
+
+
+def attn_comb_gpu[TILES: Int = 4](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tot: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    head_dim: Int32,
+) -> None:
+    """K3（三趟之三）：tile 部分和合并 + 归一。14 块 × head_dim 线程，
+    每 d 一次 TILES 加法 —— 微核（~1µs）。"""
+    var head = Int(block_idx.x)
+    var d = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    if d < hd:
+        var acc = Float64(0)
+        for t in range(TILES):
+            acc += Float64(vpart[unsafe_offset=(head * TILES + t) * hd + d])
+        dst[unsafe_offset=head * hd + d] = Float32(
+            acc / tot[unsafe_offset=head]
+        )

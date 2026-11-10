@@ -34,7 +34,8 @@ from alofa.core.error import (
 )
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
-from alofa.kernels.cuda.attention import attn_rope_gpu
+from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
+    attn_vt_gpu, attn_comb_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -177,6 +178,8 @@ struct GpuSession:
     var d_act: DeviceBuffer[DType.float32]
     var d_ws: DeviceBuffer[DType.float32]
     var d_scores: DeviceBuffer[DType.float32]
+    var d_vpart: DeviceBuffer[DType.float32]
+    var d_attot: DeviceBuffer[DType.float64]
     var d_logits: DeviceBuffer[DType.float32]
     var d_token: DeviceBuffer[DType.int32]
 
@@ -387,6 +390,14 @@ struct GpuSession:
         self.d_ws = self.ctx.enqueue_create_buffer[DType.float32](self.hidden)
         self.d_scores = self.ctx.enqueue_create_buffer[DType.float32](
             self.n_heads * max_tokens
+        )
+        # 跨块 j 分块三趟（账本八十二）：V 部分和（容量按 TILES=8 预留）
+        # 与每头 gsum。
+        self.d_vpart = self.ctx.enqueue_create_buffer[DType.float32](
+            self.n_heads * 8 * self.head_dim
+        )
+        self.d_attot = self.ctx.enqueue_create_buffer[DType.float64](
+            self.n_heads
         )
         self.d_logits = self.ctx.enqueue_create_buffer[DType.float32](self.vocab)
         self.d_token = self.ctx.enqueue_create_buffer[DType.int32](1)
@@ -631,7 +642,7 @@ struct GpuSession:
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
-        attn_smode: Int = 0,
+        attn_smode: Int = 0, attn_tiles: Int = 8,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -667,6 +678,13 @@ struct GpuSession:
         不变 ⇒ scores 逐位同）三轮一致 -0.017ms，默认开。⚠️ attention
         20µs/层的主导项仍未定位 —— 14 块 SM 饥饿是结构性的（j 分块
         跨块归约是下一刀），VEC 只是零头。
+        attn_tiles（账本八十二）：跨块 j 分块三趟的 tile 数（默认 8；
+        0 = 旧单 kernel 路径）。八十一判决 scores 锁 per-SM 天花板
+        （14 块 × 9.7GB/s）—— 三趟（K1 scores 分块 / K2 V 分块+冗余
+        softmax / K3 合并）把 SM 数 ×8。scores 与 total 逐位同旧，
+        V 部分和按 tile×组重结合（门 1e-5 + argmax 判据）。端到端
+        交错：单 kernel 均值随 kv 爬升（2.40→2.81@kv282），tiles=8
+        平稳（~2.44）——高 kv 段 -0.32ms；tiles=8 对 4 四轮小胜。
         skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
         路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
         拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令
@@ -755,28 +773,77 @@ struct GpuSession:
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
-                self.ctx.enqueue_function[
-                    attn_rope_gpu[
-                        attn_t, attn_vec, 0, attn_v2, attn_smode
-                    ]
-                ](
-                    self.d_attn.unsafe_ptr(),
-                    self.d_q_rot.unsafe_ptr(),
-                    self.d_q.unsafe_ptr(),
-                    self.d_k.unsafe_ptr(),
-                    self.d_v.unsafe_ptr(),
-                    pk,
-                    pv,
-                    cos_row,
-                    sin_row,
-                    self.d_scores.unsafe_ptr(),
-                    Int32(self.n_heads),
-                    Int32(self.n_kv_heads),
-                    Int32(self.head_dim),
-                    Int32(kv_len),
-                    grid_dim=(self.n_heads, 1, 1),
-                    block_dim=(attn_t, 1, 1),
-                )
+                comptime if attn_tiles > 0:
+                    # 跨块 j 分块三趟（账本八十二）：K1 scores ×TILES 块
+                    # → K2 V 分块（冗余 softmax）→ K3 合并。d_vpart 容量
+                    # 按 8 tile 预留，attn_tiles <= 8。
+                    self.ctx.enqueue_function[
+                        attn_rs_gpu[attn_t, attn_vec, attn_tiles]
+                    ](
+                        self.d_q_rot.unsafe_ptr(),
+                        self.d_q.unsafe_ptr(),
+                        self.d_k.unsafe_ptr(),
+                        self.d_v.unsafe_ptr(),
+                        pk,
+                        pv,
+                        cos_row,
+                        sin_row,
+                        self.d_scores.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        grid_dim=(self.n_heads, attn_tiles, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                    self.ctx.enqueue_function[
+                        attn_vt_gpu[attn_t, attn_tiles]
+                    ](
+                        self.d_scores.unsafe_ptr(),
+                        pv,
+                        self.d_vpart.unsafe_ptr(),
+                        self.d_attot.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        grid_dim=(self.n_heads, attn_tiles, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                    self.ctx.enqueue_function[
+                        attn_comb_gpu[attn_tiles]
+                    ](
+                        self.d_attn.unsafe_ptr(),
+                        self.d_vpart.unsafe_ptr(),
+                        self.d_attot.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.head_dim),
+                        grid_dim=(self.n_heads, 1, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        attn_rope_gpu[
+                            attn_t, attn_vec, 0, attn_v2, attn_smode
+                        ]
+                    ](
+                        self.d_attn.unsafe_ptr(),
+                        self.d_q_rot.unsafe_ptr(),
+                        self.d_q.unsafe_ptr(),
+                        self.d_k.unsafe_ptr(),
+                        self.d_v.unsafe_ptr(),
+                        pk,
+                        pv,
+                        cos_row,
+                        sin_row,
+                        self.d_scores.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        grid_dim=(self.n_heads, 1, 1),
+                        block_dim=(attn_t, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[noop_gpu](
                     grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
