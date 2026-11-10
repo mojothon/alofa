@@ -3337,3 +3337,13 @@
   - **HBM 纯流式探针（`hbm_probe_f16_gpu`，新锚点）**：512MB f16 流式读——18992 块 965、4748/2374 块 **1052 平台**、过度订阅（76k 块）反掉到 362（barrier 树主导）。**盒子 f16 流式上限 ≈1050GB/s**。
   - **战略结论**：权值族对上限的占比 = head 76% / dual 67% / down 64%——理论带宽余量 ~0.4ms，但三轮结构攻击（形状/split/nx）均未能把 dual/down 推向 head 的 76%。**f16 权值口径的结构地板 ≈2.1-2.2ms/token**；破 2ms 需换字节口径（权重量化，回到 q4 精度代价）或 MMA 路径（对本带宽界无益，仅益算力界）。2ms 目标在本盒 f16 口径下判定为**不可达**，建议后续轮转向：a) dual/down 向 76% 靠拢的微优化（~0.15ms）；b) 端到端系统口径（batch/多请求吞吐）。
   - **复验全绿**：diff 逐位同八十三基线、argmax 287、门 21、2.423。
+
+- **2026-11-10（第八十八条）** —— 🚀 **GPU batched prefill 落地（系统口径转折点）+ dual_o 证伪 + 三个测试侧陷阱**
+  - **dual_o 摊销证伪**：O8 +0.17、O16 +0.7（块数塌方 608/304，每线程负载链拉长反杀摊销）。dual/down 五路参数空间（tiles/threads/outs/norm/split）**全部穷尽**。
+  - **prefill_step（GpuSession）**：t 行批量前向。gather/rmsnorm 本就多行 capable；matmul 族 row=block_idx.y 直通 grid y=t；attention 三趟 batch 化（grid z=t，因果界 upto=pos0+b，scores 行=(b·heads+head)·kv_len，stride 取终态 kv_len）。`PREFILL_MAX_BATCH=128` 批缓冲 ~25MB；超长 prompt 调用方分块 = 天然 chunked prefill。
+  - **竞态发现与修复**：行 b 的 scores 读行 pos0..pos0+b-1 的 store 行 —— 同 launch 跨 block 写读竞态（decode 无此问题）。拆两发：`kv_store_b_gpu`（rope+落位）+ `attn_rs_b_gpu`（纯 scores），跨 kernel 边界可见。t=1/2/4/8 逐级二分定位。
+  - **数值门（test_session_prefill，双 PASS）**：row8 diff 0.0053、row9（decode 续接 prefill KV）diff 0.0061，argmax 一致（f16 门 0.003×ref_max）。
+  - **TTFT 基线（bench_prefill）**：128 tokens prefill **131ms** vs 逐 token decode ×128 = 315ms → **2.4×**。未达理论值的原因明确：当前 batch = B 个独立 GEMV，权重每行重读（38GB 流量）；真 GEMM 分块（x-tile 进 smem、权重每 RB 行共享一次）理论 3-6ms（20-40×）—— **这是下一轮的主战场**。
+  - **三个测试侧陷阱（记账防复发）**：① decode_step/prefill_step 共享 h_logits host 缓冲，第二次调用覆写第一次返回指针内容——先比对再步进；② CPU run 返回指针指向模型 arena，下一次 run 复用覆写——快照到自有序；③ CPU run 累积历史，row9 参照需独立模型单次跑 9 tokens。
+  - **修复悬空 import**：八十六删了 vt2r kernel 但 session import 残留（HEAD 上编译需靠远端 stale attention.mojo）——已清。
+  - **复验全绿**：门 21、decode diff 逐位同八十三、argmax 287、layer0/probe/prof 全过、2.416。

@@ -1,9 +1,11 @@
-"""dual_o 交错 A/B（账本七十八下半）。
+"""dual OUTS 摊销交错重扫（账本八十八）：每块固定成本（x 载入 +
+norm 树 + act 尾）摊到更多权重字节上。
 
-T128 拒绝后（bench_fat_ab：三轮一致 +0.15），剩 dual 的输出列宽 O：
-O4（默认，608 块…实为 ceildiv(4864,4)=1216 块 ×64 线程=35% 槽，4+4 链）
-→ O2（2432 块 ×64=70% 槽，2+2 链）/ O8（608 块=17%，8+8 链）。
-prof 六十九的 O4 冠军出自微基准（L2 暖假象），真链交错重裁。
+八十七锚定 HBM 上限 1050GB/s：head 76%（每块 14.3KB 权重，无
+norm）、dual 67%（每块 14.4KB 权重但有 x+norm 固定成本）。O4→O16
+块数 1216→304，固定成本 /4。O8 在七十五曾与 O4 打平（2.95 时代、
+K2' 之前）——管线结构已变，交错口径重扫。
+modes：o4（默认）/ o8 / o16。
 """
 
 from alofa.core.ffi.posix import monotonic_ns
@@ -15,9 +17,9 @@ comptime CONFIG = "tests/fixtures/qwen2.5-0.5b/config.tsv"
 comptime TOKEN = 42
 comptime INNER = 896
 comptime INNER_FF = 4864
-comptime PAIRS = 36
+comptime PAIRS = 24
 comptime WARMUP = 12
-comptime ROUNDS = 3
+comptime ROUNDS = 4
 comptime MAXT = WARMUP + 3 * PAIRS * ROUNDS + 12
 
 
@@ -27,11 +29,11 @@ def main() raises:
 
     for rep in range(3):
         _ = session.decode_step[INNER, INNER_FF](TOKEN)
-        _ = session.decode_step[INNER, INNER_FF, 64, 2](TOKEN)
         _ = session.decode_step[INNER, INNER_FF, 64, 8](TOKEN)
+        _ = session.decode_step[INNER, INNER_FF, 64, 16](TOKEN)
     session.ctx.synchronize()
 
-    var names = "O4(默认),O2,O8".split(",")
+    var names = "o4,o8,o16".split(",")
     for r in range(ROUNDS):
         var totals = InlineArray[Float64, 3](fill=0.0)
         var bests = InlineArray[Float64, 3](fill=1e30)
@@ -41,9 +43,9 @@ def main() raises:
                 if m == 0:
                     _ = session.decode_step[INNER, INNER_FF](TOKEN)
                 elif m == 1:
-                    _ = session.decode_step[INNER, INNER_FF, 64, 2](TOKEN)
-                else:
                     _ = session.decode_step[INNER, INNER_FF, 64, 8](TOKEN)
+                else:
+                    _ = session.decode_step[INNER, INNER_FF, 64, 16](TOKEN)
                 var ms = Float64(monotonic_ns() - t0) / 1e6
                 totals[m] += ms
                 if ms < bests[m]:

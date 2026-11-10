@@ -35,7 +35,8 @@ from alofa.core.error import (
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
-    attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, attn_vt2r_gpu
+    attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
+    kv_store_b_gpu, attn_rs_b_gpu, attn_vt2_b_gpu, attn_comb2_b_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -69,6 +70,10 @@ comptime SKIP_HEAD = 32  # 终 norm + lm_head
 comptime SKIP_GATHER = 64
 
 comptime F16_BUILD = True
+
+# prefill 批上限（账本八十八）：缓冲按此定宽；超长 prompt 由调用方分块
+# （分块间 KV 连续，天然 chunked prefill）。
+alias PREFILL_MAX_BATCH = 128
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -184,6 +189,19 @@ struct GpuSession:
     var d_vpart: DeviceBuffer[DType.float32]
     var d_attot: DeviceBuffer[DType.float64]
     var d_dpart: DeviceBuffer[DType.float64]
+    var d_xb: DeviceBuffer[DType.float32]
+    var d_qb: DeviceBuffer[DType.float32]
+    var d_kb: DeviceBuffer[DType.float32]
+    var d_vb: DeviceBuffer[DType.float32]
+    var d_qrot_b: DeviceBuffer[DType.float32]
+    var d_attnb: DeviceBuffer[DType.float32]
+    var d_gateb: DeviceBuffer[DType.float32]
+    var d_upb: DeviceBuffer[DType.float32]
+    var d_actb: DeviceBuffer[DType.float32]
+    var d_scoresb: DeviceBuffer[DType.float32]
+    var d_vpartb: DeviceBuffer[DType.float32]
+    var d_attotb: DeviceBuffer[DType.float64]
+    var d_tokenb: DeviceBuffer[DType.int32]
     var d_logits: DeviceBuffer[DType.float32]
     var d_token: DeviceBuffer[DType.int32]
 
@@ -410,6 +428,45 @@ struct GpuSession:
         self.d_dpart = self.ctx.enqueue_create_buffer[DType.float64](
             self.hidden * 8
         )
+        # prefill 批缓冲（账本八十八，PREFILL_MAX_BATCH 行）
+        var mb = PREFILL_MAX_BATCH
+        self.d_xb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.hidden
+        )
+        self.d_qb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.q_out
+        )
+        self.d_kb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.kv_dim
+        )
+        self.d_vb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.kv_dim
+        )
+        self.d_qrot_b = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.q_out
+        )
+        self.d_attnb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.q_out
+        )
+        self.d_gateb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.inter
+        )
+        self.d_upb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.inter
+        )
+        self.d_actb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.inter
+        )
+        self.d_scoresb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.n_heads * self.max_tokens
+        )
+        self.d_vpartb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.n_heads * 8 * self.head_dim
+        )
+        self.d_attotb = self.ctx.enqueue_create_buffer[DType.float64](
+            mb * self.n_heads * 8
+        )
+        self.d_tokenb = self.ctx.enqueue_create_buffer[DType.int32](mb)
         self.d_logits = self.ctx.enqueue_create_buffer[DType.float32](self.vocab)
         self.d_token = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.h_logits = self.ctx.enqueue_create_host_buffer[DType.float32](
@@ -1047,6 +1104,219 @@ struct GpuSession:
             self.ctx.enqueue_function[noop_gpu](
                 grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
             )
+        self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
+        self.ctx.synchronize()
+        self.kv_pos = kv_len
+        return self.h_logits.unsafe_ptr()
+
+    def prefill_step[
+        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
+        tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
+        attn_t: Int = 512, attn_tiles: Int = 8,
+    ](
+        mut self, tokens: List[Int]
+    ) raises -> Pointer[Float32, MutUntrackedOrigin]:
+        """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
+        gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
+        norm → lm_head（只算末行 logits）。
+
+        matmul 族（tri/o/dual/down）与 gather/rmsnorm 本就带 row 维
+        （row = block_idx.y / 一行一块）—— grid y=t 直通；attention
+        三趟用 b 版核（grid z=t，因果界 upto = pos0+b，scores 行 =
+        (b*heads+head)*kv_len，stride 取终态 kv_len）。逐行算术与
+        decode_step 同构（同核同序同树）；t=1 时与 decode_step 同门
+        容差。KV 追加在 device 侧 store，行 b 落绝对位置 pos0+b ——
+        多次调用即 chunked prefill，KV 连续。
+
+        返回 host logits 指针（末行，下次调用前有效）。
+        """
+        var t = len(tokens)
+        if t == 0:
+            raise AlofaError(ERR_INVALID_ARGUMENT, "no tokens given", "")
+        if t > PREFILL_MAX_BATCH:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "prefill batch exceeds capacity (chunk the prompt)",
+                "t=" + String(t) + " cap=" + String(PREFILL_MAX_BATCH),
+            )
+        var pos0 = self.kv_pos
+        var kv_len = pos0 + t
+        if kv_len > self.max_tokens:
+            raise AlofaError(ERR_OUT_OF_RANGE, "kv store is full", "")
+
+        # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
+        var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
+            PREFILL_MAX_BATCH
+        )
+        self.ctx.synchronize()
+        for i in range(PREFILL_MAX_BATCH):
+            ht[i] = Int32(tokens[i]) if i < t else Int32(0)
+        self.ctx.enqueue_copy(dst_buf=self.d_tokenb, src_buf=ht)
+
+        # gather：t 行 embedding（gather_gpu 本就按 t 行索引）
+        self.ctx.enqueue_function[gather_gpu](
+            self.d_xb.unsafe_ptr(),
+            self.d_embed.unsafe_ptr(),
+            self.d_tokenb.unsafe_ptr(),
+            Int32(self.hidden),
+            Int32(t),
+            grid_dim=(ceildiv(t * self.hidden, 64), 1, 1),
+            block_dim=(64, 1, 1),
+        )
+
+        for layer in range(self.n_layers):
+            # tri：row = block_idx.y = b；NORM 块逐行就地
+            self.ctx.enqueue_function[
+                f16_matmul_qkv_gpu[tri_t, inner, True, True]
+            ](
+                self.d_xb.unsafe_ptr(),
+                self.d_w16_q[layer].unsafe_ptr(),
+                self.d_w16_k[layer].unsafe_ptr(),
+                self.d_w16_v[layer].unsafe_ptr(),
+                self.d_qb.unsafe_ptr(),
+                self.d_kb.unsafe_ptr(),
+                self.d_vb.unsafe_ptr(),
+                self.d_bias_q[layer].unsafe_ptr(),
+                self.d_bias_k[layer].unsafe_ptr(),
+                self.d_bias_v[layer].unsafe_ptr(),
+                self.d_norms[2 * layer].unsafe_ptr(),
+                self.eps,
+                Int32(inner),
+                Int32(self.q_out),
+                Int32(self.kv_dim),
+                grid_dim=(max(self.q_out, self.kv_dim), t, 1),
+                block_dim=(tri_t, 1, 1),
+            )
+            # attention 三趟 b 版：grid z = t
+            var pk = self.d_k_store[layer].unsafe_ptr()
+            var pv = self.d_v_store[layer].unsafe_ptr()
+            # store 与 scores 分跨 launch 边界（同 launch 跨 block 写读
+            # store 行是竞态：行 b 读 pos0..pos0+b-1，全由本批写入）。
+            self.ctx.enqueue_function[
+                kv_store_b_gpu[attn_t]
+            ](
+                self.d_qrot_b.unsafe_ptr(),
+                self.d_qb.unsafe_ptr(),
+                self.d_kb.unsafe_ptr(),
+                self.d_vb.unsafe_ptr(),
+                pk,
+                pv,
+                self.d_cos.unsafe_ptr(),
+                self.d_sin.unsafe_ptr(),
+                Int32(self.n_heads),
+                Int32(self.n_kv_heads),
+                Int32(self.head_dim),
+                Int32(pos0),
+                grid_dim=(self.n_heads, 1, t),
+                block_dim=(attn_t, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                attn_rs_b_gpu[attn_t, True, attn_tiles]
+            ](
+                self.d_qrot_b.unsafe_ptr(),
+                pk,
+                self.d_scoresb.unsafe_ptr(),
+                Int32(self.n_heads),
+                Int32(self.n_kv_heads),
+                Int32(self.head_dim),
+                Int32(kv_len),
+                Int32(pos0),
+                grid_dim=(self.n_heads, attn_tiles, t),
+                block_dim=(attn_t, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                attn_vt2_b_gpu[attn_t, attn_tiles]
+            ](
+                self.d_scoresb.unsafe_ptr(),
+                pv,
+                self.d_vpartb.unsafe_ptr(),
+                self.d_attotb.unsafe_ptr(),
+                Int32(self.n_heads),
+                Int32(self.n_kv_heads),
+                Int32(self.head_dim),
+                Int32(kv_len),
+                Int32(pos0),
+                grid_dim=(self.n_heads, attn_tiles, t),
+                block_dim=(attn_t, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                attn_comb2_b_gpu[attn_tiles]
+            ](
+                self.d_attnb.unsafe_ptr(),
+                self.d_vpartb.unsafe_ptr(),
+                self.d_attotb.unsafe_ptr(),
+                Int32(self.n_heads),
+                Int32(self.head_dim),
+                grid_dim=(self.n_heads, 1, t),
+                block_dim=(attn_t, 1, 1),
+            )
+            # o：ACC 进 d_xb（残差），row = b
+            self.ctx.enqueue_function[
+                f16_matmul_fat_gpu[o_t, inner, 2, False, True]
+            ](
+                self.d_attnb.unsafe_ptr(),
+                self.d_w16_o[layer].unsafe_ptr(),
+                self.d_xb.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                Int32(inner),
+                Int32(self.hidden),
+                grid_dim=(ceildiv(self.hidden, 2), t, 1),
+                block_dim=(o_t, 1, 1),
+            )
+            # dual：NORM + act 尾缀，row = b
+            self.ctx.enqueue_function[
+                f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
+            ](
+                self.d_xb.unsafe_ptr(),
+                self.d_w16_gate[layer].unsafe_ptr(),
+                self.d_w16_up[layer].unsafe_ptr(),
+                self.d_gateb.unsafe_ptr(),
+                self.d_upb.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                self.d_proj.unsafe_ptr(),
+                self.d_actb.unsafe_ptr(),
+                self.d_norms[2 * layer + 1].unsafe_ptr(),
+                self.eps,
+                Int32(inner),
+                Int32(self.inter),
+                grid_dim=(ceildiv(self.inter, dual_o), t, 1),
+                block_dim=(dual_t, 1, 1),
+            )
+            # down：吃 d_actb，ACC 进 d_xb
+            self.ctx.enqueue_function[
+                f16_matmul_fat_gpu[down_t, inner_ff, 2, False, True]
+            ](
+                self.d_actb.unsafe_ptr(),
+                self.d_w16_down[layer].unsafe_ptr(),
+                self.d_xb.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                Int32(inner_ff),
+                Int32(self.hidden),
+                grid_dim=(ceildiv(self.hidden, 2), t, 1),
+                block_dim=(down_t, 1, 1),
+            )
+
+        # 末行终 norm + lm_head（只算末行 logits）
+        self.ctx.enqueue_function[rmsnorm_gpu](
+            self.d_xb.unsafe_ptr() + (t - 1) * self.hidden,
+            self.d_norms[2 * self.n_layers].unsafe_ptr(),
+            self.d_normed.unsafe_ptr(),
+            Int32(self.hidden),
+            Int32(1),
+            self.eps,
+            grid_dim=(1, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
+            self.d_normed.unsafe_ptr(),
+            self.d_embed16.unsafe_ptr(),
+            self.d_logits.unsafe_ptr(),
+            self.d_ws.unsafe_ptr(),
+            self.eps,
+            Int32(self.vocab),
+            grid_dim=(ceildiv(self.vocab, 8), 1, 1),
+            block_dim=(256, 1, 1),
+        )
         self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         self.ctx.synchronize()
         self.kv_pos = kv_len
