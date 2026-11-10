@@ -453,6 +453,265 @@ def q4_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool](
             dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
 
 
+def f16_bmm_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """真 GEMM 分块 fat（账本八十九，prefill 主战场）：每 block 计算
+    OUTS 个输出 × RB 行 —— 权重每 RB 行只读一次（w 载入提出 rr 环），
+    x tile 走 L2（t×INNER f32 ≈ MB 级，L2 40MB 装得下）。
+
+    与 batched-GEMV 版（八十八，grid y=t 每行重读全部权重）的差别
+    就是 w 流量：t×矩阵 → ceil(t/RB)×矩阵。每输出累加序与 fat 核
+    同构（k 升序 tid 步 THREADS*8、j 升序、THREADS 树收口）⇒ 与旧
+    路径逐位一致。ACC 语义同 fat（残差就地累加）。RB=8 时 acc 16
+    路 f64 全寄存器；sacc 树收口 16KB smem。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, OUTS * RB](0)
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            var k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8](w_base + k)
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var xv = x.load[8](r * Int(INNER) + k)
+                        @parameter
+                        for j in range(8):
+                            comptime if AF == DType.float64:
+                                acc[oo * RB + rr] += Scalar[AF](
+                                    Float64(xv[j]) * Float64(Float32(wv[j]))
+                                )
+                            else:
+                                acc[oo * RB + rr] += Scalar[AF](xv[j] * Float32(wv[j]))
+                k += THREADS * 8
+    var sacc = stack_allocation[
+        OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * THREADS]
+                        )
+                        comptime if ACC:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = (
+                                dst[unsafe_offset=r * Int(out_cols) + o] + v
+                            )
+                        else:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = v
+
+
+def f16_bmm_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """真 GEMM 分块 dual（账本八十九）：gate/up 双链 × RB 行，w 载入
+    每 RB 行一次。x 为预归一化流（rmsnorm 前置单发，t 行一次 ——
+    norm 树序与 in-kernel NORM 合法重组差，门容差覆盖）。每输出累加
+    序与 dual 核同构（k 升序、j 升序、THREADS 树）⇒ 逐位同。act 尾
+    同款：sigmoid(g)·g·up。RB=8 时 acc 32 路 f64。"""
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, 2 * OUTS * RB](0)
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            var k = tid * 8
+            while k < Int(INNER):
+                var wav = w_a.load[8](w_base + k)
+                var wbv = w_b.load[8](w_base + k)
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var xv = x.load[8](r * Int(INNER) + k)
+                        @parameter
+                        for j in range(8):
+                            comptime if AF == DType.float64:
+                                acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                    Float64(xv[j]) * Float64(Float32(wav[j]))
+                                )
+                                acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                    Float64(xv[j]) * Float64(Float32(wbv[j]))
+                                )
+                            else:
+                                acc[(oo * RB + rr) * 2] += Scalar[AF](xv[j] * Float32(wav[j]))
+                                acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](xv[j] * Float32(wbv[j]))
+                k += THREADS * 8
+    var sacc = stack_allocation[
+        2 * OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(2 * OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(2 * OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * 2 * THREADS]
+                        )
+                        var v2 = Float32(
+                            sacc[unsafe_offset=((oo * RB + rr) * 2 + 1) * THREADS]
+                        )
+                        dst_a[unsafe_offset=r * Int(out_cols) + o] = v
+                        dst_b[unsafe_offset=r * Int(out_cols) + o] = v2
+                        var g = Float64(v)
+                        dst_act[unsafe_offset=r * Int(out_cols) + o] = Float32(
+                            g / (Float64(1) + exp(-g)) * Float64(v2)
+                        )
+
+
+def f16_bmm_qkv_gpu[THREADS: Int, INNER: Int, RB: Int, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_q: Pointer[Float16, MutUntrackedOrigin],
+    w_k: Pointer[Float16, MutUntrackedOrigin],
+    w_v: Pointer[Float16, MutUntrackedOrigin],
+    bias_q: Pointer[Float32, MutUntrackedOrigin],
+    bias_k: Pointer[Float32, MutUntrackedOrigin],
+    bias_v: Pointer[Float32, MutUntrackedOrigin],
+    dst_q: Pointer[Float32, MutUntrackedOrigin],
+    dst_k: Pointer[Float32, MutUntrackedOrigin],
+    dst_v: Pointer[Float32, MutUntrackedOrigin],
+    q_out: Int32,
+    kv_out: Int32,
+    n_rows: Int32,
+) -> None:
+    """真 GEMM 分块 qkv（账本八十九）：q/k/v 三链 × RB 行（OUTS=1，
+    grid x = max(q_out, kv_out)，o 守卫分派三路），w 每 RB 行一次。
+    x 为预归一化流。每输出累加序与 qkv 核同构 ⇒ 逐位同；bias 尾加
+    同款。acc 24 路 f64。"""
+    var o = Int(block_idx.x)
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, 4 * RB](0)
+    @parameter
+    for seg in range(3):
+        var active = False
+        var w = w_q
+        comptime if seg == 0:
+            active = o < Int(q_out)
+            w = w_q
+        elif seg == 1:
+            active = o < Int(kv_out)
+            w = w_k
+        else:
+            active = o < Int(kv_out)
+            w = w_v
+        if active:
+            var w_base = o * Int(INNER)
+            var k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8](w_base + k)
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var xv = x.load[8](r * Int(INNER) + k)
+                        @parameter
+                        for j in range(8):
+                            comptime if AF == DType.float64:
+                                acc[seg * RB + rr] += Scalar[AF](
+                                    Float64(xv[j]) * Float64(Float32(wv[j]))
+                                )
+                            else:
+                                acc[seg * RB + rr] += Scalar[AF](xv[j] * Float32(wv[j]))
+                k += THREADS * 8
+    var sacc = stack_allocation[
+        3 * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(3 * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(3 * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        if o < Int(q_out):
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var v = Float32(sacc[unsafe_offset=rr * THREADS])
+                    v = v + bias_q[unsafe_offset=o]
+                    dst_q[unsafe_offset=r * Int(q_out) + o] = v
+        if o < Int(kv_out):
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var vk = Float32(sacc[unsafe_offset=(RB + rr) * THREADS])
+                    var vv = Float32(sacc[unsafe_offset=(2 * RB + rr) * THREADS])
+                    vk = vk + bias_k[unsafe_offset=o]
+                    vv = vv + bias_v[unsafe_offset=o]
+                    dst_k[unsafe_offset=r * Int(kv_out) + o] = vk
+                    dst_v[unsafe_offset=r * Int(kv_out) + o] = vv
+
 def f16_matmul_fat_si_gpu[THREADS: Int, INNER: Int, OUTS: Int, SPLIT: Int](
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float16, MutUntrackedOrigin],

@@ -3347,3 +3347,11 @@
   - **三个测试侧陷阱（记账防复发）**：① decode_step/prefill_step 共享 h_logits host 缓冲，第二次调用覆写第一次返回指针内容——先比对再步进；② CPU run 返回指针指向模型 arena，下一次 run 复用覆写——快照到自有序；③ CPU run 累积历史，row9 参照需独立模型单次跑 9 tokens。
   - **修复悬空 import**：八十六删了 vt2r kernel 但 session import 残留（HEAD 上编译需靠远端 stale attention.mojo）——已清。
   - **复验全绿**：门 21、decode diff 逐位同八十三、argmax 287、layer0/probe/prof 全过、2.416。
+
+- **2026-11-10（第八十九条）** —— 🚀 **真 GEMM 分块落地（prefill 主战场第一刀）：同核 A/B 2×，双数值门 bit-exact PASS；共享卡噪声入档**
+  - **三核落地（`f16_bmm_fat/dual/qkv_gpu`）**：每 block 计算 OUTS 输出 × RB 行——w 载入提出 rr 环（权重每 RB 行一次读，流量 t×矩阵 → ceil(t/RB)×矩阵），x tile 走 L2（5.2GB@4TB/s ≈ 1.3ms 非瓶颈）。norm 前置单发（rmsnorm_gpu 本就多行 capable）。每输出累加序与 fat/dual/qkv 同构 ⇒ **f64 档与八十八路径 bit-exact**（row8/row9 diff 逐位相同）。RB/AF 均 comptime 参（AF=f64 默认保 bit-exact，f32 备选）。
+  - **同核 A/B（bench_prefill_rb，rb=1 即 GEMV 行为）**：rb=8 vs rb=1 ≈ **2×**（~130-166ms vs ~230-341ms，128 tokens）。理论（权重 4.8GB@1050 = 4.6ms）未达——**f64 FMA 吞吐/发射界**确诊：每 FMA 2 条 cvt 挤占发射口，FP64 有效利用率 ~11%；f32 档仅 -10%（cvt 假说只兑现一小部分，且在共享卡噪声边缘）。
+  - **测试侧陷阱两个**：① bench 位序 kv 超卖（3 档 × 2 rep × 128 = 768 > max_tokens 512 → "kv store is full"——rb=16 的"崩溃"实为同一原因，非 smem）；② SIMD[DType.float64] 语法三连坑（f64 别名不存在、DType 需 DType.float64、DType 无 __is__ 用 ==、lane += 需 Scalar[AF] 包装）。
+  - **共享卡噪声入档**：卡3 被邻居占满（decode 7.5ms vs 惯常 2.42）——跨轮对比必须换卡重锚定基线；卡2 也有 ±30% 波动（decode mean 3.64 vs best 2.48）——同核同进程 A/B 是唯一可信口径。
+  - **复验全绿**：门 21、decode diff 逐位同八十三、argmax 287、layer0/probe/prof 全过、prefill 双门 bit-exact 同八十八。
+  - **下一步**：TTFT 仍 ~150ms 距 4.6ms 带宽地板 30×——需 MMA/tensor core（FP16 进 f32 acc，312 TFLOPS 级）或 w 载入形态重构；共享卡噪声下建议先做长窗口多次采样（每组 ≥10 rep 取 min）再比。

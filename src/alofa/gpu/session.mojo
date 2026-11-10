@@ -49,6 +49,7 @@ from alofa.kernels.cuda.matmul import (
     f16_matmul_dual_gpu,
     q4_matmul_dual_fat_gpu,
     f16_matmul_fat_gpu, f16_matmul_fat_si_gpu, fat_si_comb_gpu,
+    f16_bmm_fat_gpu, f16_bmm_dual_gpu, f16_bmm_qkv_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -198,6 +199,7 @@ struct GpuSession:
     var d_gateb: DeviceBuffer[DType.float32]
     var d_upb: DeviceBuffer[DType.float32]
     var d_actb: DeviceBuffer[DType.float32]
+    var d_xnormb: DeviceBuffer[DType.float32]
     var d_scoresb: DeviceBuffer[DType.float32]
     var d_vpartb: DeviceBuffer[DType.float32]
     var d_attotb: DeviceBuffer[DType.float64]
@@ -456,6 +458,9 @@ struct GpuSession:
         )
         self.d_actb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.inter
+        )
+        self.d_xnormb = self.ctx.enqueue_create_buffer[DType.float32](
+            mb * self.hidden
         )
         self.d_scoresb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.n_heads * self.max_tokens
@@ -1113,6 +1118,8 @@ struct GpuSession:
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_tiles: Int = 8,
+        prefill_rb: Int = 8,
+        prefill_af: DType = DType.float64,
     ](
         mut self, tokens: List[Int]
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -1165,26 +1172,35 @@ struct GpuSession:
         )
 
         for layer in range(self.n_layers):
-            # tri：row = block_idx.y = b；NORM 块逐行就地
-            self.ctx.enqueue_function[
-                f16_matmul_qkv_gpu[tri_t, inner, True, True]
-            ](
+            # tri：norm 前置单发（t 行一次，树序重组差在门容差内）+
+            # 真 GEMM 分块（八十九）：权重每 RB 行一次读，x 走 L2。
+            self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
+                self.d_norms[2 * layer].unsafe_ptr(),
+                self.d_xnormb.unsafe_ptr(),
+                Int32(inner),
+                Int32(t),
+                self.eps,
+                grid_dim=(t, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                f16_bmm_qkv_gpu[tri_t, inner, prefill_rb, prefill_af]
+            ](
+                self.d_xnormb.unsafe_ptr(),
                 self.d_w16_q[layer].unsafe_ptr(),
                 self.d_w16_k[layer].unsafe_ptr(),
                 self.d_w16_v[layer].unsafe_ptr(),
-                self.d_qb.unsafe_ptr(),
-                self.d_kb.unsafe_ptr(),
-                self.d_vb.unsafe_ptr(),
                 self.d_bias_q[layer].unsafe_ptr(),
                 self.d_bias_k[layer].unsafe_ptr(),
                 self.d_bias_v[layer].unsafe_ptr(),
-                self.d_norms[2 * layer].unsafe_ptr(),
-                self.eps,
-                Int32(inner),
+                self.d_qb.unsafe_ptr(),
+                self.d_kb.unsafe_ptr(),
+                self.d_vb.unsafe_ptr(),
                 Int32(self.q_out),
                 Int32(self.kv_dim),
-                grid_dim=(max(self.q_out, self.kv_dim), t, 1),
+                Int32(t),
+                grid_dim=(max(self.q_out, self.kv_dim), ceildiv(t, prefill_rb), 1),
                 block_dim=(tri_t, 1, 1),
             )
             # attention 三趟 b 版：grid z = t
@@ -1250,49 +1266,53 @@ struct GpuSession:
                 grid_dim=(self.n_heads, 1, t),
                 block_dim=(attn_t, 1, 1),
             )
-            # o：ACC 进 d_xb（残差），row = b
+            # o：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
-                f16_matmul_fat_gpu[o_t, inner, 2, False, True]
+                f16_bmm_fat_gpu[o_t, inner, 2, prefill_rb, True, prefill_af]
             ](
                 self.d_attnb.unsafe_ptr(),
                 self.d_w16_o[layer].unsafe_ptr(),
                 self.d_xb.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                Int32(inner),
                 Int32(self.hidden),
-                grid_dim=(ceildiv(self.hidden, 2), t, 1),
+                Int32(t),
+                grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(o_t, 1, 1),
             )
-            # dual：NORM + act 尾缀，row = b
-            self.ctx.enqueue_function[
-                f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
-            ](
+            # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
+            self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
+                self.d_norms[2 * layer + 1].unsafe_ptr(),
+                self.d_xnormb.unsafe_ptr(),
+                Int32(inner),
+                Int32(t),
+                self.eps,
+                grid_dim=(t, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                f16_bmm_dual_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
+            ](
+                self.d_xnormb.unsafe_ptr(),
                 self.d_w16_gate[layer].unsafe_ptr(),
                 self.d_w16_up[layer].unsafe_ptr(),
                 self.d_gateb.unsafe_ptr(),
                 self.d_upb.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                self.d_proj.unsafe_ptr(),
                 self.d_actb.unsafe_ptr(),
-                self.d_norms[2 * layer + 1].unsafe_ptr(),
-                self.eps,
-                Int32(inner),
                 Int32(self.inter),
-                grid_dim=(ceildiv(self.inter, dual_o), t, 1),
+                Int32(t),
+                grid_dim=(ceildiv(self.inter, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(dual_t, 1, 1),
             )
-            # down：吃 d_actb，ACC 进 d_xb
+            # down：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
-                f16_matmul_fat_gpu[down_t, inner_ff, 2, False, True]
+                f16_bmm_fat_gpu[down_t, inner_ff, 2, prefill_rb, True, prefill_af]
             ](
                 self.d_actb.unsafe_ptr(),
                 self.d_w16_down[layer].unsafe_ptr(),
                 self.d_xb.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                Int32(inner_ff),
                 Int32(self.hidden),
-                grid_dim=(ceildiv(self.hidden, 2), t, 1),
+                Int32(t),
+                grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(down_t, 1, 1),
             )
 
