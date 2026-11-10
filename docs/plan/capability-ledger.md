@@ -3407,3 +3407,33 @@
   - **sync 语义恢复正常解读**：九十四的"sync 跳变"实为不同调用点 sync 时机不同；`asyncrt.await.spinning/sleeping` + `MODULAR_THREAD_BUSY_WAIT_US=10s` 实验无效——不是 worker 等待机制。
   - **未解残余（九十六）**：生产每层 GPU ~3.6ms vs 手写重放 1.9ms/层（同参数逐字节对照仅做过 o launch；qkv/dual/down/attention 未对照）——1.9× 差在 GPU 执行本身。sync-profile 段谱（12 层重算）：tri 0.68 + o 1.25 + ff 1.28 + down 0.67 ≈ 3.9/层——o/ff 回归为最大目标。
   - **工程红线**：session max_tokens ≤ 512（rope 表 = model.cos 仅 512 行，>512 段错误 crash）。
+
+- **2026-11-10（第九十六条）** —— 🔬 nsys 突破：GPU 时间线到手——生产与重放 launch 序列逐字节一致、但存在均匀 1.8× 慢执行区
+  - **nsys 可用**（/usr/local/cuda/bin/nsys，九十四时误判不可用）： + ERROR: No input file specified.。
+  - **launch 全参数逐字节对照**（python 块级提取并排 diff）：生产 10 launch/层与重放完全一致（kernel 名、Int32 参数、grid、block、buffer 指针）——序列无罪。
+  - **trace 铁证**：重放 12 层 GPU = 22.5ms（S21=3 rep×22.5）；生产 12 层 GPU = 23.1ms（S17 前 124 kernel，1.03×）——**但同一 trace 中存在 1.8× 慢区**：qkv 608 vs 330、dual 1149 vs 627、down 592 vs 331、o 250 vs 138、vt2 511 vs 330——**所有 kernel 同比慢 ~1.8×**（grid 相同）。
+  - **慢区位置**：紧随新 session 的 544MB H2D 权重上传（35.263s）之后的首个 prefill（35.29 区层 3.54ms）；快区（35.51 区层 2.37ms）在同 trace 稍后。
+  - **假说排除**：①冷权重预热无效（warm0/1 后 call 仍 48.65，同 session 第 3 次调用与第 1 次一样慢）；②launch 消化（noop 2.9µs/launch）；③BUSY_WAIT；④序列/参数差异。
+  - **未解（九十七）**：慢 1.8× 区与快区的切换条件不明——嫌疑收敛到 GPU 执行上下文（频率/功耗状态/L2 全局状态/AsyncRT 队列深度对 kernel 调度的影响）。下一步：NVTX range 精确标注每个 prefill 调用与重放 rep 的边界（ usage: nsys [--version] [--help] <command> [<args>] [application] [<application args>]
+
+ The most commonly used nsys commands are:
+	profile       Run an application and capture its profile into a nsys-rep file.
+	launch        Launch an application ready to be profiled.
+	start         Start a profiling session.
+	stop          Stop a profiling session and capture its profile into a nsys-rep file.
+	cancel        Cancel a profiling session and discard any collected data.
+	service       Launch the Nsight Systems data service.
+	stats         Generate statistics from an existing nsys-rep or SQLite file.
+	status        Provide current status of CLI or the collection environment.
+	shutdown      Disconnect launched processes from the profiler and shutdown the profiler.
+	sessions list List active sessions.
+	export        Export nsys-rep file into another format.
+	analyze       Identify optimization opportunities in a nsys-rep or SQLITE file.
+	recipe        Run a recipe for multi-node analysis.
+	nvprof        Translate nvprof switches to nsys switches and execute collection.
+
+ Use 'nsys --help <command>' for more information about a specific command.
+
+ To run a basic profiling session:   nsys profile ./my-application
+ For more details see "Profiling from the CLI" at https://docs.nvidia.com/nsight-systems），一次 trace 内交替触发慢/快区，锁定切换条件；辅以 nvidia-smi 时钟采样。
+  - **方法论**：trace 分段必须用强边界（sleep/usleep 插入）+ kernel 名+grid 双重对齐，仅靠时长模式分段会错位。

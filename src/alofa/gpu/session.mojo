@@ -1193,6 +1193,11 @@ struct GpuSession:
             prof_t0 = monotonic_ns()
 
         for layer in range(self.n_layers):
+            var ltri = 0.0
+            var lattn = 0.0
+            var lo = 0.0
+            var lff = 0.0
+            var ldown = 0.0
             # tri：norm 前置单发（t 行一次，树序重组差在门容差内）+
             # 真 GEMM 分块（八十九）：权重每 RB 行一次读，x 走 L2。
             self.ctx.enqueue_function[rmsnorm_gpu](
@@ -1227,6 +1232,7 @@ struct GpuSession:
             if profile:
                 self.ctx.synchronize()
                 prof[1] += Float64(monotonic_ns() - prof_t0) / 1e6
+                ltri = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # attention 三趟 b 版：grid z = t
             var pk = self.d_k_store[layer].unsafe_ptr()
@@ -1254,18 +1260,22 @@ struct GpuSession:
             if profile:
                 self.ctx.synchronize()
                 prof[5] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
                 self.ctx.synchronize()
                 prof[4] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
                 self.ctx.synchronize()
                 prof[3] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
                 self.ctx.synchronize()
                 prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             self.ctx.enqueue_function[
                 RS_K
@@ -1322,6 +1332,7 @@ struct GpuSession:
             if profile:
                 self.ctx.synchronize()
                 prof[6] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lo = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
             self.ctx.enqueue_function[rmsnorm_gpu](
@@ -1351,6 +1362,7 @@ struct GpuSession:
             if profile:
                 self.ctx.synchronize()
                 prof[7] += Float64(monotonic_ns() - prof_t0) / 1e6
+                lff = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
@@ -1367,6 +1379,9 @@ struct GpuSession:
             if profile:
                 self.ctx.synchronize()
                 prof[8] += Float64(monotonic_ns() - prof_t0) / 1e6
+                ldown = Float64(monotonic_ns() - prof_t0) / 1e6
+            if profile:
+                print("层", layer, "tri:", ltri, "attn:", lattn, "o:", lo, "ff:", lff, "down:", ldown)
                 prof_t0 = monotonic_ns()
 
         # 末行终 norm + lm_head（只算末行 logits）
