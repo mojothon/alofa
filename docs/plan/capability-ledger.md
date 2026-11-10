@@ -3372,3 +3372,11 @@
   - **bit-exact 保持**：载入形式变化不改数值——prefill row8/row9 diff 逐位同八十八（0.005281…/0.006142…），decode diff 逐位同八十三，门 21/layer0/probe/prof 全绿。
   - **prof_bmm 归档**：16 臂假说排除表（九十）+ vec/vec2 探针核。标量 LDG 假说其实统一解释了九十的全部"矛盾"：单因子小、组合爆炸（LDG×acc lanes×块数的发射口挤兑）。
   - **九十二攻击面**：① 干净卡重锚定全部数字（decode 收益确认）；② MMA/tensor core（剩余 6× 的唯一解，f16 v4 载入已就位）；③ 876µs→理论 132µs 的缺口 = LDG 发射 + 依赖停顿，MMA 把 FMA:LDG 比从 1:1.1 翻到 64:1。
+
+- **2026-11-10（第九十二条）** —— ⚖️ 干净卡重锚定：两旧结论修正 + 主战场重新定位（matmul 已非 prefill 瓶颈）
+  - **卡 4 空闲重锚定（全部 bit-exact 门同步全绿）**：decode **2.243ms/token（历史最佳，向量载入 decode 也 -8%）**；rb=1 f64 **56.8ms**（八十九口径 306ms → **5.4× 累计**）；rb=8 f64 61.3ms；**rb=8 f32 45.1ms/128tok**。九十一的折算（1.4×）低估了实际污染。
+  - **修正一（九十条"组合爆炸 14×"）**：干净卡上 RB8-n1-gridY1 = 16.9µs vs RB1-gridY16 = 16.8µs——**1×**！"超线性交互"是脏卡伪象（邻居负载对多块核打击更重）；唯一真毒就是标量 LDG（已修）。
+  - **修正二（decode-fat x-smem 路线）**：干净卡 decode-fat 12.5µs (700 GB/s) **慢于** bmm RB1 全局 x 8.1µs (**1084 GB/s ≈ HBM 满速**)——对齐向量载入后 x 进 smem 反而是负资产。
+  - **主战场重新定位**：down f32 单核 325µs (438 GB/s) → 全模型 prefill matmul 估 ~1-5ms，而 prefill_step 全步 45ms——**matmul 已降至个位数占比**，TTFT 瓶颈转移至 attention/kv/softmax/逐 token 核链路。MMA（九十一预案）对 TTFT 的收益上限从"10×"缩至"~2×"以内，优先级下降。
+  - **tiled 系列维持全灭**（944-1571µs，含干净卡复核）；prof_bmm 全 16+ 臂数据已入档供九十三使用。
+  - **九十三攻击面**：prefill_step 45ms 逐段分解（attention vs kv vs norm vs 发射开销）——先测出大头再动手；MMA 降级为 matmul 补完项（f32 档容差门下做）。
