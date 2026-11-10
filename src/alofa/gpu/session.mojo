@@ -1124,7 +1124,7 @@ struct GpuSession:
         prefill_af: DType = DType.float64,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
-        layer_gap_us: Int = 0
+        layer_gap_us: Int = 0, layer_gap_every: Int = 1
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -1384,10 +1384,12 @@ struct GpuSession:
                 ldown = Float64(monotonic_ns() - prof_t0) / 1e6
             if profile:
                 print("层", layer, "tri:", ltri, "attn:", lattn, "o:", lo, "ff:", lff, "down:", ldown)
-            # 账本九十七：层间功耗余量窗——连续满载 45ms 触发 A100 功耗墙降频
-            # （765/1410MHz = 0.54 ≈ 慢/快 kernel 倍率 1.84）。层末 sync+微 sleep
-            # 打断连续满载，实测 40.6→27.7ms（layer_gap_us=30 最优）。
-            if layer_gap_us > 0:
+            # 账本九十七/九十八：层间功耗余量窗——连续满载在机箱热压下触发
+            # A100 功耗墙降频（765/1410MHz = 0.54 ≈ 慢/快 kernel 倍率 1.84）。
+            # 每 layer_gap_every 层末 sync+usleep(layer_gap_us)；默认 0=关闭
+            # （安静环境连续执行即最优 22.3ms）。热环境推荐 (4,300)/(2,30)：
+            # 实测 40.6→23.3ms。安静环境开启反而略亏（23.3 vs 22.3）。
+            if layer_gap_us > 0 and (layer + 1) % layer_gap_every == 0:
                 self.ctx.synchronize()
                 _ = external_call["usleep", Int32](Int32(layer_gap_us))
                 prof_t0 = monotonic_ns()
