@@ -1122,7 +1122,7 @@ struct GpuSession:
         prefill_rb: Int = 8,
         prefill_af: DType = DType.float64,
     ](
-        mut self, tokens: List[Int], profile: Bool = False
+        mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -1155,6 +1155,18 @@ struct GpuSession:
         # 分段计时（profile=True 时段间 synchronize——破坏流水只看占比）
         var prof = InlineArray[Float64, 10](fill=Float64(0))
         var prof_t0 = monotonic_ns()
+
+        # 九十四：kernel 特化提为 alias（编译期构造，发射路径免重复特化查找）
+        alias NORM_K = rmsnorm_gpu
+        alias QKV_K = f16_bmm_qkv_gpu[tri_t, inner, prefill_rb, prefill_af]
+        alias KVS_K = kv_store_b_gpu[attn_t]
+        alias RS_K = attn_rs_b_gpu[attn_t, True, attn_tiles]
+        alias VT2_K = attn_vt2_b_gpu[attn_t, attn_tiles]
+        alias COMB_K = attn_comb2_b_gpu[attn_tiles]
+        alias O_K = f16_bmm_fat_gpu[o_t, inner, 2, prefill_rb, True, prefill_af]
+        alias DUAL_K = f16_bmm_dual_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
+        alias DOWN_K = f16_bmm_fat_gpu[down_t, inner_ff, 2, prefill_rb, True, prefill_af]
+        alias LMHEAD_K = linear_fat_f16_gpu[256, inner, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -1194,7 +1206,7 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_function[
-                f16_bmm_qkv_gpu[tri_t, inner, prefill_rb, prefill_af]
+                QKV_K
             ](
                 self.d_xnormb.unsafe_ptr(),
                 self.d_w16_q[layer].unsafe_ptr(),
@@ -1222,7 +1234,7 @@ struct GpuSession:
             # store 与 scores 分跨 launch 边界（同 launch 跨 block 写读
             # store 行是竞态：行 b 读 pos0..pos0+b-1，全由本批写入）。
             self.ctx.enqueue_function[
-                kv_store_b_gpu[attn_t]
+                KVS_K
             ](
                 self.d_qrot_b.unsafe_ptr(),
                 self.d_qb.unsafe_ptr(),
@@ -1256,7 +1268,7 @@ struct GpuSession:
                 prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             self.ctx.enqueue_function[
-                attn_rs_b_gpu[attn_t, True, attn_tiles]
+                RS_K
             ](
                 self.d_qrot_b.unsafe_ptr(),
                 pk,
@@ -1270,7 +1282,7 @@ struct GpuSession:
                 block_dim=(attn_t, 1, 1),
             )
             self.ctx.enqueue_function[
-                attn_vt2_b_gpu[attn_t, attn_tiles]
+                VT2_K
             ](
                 self.d_scoresb.unsafe_ptr(),
                 pv,
@@ -1285,7 +1297,7 @@ struct GpuSession:
                 block_dim=(attn_t, 1, 1),
             )
             self.ctx.enqueue_function[
-                attn_comb2_b_gpu[attn_tiles]
+                COMB_K
             ](
                 self.d_attnb.unsafe_ptr(),
                 self.d_vpartb.unsafe_ptr(),
@@ -1297,7 +1309,7 @@ struct GpuSession:
             )
             # o：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
-                f16_bmm_fat_gpu[o_t, inner, 2, prefill_rb, True, prefill_af]
+                O_K
             ](
                 self.d_attnb.unsafe_ptr(),
                 self.d_w16_o[layer].unsafe_ptr(),
@@ -1323,7 +1335,7 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_function[
-                f16_bmm_dual_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
+                DUAL_K
             ](
                 self.d_xnormb.unsafe_ptr(),
                 self.d_w16_gate[layer].unsafe_ptr(),
@@ -1342,7 +1354,7 @@ struct GpuSession:
                 prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
             self.ctx.enqueue_function[
-                f16_bmm_fat_gpu[down_t, inner_ff, 2, prefill_rb, True, prefill_af]
+                DOWN_K
             ](
                 self.d_actb.unsafe_ptr(),
                 self.d_w16_down[layer].unsafe_ptr(),
@@ -1368,7 +1380,7 @@ struct GpuSession:
             grid_dim=(1, 1, 1),
             block_dim=(256, 1, 1),
         )
-        self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
+        self.ctx.enqueue_function[LMHEAD_K](
             self.d_normed.unsafe_ptr(),
             self.d_embed16.unsafe_ptr(),
             self.d_logits.unsafe_ptr(),

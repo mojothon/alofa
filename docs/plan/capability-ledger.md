@@ -3388,3 +3388,13 @@
   - **o/qkv vs down/dual 5× 的结构因子**：THREADS×8=1024 元素/迭代，INNER=896 → **单 k 迭代**——每线程仅 1 个 w load + 8 个 x load，无流水可谈，内存延迟全暴露；down/dual（INNER=4864）5 迭代流水 → 快 5×。session-env 连发 down = 518µs/launch（孤立 325，仅 1.6× 差）证明 session 环境无罪——**核结构就是原罪**。
   - **九十四攻击面（按预期收益排序）**：① qkv/o 核 k 维重构——split-K（grid.z 拆 k-slice + 两阶段归约，f32 档容差门）或 THREADS 减半×块翻倍（总量不变但调度粒度细化）；② norm 融回 bmm 核（省 8 launch ≈ 1ms CPU + 一次 xnormb 读写）；③ CPU 发射 125µs/launch 的构成（参数打包 vs JIT 查找）——若可降至 ~50µs，43 launch 省 3ms。
   - **工具链沉淀**：bench_prefill_profile（分段/无 profile/t=1 三口径一体）；arm_env（session-env 连发实验模板）。
+
+- **2026-11-10（第九十四条）** —— 🕳️ 测量体系崩塌与重建：n_layers=12（非 4/8）、sync 弱语义、发射 0.3ms/launch、GPU 真实 ~1ms；45ms 主体 = final sync 的 AsyncRT 神秘等待
+  - **o 形状 T 扫描（prof_bmm 六臂）**：back-to-back o（INNER=896）= 135µs（比 down 325 还快！）、T64/T32 = 87/84µs——**九三"单 k 迭代延迟暴露"证伪**（那是 sync 分段环境的伪象）。
+  - **同进程铁证链**：prefill_step hot = 49-85ms vs 手写重放（同 session 同 buffer 同参数逐字节 dump 证实）同序列 7.6ms/4层——3-5× 差。**launch 参数逐字节相同**（指针 dump 对照）。
+  - **n_layers = 12**（index 越界暴露）——**九十二/九三全部"4 层"解读作废**：生产 123 launch/次；probe 段值重算 tri 0.68/层、o 1.25、ff 1.28。
+  - **probe-copy 法（本轮发明）**：D2H copy 阻塞至 stream 前序完成 → 每段真实 GPU 25-28µs/层、tail 353µs——**GPU 全模型真实 ~1ms**。孤立单核全家 2-3ms（o 142µs、down 330-590µs、qkv 87µs、lm_head 310µs=876GB/s）。
+  - **synchronize() 语义崩塌**：second-sync 恒 0.0016ms、final-sync 在 0.001-79.9ms 跳变、GPU 空闲（tail probe 353µs 完成）状态下 final sync 仍等 43-80ms——**AsyncRT_DeviceStream_synchronize 层的神秘等待**（源码确认强语义外壳、内部行为异常）。**全部历史基于 sync 的 bench 数字可信度存疑**。
+  - **分组 host 时刻戳（lts 法）**：发射 0.43ms/层 × 12 = 12.4ms（~0.3ms/launch，AsyncRT worker 层）、tail 发射 3.3-3.9ms、GPU ~1ms——**生产 45ms ≈ 发射 12 + sync 神秘 30-70**。
+  - **修复落地（门全绿）**：① kernel 特化提为方法内 alias（LMHEAD_K 等 10 个）；② prefill_step 加 `sync_tail: Bool = True` 运行时参——**流水化调用路径可跳过尾部 sync**。
+  - **九十五攻击面**：① AsyncRT sync 神秘等待机制（升级 MAX/AsyncRT 版本对照 / MAX_WORKER 环境变量）；② 流水化调用语义改造（sync_tail=False 的正确性协议：读 logits 前的单次轻同步）；③ 发射 0.3ms/launch 的构成（kernel 参数 marshalling vs worker 队列）——launch 融合（norm 进 bmm）直接减少发射数；④ 重放 1.9ms/层 vs 生产 3.75ms/层 的残余 2× 差。
