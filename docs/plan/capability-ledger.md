@@ -3437,3 +3437,12 @@
  To run a basic profiling session:   nsys profile ./my-application
  For more details see "Profiling from the CLI" at https://docs.nvidia.com/nsight-systems），一次 trace 内交替触发慢/快区，锁定切换条件；辅以 nvidia-smi 时钟采样。
   - **方法论**：trace 分段必须用强边界（sleep/usleep 插入）+ kernel 名+grid 双重对齐，仅靠时长模式分段会错位。
+
+- **2026-11-11（第九十七条）** —— 🌡️ 慢区之谜破案：A100 功耗墙降频 + 层间功耗余量窗落地（1.47×）
+  - **GPU 映射确认**（ctypes cuDeviceGetUuid）：CUDA_VISIBLE_DEVICES=4 → 物理 GPU 4（空闲无争用）——争用假说死亡，DVFS 复活。
+  - **GEMM 时钟探针**（1500 发/12.5min）：短 burst（每 500ms 10 发）恒 254µs；重放连续流 138µs——同 kernel 同 grid 同 buffer，差异只在活动模式。
+  - **间隙阶梯 U 型曲线**（probe_gap）：连续/0-2ms 间隙 250µs（慢）→ **5-100ms 间隙 136µs（全速）** → 500ms 254µs（深眠掉档）。765/1410MHz = 0.54，136×1.84 = 250——**功耗墙降频模型精确闭合**：连续满载 45ms 撞 250W cap → SM 降到 765MHz；段级节奏让功耗余量恢复 → 1410 全速。
+  - **层间功耗余量窗**（probe_layergap，8 臂受控）：nest0 连续 40.6ms（=生产模式）→ 纯 sync 34.1 → sync+20us 30.3 → **sync+30us 27.7ms（最优）** → sync+50us 28.0 → sync+300us 44.9（开销反噬）。
+  - **落地**：prefill_step 加 `layer_gap_us: Int = 0` 参数（层末 sync+usleep；默认 0 行为不变），生产推荐 30。门 bit-exact 全绿（prefill row8/decode row9/decode PARITY）。
+  - **环境噪声教训**：bench_r97 ABCD 顺序对照在整机高载（其他 GPU 96%）下被趋势污染（A 先跑系统性偏慢）——受控 probe_layergap（同 session 内臂间对比）为准。今天绝对值整体 +30%。
+  - **未竟（九十八）**：①29.0 vs 重放 22.5 的残余差（sync 往返 ~0.55ms/层）——段级更细粒度间隙或 gap 与发射重叠；②生产服务层启用 layer_gap_us=30（TTFT 43→~29ms）；③功耗墙根因——其他 GPU 满载时机箱散热，建议向运维要 GPU 4 独立供电/散热数据或 -lgc 权限。

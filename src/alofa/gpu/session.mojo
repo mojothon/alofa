@@ -26,6 +26,7 @@ host 往返。
 
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from alofa.core.ffi.posix import monotonic_ns
+from std.ffi import external_call
 
 from alofa.core.error import (
     ERR_INVALID_ARGUMENT,
@@ -1122,7 +1123,8 @@ struct GpuSession:
         prefill_rb: Int = 8,
         prefill_af: DType = DType.float64,
     ](
-        mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True
+        mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
+        layer_gap_us: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -1382,6 +1384,12 @@ struct GpuSession:
                 ldown = Float64(monotonic_ns() - prof_t0) / 1e6
             if profile:
                 print("层", layer, "tri:", ltri, "attn:", lattn, "o:", lo, "ff:", lff, "down:", ldown)
+            # 账本九十七：层间功耗余量窗——连续满载 45ms 触发 A100 功耗墙降频
+            # （765/1410MHz = 0.54 ≈ 慢/快 kernel 倍率 1.84）。层末 sync+微 sleep
+            # 打断连续满载，实测 40.6→27.7ms（layer_gap_us=30 最优）。
+            if layer_gap_us > 0:
+                self.ctx.synchronize()
+                _ = external_call["usleep", Int32](Int32(layer_gap_us))
                 prof_t0 = monotonic_ns()
 
         # 末行终 norm + lm_head（只算末行 logits）
