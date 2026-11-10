@@ -630,7 +630,7 @@ struct GpuSession:
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
-        attn_t: Int = 128, attn_vec: Bool = True,
+        attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -655,7 +655,13 @@ struct GpuSession:
         down_t/o_t（账本七十八）：down/o 发射的线程数 comptime 参
         （默认 128）。fat 核 grid=ceildiv(hidden,2)=448 块 —— T128 只有
         26% 线程槽（tri 同款占据率病）；交错 A/B 裁决后定默认。
-        attn_t/attn_vec（账本七十九）：attention 发射形状/向量化开关。
+        attn_t/attn_vec/attn_v2（账本七十九/八十）：attention 发射
+        形状/向量化/V 相并行开关。八十分相：V 相占 kernel 35%（16.3µs
+        @kv300，只许 128 线程干活）——V2（T512，j 分 4 组并行 + smem
+        部分和按组序合并）砍到 6.6µs，kernel 46.1 → 36.5µs；端到端
+        交错三轮同序（默认 2.80/2.70/2.89 vs V2 2.79/2.55/2.60）。默认
+        T512+V2。⚠️ j 求和序 + sum 树序变（f64 重结合，bit-exact 判据
+        弃用，转门 1e-5 容差 + argmax）。
         T 扫无效（T256/512 噪声内）；VEC（k 行 load[8] 向量读，求和序
         不变 ⇒ scores 逐位同）三轮一致 -0.017ms，默认开。⚠️ attention
         20µs/层的主导项仍未定位 —— 14 块 SM 饥饿是结构性的（j 分块
@@ -748,7 +754,9 @@ struct GpuSession:
             var pk = self.d_k_store[layer].unsafe_ptr()
             var pv = self.d_v_store[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
-                self.ctx.enqueue_function[attn_rope_gpu[attn_t, attn_vec]](
+                self.ctx.enqueue_function[
+                    attn_rope_gpu[attn_t, attn_vec, 0, attn_v2]
+                ](
                     self.d_attn.unsafe_ptr(),
                     self.d_q_rot.unsafe_ptr(),
                     self.d_q.unsafe_ptr(),

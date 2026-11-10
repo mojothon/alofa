@@ -176,7 +176,7 @@ def attention_par_gpu[THREADS: Int](
         dst[unsafe_offset=t * q_cols + q_head_base + tid] = Float32(acc / total)
 
 
-def attn_rope_gpu[THREADS: Int, VEC: Bool = False](
+def attn_rope_gpu[THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = False](
     dst: Pointer[Float32, MutUntrackedOrigin],
     q_rot: Pointer[Float32, MutUntrackedOrigin],
     q_src: Pointer[Float32, MutUntrackedOrigin],
@@ -266,84 +266,124 @@ def attn_rope_gpu[THREADS: Int, VEC: Bool = False](
     # 的线程在循环后补算（max 无舍入，并入 best_local 的次序自由）。
     var best_local = LOWEST_FP32
     var j = tid
-    while j < upto:
-        var acc = Float64(0)
-        var kbase = j * kv_cols + kv_head_base
-        # VEC（账本七十九）：k 行 16B 向量读（load[8]，matmul 同款）——
-        # 每 j 16 条向量 load 替代 128 条标量 2B 读，load 相互独立可
-        # 全部在飞。求和序 d 升序不变（8 元组内 dd 升序）⇒ scores
-        # 逐位同旧，下游 bit-exact。
-        comptime if VEC:
-            var c8 = Int(head_dim) // 8
-            for c in range(c8):
-                var kv8 = k_store.load[8](kbase + c * 8)
-                @parameter
-                for dd in range(8):
-                    acc += Float64(
-                        q_rot[unsafe_offset=q_head_base + c * 8 + dd]
-                    ) * Float64(Float32(kv8[dd]))
-            for d in range(c8 * 8, Int(head_dim)):
-                acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
-                    k_store[unsafe_offset=kbase + d]
-                )
-        else:
+    comptime if cut & 1 == 0:
+        while j < upto:
+            var acc = Float64(0)
+            var kbase = j * kv_cols + kv_head_base
+            # VEC（账本七十九）：k 行 16B 向量读（load[8]，matmul 同款）——
+            # 每 j 16 条向量 load 替代 128 条标量 2B 读，load 相互独立可
+            # 全部在飞。求和序 d 升序不变（8 元组内 dd 升序）⇒ scores
+            # 逐位同旧，下游 bit-exact。
+            comptime if VEC:
+                var c8 = Int(head_dim) // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_head_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, Int(head_dim)):
+                    acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                        k_store[unsafe_offset=kbase + d]
+                    )
+            else:
+                for d in range(Int(head_dim)):
+                    acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
+                        k_store[unsafe_offset=kbase + d]
+                    )
+            var s = Float32(acc) * scale
+            scores[unsafe_offset=row + j] = s
+            if s > best_local:
+                best_local = s
+            j += THREADS
+        if tid == upto % THREADS:
+            var acc = Float64(0)
             for d in range(Int(head_dim)):
                 acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
-                    k_store[unsafe_offset=kbase + d]
+                    s_k[unsafe_offset=d]
                 )
-        var s = Float32(acc) * scale
-        scores[unsafe_offset=row + j] = s
-        if s > best_local:
-            best_local = s
-        j += THREADS
-    if tid == upto % THREADS:
-        var acc = Float64(0)
-        for d in range(Int(head_dim)):
-            acc += Float64(q_rot[unsafe_offset=q_head_base + d]) * Float64(
-                s_k[unsafe_offset=d]
-            )
-        var s = Float32(acc) * scale
-        scores[unsafe_offset=row + upto] = s
-        if s > best_local:
-            best_local = s
+            var s = Float32(acc) * scale
+            scores[unsafe_offset=row + upto] = s
+            if s > best_local:
+                best_local = s
 
-    smax[tid] = best_local
-    barrier()
+    var best = Float32(0)
     var stride = THREADS // 2
-    while stride > 0:
-        if tid < stride:
-            if smax[tid + stride] > smax[tid]:
-                smax[tid] = smax[tid + stride]
+    comptime if cut & 2 == 0:
+        smax[tid] = best_local
         barrier()
-        stride //= 2
-    var best = smax[0]
+        stride = THREADS // 2
+        while stride > 0:
+            if tid < stride:
+                if smax[tid + stride] > smax[tid]:
+                    smax[tid] = smax[tid + stride]
+            barrier()
+            stride //= 2
+        best = smax[0]
 
     var total_local = Float64(0)
-    j = tid
-    while j <= upto:
-        var e = Float64(exp(Float64(scores[unsafe_offset=row + j] - best)))
-        scores[unsafe_offset=row + j] = Float32(e)
-        total_local += e
-        j += THREADS
+    comptime if cut & 4 == 0:
+        j = tid
+        while j <= upto:
+            var e = Float64(exp(Float64(scores[unsafe_offset=row + j] - best)))
+            scores[unsafe_offset=row + j] = Float32(e)
+            total_local += e
+            j += THREADS
 
-    stot[tid] = total_local
-    barrier()
-    stride = THREADS // 2
-    while stride > 0:
-        if tid < stride:
-            stot[tid] += stot[tid + stride]
+    var total = Float64(1)
+    comptime if cut & 8 == 0:
+        stot[tid] = total_local
         barrier()
-        stride //= 2
-    var total = stot[0]
+        stride = THREADS // 2
+        while stride > 0:
+            if tid < stride:
+                stot[tid] += stot[tid + stride]
+            barrier()
+            stride //= 2
+        total = stot[0]
 
     # V 相位：j < upto 读 store，当前 token 读 smem（j 升序不变）。
-    if tid < Int(head_dim):
-        var acc = Float64(0)
-        for jj in range(upto):
-            acc += Float64(scores[unsafe_offset=row + jj]) * Float64(
-                v_store[unsafe_offset=jj * kv_cols + kv_head_base + tid]
-            )
-        acc += Float64(scores[unsafe_offset=row + upto]) * Float64(
-            s_v[unsafe_offset=tid]
-        )
-        dst[unsafe_offset=q_head_base + tid] = Float32(acc / total)
+    # V2（账本八十）：THREADS > head_dim 时按 j 分组并行（组 g 处理
+    # j ≡ g (mod groups)，组内升序），部分和进 smem 后按组序合并 ——
+    # 串行链 ÷ groups。⚠️ j 求和序变（f64 重结合），非 bit-exact，
+    # 以门 1e-5 容差 + argmax 不变为判据（分相实测 V 占 kernel 35%）。
+    comptime if cut & 16 == 0:
+        comptime if V2:
+            var s_vg = stack_allocation[
+                THREADS, Float64, address_space = AddressSpace.SHARED
+            ]()
+            var groups = Int(THREADS) // Int(head_dim)
+            var d = tid % Int(head_dim)
+            var g = tid // Int(head_dim)
+            var acc2 = Float64(0)
+            var jj2 = g
+            while jj2 < upto:
+                acc2 += Float64(scores[unsafe_offset=row + jj2]) * Float64(
+                    v_store[
+                        unsafe_offset=jj2 * kv_cols + kv_head_base + d
+                    ]
+                )
+                jj2 += groups
+            if g == 0:
+                acc2 += Float64(scores[unsafe_offset=row + upto]) * Float64(
+                    s_v[unsafe_offset=d]
+                )
+            s_vg[tid] = acc2
+            barrier()
+            if tid < Int(head_dim):
+                var acc = s_vg[tid]
+                for g2 in range(1, groups):
+                    acc += s_vg[tid + g2 * Int(head_dim)]
+                dst[unsafe_offset=q_head_base + tid] = Float32(acc / total)
+        else:
+            if tid < Int(head_dim):
+                var acc = Float64(0)
+                for jj in range(upto):
+                    acc += Float64(scores[unsafe_offset=row + jj]) * Float64(
+                        v_store[unsafe_offset=jj * kv_cols + kv_head_base + tid]
+                    )
+                acc += Float64(scores[unsafe_offset=row + upto]) * Float64(
+                    s_v[unsafe_offset=tid]
+                )
+                dst[unsafe_offset=q_head_base + tid] = Float32(acc / total)

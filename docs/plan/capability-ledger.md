@@ -3271,3 +3271,12 @@
   - **坑在案**：comptime Bool 参 + `comptime if` 在 kernel 内分支干净可用（VEC/标量两版共存，零运行时成本）。
   - **复验全绿**：门 21/21、diff 逐位、argmax 287、layer0 0.0、bench 2.759。
   - **到 2ms 剩余**：0.76ms。
+
+- **2026-11-10（第八十条）** —— ⚡ **P5 步骤 4 续（attention 分相轮）：2.759 → 2.523ms/token（396 tok/s，-0.24ms/-8.5%）；分相计时基建兑现 + 七十六探针谜案告破**
+  - **谜案告破**：round 76 六个 mini 探针全灭的根因 = **直发 import kernel 的文件必须先 `from max.gpu.host import ...`** —— 无此行 kernel 约定推断成 `thin`，绑不上 enqueue_function 的 `capturing thin` 候选（Mojo 编译器级怪象，import 集合改变约定推断；session/sections 都带这行所以无恙）。
+  - **分相计时基建**：`attn_rope_gpu` 加 `cut` 编译期相位裁剪参（1=scores 2=max 4=exp 8=sum 16=V），累计裁剪差值 = 各相成本（bench_attn_phase，kv=300 口径）：**V 相 16.3µs（35%，最大单相）**、scores ~12.7、max 1.4、sum 2.1、exp≈0。V 相只许 128 线程干活（`tid < head_dim`）—— 七十九 T 扫无效的真因（加的线程被 V 相白吃）。
+  - **刀法 V2**：V 相按 j 分组并行（组 g 处理 j ≡ g mod groups，组内升序，smem 部分和按组序合并；T512 → 4 组）—— V 16.3 → 6.6µs（-60%），kernel 46.1 → 36.5µs。端到端交错三轮同序（默认 2.80/2.70/2.89 vs V2 2.79/2.55/2.60）。默认 T512+V2。
+  - **数值（意外之喜）**：j 求和序 + sum 树序双重 f64 重结合，decode diff **仍与基线逐位相同**（0.008679389953613281）——良性分布下重结合未翻位。argmax 287、门 21/21、layer0 零容差全保。bit-exact 判据理论上已弃用，实际上仍然成立。
+  - **attention 剩余**：scores ~12.7µs 成并列主导（每 j 单线程 128 维点积；d 分摊会破点积序）。下一刀候选：scores 的 warp 级协作点积、或跨块 j 分块（两趟归约）。
+  - **复验全绿**：门 21/21、decode diff/argmax 逐位、layer0 normed 0.0、probe 1、prof 21、sections 61、bench_decode 2.523。
+  - **到 2ms 剩余**：0.52ms。
