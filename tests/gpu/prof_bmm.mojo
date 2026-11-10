@@ -172,6 +172,139 @@ def f16_bmm_sacc_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int](
                             unsafe_offset=(oo * RB + rr) * THREADS
                         ]
 
+
+
+def f16_bmm_vec_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """vec 载入探针（账本九十一）：bitcast 到 SIMD 指针再 load，
+    强制 32B/16B 对齐向量载入（对照 load[8] 的 8×b32 标量灾难）。"""
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[DType.float32, OUTS * RB](0)
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            var k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8, alignment=16](w_base + k)
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                        var prod = xv * wv.cast[DType.float32]()
+                        acc[oo * RB + rr] += prod.reduce_add()
+                k += THREADS * 8
+    var sacc = stack_allocation[
+        OUTS * RB * THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = sacc[unsafe_offset=(oo * RB + rr) * THREADS]
+                        comptime if ACC:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = (
+                                dst[unsafe_offset=r * Int(out_cols) + o] + v
+                            )
+                        else:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = v
+
+
+
+def f16_bmm_vec2_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """vec + 标量 j 累加探针（账本九十一）：向量载入 + 无 reduce_add
+    树（每元素 1 FMA 直入 acc lane）。"""
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[DType.float32, OUTS * RB](0)
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        if o < Int(out_cols):
+            var w_base = o * Int(INNER)
+            var k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8, alignment=16](w_base + k)
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                        @parameter
+                        for j in range(8):
+                            acc[oo * RB + rr] += Scalar[DType.float32](
+                                xv[j] * Float32(wv[j])
+                            )
+                k += THREADS * 8
+    var sacc = stack_allocation[
+        OUTS * RB * THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = sacc[unsafe_offset=(oo * RB + rr) * THREADS]
+                        comptime if ACC:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = (
+                                dst[unsafe_offset=r * Int(out_cols) + o] + v
+                            )
+                        else:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = v
+
 def main() raises:
     var ctx = DeviceContext()
     var x = ctx.enqueue_create_buffer[DType.float32](T * INNER)
@@ -437,3 +570,35 @@ def main() raises:
         if us < best:
             best = us
     print("tiled T128 RB8 CH1024:", best, "us/launch  有效bw=", Float64(16 * OUT * INNER * 2 + T * INNER * 4 + T * OUT * 4) / (best * 1e-6) / 1e9, "GB/s")
+
+    # 臂 18: vec 载入 O2 RB8 f32（对照标量版 1372µs）
+    best = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_vec_gpu[128, INNER, 2, 8, True]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(OUT // 2, 16, 1), block_dim=(128, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < best:
+            best = us
+    print("vec O2 RB8 f32:", best, "us/launch  有效bw=", Float64(16 * OUT * INNER * 2 + T * INNER * 4 + T * OUT * 4) / (best * 1e-6) / 1e9, "GB/s")
+
+    # 臂 19: vec + 标量 j 累加（对照 vec 树版 876µs）
+    best = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_vec2_gpu[128, INNER, 2, 8, True]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(OUT // 2, 16, 1), block_dim=(128, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < best:
+            best = us
+    print("vec2 scalar-j O2 RB8 f32:", best, "us/launch  有效bw=", Float64(16 * OUT * INNER * 2 + T * INNER * 4 + T * OUT * 4) / (best * 1e-6) / 1e9, "GB/s")

@@ -486,12 +486,12 @@ def f16_bmm_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool, AF:
             for it in range(THREADS * 8 * 0 + (INNER + THREADS * 8 - 1) // (THREADS * 8)):
                 var k = tid * 8 + it * THREADS * 8
                 if k < Int(INNER):
-                    var wv = w.load[8](w_base + k)
+                    var wv = w.load[8, alignment=16](w_base + k)
                     @parameter
                     for rr in range(RB):
                         var r = r0 + rr
                         if r < Int(n_rows):
-                            var xv = x.load[8](r * Int(INNER) + k)
+                            var xv = x.load[8, alignment=32](r * Int(INNER) + k)
                             comptime if AF == DType.float64:
                                 @parameter
                                 for j in range(8):
@@ -566,13 +566,13 @@ def f16_bmm_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = D
             var w_base = o * Int(INNER)
             var k = tid * 8
             while k < Int(INNER):
-                var wav = w_a.load[8](w_base + k)
-                var wbv = w_b.load[8](w_base + k)
+                var wav = w_a.load[8, alignment=16](w_base + k)
+                var wbv = w_b.load[8, alignment=16](w_base + k)
                 @parameter
                 for rr in range(RB):
                     var r = r0 + rr
                     if r < Int(n_rows):
-                        var xv = x.load[8](r * Int(INNER) + k)
+                        var xv = x.load[8, alignment=32](r * Int(INNER) + k)
                         comptime if AF == DType.float64:
                             @parameter
                             for j in range(8):
@@ -673,12 +673,12 @@ def f16_bmm_qkv_gpu[THREADS: Int, INNER: Int, RB: Int, AF: DType = DType.float64
             var w_base = o * Int(INNER)
             var k = tid * 8
             while k < Int(INNER):
-                var wv = w.load[8](w_base + k)
+                var wv = w.load[8, alignment=16](w_base + k)
                 @parameter
                 for rr in range(RB):
                     var r = r0 + rr
                     if r < Int(n_rows):
-                        var xv = x.load[8](r * Int(INNER) + k)
+                        var xv = x.load[8, alignment=32](r * Int(INNER) + k)
                         comptime if AF == DType.float64:
                             @parameter
                             for j in range(8):
@@ -769,7 +769,7 @@ def f16_matmul_fat_si_gpu[THREADS: Int, INNER: Int, OUTS: Int, SPLIT: Int](
             var w_base = o * Int(INNER) + x_base
             k = tid * 8
             while k < ch:
-                var wv = w.load[8](w_base + k)
+                var wv = w.load[8, alignment=16](w_base + k)
                 @parameter
                 for j in range(8):
                     a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
@@ -861,7 +861,7 @@ def f16_matmul_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool, ACC:
             var w_base = o * Int(INNER)
             k = tid * 8
             while k < Int(INNER):
-                var wv = w.load[8](w_base + k)
+                var wv = w.load[8, alignment=16](w_base + k)
                 @parameter
                 for j in range(8):
                     a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
@@ -991,7 +991,7 @@ def f16_matmul_dual_gpu[
         @parameter
         for idx in range(2 * OUTS):
             if valid[idx]:
-                var wv = wrow[idx].load[8](wbase[idx] + k)
+                var wv = wrow[idx].load[8, alignment=16](wbase[idx] + k)
                 @parameter
                 for j in range(8):
                     acc[idx] += xv[j] * Float64(Float32(wv[j]))
@@ -1111,7 +1111,7 @@ def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool, NORM: Bool = Fa
             var w_base = o * Int(INNER)
             k = tid * 8
             while k < Int(INNER):
-                var wv = w.load[8](w_base + k)
+                var wv = w.load[8, alignment=16](w_base + k)
                 @parameter
                 for j in range(8):
                     a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
@@ -1352,7 +1352,7 @@ def f16_matmul_qkv_mc_gpu[
             for c in range(COLS):
                 var o = o0 + c
                 if o < nseg:
-                    var wv = w.load[8](o * Int(INNER) + kk)
+                    var wv = w.load[8, alignment=16](o * Int(INNER) + kk)
                     @parameter
                     for j in range(8):
                         acc[seg * COLS + c] += Float64(
@@ -1447,7 +1447,7 @@ def f16_matmul_dual_nx_gpu[
         @parameter
         for idx in range(2 * OUTS):
             if valid[idx]:
-                var wv = wrow[idx].load[8](wbase[idx] + k)
+                var wv = wrow[idx].load[8, alignment=16](wbase[idx] + k)
                 @parameter
                 for j in range(8):
                     acc[idx] += xv[j] * Float64(Float32(wv[j]))

@@ -3363,3 +3363,12 @@
   - **已落地（保持 bit-exact）**：f32 快路向量化（SIMD 乘 + reduce_add，AF 参透传 session）；f64 路径 k 迭代展开（累加序不变）。门全绿：prefill row8/row9 diff 逐位同八十八，decode 门/argmax/门 21 全过。
   - **无 profiler 盲调的边界**：ncu/nsys 不在共享箱——cycle 级推理多次不能闭合（在飞字节、占用率、发射口都对不上实测），微架构定位到达极限。
   - **九一攻击面**：SASS/PTX 阅读（dump 编译产物看 lane 操作、load 流水与发射序列）——唯一剩余的决定性工具；或重审 decode-fat 431 GB/s 与 bmm 满载 100 GB/s 的差异因子表（x smem 单行 × acc 2 lanes × 无 chunk barrier 的组合形态）。
+
+- **2026-11-10（第九十一条）** —— 💥 **SASS/PTX 阅读破案：`load[8]` 全仓库标量化灾难（736 条 LDG vs 999 条 FP 指令）；`alignment` 参一行修复，GEMV 路径 -65%**
+  - **破案手法**：本地无 ncu/nsys——包一层 ptxas（拦截脚本留档输入 PTX）+ `cuobjdump/nvdisasm` 反汇编。JIT 不落盘、二进制无设备码、std 源码不在盘，拦截是唯一口子。
+  - **病灶**：`Pointer.load[8]` 生成 **8 条 `ld.global.b32`**（w 的 f16×8 甚至拆成 8 条 2 字节载入），向量载入（v2/v4）**全仓库为零**。bmm SASS：LDG 736 条 vs FP 指令 999 条——发射口 3/4 被 LDG 淹没，这就是 0.83 TFLOP（FP 峰的 4%）与有效带宽 100 GB/s 的共同来源；decode-fat 431 GB/s 也是标量载入下的"好成绩"。
+  - **修复（一行）**：`load[8, alignment=16/32]`——`Pointer.load` 有 `alignment` 关键字参（从 max kernels 源码 `aligned_load` 实现里挖出：`ptr.load[width=w, alignment=alignof[SIMD]]`）。PTX 验证：34 条 `ld.global.v4.b32`，LDG 静态数 736→50。全仓库 11 处 load[8] 全部加对齐（x: 32B=alignof(SIMD<f32,8>) ✓ 行偏移核算全过；w: 16B）。
+  - **收益（长窗口 min，卡被邻居占满按 1.4× 折算干净卡）**：rb=1 f64 306→~107ms（**-65%**，LDG 密集度最高的 GEMV 受益最大）；rb=8 f32 110→~78ms（-29%）；rb=8 f64 122→~110（f64 档瓶颈转移回 cvt+FMA 发射）。decode 核同步受益待干净卡复测。
+  - **bit-exact 保持**：载入形式变化不改数值——prefill row8/row9 diff 逐位同八十八（0.005281…/0.006142…），decode diff 逐位同八十三，门 21/layer0/probe/prof 全绿。
+  - **prof_bmm 归档**：16 臂假说排除表（九十）+ vec/vec2 探针核。标量 LDG 假说其实统一解释了九十的全部"矛盾"：单因子小、组合爆炸（LDG×acc lanes×块数的发射口挤兑）。
+  - **九十二攻击面**：① 干净卡重锚定全部数字（decode 收益确认）；② MMA/tensor core（剩余 6× 的唯一解，f16 v4 载入已就位）；③ 876µs→理论 132µs 的缺口 = LDG 发射 + 依赖停顿，MMA 把 FMA:LDG 比从 1:1.1 翻到 64:1。
