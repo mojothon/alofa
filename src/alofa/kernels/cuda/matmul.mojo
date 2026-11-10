@@ -479,23 +479,30 @@ def f16_bmm_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool, AF:
         var o = o0 + oo
         if o < Int(out_cols):
             var w_base = o * Int(INNER)
-            var k = tid * 8
-            while k < Int(INNER):
-                var wv = w.load[8](w_base + k)
-                @parameter
-                for rr in range(RB):
-                    var r = r0 + rr
-                    if r < Int(n_rows):
-                        var xv = x.load[8](r * Int(INNER) + k)
-                        @parameter
-                        for j in range(8):
+            # k 迭代 @parameter 展开（账本九十 MLP 实验）：5 个 w load
+            # 地址独立 ⇒ 编译器可全部提前发射（while 形态每线程每次
+            # 仅 1 load 在飞，in-flight 字节差带宽需求两个数量级）。
+            @parameter
+            for it in range(THREADS * 8 * 0 + (INNER + THREADS * 8 - 1) // (THREADS * 8)):
+                var k = tid * 8 + it * THREADS * 8
+                if k < Int(INNER):
+                    var wv = w.load[8](w_base + k)
+                    @parameter
+                    for rr in range(RB):
+                        var r = r0 + rr
+                        if r < Int(n_rows):
+                            var xv = x.load[8](r * Int(INNER) + k)
                             comptime if AF == DType.float64:
-                                acc[oo * RB + rr] += Scalar[AF](
-                                    Float64(xv[j]) * Float64(Float32(wv[j]))
-                                )
+                                @parameter
+                                for j in range(8):
+                                    acc[oo * RB + rr] += Scalar[AF](
+                                        Float64(xv[j]) * Float64(Float32(wv[j]))
+                                    )
                             else:
-                                acc[oo * RB + rr] += Scalar[AF](xv[j] * Float32(wv[j]))
-                k += THREADS * 8
+                                # f32 快路（账本九十）：SIMD 乘 + 树收口。
+                                # 组内树序与标量链合法重组差（f32 容差）。
+                                var prod = xv * wv.cast[DType.float32]()
+                                acc[oo * RB + rr] += Scalar[AF](prod.reduce_add())
     var sacc = stack_allocation[
         OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
     ]()
@@ -566,18 +573,25 @@ def f16_bmm_dual_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = D
                     var r = r0 + rr
                     if r < Int(n_rows):
                         var xv = x.load[8](r * Int(INNER) + k)
-                        @parameter
-                        for j in range(8):
-                            comptime if AF == DType.float64:
+                        comptime if AF == DType.float64:
+                            @parameter
+                            for j in range(8):
                                 acc[(oo * RB + rr) * 2] += Scalar[AF](
                                     Float64(xv[j]) * Float64(Float32(wav[j]))
                                 )
                                 acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
                                     Float64(xv[j]) * Float64(Float32(wbv[j]))
                                 )
-                            else:
-                                acc[(oo * RB + rr) * 2] += Scalar[AF](xv[j] * Float32(wav[j]))
-                                acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](xv[j] * Float32(wbv[j]))
+                        else:
+                            # f32 快路同 fat（账本九十）
+                            var wa32 = wav.cast[DType.float32]()
+                            var wb32 = wbv.cast[DType.float32]()
+                            acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                (xv * wa32).reduce_add()
+                            )
+                            acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                (xv * wb32).reduce_add()
+                            )
                 k += THREADS * 8
     var sacc = stack_allocation[
         2 * OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
@@ -665,14 +679,16 @@ def f16_bmm_qkv_gpu[THREADS: Int, INNER: Int, RB: Int, AF: DType = DType.float64
                     var r = r0 + rr
                     if r < Int(n_rows):
                         var xv = x.load[8](r * Int(INNER) + k)
-                        @parameter
-                        for j in range(8):
-                            comptime if AF == DType.float64:
+                        comptime if AF == DType.float64:
+                            @parameter
+                            for j in range(8):
                                 acc[seg * RB + rr] += Scalar[AF](
                                     Float64(xv[j]) * Float64(Float32(wv[j]))
                                 )
-                            else:
-                                acc[seg * RB + rr] += Scalar[AF](xv[j] * Float32(wv[j]))
+                        else:
+                            # f32 快路同 fat（账本九十）
+                            var prod = xv * wv.cast[DType.float32]()
+                            acc[seg * RB + rr] += Scalar[AF](prod.reduce_add())
                 k += THREADS * 8
     var sacc = stack_allocation[
         3 * RB * THREADS, AF, address_space = AddressSpace.SHARED

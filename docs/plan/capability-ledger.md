@@ -3355,3 +3355,11 @@
   - **共享卡噪声入档**：卡3 被邻居占满（decode 7.5ms vs 惯常 2.42）——跨轮对比必须换卡重锚定基线；卡2 也有 ±30% 波动（decode mean 3.64 vs best 2.48）——同核同进程 A/B 是唯一可信口径。
   - **复验全绿**：门 21、decode diff 逐位同八十三、argmax 287、layer0/probe/prof 全过、prefill 双门 bit-exact 同八十八。
   - **下一步**：TTFT 仍 ~150ms 距 4.6ms 带宽地板 30×——需 MMA/tensor core（FP16 进 f32 acc，312 TFLOPS 级）或 w 载入形态重构；共享卡噪声下建议先做长窗口多次采样（每组 ≥10 rep 取 min）再比。
+
+- **2026-11-10（第九十条）** —— 🔬 **诊断战役：down-bmm 单核 1350µs vs 理论 132µs，五假说系统性证伪；两个测量口径陷阱入账**
+  - **长窗口纪律建立（bench_prefill_rb v2）**：每 rep **新 GpuSession**（同会话复 rep 会把 128 token/rep 追加 KV，rep 间注意力工作量递增——八十八/八十九的 rep0/rep1 对比全部失真，此坑记账）+ warmup rep 不计钟（per-session 首发射成本 ~95ms 落钟内——另一个口径陷阱）。10 rep 取 min 是共享卡唯一稳定口径。
+  - **单核剖析（prof_bmm，16 臂）**：down 形状（896×4864×128 行）实测 1350-3310µs vs 理论带宽墙 132µs——有效带宽仅 100-135 GB/s（HBM 的 1/10）。正面锚点：decode-fat 1 行 431 GB/s、bmm RB1 1 行 370、RB8 纯 w 流（n_rows=1）498；单因子（acc lanes 2→16、块数 448→7168）各只 1.3-1.5×，组合超线性 14×。
+  - **五假说全灭**：① FMA 吞吐界（f32 acc 仅 -10%，19.5T 峰下应 2×）✗；② x L2 流量（OUTS 2→8，x 流量 ÷4，时间不动）✗；③ MLP 不足（while→@parameter 展开 5 个 w load，无效）✗；④ smem x-tiling（三种几何全劣且越 tile 越差：CH256 1767 / CH512-T64 2481 / CH1024 3310——barrier×chunk + smem 挤占 occupancy 是毒，CH 必须=THREADS×8 否则半线程闲）✗；⑤ SIMD lane 累加 lowering（acc 搬 smem RMW 同速 1321µs）✗。
+  - **已落地（保持 bit-exact）**：f32 快路向量化（SIMD 乘 + reduce_add，AF 参透传 session）；f64 路径 k 迭代展开（累加序不变）。门全绿：prefill row8/row9 diff 逐位同八十八，decode 门/argmax/门 21 全过。
+  - **无 profiler 盲调的边界**：ncu/nsys 不在共享箱——cycle 级推理多次不能闭合（在飞字节、占用率、发射口都对不上实测），微架构定位到达极限。
+  - **九一攻击面**：SASS/PTX 阅读（dump 编译产物看 lane 操作、load 流水与发射序列）——唯一剩余的决定性工具；或重审 decode-fat 431 GB/s 与 bmm 满载 100 GB/s 的差异因子表（x smem 单行 × acc 2 lanes × 无 chunk barrier 的组合形态）。
