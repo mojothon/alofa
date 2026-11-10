@@ -896,3 +896,134 @@ def q4_matmul_vec_gpu[THREADS: Int](
         stride //= 2
     if tid == 0:
         dst[unsafe_offset=row * Int(out_cols) + o] = Float32(smem[0])
+
+
+def f16_matmul_qkv_mc_gpu[
+    THREADS: Int, INNER: Int, COLS: Int, HAS_BIAS: Bool, NORM: Bool = False,
+](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_q: Pointer[Float16, MutUntrackedOrigin],
+    w_k: Pointer[Float16, MutUntrackedOrigin],
+    w_v: Pointer[Float16, MutUntrackedOrigin],
+    dst_q: Pointer[Float32, MutUntrackedOrigin],
+    dst_k: Pointer[Float32, MutUntrackedOrigin],
+    dst_v: Pointer[Float32, MutUntrackedOrigin],
+    bias_q: Pointer[Float32, MutUntrackedOrigin],
+    bias_k: Pointer[Float32, MutUntrackedOrigin],
+    bias_v: Pointer[Float32, MutUntrackedOrigin],
+    rms_w: Pointer[Float32, MutUntrackedOrigin],
+    eps: Float32,
+    inner: Int32,
+    q_out: Int32,
+    kv_out: Int32,
+) -> None:
+    """多列 tri（账本八十四）：每块算 COLS 个输出（三段各自越界裁剪）
+    —— x 的 smem 载入与 rmsnorm 摊薄 COLS 倍，块数 ÷COLS（896→112），
+    每线程 COLS×3 条独立 16B load 在飞（旧版 3 条）。旧版 245GB/s
+    病根：896 块每块只算 1 输出，latency 主导。
+    数值：k 序（tid*8 步 THREADS*8）与树规约组序同旧 ⇒ 逐位同。
+    """
+    var o0 = Int(block_idx.x) * COLS
+    var row = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[INNER, Float32, address_space = AddressSpace.SHARED]()
+    var x_base = row * Int(inner)
+    var k = tid
+    while k < Int(inner):
+        sx[unsafe_offset=k] = x[unsafe_offset=x_base + k]
+        k += THREADS
+    barrier()
+    comptime if NORM:
+        var nlocal = Float64(0)
+        var nk = tid
+        while nk < Int(INNER):
+            var nv = Float64(sx[unsafe_offset=nk])
+            nlocal += nv * nv
+            nk += THREADS
+        var sred = stack_allocation[THREADS, Float64, address_space = AddressSpace.SHARED]()
+        sred[unsafe_offset=tid] = nlocal
+        barrier()
+        var nstride = THREADS // 2
+        while nstride > 0:
+            if tid < nstride:
+                sred[unsafe_offset=tid] = (
+                    sred[unsafe_offset=tid] + sred[unsafe_offset=tid + nstride]
+                )
+            barrier()
+            nstride //= 2
+        var nscale = Float64(1.0) / sqrt(
+            sred[unsafe_offset=0] / Float64(INNER) + Float64(eps)
+        )
+        nk = tid
+        while nk < Int(INNER):
+            sx[unsafe_offset=nk] = Float32(
+                Float64(sx[unsafe_offset=nk])
+                * nscale
+                * Float64(rms_w[unsafe_offset=nk])
+            )
+            nk += THREADS
+        barrier()
+    var nq = Int(q_out)
+    var nkv = Int(kv_out)
+    var acc = InlineArray[Float64, 3 * COLS](fill=Float64(0))
+    @parameter
+    for seg in range(3):
+        var w = w_q
+        comptime if seg == 0:
+            w = w_q
+        elif seg == 1:
+            w = w_k
+        else:
+            w = w_v
+        var nseg = nq
+        comptime if seg != 0:
+            nseg = nkv
+        var kk = tid * 8
+        while kk < Int(INNER):
+            @parameter
+            for c in range(COLS):
+                var o = o0 + c
+                if o < nseg:
+                    var wv = w.load[8](o * Int(INNER) + kk)
+                    @parameter
+                    for j in range(8):
+                        acc[seg * COLS + c] += Float64(
+                            sx[unsafe_offset=kk + j]
+                        ) * Float64(Float32(wv[j]))
+            kk += THREADS * 8
+    var sacc = stack_allocation[
+        3 * COLS * THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for i in range(3 * COLS):
+        sacc[unsafe_offset=i * THREADS + tid] = acc[i]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for i in range(3 * COLS):
+                sacc[unsafe_offset=i * THREADS + tid] += sacc[
+                    unsafe_offset=i * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for c in range(COLS):
+            var o = o0 + c
+            if o < Int(q_out):
+                var v = Float32(sacc[unsafe_offset=c * THREADS])
+                if HAS_BIAS:
+                    v = v + bias_q[unsafe_offset=o]
+                dst_q[unsafe_offset=row * Int(q_out) + o] = v
+            if o < Int(kv_out):
+                var vk = Float32(sacc[unsafe_offset=COLS * THREADS + c * THREADS])
+                var vv = Float32(
+                    sacc[unsafe_offset=2 * COLS * THREADS + c * THREADS]
+                )
+                if HAS_BIAS:
+                    vk = vk + bias_k[unsafe_offset=o]
+                    vv = vv + bias_v[unsafe_offset=o]
+                dst_k[unsafe_offset=row * Int(kv_out) + o] = vk
+                dst_v[unsafe_offset=row * Int(kv_out) + o] = vv

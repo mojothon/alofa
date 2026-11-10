@@ -3307,3 +3307,10 @@
   - **坑在案**：① e 缓存与归约 scratch 不可共用 smem（树规约会毁缓存）；② j↔tid 映射写缓存后 V 循环读它需 barrier（跨线程）；③ session 分支交换用唯一串逐对替换（assert 锚点防错位）。
   - **复验全绿**：门 21/21、argmax 287、layer0 0.0、probe 1、prof 21、sections 61。
   - **到 2ms 剩余**：~0.18ms（按 A/B 标称）。池子更新：attn 三趟后 ~0.06（K2' 已榨）+ dual 0.70（见顶）+ down 0.40 + head 0.35 + tri 0.25 + o 0.15 + 地板 0.31。剩余候选：down/dual 结构、tri 多列、或地板（发射数再压）。
+
+- **2026-11-10（第八十四条）** —— 📊 **P5 步骤 4 续（tri 多列证伪轮）：零性能变化（默认 tri_cols=0 保持）；一次结构误判被干净证伪**
+  - **假设**：tri 245GB/s"有 2× 空间"——每块只算 1 输出、x 重载 896 次、latency 主导 ⇒ 多列（每块 COLS 输出）应摊薄。
+  - **实现**：`f16_matmul_qkv_mc_gpu[THREADS, INNER, COLS, ...]`（k 序 tid*8 步 THREADS*8 与树规约组序同旧 ⇒ 逐位同； InlineArray 参数序 [T, size] 坑一次；COLS=16/T128 爆 48KB 静态 smem 上限 53760B——sacc 3·COLS·THREADS·8B 是预算大头）。
+  - **证伪（单调签名）**：交错 A/B 四轮一致——旧 2.42-2.43 best；**c2t128 +0.05 / c4t256 +0.17 / c8t128 +0.38**，列越多块越少越慢。判决：**tri 的 896 块本身就是并行度**（~8 块/SM 驻留互相藏延迟），多列把 occupancy 砍到 1 块/SM 4 warp，延迟全暴露。245GB/s 不是带宽病是 latency-bound，"2× 空间"误读（七十八"占据率叙事不能乱套"教训的镜像：这次乱套的是我自己）。
+  - **沉淀**：mc kernel + bench_tri_mc_ab 留作复裁工具；`tri_cols` 参（默认 0）留存。tri/o 这对小 matmul（同为 896 块×1 输出形状）的剩余杠杆只剩：K3 合并折进 o kernel（省 24 发射 ≈0.05ms，代价 o 读 vpart/tsum 的跨 kernel 依赖）。
+  - **到 2ms 剩余**：~0.18（不变）。下一轮候选：K3→o 折叠、或 head/down 收尾勘察。

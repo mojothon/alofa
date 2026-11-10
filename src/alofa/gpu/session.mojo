@@ -49,6 +49,7 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_dual_fat_gpu,
     f16_matmul_fat_gpu,
     f16_matmul_qkv_gpu,
+    f16_matmul_qkv_mc_gpu,
     q4_matmul_fat_gpu,
     q4_matmul_fused_gpu,
     q4_matmul_qkv_gpu,
@@ -640,7 +641,7 @@ struct GpuSession:
 
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
-        tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
+        tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
         attn_smode: Int = 0, attn_tiles: Int = 8,
     ](
@@ -736,9 +737,32 @@ struct GpuSession:
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
             if skip & SKIP_TRI == 0:
-                self.ctx.enqueue_function[
-                    f16_matmul_qkv_gpu[tri_t, inner, True, True]
-                ](
+                comptime if tri_cols > 0:
+                    self.ctx.enqueue_function[
+                        f16_matmul_qkv_mc_gpu[tri_t, inner, tri_cols, True, True]
+                    ](
+                        self.d_x.unsafe_ptr(),
+                        self.d_w16_q[layer].unsafe_ptr(),
+                        self.d_w16_k[layer].unsafe_ptr(),
+                        self.d_w16_v[layer].unsafe_ptr(),
+                        dst_qkv_q.unsafe_ptr(),
+                        dst_qkv_k.unsafe_ptr(),
+                        dst_qkv_v.unsafe_ptr(),
+                        self.d_bias_q[layer].unsafe_ptr(),
+                        self.d_bias_k[layer].unsafe_ptr(),
+                        self.d_bias_v[layer].unsafe_ptr(),
+                        self.d_norms[2 * layer].unsafe_ptr(),
+                        self.eps,
+                        Int32(inner),
+                        Int32(self.q_out),
+                        Int32(self.kv_dim),
+                        grid_dim=(ceildiv(self.q_out, tri_cols), 1, 1),
+                        block_dim=(tri_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_matmul_qkv_gpu[tri_t, inner, True, True]
+                    ](
                     self.d_x.unsafe_ptr(),
                     self.d_w16_q[layer].unsafe_ptr(),
                     self.d_w16_k[layer].unsafe_ptr(),
