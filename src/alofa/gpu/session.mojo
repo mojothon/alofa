@@ -35,7 +35,7 @@ from alofa.core.error import (
 from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
-    attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu
+    attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, attn_vt2r_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -400,8 +400,10 @@ struct GpuSession:
         self.d_vpart = self.ctx.enqueue_create_buffer[DType.float32](
             self.n_heads * 8 * self.head_dim
         )
+        # n_heads * 8（K2' tsum[head*TILES+tile]，TILES≤8；八十六修正：
+        # 八十三起误配 n_heads，越界 784B 被分配器 slack 掩护未爆）
         self.d_attot = self.ctx.enqueue_create_buffer[DType.float64](
-            self.n_heads
+            self.n_heads * 8
         )
         self.d_logits = self.ctx.enqueue_create_buffer[DType.float32](self.vocab)
         self.d_token = self.ctx.enqueue_create_buffer[DType.int32](1)
@@ -682,13 +684,6 @@ struct GpuSession:
         不变 ⇒ scores 逐位同）三轮一致 -0.017ms，默认开。⚠️ attention
         20µs/层的主导项仍未定位 —— 14 块 SM 饥饿是结构性的（j 分块
         跨块归约是下一刀），VEC 只是零头。
-        attn_tiles（账本八十二）：跨块 j 分块三趟的 tile 数（默认 8；
-        0 = 旧单 kernel 路径）。八十一判决 scores 锁 per-SM 天花板
-        （14 块 × 9.7GB/s）—— 三趟（K1 scores 分块 / K2 V 分块+冗余
-        softmax / K3 合并）把 SM 数 ×8。scores 与 total 逐位同旧，
-        V 部分和按 tile×组重结合（门 1e-5 + argmax 判据）。端到端
-        交错：单 kernel 均值随 kv 爬升（2.40→2.81@kv282），tiles=8
-        平稳（~2.44）——高 kv 段 -0.32ms；tiles=8 对 4 四轮小胜。
         skip（账本七十六）：骨架测量掩码（SKIP_* 位，默认 0 = 完整
         路径）。置位的 kernel 类换成 noop 发射 —— 发射结构与同步/
         拷贝原样保留，只剥离该类 GPU 工作；skip=0 时与原路径逐指令

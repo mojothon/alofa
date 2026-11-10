@@ -723,16 +723,16 @@ def attn_vt2_gpu[
     if t1 > nsc:
         t1 = nsc
 
-    var smax = stack_allocation[
-        THREADS, Float32, address_space = AddressSpace.SHARED
-    ]()
     var stot = stack_allocation[
         THREADS, Float64, address_space = AddressSpace.SHARED
     ]()
     var e_s = stack_allocation[
         THREADS, Float64, address_space = AddressSpace.SHARED
     ]()
-    # gmax（冗余只读；max 无舍入序自由）
+    # gmax（冗余只读；max 无舍入序自由）。
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
     var best = LOWEST_FP32
     var j = tid
     while j <= upto:

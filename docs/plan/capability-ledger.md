@@ -3322,3 +3322,10 @@
   - **判决**：dual/down 卡在 ~580-800GB/s 的统一平台上（f32 FMA 点积 + f16 读的指令路径），微结构路线（形状/ILP/occupancy/smem）全部走完。**剩余大杠杆只剩 tensor core（MMA）路径**——dual+down+head+tri+o ≈ 1.85ms 池子，MMA 潜在 2-4×，但为多轮工程。
   - **复验全绿**：门 21/21、decode diff 与八十三基线逐位同（0.008678674697875977）、argmax 287、layer0/probe/prof/sections 全过。
   - **到 2ms 剩余**：~0.18（微结构路线已尽，MMA 是下一阶段的主战场）。
+
+- **2026-11-10（第八十六条）** —— 📊 **P5 步骤 4 续（skip 归因轮）：默认回滚 tiles=8 保持（2.417，diff 逐位同八十三）；换来管线真值归因 + 重大 bug 修复；RAWEXP 止损**
+  - **skip 掩码归因（bench_skip_attr，管线真值）**：sections bench 是 q4 旧口径不可用；skip 差值 = 家族管线成本。四轮 best 稳定：**attention 0.472（#2，比池子估算高 0.17——三趟 48 发射税计入）**、dual 0.637、down 0.355、head 0.352、tri 0.228、o 0.155、gather ≈0；合计 2.204 → **真地板仅 ~0.22**（token 路径 0.011 + logits d2h 0.032 + 发射队列）。⚠️ probe MAXT > ~512 会炸（cos 表 fixture 上限）。
+  - **重大 bug 修复（d_attot OOB）**：八十三起 d_attot 误配 `n_heads`（14 f64），K2' 写 tsum[head×8+tile] 需 112 —— **越界 784B 三轮未爆**（分配器 slack 掩护），diff 仅第 6 位微移的"好运气"其实是写坏邻接缓冲未发作。RAWEXP 改变布局后爆（device 端 tsum 行 assert）。已修 `n_heads * 8`。教训：**设备端越界写在本栈不 fault——需要缓冲金丝雀门**。
+  - **RAWEXP（跳过 gmax 减稳）止损**：首轮 A/B -0.27ms 全胜是**假象**——RAWEXP 分支漏发 K1（rope/scores/kv store 全没跑，attn=0、tsum=陈旧 scores 的 exp≈1，-0.27 主要是"漏发整个 K1"）。补 K1 后 diff=inf；物理删 gmax 版（vt2r）+ 恒等直证 K2r 读到干净 scores（-3.5），exp 恢复后仍 inf——恒等/单行差异改变 K1 可观测输出，属编译器/缓存域，非我的代码域。**按止损纪律回滚**：默认 tiles=8，vt2 还原、vt2r 删除。gmax 相真实成本 ~2-4µs/层（非 11），候选保留但需另寻实现路径。
+  - **复验全绿**：门 21/21、decode diff 逐位同八十三基线（0.008678674697875977）、argmax 287、layer0/probe 全过、bench 2.417。
+  - **到 2ms 剩余**：~0.42（按管线真值重算：attention 0.472 是下一个主战场——但三趟结构已就位，K1/K2' 内部还有 ~5µs/层发射间隙；MMA 仍是 down/dual/head 的大杠杆）。
