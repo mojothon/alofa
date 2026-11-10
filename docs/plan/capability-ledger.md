@@ -3280,3 +3280,12 @@
   - **attention 剩余**：scores ~12.7µs 成并列主导（每 j 单线程 128 维点积；d 分摊会破点积序）。下一刀候选：scores 的 warp 级协作点积、或跨块 j 分块（两趟归约）。
   - **复验全绿**：门 21/21、decode diff/argmax 逐位、layer0 normed 0.0、probe 1、prof 21、sections 61、bench_decode 2.523。
   - **到 2ms 剩余**：0.52ms。
+
+- **2026-11-10（第八十一条）** —— 📊 **P5 步骤 4 续（scores 归因轮）：零性能变化（2.523 保持）；三个假设全证伪 + 两个硬事实，scores 结构性判决**
+  - **标度诊断**（bench_attn_phase kv=100/300 两口径）：kernel floor（launch+rope+屏障）**恒 9.2µs 不随 kv 变**；scores 与 V 均随 kv 线性（scores 6.3@100 → 17.6@300）。
+  - **三个变体全负**（`smode` 编译期参：1=q 行进 smem f64 / 2=+k 预取 / 4=2 线程/j 半维点积+smem 对合并）：36.40/37.35/39.15 vs 基线 37.35 —— **q 的 LDG 重读、合迹、浅预取都不是病根**（pair 还慢 1.8µs）。
+  - **微核直接测**（bench_scores_kernel，scores 循环剥离，grid=14 复刻真链并行度）：**空核地板 8.4µs**（launch+sync 税，解释分相"only-scores"9.2µs 的几乎全部）；load[8] 循环 23.8 → 实体 **15.4µs**，即 2.2MB/15.4µs = 143GB/s、**每 SM 9.7GB/s —— 14 块 × 单块 per-SM 天花板**。整行预取（4×load[32]）爆慢 38.5（向量降级/溢出，坑在案）。
+  - **判决**：scores/floor 都锁死在"只有 14 块"上——**跨块 j 分块（两趟/三趟归约）是唯一剩余杠杆**，不是循环微优化。V2 已把 V 压到 6.6µs；T1024（V2×8 组）分相 -2.2µs 但端到端交错打平（+0.03/-0.02/-0.05）——不确认，保持 T512。
+  - **沉淀**：`smode` 参（默认 0）+ 两个新 bench（bench_scores_kernel 微核剥离法、bench_attn_t1024_ab）留作复裁；分相 bench 恢复 kv=300 口径。
+  - **复验全绿**：门 21/21、decode diff 逐位同基线、argmax 287、layer0 PASS、bench_decode 2.534（基线带内）。
+  - **到 2ms 剩余**：0.52ms。attention 下一步：j 分块跨块（grid=(14, TILES)，三趟：scores+tile max/sum → V 分块部分和 → 合并；预计 scores 15.4 → ~5µs，代价 +2 发射/层）。

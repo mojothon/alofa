@@ -176,7 +176,10 @@ def attention_par_gpu[THREADS: Int](
         dst[unsafe_offset=t * q_cols + q_head_base + tid] = Float32(acc / total)
 
 
-def attn_rope_gpu[THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = False](
+def attn_rope_gpu[
+    THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = False,
+    smode: Int = 0,
+](
     dst: Pointer[Float32, MutUntrackedOrigin],
     q_rot: Pointer[Float32, MutUntrackedOrigin],
     q_src: Pointer[Float32, MutUntrackedOrigin],
@@ -261,12 +264,60 @@ def attn_rope_gpu[THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = Fals
             v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = vv
     barrier()
 
+    # q 行预载（账本八十一 smode≥1）：q 每块恒定，原实现每 j 重读
+    # 128 条 global LDG —— 一次搬进 smem（f64），点积改 smem 读。
+    # 值 Float64(q_rot[...]) 逐位同原式 ⇒ scores bit-exact。
+    var s_q = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    comptime if smode >= 1:
+        if tid < Int(head_dim):
+            s_q[tid] = Float64(q_rot[unsafe_offset=q_head_base + tid])
+        barrier()
+
     # scores 相位：j < upto 读 store（旧 token，此前 launch 已写定）；
     # j == upto（当前 token）读 smem 副本 —— 由 `tid == upto % THREADS`
     # 的线程在循环后补算（max 无舍入，并入 best_local 的次序自由）。
     var best_local = LOWEST_FP32
     var j = tid
-    comptime if cut & 1 == 0:
+    comptime if cut & 1 == 0 and smode == 4:
+        # smode 4（账本八十一）：2 线程/j 半维点积 —— 线程对 (2j, 2j+1)
+        # 各算 head_dim 一半（16B 向量读、成对覆盖连续行），smem 对合
+        # 并。⚠️ d 求和序变（两半 f64 重结合），非 bit-exact（门 1e-5
+        # + argmax 判据；V2 先例 diff 未翻位）。
+        var s_pair = stack_allocation[
+            THREADS, Float64, address_space = AddressSpace.SHARED
+        ]()
+        var half_hd = Int(head_dim) // 2
+        var c8h = half_hd // 8
+        var half = tid % 2
+        var jstep = THREADS // 2
+        var rounds = (upto + jstep - 1) // jstep
+        for r4 in range(rounds):
+            var jj = r4 * jstep + tid // 2
+            var acc4 = Float64(0)
+            if jj < upto:
+                var kb4 = jj * kv_cols + kv_head_base + half * half_hd
+                for c in range(c8h):
+                    var kv8 = k_store.load[8](kb4 + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc4 += s_q[half * half_hd + c * 8 + dd] * Float64(
+                            kv8[dd]
+                        )
+                for d in range(c8h * 8, half_hd):
+                    acc4 += s_q[half * half_hd + d] * Float64(
+                        k_store[unsafe_offset=kb4 + d]
+                    )
+            s_pair[tid] = acc4
+            barrier()
+            if half == 0 and jj < upto:
+                var s4 = Float32(s_pair[tid] + s_pair[tid + 1]) * scale
+                scores[unsafe_offset=row + jj] = s4
+                if s4 > best_local:
+                    best_local = s4
+            barrier()
+    comptime if cut & 1 == 0 and smode != 4:
         while j < upto:
             var acc = Float64(0)
             var kbase = j * kv_cols + kv_head_base
@@ -274,7 +325,30 @@ def attn_rope_gpu[THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = Fals
             # 每 j 16 条向量 load 替代 128 条标量 2B 读，load 相互独立可
             # 全部在飞。求和序 d 升序不变（8 元组内 dd 升序）⇒ scores
             # 逐位同旧，下游 bit-exact。
-            comptime if VEC:
+            comptime if smode == 2:
+                var c8 = Int(head_dim) // 8
+                var cur = k_store.load[8](kbase)
+                for c in range(c8):
+                    var nxi = c + 1
+                    if nxi >= c8:
+                        nxi = c8 - 1
+                    var nxt = k_store.load[8](kbase + nxi * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += s_q[c * 8 + dd] * Float64(cur[dd])
+                    cur = nxt
+                for d in range(c8 * 8, Int(head_dim)):
+                    acc += s_q[d] * Float64(k_store[unsafe_offset=kbase + d])
+            elif smode == 1:
+                var c8 = Int(head_dim) // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += s_q[c * 8 + dd] * Float64(kv8[dd])
+                for d in range(c8 * 8, Int(head_dim)):
+                    acc += s_q[d] * Float64(k_store[unsafe_offset=kbase + d])
+            elif VEC:
                 var c8 = Int(head_dim) // 8
                 for c in range(c8):
                     var kv8 = k_store.load[8](kbase + c * 8)
@@ -297,6 +371,7 @@ def attn_rope_gpu[THREADS: Int, VEC: Bool = False, cut: Int = 0, V2: Bool = Fals
             if s > best_local:
                 best_local = s
             j += THREADS
+    comptime if cut & 1 == 0:
         if tid == upto % THREADS:
             var acc = Float64(0)
             for d in range(Int(head_dim)):

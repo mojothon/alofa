@@ -147,6 +147,120 @@ def bench_level_v2(
     print(name, ": mean=", total / Float64(ITERS), "us  best=", bestv, "us")
 
 
+def bench_smode[
+    S: Int
+](
+    mut session: GpuSession,
+    name: String,
+    kv_len: Int,
+    hd: Int,
+) raises:
+    for r in range(3):
+        session.ctx.enqueue_function[attn_rope_gpu[512, True, 0, True, S]](
+            session.d_attn.unsafe_ptr(),
+            session.d_q_rot.unsafe_ptr(),
+            session.d_q.unsafe_ptr(),
+            session.d_k.unsafe_ptr(),
+            session.d_v.unsafe_ptr(),
+            session.d_k_store[0].unsafe_ptr(),
+            session.d_v_store[0].unsafe_ptr(),
+            session.d_cos.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_sin.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_scores.unsafe_ptr(),
+            Int32(session.n_heads),
+            Int32(session.n_kv_heads),
+            Int32(hd),
+            Int32(kv_len),
+            grid_dim=(session.n_heads, 1, 1),
+            block_dim=(512, 1, 1),
+        )
+    session.ctx.synchronize()
+    var total = 0.0
+    var bestv = 1e30
+    for r in range(ITERS):
+        var t0 = monotonic_ns()
+        session.ctx.enqueue_function[attn_rope_gpu[512, True, 0, True, S]](
+            session.d_attn.unsafe_ptr(),
+            session.d_q_rot.unsafe_ptr(),
+            session.d_q.unsafe_ptr(),
+            session.d_k.unsafe_ptr(),
+            session.d_v.unsafe_ptr(),
+            session.d_k_store[0].unsafe_ptr(),
+            session.d_v_store[0].unsafe_ptr(),
+            session.d_cos.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_sin.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_scores.unsafe_ptr(),
+            Int32(session.n_heads),
+            Int32(session.n_kv_heads),
+            Int32(hd),
+            Int32(kv_len),
+            grid_dim=(session.n_heads, 1, 1),
+            block_dim=(512, 1, 1),
+        )
+        session.ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3
+        total += us
+        if us < bestv:
+            bestv = us
+    print(name, ": mean=", total / Float64(ITERS), "us  best=", bestv, "us")
+
+
+def bench_t1024(
+    mut session: GpuSession,
+    name: String,
+    kv_len: Int,
+    hd: Int,
+) raises:
+    for r in range(3):
+        session.ctx.enqueue_function[attn_rope_gpu[1024, True, 0, True, 0]](
+            session.d_attn.unsafe_ptr(),
+            session.d_q_rot.unsafe_ptr(),
+            session.d_q.unsafe_ptr(),
+            session.d_k.unsafe_ptr(),
+            session.d_v.unsafe_ptr(),
+            session.d_k_store[0].unsafe_ptr(),
+            session.d_v_store[0].unsafe_ptr(),
+            session.d_cos.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_sin.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_scores.unsafe_ptr(),
+            Int32(session.n_heads),
+            Int32(session.n_kv_heads),
+            Int32(hd),
+            Int32(kv_len),
+            grid_dim=(session.n_heads, 1, 1),
+            block_dim=(1024, 1, 1),
+        )
+    session.ctx.synchronize()
+    var total = 0.0
+    var bestv = 1e30
+    for r in range(ITERS):
+        var t0 = monotonic_ns()
+        session.ctx.enqueue_function[attn_rope_gpu[1024, True, 0, True, 0]](
+            session.d_attn.unsafe_ptr(),
+            session.d_q_rot.unsafe_ptr(),
+            session.d_q.unsafe_ptr(),
+            session.d_k.unsafe_ptr(),
+            session.d_v.unsafe_ptr(),
+            session.d_k_store[0].unsafe_ptr(),
+            session.d_v_store[0].unsafe_ptr(),
+            session.d_cos.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_sin.unsafe_ptr() + (kv_len - 1) * hd,
+            session.d_scores.unsafe_ptr(),
+            Int32(session.n_heads),
+            Int32(session.n_kv_heads),
+            Int32(hd),
+            Int32(kv_len),
+            grid_dim=(session.n_heads, 1, 1),
+            block_dim=(1024, 1, 1),
+        )
+        session.ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3
+        total += us
+        if us < bestv:
+            bestv = us
+    print(name, ": mean=", total / Float64(ITERS), "us  best=", bestv, "us")
+
+
 def main() raises:
     var model = QwenForward(WEIGHTS, CONFIG, MAXT, True)
     var session = GpuSession(model, MAXT)
@@ -165,6 +279,10 @@ def main() raises:
 
     bench_level[0](session, "full", kv_len, hd)
     bench_level_v2(session, "full-V2", kv_len, hd)
+    bench_smode[1](session, "V2+sq", kv_len, hd)
+    bench_smode[2](session, "V2+sq+pf", kv_len, hd)
+    bench_smode[4](session, "V2+pair", kv_len, hd)
+    bench_t1024(session, "T1024 V2x8", kv_len, hd)
     bench_level[16](session, "  -V", kv_len, hd)
     bench_level[24](session, "  -V-sum", kv_len, hd)
     bench_level[28](session, "  -V-sum-exp", kv_len, hd)

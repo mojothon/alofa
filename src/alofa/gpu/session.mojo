@@ -631,6 +631,7 @@ struct GpuSession:
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
+        attn_smode: Int = 0,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -755,7 +756,9 @@ struct GpuSession:
             var pv = self.d_v_store[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
                 self.ctx.enqueue_function[
-                    attn_rope_gpu[attn_t, attn_vec, 0, attn_v2]
+                    attn_rope_gpu[
+                        attn_t, attn_vec, 0, attn_v2, attn_smode
+                    ]
                 ](
                     self.d_attn.unsafe_ptr(),
                     self.d_q_rot.unsafe_ptr(),
