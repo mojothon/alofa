@@ -3314,3 +3314,11 @@
   - **证伪（单调签名）**：交错 A/B 四轮一致——旧 2.42-2.43 best；**c2t128 +0.05 / c4t256 +0.17 / c8t128 +0.38**，列越多块越少越慢。判决：**tri 的 896 块本身就是并行度**（~8 块/SM 驻留互相藏延迟），多列把 occupancy 砍到 1 块/SM 4 warp，延迟全暴露。245GB/s 不是带宽病是 latency-bound，"2× 空间"误读（七十八"占据率叙事不能乱套"教训的镜像：这次乱套的是我自己）。
   - **沉淀**：mc kernel + bench_tri_mc_ab 留作复裁工具；`tri_cols` 参（默认 0）留存。tri/o 这对小 matmul（同为 896 块×1 输出形状）的剩余杠杆只剩：K3 合并折进 o kernel（省 24 发射 ≈0.05ms，代价 o 读 vpart/tsum 的跨 kernel 依赖）。
   - **到 2ms 剩余**：~0.18（不变）。下一轮候选：K3→o 折叠、或 head/down 收尾勘察。
+
+- **2026-11-10（第八十五条）** —— 📊 **P5 步骤 4 续（dual 深挖轮）：零性能变化（默认保持 ~2.18 标称）；dual 三条路线全证伪 + 池子重估**
+  - **形状扫描证伪**（bench_dual_ab，端到端交错四轮）：t64o4（默认）best 2.40/2.44/2.44 最优；t64o8 +0.14、t128o4 +0.11、t128o8 +0.02~0.03 —— ILP/occupancy 旋钮不是病根。
+  - **池子重估（prof_f16 重读）**：head T128O8 实测 **1031GB/s**（264µs 长核，稳态）证明盒子 >1TB/s 可达；但 dual/down 的独立测量含 ~8-10µs launch+sync 地板（八十一空核 8.4µs）——**dual 真实体 ≈800GB/s 而非 576**，池子里 dual 0.70 的"砍半"想象空间实际 ~0.1ms 级。
+  - **norm 出核 + 无 smem 变体证伪**（`f16_matmul_dual_nx_gpu` + rmsnorm 单发写 d_xnorm，bench_dual_nx_ab 四轮）：nx4 +0.02、nx2 +0.04、nx4t128 +0.19 —— **44 warp/SM 也没换来带宽**（occupancy 假设第二次死），且 +1 norm 发射税吃掉 kernel 端收益。nx 路线留档（dot 序同旧，逐位同；d_xnorm 缓冲 + dual_nx 参留存）。
+  - **判决**：dual/down 卡在 ~580-800GB/s 的统一平台上（f32 FMA 点积 + f16 读的指令路径），微结构路线（形状/ILP/occupancy/smem）全部走完。**剩余大杠杆只剩 tensor core（MMA）路径**——dual+down+head+tri+o ≈ 1.85ms 池子，MMA 潜在 2-4×，但为多轮工程。
+  - **复验全绿**：门 21/21、decode diff 与八十三基线逐位同（0.008678674697875977）、argmax 287、layer0/probe/prof/sections 全过。
+  - **到 2ms 剩余**：~0.18（微结构路线已尽，MMA 是下一阶段的主战场）。

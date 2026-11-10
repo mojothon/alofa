@@ -48,6 +48,7 @@ from alofa.kernels.cuda.matmul import (
     f16_matmul_dual_gpu,
     q4_matmul_dual_fat_gpu,
     f16_matmul_fat_gpu,
+        f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
     q4_matmul_fat_gpu,
@@ -177,6 +178,7 @@ struct GpuSession:
     var d_gate: DeviceBuffer[DType.float32]
     var d_up: DeviceBuffer[DType.float32]
     var d_act: DeviceBuffer[DType.float32]
+    var d_xnorm: DeviceBuffer[DType.float32]
     var d_ws: DeviceBuffer[DType.float32]
     var d_scores: DeviceBuffer[DType.float32]
     var d_vpart: DeviceBuffer[DType.float32]
@@ -388,6 +390,7 @@ struct GpuSession:
         self.d_gate = self.ctx.enqueue_create_buffer[DType.float32](self.inter)
         self.d_up = self.ctx.enqueue_create_buffer[DType.float32](self.inter)
         self.d_act = self.ctx.enqueue_create_buffer[DType.float32](self.inter)
+        self.d_xnorm = self.ctx.enqueue_create_buffer[DType.float32](self.hidden)
         self.d_ws = self.ctx.enqueue_create_buffer[DType.float32](self.hidden)
         self.d_scores = self.ctx.enqueue_create_buffer[DType.float32](
             self.n_heads * max_tokens
@@ -643,7 +646,7 @@ struct GpuSession:
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 128, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
-        attn_smode: Int = 0, attn_tiles: Int = 8,
+        attn_smode: Int = 0, attn_tiles: Int = 8, dual_nx: Bool = False,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -927,9 +930,38 @@ struct GpuSession:
             var dst_gate = self._dst(4)
             var dst_up = self._dst(5)
             if skip & SKIP_DUAL == 0:
-                self.ctx.enqueue_function[
-                    f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
-                ](
+                comptime if dual_nx:
+                    # 账本八十五：norm 出核（rmsnorm 单发写 d_xnorm）+
+                    # dual 去 smem 直读 L1 —— 破 x 摊薄 vs occupancy 死锁。
+                    self.ctx.enqueue_function[rmsnorm_gpu](
+                        self.d_x.unsafe_ptr(),
+                        self.d_norms[2 * layer + 1].unsafe_ptr(),
+                        self.d_xnorm.unsafe_ptr(),
+                        Int32(inner),
+                        Int32(1),
+                        self.eps,
+                        grid_dim=(1, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.enqueue_function[
+                        f16_matmul_dual_nx_gpu[dual_t, inner, dual_o, True]
+                    ](
+                        self.d_xnorm.unsafe_ptr(),
+                        w_gate,
+                        w_up,
+                        dst_gate.unsafe_ptr(),
+                        dst_up.unsafe_ptr(),
+                        self.d_ws.unsafe_ptr(),
+                        self.d_proj.unsafe_ptr(),
+                        self.d_act.unsafe_ptr(),
+                        Int32(self.inter),
+                        grid_dim=(ceildiv(self.inter, dual_o), 1, 1),
+                        block_dim=(dual_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_matmul_dual_gpu[dual_t, inner, dual_o, False, True, True]
+                    ](
                     self.d_x.unsafe_ptr(),
                     w_gate,
                     w_up,

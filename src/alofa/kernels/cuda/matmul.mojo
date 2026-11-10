@@ -1027,3 +1027,91 @@ def f16_matmul_qkv_mc_gpu[
                     vv = vv + bias_v[unsafe_offset=o]
                 dst_k[unsafe_offset=row * Int(kv_out) + o] = vk
                 dst_v[unsafe_offset=row * Int(kv_out) + o] = vv
+
+
+def f16_matmul_dual_nx_gpu[
+    THREADS: Int, INNER: Int, OUTS: Int, HAS_ACT: Bool = False,
+](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    bias_a: Pointer[Float32, MutUntrackedOrigin],
+    bias_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+) -> None:
+    """dual 无 smem 变体（账本八十五）：x 已由 rmsnorm 单发归一（调用方
+    保证），直读全局（行 3.5KB，L1 常驻）。去 sx 载入相 + NORM 相
+    （1216 块 × 冗余 norm 树全免）—— 换 o2 时块数翻倍（2432 块 ×
+    2 warp = 44 warp/SM，旧结构 smem+X 税锁死 22）。dot 循环 k 序/
+    j 序/树序同 f16_matmul_dual_gpu ⇒ 对同一归一化输入逐位同。
+    形状扫描（bench_dual_ab）证伪旋钮路线：t64o4 565GB/s 最优，
+    t128o8 打平——瓶颈是 x 摊薄 vs occupancy 死锁，唯一破法出核。
+    head T128O8 实测 1031GB/s 证明盒子能跑 >1TB/s。
+    """
+    var o0 = Int(block_idx.x) * OUTS
+    var row = Int(block_idx.y)
+    if o0 >= Int(out_cols):
+        return
+    var tid = Int(thread_idx.x)
+    var acc = InlineArray[Float64, 2 * OUTS](fill=Float64(0))
+    var wrow = InlineArray[Pointer[Float16, MutUntrackedOrigin], 2 * OUTS](fill=w_a)
+    var wbase = InlineArray[Int, 2 * OUTS](fill=0)
+    var valid = InlineArray[Bool, 2 * OUTS](fill=False)
+    @parameter
+    for half in range(2):
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            valid[half * OUTS + oo] = o < Int(out_cols)
+            comptime if half == 1:
+                wrow[half * OUTS + oo] = w_b
+            wbase[half * OUTS + oo] = o * Int(INNER)
+    var x_base = row * Int(INNER)
+    var k = tid * 8
+    while k < Int(INNER):
+        var xv = InlineArray[Float64, 8](fill=Float64(0))
+        @parameter
+        for j in range(8):
+            xv[j] = Float64(x[unsafe_offset=x_base + k + j])
+        @parameter
+        for idx in range(2 * OUTS):
+            if valid[idx]:
+                var wv = wrow[idx].load[8](wbase[idx] + k)
+                @parameter
+                for j in range(8):
+                    acc[idx] += xv[j] * Float64(Float32(wv[j]))
+        k += THREADS * 8
+    var sacc = stack_allocation[
+        2 * OUTS * THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(2 * OUTS):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(2 * OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                var v2 = Float32(sacc[unsafe_offset=(OUTS + oo) * THREADS])
+                dst_a[unsafe_offset=row * Int(out_cols) + o] = v
+                dst_b[unsafe_offset=row * Int(out_cols) + o] = v2
+                comptime if HAS_ACT:
+                    var g = Float64(v)
+                    dst_act[unsafe_offset=row * Int(out_cols) + o] = Float32(
+                        g / (Float64(1) + exp(-g)) * Float64(v2)
+                    )
