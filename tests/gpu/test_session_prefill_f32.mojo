@@ -41,6 +41,7 @@ def main() raises:
     # 变体 run 前必须重置 0，否则 attention 读到上次 run 的 KV 残留
     #（一百零五教训：之前所有连跑变体的 diff 都被此污染）。
     session.kv_pos = 0
+    session.wp_ready = False
     var gpu32 = session.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128,
         512, 1, 8, DType.float32](ids8)
     var diff = Float64(0)
@@ -62,15 +63,19 @@ def main() raises:
         raise Error("f32 fast path argmax mismatch")
     # MMA 诊断变体（kv_pos 重置后重测——一百零五重审）
     comptime VARIANTS = (
-        ("dual-only", False, True),
-        ("down-only", True, False),
+        ("qo-off", True, True, False, False),
+        ("q-only", True, True, True, False),
+        ("o-only", True, True, False, True),
+        ("qo-on", True, True, True, True),
     )
     @parameter
-    for v in range(2):
+    for v in range(4):
         session.kv_pos = 0
+        session.wp_ready = False
         var gm = session.prefill_step[INNER, INNER_FF, 64, 4, 128, 128,
             128, 512, 1, 8, DType.float32, VARIANTS[v][1],
-            VARIANTS[v][2]](ids8)
+            VARIANTS[v][2], True, VARIANTS[v][3], VARIANTS[v][4]](ids8)
+        print("variant", VARIANTS[v][0])
         var dm = Float64(0)
         var bm = 0
         for i in range(n):

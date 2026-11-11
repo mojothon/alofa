@@ -2348,6 +2348,137 @@ def f16_mma_down_pk_gpu[INNER: Int, CH: Int, OUTS: Int, WARP: Int](
 
 
 
+def f16_mma_gemm_pk_gpu[
+    INNER: Int, CH: Int, OUTS: Int, WARP: Int, HAS_BIAS: Bool
+](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    wp: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """通用 packed GEMM（账本一百零八）：`dst = x @ wp^T (+ bias)`，
+    wp 来自 pack_w_mma_gpu[INNER, OUTS, WARP]，几何/主循环与
+    f16_mma_down_pk_gpu 逐指令相同，只是尾部从 ACC 累加改为裸写
+    （HAS_BIAS 时叠 f32 bias，索引 = 全局列）。供 q2/o 的 896×896
+    小 GEMM 使用；要求 out_cols % (WARP*OUTS*8) == 0。"""
+
+    var cb = Int(block_idx.x) * WARP * OUTS * 8
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    @parameter
+    for ch in range(INNER // CH):
+        var i = tid
+        while i < 16 * CH:
+            sxf[unsafe_offset=i] = xh[
+                unsafe_offset=(r0 + i // CH) * INNER + ch * CH + i % CH
+            ]
+            i += WARP * 32
+        barrier()
+        @parameter
+        for st in range(CH // 16):
+            var av = SIMD[DType.float16, 8](
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 9],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 9],
+            )
+            @parameter
+            for j in range(OUTS):
+                var col = cb + warp * 8 + j * (WARP * 8)
+                var pk0 = ((cb // (WARP * OUTS * 8)) * (INNER // 16) + ch * (CH // 16) + st) * (WARP * OUTS * 8 * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+                var bv = SIMD[DType.float16, 4](
+                    wp[unsafe_offset=pk0],
+                    wp[unsafe_offset=pk0 + 1],
+                    wp[unsafe_offset=pk0 + 2],
+                    wp[unsafe_offset=pk0 + 3],
+                )
+                var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+                comptime if st % 2 == 0:
+                    mma(dv, av, bv, accA[j])
+                    accA[j] = dv
+                else:
+                    mma(dv, av, bv, accB[j])
+                    accB[j] = dv
+        barrier()
+
+    @parameter
+    for ks in range((INNER % CH) // 16):
+        var k = (INNER // CH) * CH + ks * 16
+        var av = SIMD[DType.float16, 8](
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 9],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(OUTS):
+            var col = cb + warp * 8 + j * (WARP * 8)
+            var pk1 = ((cb // (WARP * OUTS * 8)) * (INNER // 16) + (k // 16)) * (WARP * OUTS * 8 * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+            var bv = SIMD[DType.float16, 4](
+                wp[unsafe_offset=pk1],
+                wp[unsafe_offset=pk1 + 1],
+                wp[unsafe_offset=pk1 + 2],
+                wp[unsafe_offset=pk1 + 3],
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+
+    @parameter
+    for j in range(OUTS):
+        var col = cb + warp * 8 + j * (WARP * 8)
+        var acc = accA[j] + accB[j]
+        var b0 = Float32(0)
+        var b1 = Float32(0)
+        comptime if HAS_BIAS:
+            b0 = bias[unsafe_offset=col + tig * 2]
+            b1 = bias[unsafe_offset=col + tig * 2 + 1]
+        if r0 + gid < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = acc[0] + b0
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = acc[1] + b1
+        if r0 + gid + 8 < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = acc[2] + b0
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = acc[3] + b1
+
+
 def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
     xh: Pointer[Float16, MutUntrackedOrigin],
     w_a: Pointer[Float16, MutUntrackedOrigin],
