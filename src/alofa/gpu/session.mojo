@@ -39,8 +39,9 @@ from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
-    attn_vt2_h_gpu, attn_comb2_b_gpu
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu
+    attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
+    attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -251,6 +252,16 @@ struct GpuSession:
     var d_amax: DeviceBuffer[DType.float32]
     var d_aidx: DeviceBuffer[DType.int32]
     var last_token: Int
+    # 一百二十：批解码基建（batch=True 的 prefill；BMAX=8）
+    var d_k_store_b: List[DeviceBuffer[DType.float32]]
+    var d_v_store_b: List[DeviceBuffer[DType.float32]]
+    var d_posarr: DeviceBuffer[DType.int32]
+    var h_posarr: HostBuffer[DType.int32]
+    var d_normedb: DeviceBuffer[DType.float32]
+    var d_logits_b: DeviceBuffer[DType.float32]
+    var h_logits_b: HostBuffer[DType.float32]
+    var d_tokout: DeviceBuffer[DType.int32]
+    var h_tokout: HostBuffer[DType.int32]
 
     def __init__(out self, model: QwenForward, max_tokens: Int) raises:
         """全量上传并分配激活/KV。要求 `model` 以 `quantize=True` 构造。"""
@@ -598,6 +609,38 @@ struct GpuSession:
         self.h_logits = self.ctx.enqueue_create_host_buffer[DType.float32](
             self.vocab
         )
+        # 一百二十：批解码分配（与上方同属纯分配区，不与拷贝交错——
+        # 账本六十三的 AsyncRT 悬崖）。BMAX=8；store 布局
+        # [B][max_tokens][kv_dim]，比单序列 store 多 8×（100MB）。
+        self.d_k_store_b = List[DeviceBuffer[DType.float32]]()
+        self.d_v_store_b = List[DeviceBuffer[DType.float32]]()
+        for _bl in range(self.n_layers):
+            self.d_k_store_b.append(
+                self.ctx.enqueue_create_buffer[DType.float32](
+                    8 * self.max_tokens * self.kv_dim
+                )
+            )
+            self.d_v_store_b.append(
+                self.ctx.enqueue_create_buffer[DType.float32](
+                    8 * self.max_tokens * self.kv_dim
+                )
+            )
+        self.d_posarr = self.ctx.enqueue_create_buffer[DType.int32](8)
+        self.h_posarr = self.ctx.enqueue_create_host_buffer[DType.int32](8)
+        self.d_normedb = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * self.hidden
+        )
+        self.d_logits_b = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * self.vocab
+        )
+        self.h_logits_b = self.ctx.enqueue_create_host_buffer[DType.float32](
+            8 * self.vocab
+        )
+        self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](8)
+        self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](8)
+        self.ctx.synchronize()
+        for i in range(8):
+            self.h_posarr[i] = Int32(0)
         self.ctx.synchronize()
 
     # ---- 私有发射原语（t=1；只收索引，不收 self 派生缓冲参数）----
@@ -1364,6 +1407,9 @@ struct GpuSession:
         prefill_spl: Bool = True,
         # 一百一十三-b：kv2 换双输出 packed MMA（k/v 权重拼接一发算完）
         prefill_kv: Bool = False,
+        # 一百二十：批解码模式——t 行 = t 序列各 1 token（pos_arr 独立
+        # rope/KV 基址，_bb attention 核，B 行 head+argmax）
+        batch: Bool = False,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1389,6 +1435,7 @@ struct GpuSession:
         返回 host logits 指针（末行，下次调用前有效）。
         """
         var t = len(tokens)
+        print("prefill batch=", batch)
         if t == 0:
             raise AlofaError(ERR_INVALID_ARGUMENT, "no tokens given", "")
         if t > PREFILL_MAX_BATCH:
@@ -1399,8 +1446,23 @@ struct GpuSession:
             )
         var pos0 = self.kv_pos
         var kv_len = pos0 + t
-        if kv_len > self.max_tokens:
-            raise AlofaError(ERR_OUT_OF_RANGE, "kv store is full", "")
+        comptime if batch:
+            if t > 8:
+                raise AlofaError(
+                    ERR_INVALID_ARGUMENT, "batch decode cap is 8",
+                    "t=" + String(t),
+                )
+            for i in range(t):
+                if Int(self.h_posarr[i]) + 1 > self.max_tokens:
+                    raise AlofaError(
+                        ERR_OUT_OF_RANGE, "kv store is full (batch)", ""
+                    )
+            self.ctx.enqueue_copy(
+                dst_buf=self.d_posarr, src_buf=self.h_posarr
+            )
+        else:
+            if kv_len > self.max_tokens:
+                raise AlofaError(ERR_OUT_OF_RANGE, "kv store is full", "")
 
         # 分段计时（profile=True 时段间 synchronize——破坏流水只看占比）
         var prof = InlineArray[Float64, 10](fill=Float64(0))
@@ -1729,24 +1791,43 @@ struct GpuSession:
             var pv = self.d_v_store[layer].unsafe_ptr()
             # store 与 scores 分跨 launch 边界（同 launch 跨 block 写读
             # store 行是竞态：行 b 读 pos0..pos0+b-1，全由本批写入）。
-            self.ctx.enqueue_function[
-                KVS_K
-            ](
-                self.d_qrot_b.unsafe_ptr(),
-                self.d_qb.unsafe_ptr(),
-                self.d_kb.unsafe_ptr(),
-                self.d_vb.unsafe_ptr(),
-                pk,
-                pv,
-                self.d_cos.unsafe_ptr(),
-                self.d_sin.unsafe_ptr(),
-                Int32(self.n_heads),
-                Int32(self.n_kv_heads),
-                Int32(self.head_dim),
-                Int32(pos0),
-                grid_dim=(self.n_heads, 1, t),
-                block_dim=(attn_t, 1, 1),
-            )
+            if batch:
+                self.ctx.enqueue_function[kv_store_bb_gpu[attn_t]](
+                    self.d_qrot_b.unsafe_ptr(),
+                    self.d_qb.unsafe_ptr(),
+                    self.d_kb.unsafe_ptr(),
+                    self.d_vb.unsafe_ptr(),
+                    self.d_k_store_b[layer].unsafe_ptr(),
+                    self.d_v_store_b[layer].unsafe_ptr(),
+                    self.d_cos.unsafe_ptr(),
+                    self.d_sin.unsafe_ptr(),
+                    self.d_posarr.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(self.max_tokens),
+                    grid_dim=(self.n_heads, 1, t),
+                    block_dim=(attn_t, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    KVS_K
+                ](
+                    self.d_qrot_b.unsafe_ptr(),
+                    self.d_qb.unsafe_ptr(),
+                    self.d_kb.unsafe_ptr(),
+                    self.d_vb.unsafe_ptr(),
+                    pk,
+                    pv,
+                    self.d_cos.unsafe_ptr(),
+                    self.d_sin.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(pos0),
+                    grid_dim=(self.n_heads, 1, t),
+                    block_dim=(attn_t, 1, 1),
+                )
             if profile:
                 self.ctx.synchronize()
                 prof[5] += Float64(monotonic_ns() - prof_t0) / 1e6
@@ -1767,37 +1848,70 @@ struct GpuSession:
                 prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
-            comptime if prefill_gqa and attn_tiles == 1 and attn_t % 8 == 0:
+            if batch:
                 self.ctx.enqueue_function[
-                    attn_rs_h_gpu[attn_t, 8, True]
+                    attn_rs_h_bb_gpu[attn_t, 8, True]
                 ](
                     self.d_qrot_b.unsafe_ptr(),
-                    pk,
+                    self.d_k_store_b[layer].unsafe_ptr(),
                     self.d_scoresb.unsafe_ptr(),
+                    self.d_posarr.unsafe_ptr(),
                     Int32(self.n_heads),
                     Int32(self.n_kv_heads),
                     Int32(self.head_dim),
-                    Int32(kv_len),
-                    Int32(pos0),
+                    Int32(self.max_tokens),
                     grid_dim=(self.n_kv_heads, 1, t),
                     block_dim=(attn_t, 1, 1),
                 )
             else:
+                comptime if prefill_gqa and attn_tiles == 1 and attn_t % 8 == 0:
+                    self.ctx.enqueue_function[
+                        attn_rs_h_gpu[attn_t, 8, True]
+                    ](
+                        self.d_qrot_b.unsafe_ptr(),
+                        pk,
+                        self.d_scoresb.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        Int32(pos0),
+                        grid_dim=(self.n_kv_heads, 1, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        RS_K
+                    ](
+                        self.d_qrot_b.unsafe_ptr(),
+                        pk,
+                        self.d_scoresb.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        Int32(pos0),
+                        grid_dim=(self.n_heads, attn_tiles, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+            if batch:
                 self.ctx.enqueue_function[
-                    RS_K
+                    attn_vt2_h_bb_gpu[attn_t, 8, attn_tiles, attn_tiles == 1]
                 ](
-                    self.d_qrot_b.unsafe_ptr(),
-                    pk,
                     self.d_scoresb.unsafe_ptr(),
+                    self.d_v_store_b[layer].unsafe_ptr(),
+                    self.d_vpartb.unsafe_ptr(),
+                    self.d_attotb.unsafe_ptr(),
+                    self.d_posarr.unsafe_ptr(),
                     Int32(self.n_heads),
                     Int32(self.n_kv_heads),
                     Int32(self.head_dim),
-                    Int32(kv_len),
-                    Int32(pos0),
-                    grid_dim=(self.n_heads, attn_tiles, t),
+                    Int32(self.max_tokens),
+                    self.d_attnb.unsafe_ptr(),
+                    grid_dim=(self.n_kv_heads, attn_tiles, t),
                     block_dim=(attn_t, 1, 1),
                 )
-            if prefill_gqa and attn_t // 8 == self.head_dim and (
+            elif prefill_gqa and attn_t // 8 == self.head_dim and (
                 self.n_heads // self.n_kv_heads <= 8
             ):
                 comptime if attn_tiles == 1:
@@ -2102,28 +2216,63 @@ struct GpuSession:
                 _ = external_call["usleep", Int32](Int32(layer_gap_us))
                 prof_t0 = monotonic_ns()
 
-        # 末行终 norm + lm_head（只算末行 logits）
-        self.ctx.enqueue_function[rmsnorm_gpu](
-            self.d_xb.unsafe_ptr() + (t - 1) * self.hidden,
-            self.d_norms[2 * self.n_layers].unsafe_ptr(),
-            self.d_normed.unsafe_ptr(),
-            Int32(self.hidden),
-            Int32(1),
-            self.eps,
-            grid_dim=(1, 1, 1),
-            block_dim=(256, 1, 1),
-        )
-        self.ctx.enqueue_function[LMHEAD_K](
-            self.d_normed.unsafe_ptr(),
-            self.d_embed16.unsafe_ptr(),
-            self.d_logits.unsafe_ptr(),
-            self.d_ws.unsafe_ptr(),
-            self.eps,
-            Int32(self.vocab),
-            grid_dim=(ceildiv(self.vocab, 8), 1, 1),
-            block_dim=(256, 1, 1),
-        )
-        self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
+        if batch:
+            print("BATCH TAIL t=", t)
+            # 一百二十：B 行终 norm + B 行 lm_head + 行 argmax
+            self.ctx.enqueue_function[rmsnorm_gpu](
+                self.d_xb.unsafe_ptr(),
+                self.d_norms[2 * self.n_layers].unsafe_ptr(),
+                self.d_normedb.unsafe_ptr(),
+                Int32(self.hidden),
+                Int32(t),
+                self.eps,
+                grid_dim=(t, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[LMHEAD_K](
+                self.d_normedb.unsafe_ptr(),
+                self.d_embed16.unsafe_ptr(),
+                self.d_logits_b.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                self.eps,
+                Int32(self.vocab),
+                grid_dim=(ceildiv(self.vocab, 8), t, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[argmax_rb_gpu](
+                self.d_logits_b.unsafe_ptr(),
+                self.d_tokout.unsafe_ptr(),
+                Int32(self.vocab),
+                grid_dim=(t, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_copy(
+                dst_buf=self.h_logits_b, src_buf=self.d_logits_b
+            )
+            self.ctx.enqueue_copy(dst_buf=self.h_tokout, src_buf=self.d_tokout)
+        else:
+            # 末行终 norm + lm_head（只算末行 logits）
+            self.ctx.enqueue_function[rmsnorm_gpu](
+                self.d_xb.unsafe_ptr() + (t - 1) * self.hidden,
+                self.d_norms[2 * self.n_layers].unsafe_ptr(),
+                self.d_normed.unsafe_ptr(),
+                Int32(self.hidden),
+                Int32(1),
+                self.eps,
+                grid_dim=(1, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[LMHEAD_K](
+                self.d_normed.unsafe_ptr(),
+                self.d_embed16.unsafe_ptr(),
+                self.d_logits.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                self.eps,
+                Int32(self.vocab),
+                grid_dim=(ceildiv(self.vocab, 8), 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         if profile:
             self.ctx.synchronize()
             prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
@@ -2141,5 +2290,9 @@ struct GpuSession:
             print("prof ff:", prof[7], "ms")
             print("prof down:", prof[8], "ms")
             print("prof tail:", prof[9], "ms")
+        if batch:
+            for i in range(t):
+                self.h_posarr[i] = self.h_posarr[i] + 1
+            return self.h_logits_b.unsafe_ptr()
         self.kv_pos = kv_len
         return self.h_logits.unsafe_ptr()

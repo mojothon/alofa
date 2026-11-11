@@ -395,6 +395,49 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
                 dst[unsafe_offset=row * Int(out_cols) + o] = Float32(sacc[unsafe_offset=oo * THREADS])
 
 
+def argmax_rb_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    out_idx: Pointer[Int32, MutUntrackedOrigin],
+    vocab: Int32,
+) -> None:
+    """行 argmax（账本一百二十）：grid=(B,)，块 b 对 [b][vocab] 行
+    求 argmax 直写 out[b]。首现并列语义与 host/argmax_f32 一致。
+    256 线程跨步 + smem 树。"""
+    var b = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var base = b * Int(vocab)
+    var best = Float32(-3.402823466e38)
+    var bi = Int32(-1)
+    var i = tid
+    while i < Int(vocab):
+        var v = x[unsafe_offset=base + i]
+        if v > best:
+            best = v
+            bi = Int32(i)
+        i += 256
+    var sval = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var sidx = stack_allocation[
+        256, Int32, address_space = AddressSpace.SHARED
+    ]()
+    sval[unsafe_offset=tid] = best
+    sidx[unsafe_offset=tid] = bi
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            var v2 = sval[unsafe_offset=tid + stride]
+            var i2 = sidx[unsafe_offset=tid + stride]
+            var v1 = sval[unsafe_offset=tid]
+            var i1 = sidx[unsafe_offset=tid]
+            if (v2 > v1) or ((v2 == v1) and (i2 < i1)):
+                sval[unsafe_offset=tid] = v2
+                sidx[unsafe_offset=tid] = i2
+        barrier()
+        stride //= 2
+    if tid == 0:
+        out_idx[unsafe_offset=b] = sidx[unsafe_offset=0]
 def argmax_f32_gpu(
     x: Pointer[Float32, MutUntrackedOrigin],
     part_val: Pointer[Float32, MutUntrackedOrigin],
