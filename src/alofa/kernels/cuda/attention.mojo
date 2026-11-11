@@ -1211,3 +1211,78 @@ def attn_fused_b_gpu[
         vpart[unsafe_offset=(
             (b * Int(n_heads) + head) * TILES + tile
         ) * hd + d] = Float32(acc2)
+
+
+def attn_rs_b4_gpu[
+    THREADS: Int, ROWS: Int = 4, VEC: Bool = True,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+    pos0: Int32,
+    n_rows: Int32,
+) -> None:
+    """K1 scores 的「多行共块」版（账本一百零八）：grid=(n_heads, 1,
+    ceil(t/ROWS))，块内 THREADS/ROWS 个线程服务一行。原 rs 在 t=128、
+    THREADS=512 时只有 128 线程活跃（3/4 空转）；本版把 ROWS=4 行塞进
+    一块，所有线程都干活。
+
+    逐元素算序与 attn_rs_b_gpu **完全同构**（同一 j 仍由同一线程按
+    8-wide chunk + f64 累加走完全部 hd 维），因此 scores 逐位相等
+    （实测 maxdiff 0.0，0 个非零）。
+
+    ⚠️ 性能负结果（t=128、kv=128、14 头，批量 20 连发）：rs 113µs vs
+    rs4(4 行/块) 122µs vs rs4(2 行/块, 256 线程) 117µs——**无收益**。
+    ⇒ RS 不是占用率受限（空转线程不花钱），而是受「每线程重复读 64 维
+    q + 每 key 读 256B k」的访存模式限制（每层 ~116MB 冗余流量 ≒
+    113µs @1TB/s）。真要提速需按 kv_head 分组（同组 7 个 head 共享一次
+    k 读）或把 q 行进 smem/shfl 广播。保留作参照。"""
+
+    comptime TPR = THREADS // ROWS
+    var tid = Int(thread_idx.x)
+    var r = tid // TPR
+    var lane = tid % TPR
+    var b = Int(block_idx.z) * ROWS + r
+    if b >= Int(n_rows):
+        return
+    var head = Int(block_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var row = (b * Int(n_heads) + head) * Int(kv_len)
+    var nsc = upto + 1
+    var scale = Float32(1.0) / sqrt(Float32(hd))
+
+    var jj = lane
+    while jj < nsc:
+        var acc = Float64(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = jj * kv_cols + kv_head_base
+                var c8 = hd // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, hd):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_base + d]
+                    ) * Float64(k_store[unsafe_offset=kbase + d])
+        else:
+            for d in range(hd):
+                acc += Float64(q_rot[unsafe_offset=q_base + d]) * Float64(
+                    k_store[unsafe_offset=upto * kv_cols + kv_head_base + d]
+                )
+        scores[unsafe_offset=row + jj] = Float32(acc) * scale
+        jj += TPR
