@@ -3595,3 +3595,9 @@
   - 途中抓到两个自己埋的雷：①**comptime if 吞 else**——把运行时 if 包进 comptime if 后，`else` 绑到了 comptime 层，`prefill_kv=False` 时 kv2 被**静默跳过**（f32 门 diff 18.7 / argmax 75223，f64 却过——因为 f64 走 comptime-else）。**教训：需要 else 回落的分支不要用 comptime if 包裹；comptime 常量在运行时 if 里照样折叠。** ②**账本六十三的 AsyncRT 悬崖再遇**：24 个 `d_wp_kv` 在加载循环中途分配，与上传交错 → 双 session bench 必崩 CUDA_ERROR_INVALID_VALUE。修法：**打包缓冲改为加载循环前一次性连续分配**（与上传不交错则无事）。
   - **⚠️ 修订一百零九的「锁频」结论**：765MHz 是**空闲时钟**而非锁频——GPU 3 在 66% 负载下跑 1410MHz；GPU 2 bench 内部可见 15.5→10.3ms 的时钟爬坡（前几 rep 慢、后几 rep 快）。跨 run 绝对值不可比再加一条理由；配对 A/B 仍可靠但 min-of-4 会偏向时钟相位。
   - **事件**：日终时机器被邻居拖垮（一切慢 2-4×，bench C 65-73ms），停止测量。kv2 的 split-K（对症冷读饥饿，潜在 -0.4ms）与 GPU 1 复测都留待环境恢复。
+
+- **2026-11-11（一百一十四-a）** —— kv2 split-K（`f16_mma_gemm2_spl_gpu` S=8/CH=112 + `f32_mergb2_gpu` 归并）：**核级 1.84× 逐位恒等，但 e2e 打平——kv2 正式结案为「不值得」，生产保持标量**
+  - 修正探针方法论后（**96 套 × 458KB = 44MB > L2 轮转**，一百一十三-b 的 4 套是 L2 热假象）：scalar 22.0µs / gemm2 25.4µs（**真冷下 gemm2 确实输给标量**，一百一十三-b 的流水内负信号由此得证）/ **spl8 11.9µs = 1.84×** / spl4 14.4µs。三项 maxdiff 0.0。GPU 2 被邻居占后全程 GPU 4。
+  - **但配对 A/B（GPU 4，生产语义：打包只在 warmup 跑一次）打平**：kv-on 8.323 vs kv-off 8.297（-0.3%，同相位配对 ±0.01ms）。归因：**split-K 的 partial 往返 ~1MB/层（写 2×512KB + 归并读回）≈ 0.24ms/forward 的额外流量，恰好吃掉 ~0.24ms 的核级收益**。kv 输出太小（128KB/层）、K 太短（896），split-K 的输出流量代价不成比例——与 down（输出 458KB/层，流量代价占比小）正好相反。
+  - **修 harness**：`bench_ab113` rep 循环内不再重置 `wp_ready`（一百一十三-b 里打包被 `prefill_kv` 门控后，每 rep 重置会让 on 侧白付打包 ~0.4ms——harness 必须跟生产语义对齐：打包一次、复用）。
+  - 结论：kv2 保持标量（`prefill_kv=False` 默认，spl/gemm2 两条 MMA 路径留树内备查，spl 路径过 f32 门 diff 0.00655）。prefill 标量 GEMM 战场全部勘探完毕：q2/o/down 三处 split-K 已落，kv2 证伪，**t=128 prefill 的 GEMM 侧 optimization 空间至此收敛**。

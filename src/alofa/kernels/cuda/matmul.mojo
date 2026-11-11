@@ -2683,6 +2683,142 @@ def cat2_f32_gpu(
         dst[unsafe_offset=Int(n) + i] = b[unsafe_offset=i]
 
 
+def f16_mma_gemm2_spl_gpu[
+    INNER: Int, CH: Int, WARP: Int, S: Int,
+](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    wp: Pointer[Float16, MutUntrackedOrigin],
+    part_a: Pointer[Float32, MutUntrackedOrigin],
+    part_b: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """kv2 双输出 packed GEMM 的 **split-K** 版（账本一百一十四-a）：
+    一百一十三-b 的 gemm2 在流水内实测慢 ~1ms——探针 L2 热（每层
+    打包权重仅 458KB，4 套轮转 ≪ 40MB L2），流水内每层的 k/v 打包
+    权重都被 ~37MB/层的权重流冲出 L2，真冷 DRAM 下 16 块发射藏不住
+    延迟（down 同病）。沿 K 切 S 段（grid.z = split），块数 ×S；
+    partial 裸写 [S][n_rows][out_cols]（a/b 两侧分开），随后
+    f32_mergb2_gpu 归并加 bias。要求 (INNER // S) % CH == 0 且
+    INNER % CH == 0；分部求和改变整体累加序 ⇒ 与标量差 ~1e-4 级。"""
+
+    comptime OUTS = 2
+    var split = Int(block_idx.z)
+    var cb = Int(block_idx.x) * WARP * OUTS * 8
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    comptime KTOT = INNER // 16
+    comptime KPS = KTOT // S
+    comptime STEPS = CH // 16
+    var ks0 = split * KPS
+
+    @parameter
+    for ks in range(KPS):
+        comptime if ks % STEPS == 0:
+            var i = tid
+            while i < 16 * CH:
+                sxf[unsafe_offset=i] = xh[
+                    unsafe_offset=(r0 + i // CH) * INNER
+                    + (ks0 + ks) * 16 + i % CH
+                ]
+                i += WARP * 32
+            barrier()
+        var av = SIMD[DType.float16, 8](
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 1],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 1],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 8],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 9],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 8],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(OUTS):
+            var col = cb + warp * 8 + j * (WARP * 8)
+            var pk = (
+                (cb // (WARP * OUTS * 8)) * (INNER // 16) + (ks0 + ks)
+            ) * (WARP * OUTS * 8 * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+            var bv = SIMD[DType.float16, 4](
+                wp[unsafe_offset=pk],
+                wp[unsafe_offset=pk + 1],
+                wp[unsafe_offset=pk + 2],
+                wp[unsafe_offset=pk + 3],
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+        comptime if (ks + 1) % STEPS == 0:
+            barrier()
+
+    @parameter
+    for j in range(OUTS):
+        var col = cb + warp * 8 + j * (WARP * 8)
+        var acc = accA[j] + accB[j]
+        var is_a = col < Int(out_cols)
+        var pp = part_a if is_a else part_b
+        var cbase = col - Int(out_cols) if not is_a else col
+        var base = (split * Int(n_rows) + r0) * Int(out_cols) + cbase
+        if r0 + gid < Int(n_rows):
+            pp[unsafe_offset=base + gid * Int(out_cols) + tig * 2] = acc[0]
+            pp[unsafe_offset=base + gid * Int(out_cols) + tig * 2 + 1] = acc[
+                1
+            ]
+        if r0 + gid + 8 < Int(n_rows):
+            pp[
+                unsafe_offset=base + (gid + 8) * Int(out_cols) + tig * 2
+            ] = acc[2]
+            pp[
+                unsafe_offset=base + (gid + 8) * Int(out_cols) + tig * 2 + 1
+            ] = acc[3]
+
+
+def f32_mergb2_gpu[S: Int](
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    part_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    part_b: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n: Int32,
+) -> None:
+    """kv2 split-K 归并（账本一百一十四-a）：dst_a[i] = Σ part_a +
+    bias[i % out_cols]，dst_b[i] = Σ part_b + bias[out_cols + i %
+    out_cols]（k/v 两侧 bias 在拼接 bias 里相邻）。part 按
+    [S][n] 连续，S 编译期（必须与 spl 的 S 一致——不一致静默丢段）。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        var nn = Int(n)
+        var aa = Float32(0)
+        var ab = Float32(0)
+        for s in range(S):
+            aa += part_a[unsafe_offset=s * nn + i]
+            ab += part_b[unsafe_offset=s * nn + i]
+        var c = i % Int(out_cols)
+        dst_a[unsafe_offset=i] = aa + bias[unsafe_offset=c]
+        dst_b[unsafe_offset=i] = ab + bias[unsafe_offset=Int(out_cols) + c]
+
+
 def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int](
     xh: Pointer[Float16, MutUntrackedOrigin],
     wp: Pointer[Float16, MutUntrackedOrigin],

@@ -65,6 +65,8 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_fat_gpu,
     q4_matmul_fused_gpu,
     q4_matmul_qkv_gpu,
+    f16_mma_gemm2_spl_gpu,
+    f32_mergb2_gpu,
 )
 
 # f16 预反量化构建开关（账本六十八二分用）
@@ -216,6 +218,9 @@ struct GpuSession:
     var d_qb: DeviceBuffer[DType.float32]
     var d_kb: DeviceBuffer[DType.float32]
     var d_vb: DeviceBuffer[DType.float32]
+    # 一百一十四-a：kv2 split-K partial（[8][mb*kv_dim]，f32_mergb2 归并）
+    var d_kbpart: DeviceBuffer[DType.float32]
+    var d_vbpart: DeviceBuffer[DType.float32]
     var d_qrot_b: DeviceBuffer[DType.float32]
     var d_attnb: DeviceBuffer[DType.float32]
     var d_gateb: DeviceBuffer[DType.float32]
@@ -512,6 +517,13 @@ struct GpuSession:
         )
         self.d_vb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.kv_dim
+        )
+        # 一百一十四-a：kv2 split-K partial，S=8（与发射/归并同源）
+        self.d_kbpart = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * mb * self.kv_dim
+        )
+        self.d_vbpart = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * mb * self.kv_dim
         )
         self.d_qrot_b = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.q_out
@@ -1479,21 +1491,60 @@ struct GpuSession:
                 # 必须用运行时 if：comptime if 会把 else 绑到自己身上，
                 # prefill_kv=False 时 kv2 被静默跳过（本轮踩过，f32 门
                 # diff 18.7 / argmax 75223 的真凶）。
-                self.ctx.enqueue_function[
-                    f16_mma_gemm2_pk_gpu[
-                        inner, 896 if inner >= 896 and inner % 896 == 0 else inner, 8
-                    ]
-                ](
-                    self.d_xnormb16.unsafe_ptr(),
-                    self.d_wp_kv[layer].unsafe_ptr(),
-                    self.d_kb.unsafe_ptr(),
-                    self.d_vb.unsafe_ptr(),
-                    self.d_bias_kv[layer].unsafe_ptr(),
-                    Int32(self.kv_dim),
-                    Int32(t),
-                    grid_dim=(ceildiv(2 * self.kv_dim, 128), ceildiv(t, 16), 1),
-                    block_dim=(256, 1, 1),
-                )
+                # 一百一十四-a：inner 为 896 倍数时走 split-K
+                # （S=8/CH=112，128 块；真冷 DRAM 下 1.84×，探针
+                # 96 套轮转 >L2 逐位恒等）。两支都是完整发射，
+                # else 落在 comptime if 上不会吞分支。
+                comptime if inner % 896 == 0:
+                    self.ctx.enqueue_function[
+                        f16_mma_gemm2_spl_gpu[inner, 112, 8, 8]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_wp_kv[layer].unsafe_ptr(),
+                        self.d_kbpart.unsafe_ptr(),
+                        self.d_vbpart.unsafe_ptr(),
+                        Int32(self.kv_dim),
+                        Int32(t),
+                        grid_dim=(
+                            ceildiv(2 * self.kv_dim, 128),
+                            ceildiv(t, 16),
+                            8,
+                        ),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.enqueue_function[f32_mergb2_gpu[8]](
+                        self.d_kb.unsafe_ptr(),
+                        self.d_kbpart.unsafe_ptr(),
+                        self.d_vb.unsafe_ptr(),
+                        self.d_vbpart.unsafe_ptr(),
+                        self.d_bias_kv[layer].unsafe_ptr(),
+                        Int32(self.kv_dim),
+                        Int32(t * self.kv_dim),
+                        grid_dim=(ceildiv(t * self.kv_dim, 256), 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_mma_gemm2_pk_gpu[
+                            inner,
+                            896 if inner >= 896 and inner % 896 == 0 else inner,
+                            8,
+                        ]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_wp_kv[layer].unsafe_ptr(),
+                        self.d_kb.unsafe_ptr(),
+                        self.d_vb.unsafe_ptr(),
+                        self.d_bias_kv[layer].unsafe_ptr(),
+                        Int32(self.kv_dim),
+                        Int32(t),
+                        grid_dim=(
+                            ceildiv(2 * self.kv_dim, 128),
+                            ceildiv(t, 16),
+                            1,
+                        ),
+                        block_dim=(256, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     KV_K

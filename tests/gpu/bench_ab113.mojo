@@ -23,7 +23,7 @@ def main() raises:
     s_new.kv_pos = 0
     s_new.wp_ready = False
     _ = s_new.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
-        DType.float32](ids, False, True)
+        DType.float32, True, True, True, True, True, True, True, True](ids, False, True)
     s_old.kv_pos = 0
     s_old.wp_ready = False
     _ = s_old.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
@@ -36,12 +36,10 @@ def main() raises:
         var t0 = monotonic_ns()
         if k % 2 == 0:
             s_new.kv_pos = 0
-            s_new.wp_ready = False
             _ = s_new.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512,
-                1, 8, DType.float32](ids, False, True)
+                1, 8, DType.float32, True, True, True, True, True, True, True, True](ids, False, True)
             var d0 = Float64(monotonic_ns() - t0) / 1e6
             s_old.kv_pos = 0
-            s_old.wp_ready = False
             var t1 = monotonic_ns()
             _ = s_old.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512,
                 1, 8, DType.float32, True, True, True, True, True, True, True, True, False](
@@ -55,7 +53,6 @@ def main() raises:
             print("rep", k, " kv-on:", d0, " kv-off:", d1)
         else:
             s_old.kv_pos = 0
-            s_old.wp_ready = False
             var t1 = monotonic_ns()
             _ = s_old.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512,
                 1, 8, DType.float32, True, True, True, True, True, True, True, True, False](
@@ -63,10 +60,9 @@ def main() raises:
             )
             var d1 = Float64(monotonic_ns() - t1) / 1e6
             s_new.kv_pos = 0
-            s_new.wp_ready = False
             var t2 = monotonic_ns()
             _ = s_new.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512,
-                1, 8, DType.float32](ids, False, True)
+                1, 8, DType.float32, True, True, True, True, True, True, True, True](ids, False, True)
             var d0 = Float64(monotonic_ns() - t2) / 1e6
             if d0 < bnew:
                 bnew = d0
