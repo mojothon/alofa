@@ -3612,3 +3612,10 @@
   - **判决：配对计时全面负值**。裸核 50-70µs vs 三趟合计 33-45µs。四个排除实验：TILES 8/16/32 扫描（V 相串行长度不敏感）；块数 32→320（不变）；grid 维交换（不变）；**相删除 bisect（SKIP 编译期参数）——只跑 rope+scores 的残核仍 ~50µs**。结论：~50µs 基础成本对一切结构因素不敏感，疑点收敛到代码生成/寄存器压力层面；ncu 与本机驱动不兼容（cuFuncGetParamInfo 缺失），profile 路断，根因挂起。
   - 方法论沉淀：**「发射开销主导」的推断要小心——单发不等于省时**；114-c 单发证伪（14 块延迟链）与 115-a 融合证伪（基础成本异常）是两种不同的失败模式。decode attention 维持三趟 tiles=8；**decode 的主战场移交 115-b（GEMM 离权重流下限 3.4×）**。
   - 附：comb3 的 w_t 重标度需 smem 单次计算共享（64× f64 exp 冗余已修，但非主因）。
+- **2026-11-11（一百一十五-b）** —— decode GEMM 勘探+落地：**2.304 → 2.241ms/步（-2.7%），三旋钮可加**；天花板校准 1160GB/s
+  - skip 掩码分段带宽（kv256）：qkv 220 / O 301 / DUAL 744 / DOWN 656 / HEAD 974 GB/s；`hbm_probe` 纯 f16 流式上限 **1160GB/s**（旧注释 670-800 是 765MHz 锁频时代数据，显存钟不随 SM 降压）。HEAD 已到顶；qkv/O 是洼地。
+  - **qkv 病根实锤**：tri 核 3 段串行（每段独立 7 屏障树 = 21 屏障/块）+ 每线程 ~3 次 load；同钟同口径隔离对决（probe_decg115，64 套冷转）：**packed fat O1 11.65µs vs tri 17.64µs = 1.51×**。
+  - **落地三件**：①`cat3_f16_gpu` 打包（q+2kv 单矩阵，每层一次成本）+ `f16_matmul_qkv_fat_gpu`（fat 结构 + 就地 rmsnorm + 三路 bias——**签名保三 dst/三 bias 独立 buffer，attention 零改动**）；②`down_t` 128→256（占据率 26%→52%）；③`o_outs` 参数（2→1，块数 448→896）。decode 门 diff 与旧路径逐位同，f32 门绿。
+  - **证伪**：down split-K（`fat_si`）e2e 反而 +6%（x-chunk 重读 + f64 partial 往返 + 双发射不抵块数收益——与 kv2 教训同族：**decode 1 行 GEMM 的 split-K 也不划算**，瓶颈是每线程发射链不是块数）；dual_o2/dual_t128/tri_t256/o_t256/dsi4/16 全负。
+  - **坑两枚**：decode_step 参数序（attn_smode→attn_tiles→dual_nx→down_si）传错位静默无效（首轮 dsi 扫型白跑）；cat3 的 na/nb/nc 是元素数非列数。aliasing 检查加强版：同 buffer 派生指针落局部变量也判同源，须独立 buffer + comptime 分支直传。
+  - 剩余空间：全段到 1160 上限 ≈ 再 -0.35ms，但 dual/down 已 744/656 且形状级扫型干涸——下一刀是新核工程（batch load / cp.async 级），边际收益递减。

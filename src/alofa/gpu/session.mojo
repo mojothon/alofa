@@ -67,6 +67,8 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_qkv_gpu,
     f16_mma_gemm2_spl_gpu,
     f32_mergb2_gpu,
+    f16_matmul_qkv_fat_gpu,
+    cat3_f16_gpu,
 )
 
 # f16 预反量化构建开关（账本六十八二分用）
@@ -175,12 +177,15 @@ struct GpuSession:
     var d_wp_q: List[DeviceBuffer[DType.float16]]
     var d_wp_o: List[DeviceBuffer[DType.float16]]
     var wp_ready: Bool
+    var qkvp_ready: Bool
     # q/k/v 偏置的分流句柄（同 List 多下标同病同治）
     var d_bias_q: List[DeviceBuffer[DType.float32]]
     var d_bias_k: List[DeviceBuffer[DType.float32]]
     var d_bias_v: List[DeviceBuffer[DType.float32]]
     # 一百一十三-b：k/v 拼接打包（[2*kv_dim, inner] fragment 布局）
     var d_wp_kv: List[DeviceBuffer[DType.float16]]
+    # 一百一十五-b：qkv 打包权重（q+2kv 单矩阵 f16，cat3 一次）
+    var d_wp_qkv: List[DeviceBuffer[DType.float16]]
     var d_bias_kv: List[DeviceBuffer[DType.float32]]
     # 拼接打包的 scratch（同流顺序复用）
     var d_kvraw: DeviceBuffer[DType.float16]
@@ -268,8 +273,10 @@ struct GpuSession:
         self.d_wp_o = List[DeviceBuffer[DType.float16]]()
         # 一百一十三-b：k/v 拼接打包（[2*kv_dim, inner] fragment 布局）
         self.d_wp_kv = List[DeviceBuffer[DType.float16]]()
+        self.d_wp_qkv = List[DeviceBuffer[DType.float16]]()
         self.d_bias_kv = List[DeviceBuffer[DType.float32]]()
         self.wp_ready = False
+        self.qkvp_ready = False
         comptime if not F16_BUILD:
             self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](1)
         self.d_bias_q = List[DeviceBuffer[DType.float32]]()
@@ -468,6 +475,12 @@ struct GpuSession:
             )
             self.d_v_store.append(
                 self.ctx.enqueue_create_buffer[DType.float32](n_kv_row)
+            )
+        for i in range(self.n_layers):
+            self.d_wp_qkv.append(
+                self.ctx.enqueue_create_buffer[DType.float16](
+                    (self.q_out + 2 * self.kv_dim) * self.hidden
+                )
             )
         self.d_x = self.ctx.enqueue_create_buffer[DType.float32](self.hidden)
         self.d_normed = self.ctx.enqueue_create_buffer[DType.float32](self.hidden)
@@ -807,10 +820,11 @@ struct GpuSession:
 
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
-        tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 128, o_t: Int = 128,
+        tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 256, o_t: Int = 128,
         attn_t: Int = 512, attn_vec: Bool = True, attn_v2: Bool = True,
         attn_smode: Int = 0, attn_tiles: Int = 8, dual_nx: Bool = False,
-        down_si: Int = 0,
+        down_si: Int = 0, o_outs: Int = 1,
+        qkv_pack: Bool = True,
     ](
         mut self, token: Int, skip: Int = 0
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
@@ -897,7 +911,56 @@ struct GpuSession:
             var dst_qkv_k = self._dst(1)
             var dst_qkv_v = self._dst(2)
             if skip & SKIP_TRI == 0:
-                comptime if tri_cols > 0:
+                comptime if qkv_pack:
+                    # 一百一十五-b：权重 cat3 打包一次（首步），此后
+                    # 每层一发 qkv_fat（fat 结构 + 就地 norm + 三路
+                    # bias，隔离对决 tri 1.51×）。
+                    if not self.qkvp_ready:
+                        for pl in range(self.n_layers):
+                            self.ctx.enqueue_function[cat3_f16_gpu](
+                                self.d_wp_qkv[pl].unsafe_ptr(),
+                                self.d_w16_q[pl].unsafe_ptr(),
+                                self.d_w16_k[pl].unsafe_ptr(),
+                                self.d_w16_v[pl].unsafe_ptr(),
+                                Int32(self.q_out * inner),
+                                Int32(self.kv_dim * inner),
+                                Int32(self.kv_dim * inner),
+                                grid_dim=(
+                                    ceildiv(
+                                        (self.q_out + 2 * self.kv_dim)
+                                        * inner,
+                                        256,
+                                    ),
+                                    1,
+                                    1,
+                                ),
+                                block_dim=(256, 1, 1),
+                            )
+                        self.qkvp_ready = True
+                    self.ctx.enqueue_function[
+                        f16_matmul_qkv_fat_gpu[tri_t, inner, 2]
+                    ](
+                        self.d_x.unsafe_ptr(),
+                        self.d_wp_qkv[layer].unsafe_ptr(),
+                        dst_qkv_q.unsafe_ptr(),
+                        dst_qkv_k.unsafe_ptr(),
+                        dst_qkv_v.unsafe_ptr(),
+                        self.d_bias_q[layer].unsafe_ptr(),
+                        self.d_bias_k[layer].unsafe_ptr(),
+                        self.d_bias_v[layer].unsafe_ptr(),
+                        self.d_norms[2 * layer].unsafe_ptr(),
+                        self.eps,
+                        Int32(inner),
+                        Int32(self.q_out),
+                        Int32(self.kv_dim),
+                        grid_dim=(
+                            (self.q_out + 2 * self.kv_dim) // 2,
+                            1,
+                            1,
+                        ),
+                        block_dim=(tri_t, 1, 1),
+                    )
+                elif tri_cols > 0:
                     self.ctx.enqueue_function[
                         f16_matmul_qkv_mc_gpu[tri_t, inner, tri_cols, True, True]
                     ](
@@ -1063,7 +1126,7 @@ struct GpuSession:
             var x_o = self._src(1)
             if skip & SKIP_O == 0:
                 self.ctx.enqueue_function[
-                    f16_matmul_fat_gpu[o_t, inner, 2, False, True]
+                    f16_matmul_fat_gpu[o_t, inner, o_outs, False, True]
                 ](
                     x_o.unsafe_ptr(),
                     self.d_w16_o[layer].unsafe_ptr(),
@@ -1071,7 +1134,7 @@ struct GpuSession:
                     self.d_ws.unsafe_ptr(),
                     Int32(inner),
                     Int32(self.hidden),
-                    grid_dim=(ceildiv(self.hidden, 2), 1, 1),
+                    grid_dim=(ceildiv(self.hidden, o_outs), 1, 1),
                     block_dim=(o_t, 1, 1),
                 )
             else:

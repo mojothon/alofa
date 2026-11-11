@@ -1030,6 +1030,141 @@ def f16_matmul_dual_gpu[
                     )
 
 
+def f16_matmul_qkv_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst_q: Pointer[Float32, MutUntrackedOrigin],
+    dst_k: Pointer[Float32, MutUntrackedOrigin],
+    dst_v: Pointer[Float32, MutUntrackedOrigin],
+    bias_q: Pointer[Float32, MutUntrackedOrigin],
+    bias_k: Pointer[Float32, MutUntrackedOrigin],
+    bias_v: Pointer[Float32, MutUntrackedOrigin],
+    rms_w: Pointer[Float32, MutUntrackedOrigin],
+    eps: Float32,
+    inner: Int32,
+    q_out: Int32,
+    kv_out: Int32,
+) -> None:
+    """qkv decode 融合核（账本一百一十五-b）：fat 结构 + 就地 rmsnorm
+    + 三路 bias，权重为 cat3 打包单矩阵 [q+2kv, INNER] f16。
+
+    现役 tri 核的病：3 段串行（每段独立 7 屏障树 = 21 屏障/块），
+    每线程仅 ~3 次 f16 load——冷 DRAM 下 220GB/s（段测）。fat 化后
+    每线程负载同 o/down 族，隔离对决 1.51×（同钟同口径，探针
+    decg115 v1 vs v11）。列映射同 tri：o < q_out → q；否则 k/v。
+    数值：norm 归约序与 tri NORM 块一致（f64 树 over THREADS）；
+    GEMM 累加序同 fat 族（k=tid*8 升序）——f64 重结合走容差门。
+    INNER 须为 8 的倍数；grid=(q_out+2*kv_out)//OUTS。"""
+
+    var o0 = Int(block_idx.x) * OUTS
+    var total = Int(q_out) + 2 * Int(kv_out)
+    if o0 >= total:
+        return
+    var tid = Int(thread_idx.x)
+    var sx = stack_allocation[
+        INNER, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var k = tid
+    while k < Int(INNER):
+        sx[unsafe_offset=k] = x[unsafe_offset=k]
+        k += THREADS
+    barrier()
+    var nlocal = Float64(0)
+    var nk = tid
+    while nk < Int(INNER):
+        var nv = Float64(sx[unsafe_offset=nk])
+        nlocal += nv * nv
+        nk += THREADS
+    var sred = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    sred[unsafe_offset=tid] = nlocal
+    barrier()
+    var nstride = THREADS // 2
+    while nstride > 0:
+        if tid < nstride:
+            sred[unsafe_offset=tid] = (
+                sred[unsafe_offset=tid] + sred[unsafe_offset=tid + nstride]
+            )
+        barrier()
+        nstride //= 2
+    var nscale = Float64(1.0) / sqrt(
+        sred[unsafe_offset=0] / Float64(INNER) + Float64(eps)
+    )
+    nk = tid
+    while nk < Int(INNER):
+        sx[unsafe_offset=nk] = Float32(
+            Float64(sx[unsafe_offset=nk])
+            * nscale
+            * Float64(rms_w[unsafe_offset=nk])
+        )
+        nk += THREADS
+    barrier()
+    var sacc = stack_allocation[
+        OUTS * THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for oo in range(OUTS):
+        var o = o0 + oo
+        var a = Float64(0)
+        if o < total:
+            var w_base = o * Int(INNER)
+            k = tid * 8
+            while k < Int(INNER):
+                var wv = w.load[8, alignment=16](w_base + k)
+                @parameter
+                for j in range(8):
+                    a += Float64(sx[unsafe_offset=k + j]) * Float64(
+                        Float32(wv[j])
+                    )
+                k += THREADS * 8
+        sacc[unsafe_offset=oo * THREADS + tid] = a
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for oo in range(OUTS):
+                sacc[unsafe_offset=oo * THREADS + tid] += sacc[
+                    unsafe_offset=oo * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < total:
+                var v = Float32(sacc[unsafe_offset=oo * THREADS])
+                if o < Int(q_out):
+                    dst_q[unsafe_offset=o] = v + bias_q[unsafe_offset=o]
+                elif o < Int(q_out) + Int(kv_out):
+                    var r = o - Int(q_out)
+                    dst_k[unsafe_offset=r] = v + bias_k[unsafe_offset=r]
+                else:
+                    var r = o - Int(q_out) - Int(kv_out)
+                    dst_v[unsafe_offset=r] = v + bias_v[unsafe_offset=r]
+
+
+def cat3_f16_gpu(
+    dst: Pointer[Float16, MutUntrackedOrigin],
+    a: Pointer[Float16, MutUntrackedOrigin],
+    b: Pointer[Float16, MutUntrackedOrigin],
+    c: Pointer[Float16, MutUntrackedOrigin],
+    na: Int32,
+    nb: Int32,
+    nc: Int32,
+) -> None:
+    """三矩阵拼接（账本一百一十五-b，qkv 打包用，一次成本）。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(na):
+        dst[unsafe_offset=i] = a[unsafe_offset=i]
+    elif i < Int(na) + Int(nb):
+        dst[unsafe_offset=i] = b[unsafe_offset=i - Int(na)]
+    elif i < Int(na) + Int(nb) + Int(nc):
+        dst[unsafe_offset=i] = c[unsafe_offset=i - Int(na) - Int(nb)]
+
+
 def f16_matmul_qkv_gpu[THREADS: Int, INNER: Int, HAS_BIAS: Bool, NORM: Bool = False](
     x: Pointer[Float32, MutUntrackedOrigin],
     w_q: Pointer[Float16, MutUntrackedOrigin],
