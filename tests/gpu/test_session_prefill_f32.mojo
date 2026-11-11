@@ -62,18 +62,15 @@ def main() raises:
         raise Error("f32 fast path argmax mismatch")
     # MMA 诊断变体（kv_pos 重置后重测——一百零五重审）
     comptime VARIANTS = (
-        ("q-only", True, False, False, False),
-        ("o-only", False, True, False, False),
-        ("dual-only", False, False, True, False),
-        ("down-only", False, False, False, True),
-        ("full", True, True, True, True),
+        ("dual-only", False, True),
+        ("down-only", True, False),
     )
     @parameter
-    for v in range(5):
+    for v in range(2):
         session.kv_pos = 0
         var gm = session.prefill_step[INNER, INNER_FF, 64, 4, 128, 128,
-            128, 512, 1, 8, DType.float32, VARIANTS[v][1], VARIANTS[v][2],
-            VARIANTS[v][3], VARIANTS[v][4]](ids8)
+            128, 512, 1, 8, DType.float32, VARIANTS[v][1],
+            VARIANTS[v][2]](ids8)
         var dm = Float64(0)
         var bm = 0
         for i in range(n):

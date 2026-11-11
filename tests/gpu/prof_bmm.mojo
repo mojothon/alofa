@@ -602,3 +602,96 @@ def main() raises:
         if us < best:
             best = us
     print("vec2 scalar-j O2 RB8 f32:", best, "us/launch  有效bw=", Float64(16 * OUT * INNER * 2 + T * INNER * 4 + T * OUT * 4) / (best * 1e-6) / 1e9, "GB/s")
+
+    # ===== 九十四：INNER=896（o 形状）THREADS 扫描——单 k 迭代延迟暴露定位 =====
+    # w/x/dst 缓冲复用（o 只用前 896×896 与 128×896）。迭代数 = ceil(896/(T*8)):
+    # T128=1, T112=1(无闲线程), T64=2, T32=4, T16=7。ACC=True 同生产 o 核。
+    var b8 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[128, 896, 2, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(448, 16, 1), block_dim=(128, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b8:
+            b8 = us
+    print("o-shape T128 (1it):", b8, "us/launch")
+
+    var b9 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[112, 896, 2, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(448, 16, 1), block_dim=(112, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b9:
+            b9 = us
+    print("o-shape T112 (1it 全勤):", b9, "us/launch")
+
+    var b10 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[64, 896, 2, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(448, 16, 1), block_dim=(64, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b10:
+            b10 = us
+    print("o-shape T64 (2it):", b10, "us/launch")
+
+    var b11 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[32, 896, 2, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(448, 16, 1), block_dim=(32, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b11:
+            b11 = us
+    print("o-shape T32 (4it):", b11, "us/launch")
+
+    var b12 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[16, 896, 2, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(448, 16, 1), block_dim=(16, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b12:
+            b12 = us
+    print("o-shape T16 (7it):", b12, "us/launch")
+
+    var b13 = Float64(1e30)
+    for r in range(3):
+        ctx.synchronize()
+        var t0 = monotonic_ns()
+        for i in range(ITERS):
+            ctx.enqueue_function[f16_bmm_fat_gpu[128, 896, 8, 8, True, DType.float32]](
+                xp, wp, dp, Int32(OUT), Int32(T),
+                grid_dim=(112, 16, 1), block_dim=(128, 1, 1),
+            )
+        ctx.synchronize()
+        var us = Float64(monotonic_ns() - t0) / 1e3 / Float64(ITERS)
+        if us < b13:
+            b13 = us
+    print("o-shape T128 O8 (1it 16LD ILP):", b13, "us/launch")
