@@ -52,6 +52,7 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_dual_fat_gpu,
     f16_matmul_fat_gpu, f16_matmul_fat_si_gpu, fat_si_comb_gpu,
     f16_bmm_fat_gpu, f16_bmm_dual_gpu, f16_bmm_qkv_gpu,
+    f16_bmm_q2_gpu, f16_bmm_kv2_gpu,
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
@@ -1161,7 +1162,10 @@ struct GpuSession:
 
         # 九十四：kernel 特化提为 alias（编译期构造，发射路径免重复特化查找）
         alias NORM_K = rmsnorm_gpu
-        alias QKV_K = f16_bmm_qkv_gpu[tri_t, inner, prefill_rb, prefill_af]
+        # 账本一百：q2/kv2——qkv 拆 q 链（OUTS=4）与 k/v 双链（OUTS=2）
+        # 寄存器分块，qkv 607→188µs（3.2×，bit-exact 同旧核）。
+        alias Q_K = f16_bmm_q2_gpu[tri_t, inner, 4, prefill_rb, prefill_af]
+        alias KV_K = f16_bmm_kv2_gpu[tri_t, inner, 2, prefill_rb, prefill_af]
         alias KVS_K = kv_store_b_gpu[attn_t]
         alias RS_K = attn_rs_b_gpu[attn_t, True, attn_tiles]
         alias VT2_K = attn_vt2_b_gpu[attn_t, attn_tiles]
@@ -1216,22 +1220,30 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_function[
-                QKV_K
+                Q_K
             ](
                 self.d_xnormb.unsafe_ptr(),
                 self.d_w16_q[layer].unsafe_ptr(),
+                self.d_bias_q[layer].unsafe_ptr(),
+                self.d_qb.unsafe_ptr(),
+                Int32(self.q_out),
+                Int32(t),
+                grid_dim=(ceildiv(self.q_out, 4), ceildiv(t, prefill_rb), 1),
+                block_dim=(tri_t, 1, 1),
+            )
+            self.ctx.enqueue_function[
+                KV_K
+            ](
+                self.d_xnormb.unsafe_ptr(),
                 self.d_w16_k[layer].unsafe_ptr(),
                 self.d_w16_v[layer].unsafe_ptr(),
-                self.d_bias_q[layer].unsafe_ptr(),
                 self.d_bias_k[layer].unsafe_ptr(),
                 self.d_bias_v[layer].unsafe_ptr(),
-                self.d_qb.unsafe_ptr(),
                 self.d_kb.unsafe_ptr(),
                 self.d_vb.unsafe_ptr(),
-                Int32(self.q_out),
                 Int32(self.kv_dim),
                 Int32(t),
-                grid_dim=(max(self.q_out, self.kv_dim), ceildiv(t, prefill_rb), 1),
+                grid_dim=(ceildiv(self.kv_dim, 2), ceildiv(t, prefill_rb), 1),
                 block_dim=(tri_t, 1, 1),
             )
             if profile:
