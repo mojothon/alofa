@@ -3602,3 +3602,8 @@
   - **修 harness**：`bench_ab113` rep 循环内不再重置 `wp_ready`（一百一十三-b 里打包被 `prefill_kv` 门控后，每 rep 重置会让 on 侧白付打包 ~0.4ms——harness 必须跟生产语义对齐：打包一次、复用）。
   - 结论：kv2 保持标量（`prefill_kv=False` 默认，spl/gemm2 两条 MMA 路径留树内备查，spl 路径过 f32 门 diff 0.00655）。prefill 标量 GEMM 战场全部勘探完毕：q2/o/down 三处 split-K 已落，kv2 证伪，**t=128 prefill 的 GEMM 侧 optimization 空间至此收敛**。
 - **2026-11-11（一百一十四-b）** —— GPU 1 空出，**满时钟全量复测落账**：**生产配置（down+o split-K 全开）t=128 prefill = 10.50ms**（ab112 配对 spl-on 10.5036 vs spl-off 12.2844 = **-14.5%**，四轮 ±0.01ms 极稳）；r97 C gap 11.96 / D 无gap 11.58（首轮含时钟爬坡）。自最初 ~23ms 起**累计 -54%**。早前「~8ms」的折算偏乐观——GPU 2 锁 765MHz 的折算系数高估了 boost 增益。至此 prefill 侧（GEMM + attention + 融合）全部落账，剩余方向：decode GQA 分组（一百一十四-c）。
+- **2026-11-11（一百一十四-c）** —— decode attention 勘探（`probe_dec114` + `bench_ab114`）：**占比 21-25% 实锤，但「现成核」无一可赢，真解 = 专造融合分组核（一百一十五）**
+  - skip 掩码测量：attention 段（rope+store+rs+vt2+comb2）= **0.50-0.62ms/步，全步 2.35-2.47ms 的 21-25%，且几乎不随 kv_len（64→384）增长** ⇒ 不是 k/v 流量主导（GQA ÷7 只值 ~25µs），是**发射+延迟主导**（72 次发射/步 × ~5µs + 小 GPU 功）。
+  - **现成单发路径证伪**：`attn_tiles=0`（`attn_rope_gpu` 一核全包）配对 A/B **反而慢 ~0.3ms**（2.57-2.94 vs 2.35）——grid 只有 14 块 × 512 线程，键扫描延迟链远长于省下的 48 次发射。三趟（tiles=8）是现存最优。
+  - **一百一十五 方向**：专造 decode 融合分组核——一次发射，grid `(n_kv_heads, TILES)`，块内 8 个 q-head 槽（rs_h 思路）+ rope+store+scores+softmax+V 一体，~16-32 块足够藏延迟；潜在 **~-0.4ms/步（-17%）**。另记：decode 步 2.35ms vs 权重流下限 ~0.7ms（0.5B×f16 @1.4TB/s）——**decode GEMM 侧离下限 3.4×，长期更大的鱼**。
+  - 附带发现：`tri_cols=128` 的 `_mc_` qkv 变体在当前工具链下 **ptxas smem 超限（398KB）编译失败**——decode bench 只能用 `tri_cols=0`（历史 bench 未触雷是因走纯默认参数）。
