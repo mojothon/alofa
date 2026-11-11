@@ -3650,3 +3650,17 @@
   - **吞吐**（bench_batch120，同 run 交错、765MHz 空闲钟、KV 0→24 增长）：B=1 4.216ms/step → **B=8 6.407ms/step = 0.801ms/token = 5.3×**。对 serial decode（同钟 ~4.4ms/token）≈ 5.5×。与 119-b 上限预测（0.50ms/token，kv=0）的差 = 真 KV attention 流量 + 4.9MB B 行 logits D2H + argmax。
   - **坑四枚**：①**prefill_step 签名藏 `prefill_mma_q`/`prefill_mma_o` 两参数**——位置参数表 19 参错位，`batch=True` 落到 `prefill_spl`，kv/batch 吃默认值**静默变 False**（115-b decode_step 参数序坑的 prefill 版；症状：批分支全不执行而 backbone"恰好正确"——B=1 时单序列 else 分支算术等价，极具迷惑性，靠方法头加印破案）；②**测试设计坑：单参照 session 顺序跑多序列互相覆写 KV 历史**——v1 的 step≥1 MISMATCH 全是参照伪影（step 0 diff=0.0 已证明批侧对），参照必须逐序列独立重放；③pk/pv 跨 List origin 不兼容（同 115-b aliasing 坑：批分支直传 store_b 指针）；④`out` 保留字又踩一次（argmax_rb）。
   - **遗留**：①批 tail 每步 4.9MB logits D2H——sample 模式应只回 tokout 4B×B（argmax_rb 已就位，加参数即可）；②decode 路径（2.228ms/步单序列）与批解码（0.80ms/token×8）双轨并存——服务层统一到批；③h_posarr 簿记在 host，跨步上传 32B（可设备侧自增）。
+- **2026-11-12（一百二十-b）** —— 批规模扩展 + sample 模式：**B=64 = 0.392ms/token（~11× serial）**，拐点定位
+  - **sample 模式**（copy_logits=False）：批 tail 跳过 B×vocab logits D2H（4.9MB@B=8），只回 tokout 4B×B。同 run 对照省 **~0.8-1.6ms/步（11-20%，钟态漂移内）**。argmax_rb 产物（120-a）首次投产。
+  - **批规模扫描**（bench_batch120b，同 run 交错、KV 0→40、sample 模式）：
+
+    | B | ms/步 | ms/token | vs serial(~4.4 同钟) |
+    |---|---|---|---|
+    | 8 | 6.19 | 0.774 | 5.7× |
+    | 16 | 8.63 | 0.539 | 8.2× |
+    | 32 | 13.90 | 0.434 | **10.1×** |
+    | 64 | 25.11 | 0.392 | 11.2× |
+
+  - **拐点判读**：B=32→64 每 token 仅再降 10%——GEMM 侧早已摊薄（120-a），剩余成本是 attention 真 KV 流量 + tail。**服务甜点 B=16-32**（B=64 的 25ms 步延迟显著拉大序列间 token 间隔）；吞吐上限 ~11× 封顶，与 119-b 预测（~9×，kv=0 口径）吻合。
+  - BMAX 8→32→64 三档扩容（alias 一处 + 缓冲按 BMAX 分配 ~920MB@64）；批门（B=8）两次全绿逐位恒定。
+  - 下一刀：① 连续批处理调度层（generate_batch API + 动态进出批——真服务形态，批规模已证明不是瓶颈）；② h_posarr 设备侧自增（32B/步微末）；③ decode 路径（2.228ms 单序列）与批解码双轨并存——服务层统一到批后 decode 单序列路径只留低延迟场景。

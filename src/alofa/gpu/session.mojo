@@ -89,6 +89,8 @@ comptime F16_BUILD = True
 # prefill 批上限（账本八十八）：缓冲按此定宽；超长 prompt 由调用方分块
 # （分块间 KV 连续，天然 chunked prefill）。
 alias PREFILL_MAX_BATCH = 128
+# 一百二十-b：批解码序列上限（store/pos/logits 缓冲按此分配）
+alias BMAX = 64
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -610,36 +612,36 @@ struct GpuSession:
             self.vocab
         )
         # 一百二十：批解码分配（与上方同属纯分配区，不与拷贝交错——
-        # 账本六十三的 AsyncRT 悬崖）。BMAX=8；store 布局
-        # [B][max_tokens][kv_dim]，比单序列 store 多 8×（100MB）。
+        # 账本六十三的 AsyncRT 悬崖）。BMAX=32；store 布局
+        # [B][max_tokens][kv_dim]，比单序列 store 多 32×（~460MB）。
         self.d_k_store_b = List[DeviceBuffer[DType.float32]]()
         self.d_v_store_b = List[DeviceBuffer[DType.float32]]()
         for _bl in range(self.n_layers):
             self.d_k_store_b.append(
                 self.ctx.enqueue_create_buffer[DType.float32](
-                    8 * self.max_tokens * self.kv_dim
+                    BMAX * self.max_tokens * self.kv_dim
                 )
             )
             self.d_v_store_b.append(
                 self.ctx.enqueue_create_buffer[DType.float32](
-                    8 * self.max_tokens * self.kv_dim
+                    BMAX * self.max_tokens * self.kv_dim
                 )
             )
-        self.d_posarr = self.ctx.enqueue_create_buffer[DType.int32](8)
-        self.h_posarr = self.ctx.enqueue_create_host_buffer[DType.int32](8)
+        self.d_posarr = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
+        self.h_posarr = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.d_normedb = self.ctx.enqueue_create_buffer[DType.float32](
-            8 * self.hidden
+            BMAX * self.hidden
         )
         self.d_logits_b = self.ctx.enqueue_create_buffer[DType.float32](
-            8 * self.vocab
+            BMAX * self.vocab
         )
         self.h_logits_b = self.ctx.enqueue_create_host_buffer[DType.float32](
-            8 * self.vocab
+            BMAX * self.vocab
         )
-        self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](8)
-        self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](8)
+        self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
+        self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.ctx.synchronize()
-        for i in range(8):
+        for i in range(BMAX):
             self.h_posarr[i] = Int32(0)
         self.ctx.synchronize()
 
@@ -1412,6 +1414,9 @@ struct GpuSession:
         batch: Bool = False,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
+        # 一百二十-b：False 时批 tail 跳过 B×vocab logits D2H（sample
+        # 模式，只回 tokout 4B×B）
+        copy_logits: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
@@ -1447,9 +1452,9 @@ struct GpuSession:
         var pos0 = self.kv_pos
         var kv_len = pos0 + t
         comptime if batch:
-            if t > 8:
+            if t > BMAX:
                 raise AlofaError(
-                    ERR_INVALID_ARGUMENT, "batch decode cap is 8",
+                    ERR_INVALID_ARGUMENT, "batch decode cap is 64",
                     "t=" + String(t),
                 )
             for i in range(t):
@@ -2246,9 +2251,10 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            self.ctx.enqueue_copy(
-                dst_buf=self.h_logits_b, src_buf=self.d_logits_b
-            )
+            if copy_logits:
+                self.ctx.enqueue_copy(
+                    dst_buf=self.h_logits_b, src_buf=self.d_logits_b
+                )
             self.ctx.enqueue_copy(dst_buf=self.h_tokout, src_buf=self.d_tokout)
         else:
             # 末行终 norm + lm_head（只算末行 logits）
