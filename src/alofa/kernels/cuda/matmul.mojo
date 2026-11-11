@@ -2947,6 +2947,31 @@ def f32_mergb_gpu[S: Int](
         dst[unsafe_offset=i] = acc + bias[unsafe_offset=i % Int(out_cols)]
 
 
+def f32_mergsw_gpu[S: Int](
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    part_a: Pointer[Float32, MutUntrackedOrigin],
+    part_b: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """dual split-K 收口（账本一百一十八）：dst_act[i] =
+    silu(Σ_s part_a[s][i]) * Σ_s part_b[s][i]——f64 中间量，序同
+    swiglu_gpu / dual_pk 尾部。part 按 [S][n] 连续布局，S 编译期
+    （必须与 spl 的 S 一致——不一致静默丢段）。gate/up 的 f32
+    全量落盘被跳过（prefill 的 down 只吃 act）。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        var nn = Int(n)
+        var sa = Float32(0)
+        var sb = Float32(0)
+        for s in range(S):
+            sa += part_a[unsafe_offset=s * nn + i]
+            sb += part_b[unsafe_offset=s * nn + i]
+        var g = Float64(sa)
+        dst_act[unsafe_offset=i] = Float32(
+            g / (Float64(1) + exp(-g)) * Float64(sb)
+        )
+
+
 def f32_mergb2_gpu[S: Int](
     dst_a: Pointer[Float32, MutUntrackedOrigin],
     part_a: Pointer[Float32, MutUntrackedOrigin],

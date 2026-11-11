@@ -10,10 +10,12 @@
 
 from alofa.core.ffi.posix import monotonic_ns
 from max.gpu.host import DeviceContext
+from alofa.kernels.cuda.elementwise import swiglu_gpu
 from alofa.kernels.cuda.matmul import (
     pack_w_mma_gpu, f16_mma_gemm_pk_gpu, f16_mma_down_spl_gpu,
     f16_mma_gemm2_spl_gpu, f16_mma_dual_pk_gpu,
-    f32_mergb_gpu, f32_mergb2_gpu, f32_adds_gpu,
+    f32_mergb_gpu, f32_mergb2_gpu, f32_adds_gpu, f32_mergsw_gpu,
+    f16_mma_gemm_pk_gpu,
 )
 
 comptime NSET = 48
@@ -44,10 +46,13 @@ def main() raises:
 
     comptime WQ = QO * INNER
     comptime WKV = 2 * KVO * INNER
+    comptime WGA = INNER_FF * INNER
     comptime WDN = INNER_FF * INNER
     var hwq = ctx.enqueue_create_host_buffer[DType.float16](NSET * WQ)
     var hwkv = ctx.enqueue_create_host_buffer[DType.float16](NSET * WKV)
     print("s2")
+    var hwga = ctx.enqueue_create_host_buffer[DType.float16](NSET * WGA)
+    var hwup = ctx.enqueue_create_host_buffer[DType.float16](NSET * WGA)
     var hwdn = ctx.enqueue_create_host_buffer[DType.float16](NSET * WDN)
     print("s3")
     var hbq = ctx.enqueue_create_host_buffer[DType.float32](QO)
@@ -67,23 +72,40 @@ def main() raises:
             hwkv[s * WKV + i] = Float16(
                 Float64((s * 23 + i * 11) % 27 - 13) / 16.0
             )
+        for i in range(WGA):
+            hwga[s * WGA + i] = Float16(
+                Float64((s * 41 + i * 7) % 25 - 12) / 16.0
+            )
+            hwup[s * WGA + i] = Float16(
+                Float64((s * 43 + i * 5) % 21 - 10) / 16.0
+            )
         for i in range(WDN):
             hwdn[s * WDN + i] = Float16(
                 Float64((s * 47 + i * 3) % 33 - 16) / 16.0
             )
     var dwq = ctx.enqueue_create_buffer[DType.float16](NSET * WQ)
     var dwkv = ctx.enqueue_create_buffer[DType.float16](NSET * WKV)
+    var dwga = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwup = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
     var dwdn = ctx.enqueue_create_buffer[DType.float16](NSET * WDN)
     # 打包权重（q/kv 同 pack[896,2,8] 布局；down pack[4864,2,8]）
     var dwpq = ctx.enqueue_create_buffer[DType.float16](NSET * WQ)
     var dwpkv = ctx.enqueue_create_buffer[DType.float16](NSET * WKV)
     var dwpdn = ctx.enqueue_create_buffer[DType.float16](NSET * WDN)
+    var dwpga = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwpup = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwpga1 = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwpup1 = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwpga16 = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
+    var dwpup16 = ctx.enqueue_create_buffer[DType.float16](NSET * WGA)
     var dwpq2 = ctx.enqueue_create_buffer[DType.float16](NSET * WQ)
     print("s5")
     var dbq = ctx.enqueue_create_buffer[DType.float32](QO)
     var dbkv = ctx.enqueue_create_buffer[DType.float32](2 * KVO)
     ctx.enqueue_copy(dst_buf=dwq, src_buf=hwq)
     ctx.enqueue_copy(dst_buf=dwkv, src_buf=hwkv)
+    ctx.enqueue_copy(dst_buf=dwga, src_buf=hwga)
+    ctx.enqueue_copy(dst_buf=dwup, src_buf=hwup)
     ctx.enqueue_copy(dst_buf=dwdn, src_buf=hwdn)
     ctx.enqueue_copy(dst_buf=dbq, src_buf=hbq)
     ctx.enqueue_copy(dst_buf=dbkv, src_buf=hbkv)
@@ -102,10 +124,46 @@ def main() raises:
             grid_dim=((2 * KVO) // 128, INNER // 16, 1),
             block_dim=(256, 1, 1),
         )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 2, 8]](
+            dwga.unsafe_ptr() + i * WGA,
+            dwpga.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 128, INNER // 16, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 2, 8]](
+            dwup.unsafe_ptr() + i * WGA,
+            dwpup.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 128, INNER // 16, 1),
+            block_dim=(256, 1, 1),
+        )
         ctx.enqueue_function[pack_w_mma_gpu[4864, 2, 8]](
             dwdn.unsafe_ptr() + i * WDN,
             dwpdn.unsafe_ptr() + i * WDN,
             grid_dim=(QO // 128, INNER_FF // 16, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 1, 8]](
+            dwga.unsafe_ptr() + i * WGA,
+            dwpga1.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 64, INNER // 16, 1),
+            block_dim=(128, 1, 1),
+        )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 1, 8]](
+            dwup.unsafe_ptr() + i * WGA,
+            dwpup1.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 64, INNER // 16, 1),
+            block_dim=(128, 1, 1),
+        )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 2, 16]](
+            dwga.unsafe_ptr() + i * WGA,
+            dwpga16.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 256, INNER // 16, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_function[pack_w_mma_gpu[896, 2, 16]](
+            dwup.unsafe_ptr() + i * WGA,
+            dwpup16.unsafe_ptr() + i * WGA,
+            grid_dim=(INNER_FF // 256, INNER // 16, 1),
             block_dim=(256, 1, 1),
         )
     ctx.synchronize()
@@ -125,12 +183,14 @@ def main() raises:
     var dga = ctx.enqueue_create_buffer[DType.float32](T * INNER_FF)
     var dup = ctx.enqueue_create_buffer[DType.float32](T * INNER_FF)
     var dact = ctx.enqueue_create_buffer[DType.float32](T * INNER_FF)
+    var dgp = ctx.enqueue_create_buffer[DType.float32](4 * T * INNER_FF)
+    var dup_p = ctx.enqueue_create_buffer[DType.float32](4 * T * INNER_FF)
     ctx.synchronize()
 
     # v0 q2_pk(56块)  v1 q2_spl4(224)  v2 q2_spl8(448)
     # v3 kv2_spl8(现状参照)  v4 dual_pk(现状参照)  v5 down_spl4(现状参照)
     @parameter
-    for v in range(6):
+    for v in range(10):
         var best = 1e30
         for rep in range(ROUNDS):
             var t0 = monotonic_ns()
@@ -198,11 +258,80 @@ def main() raises:
                     ctx.enqueue_function[
                         f16_mma_dual_pk_gpu[896, 896, 8]
                     ](
-                        dx1.unsafe_ptr(), wq,
-                        (dwpq2.unsafe_ptr() + i * WQ),
+                        dx1.unsafe_ptr(),
+                        (dwpga.unsafe_ptr() + i * WGA),
+                        (dwpup.unsafe_ptr() + i * WGA),
                         dga.unsafe_ptr(), dup.unsafe_ptr(),
                         dact.unsafe_ptr(), Int32(INNER_FF), Int32(T),
                         grid_dim=(INNER_FF // 128, T // 16, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                elif v == 6 or v == 7:
+                    comptime SS = 2 if v == 6 else 4
+                    comptime CHS = 448 if v == 6 else 224
+                    ctx.enqueue_function[
+                        f16_mma_down_spl_gpu[896, CHS, 2, 8, SS]
+                    ](
+                        dx1.unsafe_ptr(),
+                        (dwpga.unsafe_ptr() + i * WGA),
+                        dgp.unsafe_ptr(),
+                        Int32(INNER_FF), Int32(T),
+                        grid_dim=(INNER_FF // 128, T // 16, SS),
+                        block_dim=(256, 1, 1),
+                    )
+                    ctx.enqueue_function[
+                        f16_mma_down_spl_gpu[896, CHS, 2, 8, SS]
+                    ](
+                        dx1.unsafe_ptr(),
+                        (dwpup.unsafe_ptr() + i * WGA),
+                        dup_p.unsafe_ptr(),
+                        Int32(INNER_FF), Int32(T),
+                        grid_dim=(INNER_FF // 128, T // 16, SS),
+                        block_dim=(256, 1, 1),
+                    )
+                    ctx.enqueue_function[f32_mergsw_gpu[SS]](
+                        dact.unsafe_ptr(), dgp.unsafe_ptr(),
+                        dup_p.unsafe_ptr(), Int32(T * INNER_FF),
+                        grid_dim=((T * INNER_FF + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                elif v == 9:
+                    ctx.enqueue_function[
+                        f16_mma_dual_pk_gpu[896, 896, 16]
+                    ](
+                        dx1.unsafe_ptr(),
+                        (dwpga16.unsafe_ptr() + i * WGA),
+                        (dwpup16.unsafe_ptr() + i * WGA),
+                        dga.unsafe_ptr(), dup.unsafe_ptr(),
+                        dact.unsafe_ptr(), Int32(INNER_FF), Int32(T),
+                        grid_dim=(INNER_FF // 256, T // 16, 1),
+                        block_dim=(512, 1, 1),
+                    )
+                elif v == 8:
+                    ctx.enqueue_function[
+                        f16_mma_gemm_pk_gpu[896, 896, 1, 8, False]
+                    ](
+                        dx1.unsafe_ptr(),
+                        (dwpga1.unsafe_ptr() + i * WGA),
+                        dga.unsafe_ptr(),
+                        dbq.unsafe_ptr(), Int32(INNER_FF), Int32(T),
+                        grid_dim=(INNER_FF // 64, T // 16, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    ctx.enqueue_function[
+                        f16_mma_gemm_pk_gpu[896, 896, 1, 8, False]
+                    ](
+                        dx1.unsafe_ptr(),
+                        (dwpup1.unsafe_ptr() + i * WGA),
+                        dup.unsafe_ptr(),
+                        dbq.unsafe_ptr(), Int32(INNER_FF), Int32(T),
+                        grid_dim=(INNER_FF // 64, T // 16, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    ctx.enqueue_function[swiglu_gpu](
+                        dga.unsafe_ptr(), dup.unsafe_ptr(),
+                        dact.unsafe_ptr(), Int32(T * INNER_FF),
+                        grid_dim=((T * INNER_FF + 255) // 256, 1, 1),
                         block_dim=(256, 1, 1),
                     )
                 else:
@@ -226,7 +355,7 @@ def main() raises:
                 best = per
         print("v", v, "us:", best)
 
-    # 正确性抽查：v1/v2 vs v0（q2 spl 与 pk 差 ~1e-4 级，门容差覆盖）
+    # 正确性抽查（v6 checksum 与 v4 同序同公式，差 ~1e-4 级）
     var hq = ctx.enqueue_create_host_buffer[DType.float32](T * QO)
     ctx.enqueue_copy(dst_buf=hq, src_buf=dq)
     ctx.synchronize()
