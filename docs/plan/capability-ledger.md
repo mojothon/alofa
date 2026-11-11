@@ -3619,3 +3619,10 @@
   - **证伪**：down split-K（`fat_si`）e2e 反而 +6%（x-chunk 重读 + f64 partial 往返 + 双发射不抵块数收益——与 kv2 教训同族：**decode 1 行 GEMM 的 split-K 也不划算**，瓶颈是每线程发射链不是块数）；dual_o2/dual_t128/tri_t256/o_t256/dsi4/16 全负。
   - **坑两枚**：decode_step 参数序（attn_smode→attn_tiles→dual_nx→down_si）传错位静默无效（首轮 dsi 扫型白跑）；cat3 的 na/nb/nc 是元素数非列数。aliasing 检查加强版：同 buffer 派生指针落局部变量也判同源，须独立 buffer + comptime 分支直传。
   - 剩余空间：全段到 1160 上限 ≈ 再 -0.35ms，但 dual/down 已 744/656 且形状级扫型干涸——下一刀是新核工程（batch load / cp.async 级），边际收益递减。
+- **2026-11-11（一百一十六）** —— decode 全景复测 + 尾部链瘦身：**sample 快尾 -0.013ms（2.241 → 2.228）**；固定底之谜破案
+  - 新默认（qkv_pack+down_t256+o_outs1）分段：TRI 0.199 / ATTN 0.461 / O 0.130 / DUAL 0.578 / DOWN 0.312 / HEAD 0.316ms。HEAD 861GB/s 近顶；DUAL 723、DOWN 670；TRI 249、O 297 仍洼。
+  - **skipALL"固定底"0.315ms 是测量伪影**：skip 分支每层发 6 个 noop 替身（144 发射/步 × ~2µs）——skip 掩码法的"底"不可当真实开销解读（账本新坑）。真实固定成本 ~20-30µs/步。
+  - **sample 快尾落地**：`argmax_f32_gpu`（分块 partial + smem 树，并列取小下标=host 首现语义）+ `argmax_comb_gpu`（单块收口直写 d_token）+ 持久 `h_token` 缓冲（去每步 pinned alloc + 早 sync）。尾部 4B 回传替代 608KB logits D2H。正确定性：合成并列最大值 + 真实步 token 84 双 MATCH；双门绿。默认 sample=False 保 API。
+  - **span 证伪**：跳尾部 D2H+sync 仅 -0.016ms——每步 sync 几乎免费（发射流水吸收排空）；N 步一 sync 的 span API 不值得建。
+  - ⚠️ `out` 是 Mojo 保留字（核参数命名避开）；sample 落 comptime 表是静默的——运行时分支参数必须放 `](` 之后的运行时表。
+  - 剩余空间（到 1160GB/s 上限）：DUAL -0.27 / DOWN -0.15 / TRI -0.14 / ATTN -0.1 量级——全部要 batch-load/cp.async 级新核工程；decode 收益边际明显递减，下一步建议转向 prefill attention 复查或端到端服务层。

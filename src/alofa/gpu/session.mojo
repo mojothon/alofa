@@ -40,7 +40,7 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
     attn_vt2_h_gpu, attn_comb2_b_gpu
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -245,6 +245,11 @@ struct GpuSession:
     var d_token: DeviceBuffer[DType.int32]
 
     var h_logits: HostBuffer[DType.float32]
+    # 一百一十六-b：sample 快尾（device argmax + 4B 回传）的基建
+    var h_token: HostBuffer[DType.int32]
+    var d_amax: DeviceBuffer[DType.float32]
+    var d_aidx: DeviceBuffer[DType.int32]
+    var last_token: Int
 
     def __init__(out self, model: QwenForward, max_tokens: Int) raises:
         """全量上传并分配激活/KV。要求 `model` 以 `quantize=True` 构造。"""
@@ -581,6 +586,10 @@ struct GpuSession:
         self.d_tokenb = self.ctx.enqueue_create_buffer[DType.int32](mb)
         self.d_logits = self.ctx.enqueue_create_buffer[DType.float32](self.vocab)
         self.d_token = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.h_token = self.ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.d_amax = self.ctx.enqueue_create_buffer[DType.float32](128)
+        self.d_aidx = self.ctx.enqueue_create_buffer[DType.int32](128)
+        self.last_token = 0
         self.h_logits = self.ctx.enqueue_create_host_buffer[DType.float32](
             self.vocab
         )
@@ -826,7 +835,8 @@ struct GpuSession:
         down_si: Int = 0, o_outs: Int = 1,
         qkv_pack: Bool = True,
     ](
-        mut self, token: Int, skip: Int = 0
+        mut self, token: Int, skip: Int = 0, sample: Bool = False,
+        span: Bool = False
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t=1 的完整前向：返回 host logits 指针（下次调用前有效）。
 
@@ -884,10 +894,10 @@ struct GpuSession:
         if kv_len > self.max_tokens:
             raise AlofaError(ERR_OUT_OF_RANGE, "kv store is full", "")
 
-        var ht = self.ctx.enqueue_create_host_buffer[DType.int32](1)
-        self.ctx.synchronize()
-        ht[0] = Int32(token)
-        self.ctx.enqueue_copy(dst_buf=self.d_token, src_buf=ht)
+        # 一百一十六-b：持久 pinned 缓冲，去每步 alloc + 早 sync
+        # （步骤末尾本就有 sync，上一循环的 H2D 必已完成）
+        self.h_token[0] = Int32(token)
+        self.ctx.enqueue_copy(dst_buf=self.d_token, src_buf=self.h_token)
         if skip & SKIP_GATHER == 0:
             self.ctx.enqueue_function[gather_gpu](
                 self.d_x.unsafe_ptr(),
@@ -1266,8 +1276,54 @@ struct GpuSession:
             self.ctx.enqueue_function[noop_gpu](
                 grid_dim=(1, 1, 1), block_dim=(32, 1, 1)
             )
-        self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
-        self.ctx.synchronize()
+        if span:
+            # 一百一十六-c 试验位：跳尾部回传与 sync（argmax 仍写
+            # d_token，链条设备侧闭环）——量 N 步一 sync 的上限。
+            self.ctx.enqueue_function[argmax_f32_gpu](
+                self.d_logits.unsafe_ptr(),
+                self.d_amax.unsafe_ptr(),
+                self.d_aidx.unsafe_ptr(),
+                Int32(self.vocab),
+                grid_dim=(128, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[argmax_comb_gpu](
+                self.d_amax.unsafe_ptr(),
+                self.d_aidx.unsafe_ptr(),
+                self.d_token.unsafe_ptr(),
+                Int32(128),
+                grid_dim=(1, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.kv_pos = kv_len
+            return self.h_logits.unsafe_ptr()
+        if sample:
+            # 一百一十六-b：device argmax 收口 + 4B 回传（vs 608KB
+            # logits D2H）；完整 logits 走 sample=False 或 run()。
+            self.ctx.enqueue_function[argmax_f32_gpu](
+                self.d_logits.unsafe_ptr(),
+                self.d_amax.unsafe_ptr(),
+                self.d_aidx.unsafe_ptr(),
+                Int32(self.vocab),
+                grid_dim=(128, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[argmax_comb_gpu](
+                self.d_amax.unsafe_ptr(),
+                self.d_aidx.unsafe_ptr(),
+                self.d_token.unsafe_ptr(),
+                Int32(128),
+                grid_dim=(1, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_copy(dst_buf=self.h_token, src_buf=self.d_token)
+            self.ctx.synchronize()
+            self.last_token = Int(self.h_token[0])
+        else:
+            self.ctx.enqueue_copy(
+                dst_buf=self.h_logits, src_buf=self.d_logits
+            )
+            self.ctx.synchronize()
         self.kv_pos = kv_len
         return self.h_logits.unsafe_ptr()
 

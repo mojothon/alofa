@@ -395,6 +395,101 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
                 dst[unsafe_offset=row * Int(out_cols) + o] = Float32(sacc[unsafe_offset=oo * THREADS])
 
 
+def argmax_f32_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    part_val: Pointer[Float32, MutUntrackedOrigin],
+    part_idx: Pointer[Int32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """词表 argmax 相一（账本一百一十六-b）：每块扫一段，块内跨步
+    遍历 + smem 树（并列取小下标，与 host 首现语义一致），partials
+    写 (val, idx) 两数组。配 argmax_comb_gpu 收口。"""
+    var tid = Int(thread_idx.x)
+    var bid = Int(block_idx.x)
+    var nblocks = Int(grid_dim.x)
+    var chunk = (Int(n) + nblocks - 1) // nblocks
+    var lo = bid * chunk
+    var hi = min(lo + chunk, Int(n))
+    var best = Float32(-3.402823466e38)
+    var bi = Int32(-1)
+    var i = lo + tid
+    while i < hi:
+        var v = x[unsafe_offset=i]
+        if v > best:
+            best = v
+            bi = Int32(i)
+        i += 256
+    var sval = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var sidx = stack_allocation[
+        256, Int32, address_space = AddressSpace.SHARED
+    ]()
+    sval[unsafe_offset=tid] = best
+    sidx[unsafe_offset=tid] = bi
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            var v2 = sval[unsafe_offset=tid + stride]
+            var i2 = sidx[unsafe_offset=tid + stride]
+            var v1 = sval[unsafe_offset=tid]
+            var i1 = sidx[unsafe_offset=tid]
+            if (v2 > v1) or ((v2 == v1) and (i2 < i1)):
+                sval[unsafe_offset=tid] = v2
+                sidx[unsafe_offset=tid] = i2
+        barrier()
+        stride //= 2
+    if tid == 0:
+        part_val[unsafe_offset=bid] = sval[unsafe_offset=0]
+        part_idx[unsafe_offset=bid] = sidx[unsafe_offset=0]
+
+
+def argmax_comb_gpu(
+    part_val: Pointer[Float32, MutUntrackedOrigin],
+    part_idx: Pointer[Int32, MutUntrackedOrigin],
+    out_idx: Pointer[Int32, MutUntrackedOrigin],
+    nb: Int32,
+) -> None:
+    """词表 argmax 相二（账本一百一十六-b）：单块树收 partials，
+    直写 d_token（4 字节回传替代 608KB logits D2H）。"""
+    var tid = Int(thread_idx.x)
+    var sval = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var sidx = stack_allocation[
+        256, Int32, address_space = AddressSpace.SHARED
+    ]()
+    var best = Float32(-3.402823466e38)
+    var bi = Int32(-1)
+    var i = tid
+    while i < Int(nb):
+        var v = part_val[unsafe_offset=i]
+        if v > best:
+            best = v
+            bi = part_idx[unsafe_offset=i]
+        elif (v == best) and (part_idx[unsafe_offset=i] < bi):
+            bi = part_idx[unsafe_offset=i]
+        i += 256
+    sval[unsafe_offset=tid] = best
+    sidx[unsafe_offset=tid] = bi
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            var v2 = sval[unsafe_offset=tid + stride]
+            var i2 = sidx[unsafe_offset=tid + stride]
+            var v1 = sval[unsafe_offset=tid]
+            var i1 = sidx[unsafe_offset=tid]
+            if (v2 > v1) or ((v2 == v1) and (i2 < i1)):
+                sval[unsafe_offset=tid] = v2
+                sidx[unsafe_offset=tid] = i2
+        barrier()
+        stride //= 2
+    if tid == 0:
+        out_idx[unsafe_offset=0] = sidx[unsafe_offset=0]
+
+
 def hbm_probe_f16_gpu[THREADS: Int](
     src: Pointer[Float16, MutUntrackedOrigin],
     sink: Pointer[Float64, MutUntrackedOrigin],
