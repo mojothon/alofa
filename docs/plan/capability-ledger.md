@@ -3453,3 +3453,13 @@
   - **落地**：prefill_step 加 `layer_gap_every: Int = 1`（每 N 层末 sync+usleep；默认 1，配 layer_gap_us=0 等效关闭）。热环境推荐 (4,300) 或 (2,30)。门 bit-exact 全绿。
   - **方法论**：整机高载时环境漂移 ±60%——**跨轮绝对值不可比，同轮内臂间相对值才可比**；调度扫描必须含 (0,0) 连续对照臂才能发现墙是否在场。
   - **未竟（九十九）**：①攻击面回归 kernel 本身（22.3ms 中 o/dual/down 段谱细分——重放段谱 tri 0.34/attn 0.3/o 0.33/ff 0.64+down 0.34）；②服务层接入引擎时按热压自适应启用 gap；③运维项：GPU 4 散热/-lgc 权限。
+
+- **2026-11-11（第九十九条）** —— ⚡ FF/o GEMM 寄存器重构：x tile ÷OUTS + w 寄存器组（kernel 1.6-1.9×，端到端 20.0ms 新纪录）
+  - **瓶颈定位**：fat/dual 的循环是"每输出重读 x tile"——x 的 L2 流量 = out_cols×t×its×4KB，与 OUTS 无关；down 段 2.34GB/0.545ms = **4.3TB/s 贴住 A100 L2 带宽墙**。
+  - **fat2/dual2 失败**（纯循环倒置）：w 重载 ×RB 抵消 x 收益——down 545→616µs、dual 943→1482µs；只有 o（its=1）赚 11%。
+  - **fat3/dual3 成功**：w tile 先进寄存器组（InlineArray+S@parameter 展开），再 rr×oo FMA——x÷OUTS 且 w 流量持平。kernel 级交替 30 rep：**down 585→328µs（1.78×）、dual 677→370µs（1.83×）、o 154→97µs（1.60×）**，device 侧逐位对照 **maxdiff 全 0.0**。
+  - **寄存器配比是关键**：dual3 OUTS=4（acc 64 f32 + 双 w 32 regs）spill 反而慢 46%；OUTS=2（acc 32）达成 1.83×。fat3 OUTS=4 恰在甜点。
+  - **端到端严格 AB**（同进程双 session 交替、kv 与顺序双平衡）：NEW 一致更快 1.11-1.44×；安静态 **22.3→20.0ms（−10%）**、热态 40.9→36.4。
+  - **落地**：session.mojo 的 O_K/DUAL_K/DOWN_K 换 fat3(OUTS=4)/dual3(OUTS=2)/fat3(OUTS=4)，grid 相应 ÷OUTS；fat3/dual3 补齐 AF=float64 精确路径（与旧核逐位同，门 diff 数值不变）。门全绿。
+  - **方法论**：①先量化墙（流量/带宽）再动刀；②寄存器预算决定 OUTS 上限（f32 acc 每份 4B×RB）；③grid 必须随 OUTS 同步改（改漏=只算一半输出，diff 5.78 当场暴露）；④跨轮端到端比较不可靠，同进程交替+双平衡才干净。
+  - **未竟（一百）**：①qkv kernel 同构可改（o 同 INNER=896，潜力 ~1.6×≈0.2ms/层）；②attn rs/vt2 段（kv 相关）；③FA 融合 norm 进 GEMM 省 24 launch；④decode_step 的 matmul 同款改造。

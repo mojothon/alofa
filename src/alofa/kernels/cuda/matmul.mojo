@@ -1483,3 +1483,360 @@ def f16_matmul_dual_nx_gpu[
                     dst_act[unsafe_offset=row * Int(out_cols) + o] = Float32(
                         g / (Float64(1) + exp(-g)) * Float64(v2)
                     )
+
+
+def f16_bmm_fat2_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """fat2（账本九十九）：fat 的 x 外层重排——(it, rr) 外环、(oo) 内环，
+    x tile 每 (it,rr) 只载一次、w 每 (it,oo) 一次。x 的 L2 流量
+    out_cols×t×its×4KB ÷ OUTS（原版与 OUTS 无关，down 段 2.34GB）。
+    每输出累加序不变（it 升序、THREADS 树同构）⇒ 与 fat 逐位同。
+    要求 out_cols % OUTS == 0。"""
+
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, OUTS * RB](0)
+    @parameter
+    for it in range((INNER + THREADS * 8 - 1) // (THREADS * 8)):
+        var k = tid * 8 + it * THREADS * 8
+        if k < Int(INNER):
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                    @parameter
+                    for oo in range(OUTS):
+                        var o = o0 + oo
+                        if o < Int(out_cols):
+                            var wv = w.load[8, alignment=16](
+                                o * Int(INNER) + k
+                            )
+                            comptime if AF == DType.float64:
+                                @parameter
+                                for j in range(8):
+                                    acc[oo * RB + rr] += Scalar[AF](
+                                        Float64(xv[j]) * Float64(Float32(wv[j]))
+                                    )
+                            else:
+                                var prod = xv * wv.cast[DType.float32]()
+                                acc[oo * RB + rr] += Scalar[AF](prod.reduce_add())
+    var sacc = stack_allocation[
+        OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * THREADS]
+                        )
+                        comptime if ACC:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = (
+                                dst[unsafe_offset=r * Int(out_cols) + o] + v
+                            )
+                        else:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = v
+
+
+def f16_bmm_dual2_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """dual2（账本九十九）：dual 的 x 外层重排，同 fat2。x 流量 ÷OUTS。
+    每输出累加序不变 ⇒ 与 dual 逐位同。要求 out_cols % OUTS == 0。"""
+
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, 2 * OUTS * RB](0)
+    @parameter
+    for it in range((INNER + THREADS * 8 - 1) // (THREADS * 8)):
+        var k = tid * 8 + it * THREADS * 8
+        if k < Int(INNER):
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                    @parameter
+                    for oo in range(OUTS):
+                        var o = o0 + oo
+                        if o < Int(out_cols):
+                            var wav = w_a.load[8, alignment=16](
+                                o * Int(INNER) + k
+                            )
+                            var wbv = w_b.load[8, alignment=16](
+                                o * Int(INNER) + k
+                            )
+                            comptime if AF == DType.float64:
+                                @parameter
+                                for j in range(8):
+                                    acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                        Float64(xv[j]) * Float64(Float32(wav[j]))
+                                    )
+                                    acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                        Float64(xv[j]) * Float64(Float32(wbv[j]))
+                                    )
+                            else:
+                                var wa32 = wav.cast[DType.float32]()
+                                var wb32 = wbv.cast[DType.float32]()
+                                acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                    (xv * wa32).reduce_add()
+                                )
+                                acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                    (xv * wb32).reduce_add()
+                                )
+    var sacc = stack_allocation[
+        2 * OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(2 * OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(2 * OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * 2 * THREADS]
+                        )
+                        var v2 = Float32(
+                            sacc[unsafe_offset=((oo * RB + rr) * 2 + 1) * THREADS]
+                        )
+                        dst_a[unsafe_offset=r * Int(out_cols) + o] = v
+                        dst_b[unsafe_offset=r * Int(out_cols) + o] = v2
+                        var g = Float64(v)
+                        dst_act[unsafe_offset=r * Int(out_cols) + o] = Float32(
+                            g / (Float64(1) + exp(-g)) * Float64(v2)
+                        )
+
+
+def f16_bmm_fat3_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, ACC: Bool, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """fat3（账本九十九）：fat2 的 w 寄存器修正——(it) 外环：w tile
+    先载入寄存器组（@parameter 展开），再 rr×oo FMA。x 流量 ÷OUTS、
+    w 流量与 fat 持平。要求 out_cols % OUTS == 0。累加序同 ⇒ 逐位同。"""
+
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, OUTS * RB](0)
+    @parameter
+    for it in range((INNER + THREADS * 8 - 1) // (THREADS * 8)):
+        var k = tid * 8 + it * THREADS * 8
+        if k < Int(INNER):
+            var warr = InlineArray[SIMD[DType.float16, 8], OUTS](
+                fill=w.load[8, alignment=16](o0 * Int(INNER) + k)
+            )
+            @parameter
+            for oo in range(1, OUTS):
+                warr[oo] = w.load[8, alignment=16](
+                    (o0 + oo) * Int(INNER) + k
+                )
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                    @parameter
+                    for oo in range(OUTS):
+                        comptime if AF == DType.float64:
+                            @parameter
+                            for j in range(8):
+                                acc[oo * RB + rr] += Scalar[AF](
+                                    Float64(xv[j])
+                                    * Float64(Float32(warr[oo][j]))
+                                )
+                        else:
+                            var prod = xv * warr[oo].cast[DType.float32]()
+                            acc[oo * RB + rr] += Scalar[AF](prod.reduce_add())
+    var sacc = stack_allocation[
+        OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * THREADS]
+                        )
+                        comptime if ACC:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = (
+                                dst[unsafe_offset=r * Int(out_cols) + o] + v
+                            )
+                        else:
+                            dst[unsafe_offset=r * Int(out_cols) + o] = v
+
+
+def f16_bmm_dual3_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = DType.float64](
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """dual3（账本九十九）：dual2 的 w 寄存器修正——w_a/w_b tile 各进
+    寄存器组。x 流量 ÷OUTS、w 流量与 dual 持平。要求 out_cols % OUTS == 0。
+    累加序同 ⇒ 逐位同。"""
+
+    var o0 = Int(block_idx.x) * OUTS
+    var r0 = Int(block_idx.y) * RB
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[AF, 2 * OUTS * RB](0)
+    @parameter
+    for it in range((INNER + THREADS * 8 - 1) // (THREADS * 8)):
+        var k = tid * 8 + it * THREADS * 8
+        if k < Int(INNER):
+            var waa = InlineArray[SIMD[DType.float16, 8], OUTS](
+                fill=w_a.load[8, alignment=16](o0 * Int(INNER) + k)
+            )
+            var wbb = InlineArray[SIMD[DType.float16, 8], OUTS](
+                fill=w_b.load[8, alignment=16](o0 * Int(INNER) + k)
+            )
+            @parameter
+            for oo in range(1, OUTS):
+                waa[oo] = w_a.load[8, alignment=16](
+                    (o0 + oo) * Int(INNER) + k
+                )
+                wbb[oo] = w_b.load[8, alignment=16](
+                    (o0 + oo) * Int(INNER) + k
+                )
+            @parameter
+            for rr in range(RB):
+                var r = r0 + rr
+                if r < Int(n_rows):
+                    var xv = x.load[8, alignment=32](r * Int(INNER) + k)
+                    @parameter
+                    for oo in range(OUTS):
+                        comptime if AF == DType.float64:
+                            @parameter
+                            for j in range(8):
+                                acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                    Float64(xv[j])
+                                    * Float64(Float32(waa[oo][j]))
+                                )
+                                acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                    Float64(xv[j])
+                                    * Float64(Float32(wbb[oo][j]))
+                                )
+                        else:
+                            var wa32 = waa[oo].cast[DType.float32]()
+                            var wb32 = wbb[oo].cast[DType.float32]()
+                            acc[(oo * RB + rr) * 2] += Scalar[AF](
+                                (xv * wa32).reduce_add()
+                            )
+                            acc[(oo * RB + rr) * 2 + 1] += Scalar[AF](
+                                (xv * wb32).reduce_add()
+                            )
+    var sacc = stack_allocation[
+        2 * OUTS * RB * THREADS, AF, address_space = AddressSpace.SHARED
+    ]()
+    @parameter
+    for idx in range(2 * OUTS * RB):
+        sacc[unsafe_offset=idx * THREADS + tid] = acc[idx]
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            @parameter
+            for idx in range(2 * OUTS * RB):
+                sacc[unsafe_offset=idx * THREADS + tid] += sacc[
+                    unsafe_offset=idx * THREADS + tid + stride
+                ]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        @parameter
+        for oo in range(OUTS):
+            var o = o0 + oo
+            if o < Int(out_cols):
+                @parameter
+                for rr in range(RB):
+                    var r = r0 + rr
+                    if r < Int(n_rows):
+                        var v = Float32(
+                            sacc[unsafe_offset=(oo * RB + rr) * 2 * THREADS]
+                        )
+                        var v2 = Float32(
+                            sacc[unsafe_offset=((oo * RB + rr) * 2 + 1) * THREADS]
+                        )
+                        dst_a[unsafe_offset=r * Int(out_cols) + o] = v
+                        dst_b[unsafe_offset=r * Int(out_cols) + o] = v2
+                        var g = Float64(v)
+                        dst_act[unsafe_offset=r * Int(out_cols) + o] = Float32(
+                            g / (Float64(1) + exp(-g)) * Float64(v2)
+                        )

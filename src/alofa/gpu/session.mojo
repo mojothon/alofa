@@ -52,6 +52,7 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_dual_fat_gpu,
     f16_matmul_fat_gpu, f16_matmul_fat_si_gpu, fat_si_comb_gpu,
     f16_bmm_fat_gpu, f16_bmm_dual_gpu, f16_bmm_qkv_gpu,
+    f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -1165,9 +1166,11 @@ struct GpuSession:
         alias RS_K = attn_rs_b_gpu[attn_t, True, attn_tiles]
         alias VT2_K = attn_vt2_b_gpu[attn_t, attn_tiles]
         alias COMB_K = attn_comb2_b_gpu[attn_tiles]
-        alias O_K = f16_bmm_fat_gpu[o_t, inner, 2, prefill_rb, True, prefill_af]
-        alias DUAL_K = f16_bmm_dual_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
-        alias DOWN_K = f16_bmm_fat_gpu[down_t, inner_ff, 2, prefill_rb, True, prefill_af]
+        # 账本九十九：fat3/dual3——x tile 寄存器复用（流量 ÷OUTS）+
+        # w tile 寄存器组：o/down 1.6-1.8×、dual 1.8×（bit-exact 同旧核）。
+        alias O_K = f16_bmm_fat3_gpu[o_t, inner, 4, prefill_rb, True, prefill_af]
+        alias DUAL_K = f16_bmm_dual3_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
+        alias DOWN_K = f16_bmm_fat3_gpu[down_t, inner_ff, 4, prefill_rb, True, prefill_af]
         alias LMHEAD_K = linear_fat_f16_gpu[256, inner, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
@@ -1328,7 +1331,7 @@ struct GpuSession:
                 self.d_xb.unsafe_ptr(),
                 Int32(self.hidden),
                 Int32(t),
-                grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
+                grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
                 block_dim=(o_t, 1, 1),
             )
             if profile:
@@ -1375,7 +1378,7 @@ struct GpuSession:
                 self.d_xb.unsafe_ptr(),
                 Int32(self.hidden),
                 Int32(t),
-                grid_dim=(ceildiv(self.hidden, 2), ceildiv(t, prefill_rb), 1),
+                grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
                 block_dim=(down_t, 1, 1),
             )
             if profile:
