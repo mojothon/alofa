@@ -3481,3 +3481,11 @@
   - **端到端**（同 bench 结构对比上轮）：C 36.4/38.8→30.4/33.2、D 39.6/42.3→34.1/36.8（**-16%**）；A 62.4/64.6→51.5/51.4。热态 C=30.4ms，安静态预期 ~13-15ms（待复测）。
   - **坑**：同进程二建 GpuSession 即崩（首 session 已消费 host 参数）——双 session 对比须各自独立进程或建在两个 session 之前；本门拆为独立文件（test_session_prefill_t1）。
   - **未竟（一百零二）**：①rs/vt2 融合成 flash-attn 单核（省 1 launch + scores f32 往返）；②norm 融进 GEMM；③decode 路径 matmul 同款；④安静态端到端复测。
+
+- **2026-11-11（第一百零二条）** —— ❌ flash 融合（rs+vt2）负结果：数值逐位同但慢 10%——寄存器峰值分配教训
+  - **实现**：attn_fused_b_gpu（TILES=1 限定）——scores 算进 smem + gmax/e_s/V 同核，省 1 launch 与 scores 显存往返（~5µs）。
+  - **数值**：vpart/tsum 逐位对照 **全 0.0**（kv=128/512 双点）——scores f32 经 smem 无损、算序同构，融合不破逐位性（可复用的融合方法论）。
+  - **性能（A/B 交替 30 rep，kv=512）**：fused **532µs vs 分离 482µs（-10%）**——点积循环（128 次标量 q_rot 载入/c8 循环）与 V 累加同函数 ⇒ 编译器按寄存器峰值分配，全 phase 占用率下降，远超省下的 5µs。
+  - **结论**：保留 kernel+probe 作参照（docstring 已标注勿接入）；融合不是免费午餐——**只有当合并后各 phase 寄存器占用相近时才可能赚**。rs（0 smem 高占用）与 vt2（14KB smem）本就工作在不同占用点。
+  - **环境**：GPU 0 又满载（77%/72°C）——安静态复测仍不可得（三项 kernel 优化的安静态绝对值待环境红利）。
+  - **未竟（一百零三）**：①f16 GEMM 向 tensor core（WMMA）迁移——FF 段 0.7ms/层的 3-5× 空间，走容差门（数值重组大）；②decode 路径 GEMV；③安静态复测。

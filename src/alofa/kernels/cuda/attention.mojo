@@ -1066,3 +1066,148 @@ def attn_comb2_b_gpu[TILES: Int = 8](
             )
             gsum += tsum[unsafe_offset=(b * Int(n_heads) + head) * TILES + t]
         dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = Float32(acc / gsum)
+
+
+def attn_fused_b_gpu[
+    THREADS: Int, VEC: Bool = True, TILES: Int = 1,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+    pos0: Int32,
+) -> None:
+    """flash 融合（账本一百零二）：rs+vt2 单核（TILES=1 限定）——
+    scores 算进 smem（f32 无损）+ gmax/e_s/V 同核完成。逐位同
+    rs+vt2（算序同构，vpart/tsum maxdiff=0.0 已验）。
+    ⚠️ 性能负结果（A/B 交替 30 rep，kv=512）：fused 532µs vs 分离
+    482µs（-10%）——点积循环与 V 累加同函数 ⇒ 寄存器分配按峰值
+    分配，占用率下降抵消费省（launch+显存往返仅 ~5µs）。保留作
+    参照，勿接入 session；若要救活需 phase 级 noinline 或拆核。"""
+
+    var b = Int(block_idx.z)
+    var head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var row = (b * Int(n_heads) + head) * Int(kv_len)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var j0 = tile * chunk
+    var j1 = j0 + chunk
+    if j1 > nsc:
+        j1 = nsc
+    var scale = Float32(1.0) / sqrt(Float32(hd))
+
+    var s_s = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    # phase A：scores（同 rs 算序）+ 线程局部 max
+    var best = LOWEST_FP32
+    var jj = j0 + tid
+    while jj < j1:
+        var acc = Float64(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = jj * kv_cols + kv_head_base
+                var c8 = hd // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, hd):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_base + d]
+                    ) * Float64(k_store[unsafe_offset=kbase + d])
+            if not VEC:
+                for d in range(hd):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_base + d]
+                    ) * Float64(k_store[unsafe_offset=jj * kv_cols + kv_head_base + d])
+        else:
+            for d in range(hd):
+                acc += Float64(q_rot[unsafe_offset=q_base + d]) * Float64(
+                    k_store[unsafe_offset=upto * kv_cols + kv_head_base + d]
+                )
+        var s = Float32(acc) * scale
+        s_s[unsafe_offset=jj - j0] = s
+        if s > best:
+            best = s
+        jj += THREADS
+    smax[tid] = best
+    barrier()
+    var stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var gmax = smax[0]
+
+    # phase B：e_s + tsum（同 vt2）
+    var e_s = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var stot = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var tl = Float64(0)
+    var jt = j0 + tid
+    if jt < j1:
+        var e = Float64(exp(Float64(s_s[unsafe_offset=jt - j0] - gmax)))
+        e_s[unsafe_offset=jt - j0] = e
+        tl += e
+    stot[tid] = tl
+    barrier()
+    stride = THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    if tid == 0:
+        tsum[unsafe_offset=(b * Int(n_heads) + head) * TILES + tile] = stot[0]
+    barrier()
+
+    # phase C：V 累加（同 vt2 phase3）
+    var s_g = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var groups = THREADS // hd
+    var d = tid % hd
+    var g = tid // hd
+    var acc = Float64(0)
+    var jj2 = j0 + g
+    while jj2 < j1:
+        acc += e_s[unsafe_offset=jj2 - j0] * Float64(
+            v_store[unsafe_offset=jj2 * kv_cols + kv_head_base + d]
+        )
+        jj2 += groups
+    s_g[tid] = acc
+    barrier()
+    if g == 0:
+        var acc2 = s_g[tid]
+        for g2 in range(1, groups):
+            acc2 += s_g[tid + g2 * hd]
+        vpart[unsafe_offset=(
+            (b * Int(n_heads) + head) * TILES + tile
+        ) * hd + d] = Float32(acc2)
