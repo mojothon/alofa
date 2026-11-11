@@ -3639,3 +3639,8 @@
   - **x tile 重读判据（新）**：块数扩张刀法的隐性成本 = 块数增量 × t × INNER × 2B 的 x 重读流量。decode t=1（3.5KB/块）→ o_outs1/split 类刀有效；prefill t=128（28KB/块）→ 同刀全反噬。q2 spl 能赢是因为 pk 56 块连 x 都读不满（半块/SM 是纯粹饥渴），而 dual 304 块已过临界点。**ff 桶剩余刀法只剩 cp.async/batch-load 级核工程**（与 decode 残余同档，边际递减）。
   - **e2e 钟态校准**：同代码同 bench，765MHz 空闲钟 = 14.00ms vs 满钟 8.75ms——**钟态摆幅 ±37%**。跨 run e2e 数字不可直接对比；此后 A/B 必须同 run 交错（同轮 v4 143→102 的跨轮漂移再证实）。117 的 -24.6% e2e 归因按此折扣（kernel 级 1.60× 与门绿不受影响）。
   - `f32_mergsw_gpu` 收口核留档（编译验证，未采用）。
+- **2026-11-12（一百一十九-a/b）** —— 服务层勘探：**跨序列交错 1.44×（零核改动）+ 批解码吞吐上限 ~9×（t 缩放近恒定）**
+  - **交错发射**（probe_serv119）：2×GpuSession 各持独立 DeviceContext（独立流），`span=True`（116-c 遗产）交错发射 + 尾部一次 sync：serial 8.85 → **6.15ms/step-pair = 1.44×**，确定性 MATCH（token 52 双同）。decode t=1 GEMM 网格饥渴（56 块级）被双流填满。**span 参数从"不值得建 API"翻案为"服务层使能器"**——单流内 sync 免费 ≠ 跨流无价值。
+  - **prefill t 缩放**（probe_serv119b）：同核 n_rows 1→8 成本 3.85→4.00ms（**+4%**）——GEMM 侧批处理近乎免费，8 路批解码每 token 0.48ms vs serial decode 2.23ms（同钟）≈ **4.5-9× 吞吐上限**。⚠️ 仅是上限证明：prefill attention/KV 是单序列语义（t 行互为因果、共享 kv_pos），真批解码 = 现有 GEMM 核（n_rows=B 免费）+ **新批 attention 核**（每序列独立 KV 偏移）+ 每序列 kv_pos 数组。
+  - **坑三枚**：①每 session ≈9GB（权重+打包副本+缓存），**N≥4 路必须先做权重共享**（GpuSession 引用同一 device 权重）；②3 session 并存触发 host 堆损坏（`malloc(): corrupted`，2 session 干净——多实例路径有未审计的共享状态，立旗）；③共享盒 GPU 有他人进程（27.9GB，pid 16741）——OOM 诊断先查 `nvidia-smi --query-compute-apps`，勿信本进程 allocator 的 free 视图；`repro_kv113.mojo` 僵死进程残留也在占卡。
+  - **服务层路线图**：①权重共享 session（解锁 N 路）；②批 attention 核（每序列 KV）；③`generate_batch` API（span 链 + 每序列 argmax 4B 回传）；④host 侧连续批处理调度。GEMM/形状级优化全面让位。
