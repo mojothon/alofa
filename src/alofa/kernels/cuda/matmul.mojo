@@ -2928,6 +2928,25 @@ def f16_mma_gemm2_spl_gpu[
             ] = acc[3]
 
 
+def f32_mergb_gpu[S: Int](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    part: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n: Int32,
+) -> None:
+    """q2 split-K 归并（账本一百一十七-b）：dst[i] = Σ_s part[s][i]
+    + bias[i % out_cols]。part 按 [S][n] 连续布局，S 编译期（必须
+    与 spl 的 S 一致——不一致静默丢段）。mergb2 的单路版。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        var nn = Int(n)
+        var acc = Float32(0)
+        for s in range(S):
+            acc += part[unsafe_offset=s * nn + i]
+        dst[unsafe_offset=i] = acc + bias[unsafe_offset=i % Int(out_cols)]
+
+
 def f32_mergb2_gpu[S: Int](
     dst_a: Pointer[Float32, MutUntrackedOrigin],
     part_a: Pointer[Float32, MutUntrackedOrigin],

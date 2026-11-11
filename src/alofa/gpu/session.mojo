@@ -66,7 +66,7 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_fused_gpu,
     q4_matmul_qkv_gpu,
     f16_mma_gemm2_spl_gpu,
-    f32_mergb2_gpu,
+    f32_mergb2_gpu, f32_mergb_gpu,
     f16_matmul_qkv_fat_gpu,
     cat3_f16_gpu,
 )
@@ -225,6 +225,7 @@ struct GpuSession:
     var d_vb: DeviceBuffer[DType.float32]
     # 一百一十四-a：kv2 split-K partial（[8][mb*kv_dim]，f32_mergb2 归并）
     var d_kbpart: DeviceBuffer[DType.float32]
+    var d_qpart: DeviceBuffer[DType.float32]
     var d_vbpart: DeviceBuffer[DType.float32]
     var d_qrot_b: DeviceBuffer[DType.float32]
     var d_attnb: DeviceBuffer[DType.float32]
@@ -539,6 +540,10 @@ struct GpuSession:
         # 一百一十四-a：kv2 split-K partial，S=8（与发射/归并同源）
         self.d_kbpart = self.ctx.enqueue_create_buffer[DType.float32](
             8 * mb * self.kv_dim
+        )
+        # 一百一十七-b：q2 split-K partial（[8][mb][q_out]）
+        self.d_qpart = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * mb * self.q_out
         )
         self.d_vbpart = self.ctx.enqueue_create_buffer[DType.float32](
             8 * mb * self.kv_dim
@@ -1574,21 +1579,55 @@ struct GpuSession:
             comptime if prefill_af == DType.float32 and prefill_mma_q and (
                 prefill_wpack and inner % 16 == 0
             ):
-                self.ctx.enqueue_function[
-                    f16_mma_gemm_pk_gpu[
-                        inner, 896 if prefill_tile and inner >= 896 else 608, 2, 8,
-                        True,
-                    ]
-                ](
-                    self.d_xnormb16.unsafe_ptr(),
-                    self.d_wp_q[layer].unsafe_ptr(),
-                    self.d_qb.unsafe_ptr(),
-                    self.d_bias_q[layer].unsafe_ptr(),
-                    Int32(self.q_out),
-                    Int32(t),
-                    grid_dim=(ceildiv(self.q_out, 128), ceildiv(t, 16), 1),
-                    block_dim=(256, 1, 1),
-                )
+                comptime if inner % 896 == 0:
+                    # 一百一十七-b：q2 split-K（S=8/CH=112，56→448 块）。
+                    # 冷转对决（probe_pf117b，48 套）：pk 45.2µs →
+                    # spl8 28.2µs = 1.60×（每 SM 半块藏不住冷权重
+                    # ~600 周期 DRAM 延迟，down_spl 同病同方）。
+                    # 累加序变（~1e-4 级），门容差 + argmax 判据。
+                    self.ctx.enqueue_function[
+                        f16_mma_down_spl_gpu[inner, 112, 2, 8, 8]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_wp_q[layer].unsafe_ptr(),
+                        self.d_qpart.unsafe_ptr(),
+                        Int32(self.q_out),
+                        Int32(t),
+                        grid_dim=(
+                            ceildiv(self.q_out, 128), ceildiv(t, 16), 8,
+                        ),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.enqueue_function[f32_mergb_gpu[8]](
+                        self.d_qb.unsafe_ptr(),
+                        self.d_qpart.unsafe_ptr(),
+                        self.d_bias_q[layer].unsafe_ptr(),
+                        Int32(self.q_out),
+                        Int32(t * self.q_out),
+                        grid_dim=((t * self.q_out + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_mma_gemm_pk_gpu[
+                            inner,
+                            896 if prefill_tile and inner >= 896 else 608,
+                            2,
+                            8,
+                            True,
+                        ]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_wp_q[layer].unsafe_ptr(),
+                        self.d_qb.unsafe_ptr(),
+                        self.d_bias_q[layer].unsafe_ptr(),
+                        Int32(self.q_out),
+                        Int32(t),
+                        grid_dim=(
+                            ceildiv(self.q_out, 128), ceildiv(t, 16), 1,
+                        ),
+                        block_dim=(256, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     Q_K

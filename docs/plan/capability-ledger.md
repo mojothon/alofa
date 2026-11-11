@@ -3626,3 +3626,11 @@
   - **span 证伪**：跳尾部 D2H+sync 仅 -0.016ms——每步 sync 几乎免费（发射流水吸收排空）；N 步一 sync 的 span API 不值得建。
   - ⚠️ `out` 是 Mojo 保留字（核参数命名避开）；sample 落 comptime 表是静默的——运行时分支参数必须放 `](` 之后的运行时表。
   - 剩余空间（到 1160GB/s 上限）：DUAL -0.27 / DOWN -0.15 / TRI -0.14 / ATTN -0.1 量级——全部要 batch-load/cp.async 级新核工程；decode 收益边际明显递减，下一步建议转向 prefill attention 复查或端到端服务层。
+- **2026-11-12（一百一十七）** —— prefill GEMM 勘探 + q2 split-K 落地：**11.60 → 8.75ms（-24.6%）**
+  - **attention 复查证伪**（117-a）：f32 生产口径下 attention 全链 ~0.7ms/13.8ms——prefill 已被 GEMM 统治（tri 5.08 / ff 3.17 / o 2.92 / down 2.62 profile ms）。
+  - **探针纠错**：`f16_bmm_*3` 族是 f64/f32 回退核；生产 f32 快路径 = `f16_mma_*_pk/spl` 真张量核家族（x 预转 f16 + packed 权重）。首轮 probe_pf117 测的全是回退核（数字全废）；微基准 39µs 对不上也是这个原因。
+  - **split-K 版图**：kv2（gemm2_spl S=8）、o/down（down_spl S=4）已治（一百一十三/一十四）；**q2 是唯一 56 块裸奔**（每 SM 半块、12.5% 占用，藏不住冷权重 ~600 周期 DRAM 延迟）。
+  - **落地**：q2 直用通用 `down_spl` 核（S=8/CH=112，56→448 块）+ 新收口核 `f32_mergb_gpu`（mergb2 单路版：Σ part + bias）。冷转对决（probe_pf117b，48 套）：pk 45.2 → spl4 30.0 → spl8 28.2µs = **1.60×**。session 接线（d_qpart [8][mb][q_out]，inner%896==0 分支）。f32 门 + prefill 门全绿（argmax=5 不变）。
+  - **e2e**：bench_pfsect117 同法同 GPU：11.6047 → **8.7468ms**。⚠️ 降幅超单核理论值（~0.4ms）——tri 桶 -1.38ms 且各桶齐降，空闲钟 765MHz→满钟的状态差异参与其中；kernel 级 1.60× 与门绿是硬数据，e2e 归因留疑（下轮复测校准）。
+  - **坑四枚**：①`pack_w_mma_gpu` 是**二维 grid**（列块×k 步）——传一维会 cb_idx 越界读崩（本轮 crash 真凶）；②`ref` 是 Mojo 保留字；③down 的 INNER=4864 错发成 896 核 → OOB（探针里 CH=INNER//S 别抄错）；④`nvidia-smi -i 4` 需 `--format=`。
+  - 下一刀候选：dual_pk 304 块也偏稀（125µs 冷转），spl 化需双 partial + swiglu 收口新核（ff 桶 2.5ms 是最大剩余桶）。
