@@ -3471,3 +3471,13 @@
   - **端到端**（热态同轮结构对比）：C/D 臂 42.0/44.1→36.4/38.8、45.0/47.7→39.6/42.3（-12~13%）；安静态预期 20.0→~16ms（待环境红利复测）。
   - **方法论**：拆核也是优化——当链间工作量不均（q 896 vs kv 128）时，合核的 grid 按最大者铺开、小块空转；按链拆分让每核 OUTS 独立选优。
   - **未竟（一百零一）**：①attn rs/vt2 段（kv 相关，vt2 511µs 热态值）；②norm 融进 GEMM 省 24 launch/层；③decode_step matmul 同款；④安静态端到端复测（20.0→? ）。
+
+- **2026-11-11（第一百零一条）** —— ⚡ attn TILES 8→1：消 gmax 冗余 + 线程对齐，端到端 -16%
+  - **结构性低效**：rs/vt2 的 TILES=8 使 chunk=nsc/8≈16 行——**每块仅 16/512 线程活跃**，且 gmax 全行扫描 8× 冗余（每 tile 块都扫全 nsc）。16384 块大部分空转。
+  - **扫描**（正反序两轮抗漂移，call2/3 对齐）：T8 39.6/42.3 → T4 36.3/39.1 → T2 34.9/37.7 → **T1 34.1/37.1（-14%）**。T1 时 chunk=nsc≤512 ⇒ tid<nsc 全线程用满、gmax 零冗余。
+  - **数值**：TILES 变 tsum/vpart 分块 ⇒ 重组非逐位；独立门（test_session_prefill_t1）diff **0.005281567** vs 默认 0.005281448（差 1e-7 量级），PASS。
+  - **前置条件（关键）**：vt2 的 phase2 每线程只处理 1 行（jt=t0+tid），要求 **nsc ≤ THREADS(512)**——由 max_tokens ≤ attn_t(512) 的 kv 检查保证；更长上下文须 attn_tiles ≥ ceil(nsc/THREADS)。已在 docstring 记录。
+  - **落地**：prefill_step 的 attn_tiles 默认 8→1；双门全绿（prefill row8 0.005281567 / decode row9 0.006138324 / PARITY 0.008678674）。
+  - **端到端**（同 bench 结构对比上轮）：C 36.4/38.8→30.4/33.2、D 39.6/42.3→34.1/36.8（**-16%**）；A 62.4/64.6→51.5/51.4。热态 C=30.4ms，安静态预期 ~13-15ms（待复测）。
+  - **坑**：同进程二建 GpuSession 即崩（首 session 已消费 host 参数）——双 session 对比须各自独立进程或建在两个 session 之前；本门拆为独立文件（test_session_prefill_t1）。
+  - **未竟（一百零二）**：①rs/vt2 融合成 flash-attn 单核（省 1 launch + scores f32 往返）；②norm 融进 GEMM；③decode 路径 matmul 同款；④安静态端到端复测。

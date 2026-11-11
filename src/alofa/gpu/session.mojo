@@ -1121,7 +1121,7 @@ struct GpuSession:
     def prefill_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
-        attn_t: Int = 512, attn_tiles: Int = 8,
+        attn_t: Int = 512, attn_tiles: Int = 1,
         prefill_rb: Int = 8,
         prefill_af: DType = DType.float64,
     ](
@@ -1131,6 +1131,12 @@ struct GpuSession:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
         norm → lm_head（只算末行 logits）。
+
+        attn_tiles（账本一百零一）：默认 1——t=128 时 rs 的 chunk=nsc
+        可与 512 线程对齐（T8 时每块仅 nsc/8≈16 线程活跃 + gmax 全行
+        8× 冗余）。前置条件：nsc = pos0+b+1 ≤ THREADS(512)，由
+        max_tokens ≤ attn_t(512) 的 kv 检查保证；更长上下文须用
+        attn_tiles ≥ ceil(nsc/THREADS)。
 
         matmul 族（tri/o/dual/down）与 gather/rmsnorm 本就带 row 维
         （row = block_idx.y / 一行一块）—— grid y=t 直通；attention

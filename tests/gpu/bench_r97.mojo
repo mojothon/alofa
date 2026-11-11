@@ -26,25 +26,25 @@ def main() raises:
     # A：无 gap 连发 ×2（=生产现状）
     for k in range(2):
         var t0 = monotonic_ns()
-        _ = s.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 8, 8, DType.float32](ids, False, True)
+        _ = s.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32](ids, False, True)
         s.ctx.synchronize()
         print("A 无gap", k, Float64(monotonic_ns()) / 1e9, Float64(monotonic_ns() - t0) / 1e6, "ms")
     # B：gap 30us ×2（同 session，kv 继续增）
     for k in range(2):
         var t0 = monotonic_ns()
-        _ = s.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 8, 8, DType.float32](ids, False, True, 30)
+        _ = s.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32](ids, False, True, 30)
         s.ctx.synchronize()
         print("B gap30", k, Float64(monotonic_ns()) / 1e9, Float64(monotonic_ns() - t0) / 1e6, "ms")
     # C：换序——先 gap 后无 gap（排除顺序效应）
     var s2 = GpuSession(model, 512)
     for k in range(2):
         var t0 = monotonic_ns()
-        _ = s2.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 8, 8, DType.float32](ids, False, True, 30)
+        _ = s2.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32](ids, False, True, 30)
         s2.ctx.synchronize()
         print("C gap30", k, Float64(monotonic_ns()) / 1e9, Float64(monotonic_ns() - t0) / 1e6, "ms")
     for k in range(2):
         var t0 = monotonic_ns()
-        _ = s2.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 8, 8, DType.float32](ids, False, True)
+        _ = s2.prefill_step[INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32](ids, False, True)
         s2.ctx.synchronize()
         print("D 无gap", k, Float64(monotonic_ns()) / 1e9, Float64(monotonic_ns() - t0) / 1e6, "ms")
     model.params.keep_alive()
