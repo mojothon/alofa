@@ -1498,21 +1498,42 @@ struct GpuSession:
             if prefill_gqa and attn_t // 8 == self.head_dim and (
                 self.n_heads // self.n_kv_heads <= 8
             ):
-                self.ctx.enqueue_function[
-                    attn_vt2_h_gpu[attn_t, 8, attn_tiles]
-                ](
-                    self.d_scoresb.unsafe_ptr(),
-                    pv,
-                    self.d_vpartb.unsafe_ptr(),
-                    self.d_attotb.unsafe_ptr(),
-                    Int32(self.n_heads),
-                    Int32(self.n_kv_heads),
-                    Int32(self.head_dim),
-                    Int32(kv_len),
-                    Int32(pos0),
-                    grid_dim=(self.n_kv_heads, attn_tiles, t),
-                    block_dim=(attn_t, 1, 1),
-                )
+                comptime if attn_tiles == 1:
+                    # 一百一十二：TILES=1 时 COMB 只是 vpart/tsum 缩放，
+                    # 并进 VT2 尾写（省每层一发 13.6µs 的核）
+                    self.ctx.enqueue_function[
+                        attn_vt2_h_gpu[attn_t, 8, attn_tiles, True]
+                    ](
+                        self.d_scoresb.unsafe_ptr(),
+                        pv,
+                        self.d_vpartb.unsafe_ptr(),
+                        self.d_attotb.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        Int32(pos0),
+                        self.d_attnb.unsafe_ptr(),
+                        grid_dim=(self.n_kv_heads, attn_tiles, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        attn_vt2_h_gpu[attn_t, 8, attn_tiles]
+                    ](
+                        self.d_scoresb.unsafe_ptr(),
+                        pv,
+                        self.d_vpartb.unsafe_ptr(),
+                        self.d_attotb.unsafe_ptr(),
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(kv_len),
+                        Int32(pos0),
+                        self.d_attnb.unsafe_ptr(),
+                        grid_dim=(self.n_kv_heads, attn_tiles, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     VT2_K
@@ -1529,17 +1550,22 @@ struct GpuSession:
                     grid_dim=(self.n_heads, attn_tiles, t),
                     block_dim=(attn_t, 1, 1),
                 )
-            self.ctx.enqueue_function[
-                COMB_K
-            ](
-                self.d_attnb.unsafe_ptr(),
-                self.d_vpartb.unsafe_ptr(),
-                self.d_attotb.unsafe_ptr(),
-                Int32(self.n_heads),
-                Int32(self.head_dim),
-                grid_dim=(self.n_heads, 1, t),
-                block_dim=(attn_t, 1, 1),
-            )
+            # 一百一十二：GQA 分组 + TILES=1 时 VT2 已尾写 d_attnb，跳过
+            if not (
+                prefill_gqa and attn_t // 8 == self.head_dim
+                and self.n_heads // self.n_kv_heads <= 8 and attn_tiles == 1
+            ):
+                self.ctx.enqueue_function[
+                    COMB_K
+                ](
+                    self.d_attnb.unsafe_ptr(),
+                    self.d_vpartb.unsafe_ptr(),
+                    self.d_attotb.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.head_dim),
+                    grid_dim=(self.n_heads, 1, t),
+                    block_dim=(attn_t, 1, 1),
+                )
             # o：真 GEMM 分块 + ACC 残差（八十九）
             comptime if prefill_af == DType.float32 and prefill_mma_o and (
                 prefill_wpack and inner % 16 == 0

@@ -1423,7 +1423,7 @@ def attn_rs_h_gpu[
 
 
 def attn_vt2_h_gpu[
-    THREADS: Int, HMAX: Int = 8, TILES: Int = 8,
+    THREADS: Int, HMAX: Int = 8, TILES: Int = 8, FUSED: Bool = False,
 ](
     scores: Pointer[Float32, MutUntrackedOrigin],
     v_store: Pointer[Float32, MutUntrackedOrigin],
@@ -1434,6 +1434,7 @@ def attn_vt2_h_gpu[
     head_dim: Int32,
     kv_len: Int32,
     pos0: Int32,
+    dst: Pointer[Float32, MutUntrackedOrigin],
 ) -> None:
     """K2' 的 **kv_head 分组**版（账本一百一十一）：grid =
     (n_kv_heads, TILES, B)，一块服务同一 kv head 下的一组 query head
@@ -1527,6 +1528,9 @@ def attn_vt2_h_gpu[
         ]
 
     # ---- PV（groups = TPP//hd = 1：每线程一维，整段累加）----
+    # 一百一十二：TILES==1 时 chunk 即整行，acc/sum 本身就是 COMB 的
+    # 全部工作——直接尾写 dst，省掉每层一发 COMB（13.6µs）。f64 acc
+    # 不经 f32 vpart 中转，与 COMB 相差 ~1e-7（门内）。
     var d = lane
     var acc = Float64(0)
     if active:
@@ -1536,6 +1540,11 @@ def attn_vt2_h_gpu[
                 v_store[unsafe_offset=jj * kv_cols + kv_head_base + d]
             )
             jj += 1
-        vpart[unsafe_offset=(
-            (b * Int(n_heads) + head) * TILES + tile
-        ) * hd + d] = Float32(acc)
+        comptime if FUSED and TILES == 1:
+            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = (
+                Float32(acc / stot[slot * TPP])
+            )
+        else:
+            vpart[unsafe_offset=(
+                (b * Int(n_heads) + head) * TILES + tile
+            ) * hd + d] = Float32(acc)

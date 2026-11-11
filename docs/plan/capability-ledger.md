@@ -3572,3 +3572,8 @@
   - 守卫：`attn_t//8 == head_dim 且 group ≤ 8`（**运行时 if**——comptime if 吃不进 self 字段）。复用 `prefill_gqa` 开关（RS+VT2 一起切）。
   - **事件**：GPU 1 被邻居训练进程占用（99% util、303W/300W、77°C），bench 数字全废（53~74ms）；配对 A/B 改在 GPU 2（765MHz 锁频不影响相对值）：**17.98 vs 20.50ms = -12.3%**（四轮极稳；含 RS+VT2 合益，VT2 增量 ~-5.5%）。双门全绿，f32 diff 仍 0.005028843879699707。
   - **一百一十二**：①等 GPU 1 空了补绝对 bench；②down 126.8µs(30%) 需 split-K；③kv2 28.4µs；④COMB 13.6µs 并入 VT2；⑤decode 路径同款 GQA 分组。
+
+- **2026-11-11（一百一十二-a）** —— COMB 并入 VT2（`FUSED` 尾写），每层省一发 13.6µs 的核
+  - 生产 `attn_tiles=1` ⇒ COMB 就是 `dst = Σvpart / Σtsum` 的纯缩放。`attn_vt2_h_gpu` 加 `FUSED: Bool` + `dst` 参数：TILES==1 时 chunk 即整行，f64 acc 直接 `acc / stot[slot*TPP]` 尾写 `d_attnb`，跳过 COMB 发射（守卫与分组同）。f64 不经 f32 vpart 中转 ⇒ f32 门 diff 0.005029→0.006098（远小于容差 0.257，argmax 5 不变）。
+  - GPU 2 配对 A/B：**14.71 vs 16.87ms = -12.8%**（RS+VT2+COMB 合益）。跨次运行绝对值不可比（上轮 17.98，本轮邻居负载不同），配对内可靠。
+  - kernel 签名统一加 `dst`（未融合时传桩），VT2_K 旧路径不变。
