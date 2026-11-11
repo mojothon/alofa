@@ -1286,3 +1286,137 @@ def attn_rs_b4_gpu[
                 )
         scores[unsafe_offset=row + jj] = Float32(acc) * scale
         jj += TPR
+
+
+def attn_rs_f32_gpu[
+    THREADS: Int, VEC: Bool = True,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+    pos0: Int32,
+) -> None:
+    """K1 scores 的 **f32 累加**版（账本一百零九）：与 attn_rs_b_gpu 逐
+    指令同构，只把点积累加器从 Float64 换成 Float32（scores 本就存 f32，
+    f64 只在累加内部）。grid/线程映射/因果界完全不变。
+
+    动机：RS 144µs 对应 14.7M MAC（理论 ~5µs），差 30×——怀疑每 key
+    64 次**依赖链 f64 FMA**（A100 f64 吞吐 1/2、f32→f64 转换 1/4）。
+    f32 版是否翻正由 probe 判定；数值上仅累加精度差 ~1e-7 相对量级，
+    远小于 f32 快路径自身 5e-3 的门容差。"""
+
+    var b = Int(block_idx.z)
+    var head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var row = (b * Int(n_heads) + head) * Int(kv_len)
+    var nsc = upto + 1
+    var scale = Float32(1.0) / sqrt(Float32(hd))
+
+    var jj = tid
+    while jj < nsc:
+        var acc = Float32(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = jj * kv_cols + kv_head_base
+                var c8 = hd // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    var q8 = q_rot.load[8](q_base + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += q8[dd] * Float32(kv8[dd])
+                for d in range(c8 * 8, hd):
+                    acc += q_rot[unsafe_offset=q_base + d] * k_store[
+                        unsafe_offset=kbase + d
+                    ]
+        else:
+            for d in range(hd):
+                acc += q_rot[unsafe_offset=q_base + d] * k_store[
+                    unsafe_offset=upto * kv_cols + kv_head_base + d
+                ]
+        scores[unsafe_offset=row + jj] = acc * scale
+        jj += THREADS
+
+
+def attn_rs_h_gpu[
+    THREADS: Int, HMAX: Int = 8, VEC: Bool = True,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+    pos0: Int32,
+) -> None:
+    """K1 scores 的 **kv_head 分组**版（账本一百零九）：grid =
+    (n_kv_heads, 1, t)，一块服务同一 kv head 下的一组 query head
+    （GQA 里 group = n_heads/n_kv_heads 个，本模型 = 7）。
+
+    动机（nsys 实测）：原 rs 每层 79.9µs 对应 14.7M MAC，且 f32/f64 累加
+    只差 4% ⇒ 不是算力問題，而是访存——原版每个 (head, b) 块都把 k 行
+    整读一遍，同一 kv head 的 7 个 query head 重复读 7 次（每层 ~57MB
+    冗余）。本版把这些 head 塞进同一块：**k 流量 ÷group**，且块数
+    1792 → 256（更少块、更多活）。
+
+    线程映射：h_off = tid % HMAX（HMAX ≥ group，多的空转），
+    lane = tid / HMAX，键 jj = lane, lane+LPR, …。同一 (head, key) 的
+    点积仍由单线程按 8-wide chunk + f64 累加走完全部 hd 维 ⇒ **算序
+    与 attn_rs_b_gpu 完全一致，scores 逐位同**。无 barrier ⇒ 早退安全。"""
+
+    comptime LPR = THREADS // HMAX
+    var b = Int(block_idx.z)
+    var kv_head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var h_off = tid % HMAX
+    var lane = tid // HMAX
+    var group = Int(n_heads) // Int(n_kv_heads)
+    if h_off >= group:
+        return
+    var head = kv_head * group + h_off
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var row = (b * Int(n_heads) + head) * Int(kv_len)
+    var nsc = upto + 1
+    var scale = Float32(1.0) / sqrt(Float32(hd))
+
+    var jj = lane
+    while jj < nsc:
+        var acc = Float64(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = jj * kv_cols + kv_head_base
+                var c8 = hd // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, hd):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_base + d]
+                    ) * Float64(k_store[unsafe_offset=kbase + d])
+        else:
+            for d in range(hd):
+                acc += Float64(q_rot[unsafe_offset=q_base + d]) * Float64(
+                    k_store[unsafe_offset=upto * kv_cols + kv_head_base + d]
+                )
+        scores[unsafe_offset=row + jj] = Float32(acc) * scale
+        jj += LPR

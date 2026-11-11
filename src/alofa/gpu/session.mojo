@@ -38,7 +38,8 @@ from alofa.core.tensor import TensorView, f32_data
 from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
-    kv_store_b_gpu, attn_rs_b_gpu, attn_vt2_b_gpu, attn_comb2_b_gpu
+    kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
+    attn_comb2_b_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -1182,6 +1183,13 @@ struct GpuSession:
         # 降到 39/39µs；一百零五的负收益是散段载入时代的结论）
         prefill_mma_q: Bool = True,
         prefill_mma_o: Bool = True,
+        # 一百零九：t=128 的满时钟/冷权重复扫（nsys 实测 down 188µs、
+        # dual 96µs）——down 改 OUTS=1（COLS 64 → 112 块，-31%）、
+        # dual 改 CH=896（单段无尾余，-17%）
+        prefill_tile: Bool = True,
+        # 一百零九：scores 按 kv_head 分组（同组 7 个 query head 共享一次
+        # k 行读）——nsys 定位 RS 为访存受限，分组后 78→36µs（逐位同）
+        prefill_gqa: Bool = True,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1291,15 +1299,26 @@ struct GpuSession:
                         inner // 16, 1),
                         block_dim=(128, 1, 1),
                     )
-                    self.ctx.enqueue_function[
-                        pack_w_mma_gpu[inner_ff, 2, 8]
-                    ](
-                        self.d_w16_down[pl].unsafe_ptr(),
-                        self.d_wp_down[pl].unsafe_ptr(),
-                        grid_dim=(ceildiv(self.hidden, 128),
-                        inner_ff // 16, 1),
-                        block_dim=(128, 1, 1),
-                    )
+                    comptime if prefill_tile:
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner_ff, 1, 8]
+                        ](
+                            self.d_w16_down[pl].unsafe_ptr(),
+                            self.d_wp_down[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(self.hidden, 64),
+                            inner_ff // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                    else:
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner_ff, 2, 8]
+                        ](
+                            self.d_w16_down[pl].unsafe_ptr(),
+                            self.d_wp_down[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(self.hidden, 128),
+                            inner_ff // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
                     comptime if prefill_mma_q:
                         self.ctx.enqueue_function[
                             pack_w_mma_gpu[inner, 2, 8]
@@ -1443,20 +1462,36 @@ struct GpuSession:
                 prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
-            self.ctx.enqueue_function[
-                RS_K
-            ](
-                self.d_qrot_b.unsafe_ptr(),
-                pk,
-                self.d_scoresb.unsafe_ptr(),
-                Int32(self.n_heads),
-                Int32(self.n_kv_heads),
-                Int32(self.head_dim),
-                Int32(kv_len),
-                Int32(pos0),
-                grid_dim=(self.n_heads, attn_tiles, t),
-                block_dim=(attn_t, 1, 1),
-            )
+            comptime if prefill_gqa and attn_tiles == 1 and attn_t % 8 == 0:
+                self.ctx.enqueue_function[
+                    attn_rs_h_gpu[attn_t, 8, True]
+                ](
+                    self.d_qrot_b.unsafe_ptr(),
+                    pk,
+                    self.d_scoresb.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(kv_len),
+                    Int32(pos0),
+                    grid_dim=(self.n_kv_heads, 1, t),
+                    block_dim=(attn_t, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    RS_K
+                ](
+                    self.d_qrot_b.unsafe_ptr(),
+                    pk,
+                    self.d_scoresb.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(kv_len),
+                    Int32(pos0),
+                    grid_dim=(self.n_heads, attn_tiles, t),
+                    block_dim=(attn_t, 1, 1),
+                )
             self.ctx.enqueue_function[
                 VT2_K
             ](
@@ -1549,7 +1584,9 @@ struct GpuSession:
                 )
                 comptime if prefill_wpack:
                     self.ctx.enqueue_function[
-                        f16_mma_dual_pk_gpu[inner, 608, 8]
+                        f16_mma_dual_pk_gpu[
+                            inner, 896 if prefill_tile else 608, 8
+                        ]
                     ](
                         self.d_xnormb16.unsafe_ptr(),
                         self.d_wp_gate[layer].unsafe_ptr(),
@@ -1611,14 +1648,18 @@ struct GpuSession:
                 )
                 comptime if prefill_wpack:
                     self.ctx.enqueue_function[
-                        f16_mma_down_pk_gpu[inner_ff, 608, 2, 8]
+                        f16_mma_down_pk_gpu[
+                            inner_ff, 608, 1 if prefill_tile else 2, 8
+                        ]
                     ](
                         self.d_actb16.unsafe_ptr(),
                         self.d_wp_down[layer].unsafe_ptr(),
                         self.d_xb.unsafe_ptr(),
                         Int32(self.hidden),
                         Int32(t),
-                        grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                        grid_dim=(ceildiv(
+                            self.hidden, 64 if prefill_tile else 128
+                        ), ceildiv(t, 16), 1),
                         block_dim=(256, 1, 1),
                     )
                 else:
