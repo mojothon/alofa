@@ -2656,6 +2656,166 @@ def f32_adds_gpu[S: Int](
             acc += part[unsafe_offset=s * nn + i]
         dst[unsafe_offset=i] += acc
 
+def cat2_f16_gpu(
+    a: Pointer[Float16, MutUntrackedOrigin],
+    b: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float16, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """拼接两个 f16 数组：dst[0..n) = a，dst[n..2n) = b（账本
+    一百一十三-b：k/v 权重拼成 [2*kv_dim, inner] 再进 pack）。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        dst[unsafe_offset=i] = a[unsafe_offset=i]
+        dst[unsafe_offset=Int(n) + i] = b[unsafe_offset=i]
+
+
+def cat2_f32_gpu(
+    a: Pointer[Float32, MutUntrackedOrigin],
+    b: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """f32 版拼接（k/v bias 拼成 [2*kv_dim]）。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        dst[unsafe_offset=i] = a[unsafe_offset=i]
+        dst[unsafe_offset=Int(n) + i] = b[unsafe_offset=i]
+
+
+def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    wp: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """**双输出** packed GEMM（账本一百一十三-b）：把 k/v 两个
+    [kv_dim, inner] 权重拼成 [2*kv_dim, inner] 打包后一发算完，
+    dst = [x@Wk^T + bk | x@Wv^T + bv] 按列拆到 dst_a/dst_b。OUTS=2
+    时块 0 的列全落在 [0, out_cols)（→ k），块 1 全落在
+    [out_cols, 2*out_cols)（→ v），要求 out_cols % (WARP*16) == 0
+    保证块内列不跨界。主循环与 f16_mma_gemm_pk_gpu 逐指令相同。"""
+
+    comptime OUTS = 2
+    var cb = Int(block_idx.x) * WARP * OUTS * 8
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    @parameter
+    for ch in range(INNER // CH):
+        var i = tid
+        while i < 16 * CH:
+            sxf[unsafe_offset=i] = xh[
+                unsafe_offset=(r0 + i // CH) * INNER + ch * CH + i % CH
+            ]
+            i += WARP * 32
+        barrier()
+        @parameter
+        for st in range(CH // 16):
+            var av = SIMD[DType.float16, 8](
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 9],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 9],
+            )
+            @parameter
+            for j in range(OUTS):
+                var col = cb + warp * 8 + j * (WARP * 8)
+                var pk0 = ((cb // (WARP * OUTS * 8)) * (INNER // 16) + ch * (CH // 16) + st) * (WARP * OUTS * 8 * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+                var bv = SIMD[DType.float16, 4](
+                    wp[unsafe_offset=pk0],
+                    wp[unsafe_offset=pk0 + 1],
+                    wp[unsafe_offset=pk0 + 2],
+                    wp[unsafe_offset=pk0 + 3],
+                )
+                var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+                comptime if st % 2 == 0:
+                    mma(dv, av, bv, accA[j])
+                    accA[j] = dv
+                else:
+                    mma(dv, av, bv, accB[j])
+                    accB[j] = dv
+        barrier()
+
+    @parameter
+    for ks in range((INNER % CH) // 16):
+        var k = (INNER // CH) * CH + ks * 16
+        var av = SIMD[DType.float16, 8](
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 9],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(OUTS):
+            var col = cb + warp * 8 + j * (WARP * 8)
+            var pk1 = ((cb // (WARP * OUTS * 8)) * (INNER // 16) + (k // 16)) * (WARP * OUTS * 8 * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+            var bv = SIMD[DType.float16, 4](
+                wp[unsafe_offset=pk1],
+                wp[unsafe_offset=pk1 + 1],
+                wp[unsafe_offset=pk1 + 2],
+                wp[unsafe_offset=pk1 + 3],
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+
+    @parameter
+    for j in range(OUTS):
+        var col = cb + warp * 8 + j * (WARP * 8)
+        var acc = accA[j] + accB[j]
+        # 双输出拆分：j 的列区间整块落在 k 侧或 v 侧
+        var is_a = col < Int(out_cols)
+        var dp = dst_a if is_a else dst_b
+        var cbase = col - Int(out_cols) if not is_a else col
+        var b0 = bias[unsafe_offset=col + tig * 2]
+        var b1 = bias[unsafe_offset=col + tig * 2 + 1]
+        if r0 + gid < Int(n_rows):
+            dp[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + cbase + tig * 2
+            ] = acc[0] + b0
+            dp[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + cbase + tig * 2 + 1
+            ] = acc[1] + b1
+        if r0 + gid + 8 < Int(n_rows):
+            dp[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + cbase + tig * 2
+            ] = acc[2] + b0
+            dp[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + cbase + tig * 2 + 1
+            ] = acc[3] + b1
+
+
 def f16_mma_gemm_pk_gpu[
     INNER: Int, CH: Int, OUTS: Int, WARP: Int, HAS_BIAS: Bool
 ](

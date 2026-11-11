@@ -3588,3 +3588,10 @@
 - **2026-11-11（一百一十三-a）** —— o 也 split-K（S=4，CH=224），配对 A/B 合计 **-14.9%**
   - o 形状（INNER=896、OUTS=2）现 56 块占一半 SM，比 down 更缺并行度。扫描：S=2 **47.9µs 反而更差**（每 split 只有 28 步，tile 载入/barrier 占比过高）、**S=4（CH=224，每 split 恰一个 chunk）32.4µs = 1.29×**，逐位恒等 0.0（同 down：f16 精确积 ⇒ f32 求和与序无关）。**S 的甜点在「每 split 恰好整数个 chunk」而非「越多越好」。**
   - 落地复用 `f16_mma_down_spl_gpu[inner,224,2,8,4]` + `f32_adds_gpu[4]`，partial 复用 `d_downpart` 前 4 面（层间顺序执行无冲突）。守卫 `inner%16==0 且 (inner//4)%224==0`。**配对 A/B（prefill_spl 开关现同时切 down+o）：14.11 vs 16.58 = -14.9%**（四轮稳）。双门全绿（f32 diff 0.005767，o 求和序改变的正常漂移）。
+
+- **2026-11-11（一百一十三-b）** —— kv2 双输出 packed MMA（`f16_mma_gemm2_pk_gpu` + k/v 拼接打包）：**核做完了，默认关闭**（`prefill_kv=False`，生产走标量 KV_K）
+  - 设计：k/v 权重拼成 [2*kv_dim, inner] 打包 + bias 拼接 [2*kv_dim]，OUTS=2 时块 0 列全落 k 侧、块 1 全落 v 侧，一发算完写 `d_kb`/`d_vb`。探针（session 的 tri_t=64 标量配置）：**k/v maxdiff 0.0 逐位恒等**，隔离 34→21.3µs = **1.6×**。
+  - **⚠️ 但流水内配对 A/B 可复现地慢 ~1ms（-5.5%，±0.01ms 极稳）**。事后归因：**探针是 L2 热的**（4 套 × 11MB ≈ 40MB L2 命中率 ~85%），流水内真冷 DRAM 下 16 块发射重演 down 的占用率饥饿（每块 688KB 冷读）。**教训：微基准的权重轮转总量必须远超 L2，否则「冷权重」是假的。**
+  - 途中抓到两个自己埋的雷：①**comptime if 吞 else**——把运行时 if 包进 comptime if 后，`else` 绑到了 comptime 层，`prefill_kv=False` 时 kv2 被**静默跳过**（f32 门 diff 18.7 / argmax 75223，f64 却过——因为 f64 走 comptime-else）。**教训：需要 else 回落的分支不要用 comptime if 包裹；comptime 常量在运行时 if 里照样折叠。** ②**账本六十三的 AsyncRT 悬崖再遇**：24 个 `d_wp_kv` 在加载循环中途分配，与上传交错 → 双 session bench 必崩 CUDA_ERROR_INVALID_VALUE。修法：**打包缓冲改为加载循环前一次性连续分配**（与上传不交错则无事）。
+  - **⚠️ 修订一百零九的「锁频」结论**：765MHz 是**空闲时钟**而非锁频——GPU 3 在 66% 负载下跑 1410MHz；GPU 2 bench 内部可见 15.5→10.3ms 的时钟爬坡（前几 rep 慢、后几 rep 快）。跨 run 绝对值不可比再加一条理由；配对 A/B 仍可靠但 min-of-4 会偏向时钟相位。
+  - **事件**：日终时机器被邻居拖垮（一切慢 2-4×，bench C 65-73ms），停止测量。kv2 的 split-K（对症冷读饥饿，潜在 -0.4ms）与 GPU 1 复测都留待环境恢复。

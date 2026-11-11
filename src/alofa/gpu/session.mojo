@@ -57,7 +57,8 @@ from alofa.kernels.cuda.matmul import (
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
     f16_mma_down_pk_gpu, f16_mma_down_spl_gpu, f16_mma_dual_pk_gpu,
-    f16_mma_gemm_pk_gpu, f32_adds_gpu, pack_w_mma_gpu,
+    f16_mma_gemm_pk_gpu, f16_mma_gemm2_pk_gpu, f32_adds_gpu,
+    pack_w_mma_gpu, cat2_f16_gpu, cat2_f32_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -176,6 +177,11 @@ struct GpuSession:
     var d_bias_q: List[DeviceBuffer[DType.float32]]
     var d_bias_k: List[DeviceBuffer[DType.float32]]
     var d_bias_v: List[DeviceBuffer[DType.float32]]
+    # 一百一十三-b：k/v 拼接打包（[2*kv_dim, inner] fragment 布局）
+    var d_wp_kv: List[DeviceBuffer[DType.float16]]
+    var d_bias_kv: List[DeviceBuffer[DType.float32]]
+    # 拼接打包的 scratch（同流顺序复用）
+    var d_kvraw: DeviceBuffer[DType.float16]
     # lm_head 权重的 f16 副本（d_embed 本体留给 gather）
     var d_embed16: DeviceBuffer[DType.float16]
     # F16_BUILD=False 时置空句柄（conservative 检查要求全字段初始化）
@@ -255,6 +261,9 @@ struct GpuSession:
         self.d_wp_down = List[DeviceBuffer[DType.float16]]()
         self.d_wp_q = List[DeviceBuffer[DType.float16]]()
         self.d_wp_o = List[DeviceBuffer[DType.float16]]()
+        # 一百一十三-b：k/v 拼接打包（[2*kv_dim, inner] fragment 布局）
+        self.d_wp_kv = List[DeviceBuffer[DType.float16]]()
+        self.d_bias_kv = List[DeviceBuffer[DType.float32]]()
         self.wp_ready = False
         comptime if not F16_BUILD:
             self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](1)
@@ -289,6 +298,20 @@ struct GpuSession:
         var max_bytes = self.inter * self.hidden // 32 * 18
         var hq4 = self.ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
         self.ctx.synchronize()
+        # 一百一十三-b：k/v 拼接打包缓冲 **加载循环前一次性连续分配**。
+        # 账本六十三在案：AsyncRT 拷贝队列在「分配与上传交错」过多后
+        # 抛 CUDA_ERROR_INVALID_VALUE（host 路径第 15 次 copy）——24 个
+        # 中途分配正好推过悬崖，症状为非确定性（门时过时不过、bench
+        # 必崩）。连续分配不与上传交错则无事。
+        for _pl in range(self.n_layers):
+            self.d_wp_kv.append(
+                self.ctx.enqueue_create_buffer[DType.float16](
+                    2 * self.kv_dim * self.hidden
+                )
+            )
+            self.d_bias_kv.append(
+                self.ctx.enqueue_create_buffer[DType.float32](2 * self.kv_dim)
+            )
         for layer in range(self.n_layers):
             for slot in range(Q4_SLOTS_PER_LAYER):
                 # 槽位宽度内联（__init__ 半初始化状态调不了 self 的方法：
@@ -479,6 +502,10 @@ struct GpuSession:
         )
         self.d_qb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.q_out
+        )
+        # 一百一十三-b：k/v 拼接打包 scratch（[2*kv_dim, inter] f16）
+        self.d_kvraw = self.ctx.enqueue_create_buffer[DType.float16](
+            2 * self.kv_dim * self.inter
         )
         self.d_kb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.kv_dim
@@ -1199,6 +1226,8 @@ struct GpuSession:
         # 一百一十二-b：down split-K（t=128 时 112 块只够每 SM 1 块 8 warp，
         # 藏不住冷权重延迟；沿 K 切 8 段 → 896 块，实测 1.96×）
         prefill_spl: Bool = True,
+        # 一百一十三-b：kv2 换双输出 packed MMA（k/v 权重拼接一发算完）
+        prefill_kv: Bool = False,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1338,6 +1367,38 @@ struct GpuSession:
                             inner // 16, 1),
                             block_dim=(128, 1, 1),
                         )
+                    comptime if prefill_kv and prefill_wpack and (
+                        inner % 16 == 0 and inner % 896 == 0
+                    ):
+                        # 一百一十三-b：k/v 拼成 [2*kv_dim, inner] 再打包
+                        # + bias 拼接（kvraw 同流顺序复用一块 scratch）
+                        self.ctx.enqueue_function[cat2_f16_gpu](
+                            self.d_w16_k[pl].unsafe_ptr(),
+                            self.d_w16_v[pl].unsafe_ptr(),
+                            self.d_kvraw.unsafe_ptr(),
+                            Int32(self.kv_dim * inner),
+                            grid_dim=(ceildiv(
+                                self.kv_dim * inner, 256
+                            ), 1, 1),
+                            block_dim=(256, 1, 1),
+                        )
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner, 2, 8]
+                        ](
+                            self.d_kvraw.unsafe_ptr(),
+                            self.d_wp_kv[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(2 * self.kv_dim, 128),
+                            inner // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.ctx.enqueue_function[cat2_f32_gpu](
+                            self.d_bias_k[pl].unsafe_ptr(),
+                            self.d_bias_v[pl].unsafe_ptr(),
+                            self.d_bias_kv[pl].unsafe_ptr(),
+                            Int32(self.kv_dim),
+                            grid_dim=(ceildiv(2 * self.kv_dim, 256), 1, 1),
+                            block_dim=(256, 1, 1),
+                        )
                     comptime if prefill_mma_o:
                         self.ctx.enqueue_function[
                             pack_w_mma_gpu[inner, 2, 8]
@@ -1411,21 +1472,44 @@ struct GpuSession:
                     ceildiv(t, prefill_rb), 1),
                     block_dim=(tri_t, 1, 1),
                 )
-            self.ctx.enqueue_function[
-                KV_K
-            ](
-                self.d_xnormb.unsafe_ptr(),
-                self.d_w16_k[layer].unsafe_ptr(),
-                self.d_w16_v[layer].unsafe_ptr(),
-                self.d_bias_k[layer].unsafe_ptr(),
-                self.d_bias_v[layer].unsafe_ptr(),
-                self.d_kb.unsafe_ptr(),
-                self.d_vb.unsafe_ptr(),
-                Int32(self.kv_dim),
-                Int32(t),
-                grid_dim=(ceildiv(self.kv_dim, 2), ceildiv(t, prefill_rb), 1),
-                block_dim=(tri_t, 1, 1),
-            )
+            if prefill_kv and prefill_af == DType.float32 and prefill_wpack and (
+                inner % 16 == 0 and inner % 896 == 0
+            ) and self.kv_dim % 64 == 0:
+                # 一百一十三-b：双输出 packed MMA（k/v 拼接一发算完）。
+                # 必须用运行时 if：comptime if 会把 else 绑到自己身上，
+                # prefill_kv=False 时 kv2 被静默跳过（本轮踩过，f32 门
+                # diff 18.7 / argmax 75223 的真凶）。
+                self.ctx.enqueue_function[
+                    f16_mma_gemm2_pk_gpu[
+                        inner, 896 if inner >= 896 and inner % 896 == 0 else inner, 8
+                    ]
+                ](
+                    self.d_xnormb16.unsafe_ptr(),
+                    self.d_wp_kv[layer].unsafe_ptr(),
+                    self.d_kb.unsafe_ptr(),
+                    self.d_vb.unsafe_ptr(),
+                    self.d_bias_kv[layer].unsafe_ptr(),
+                    Int32(self.kv_dim),
+                    Int32(t),
+                    grid_dim=(ceildiv(2 * self.kv_dim, 128), ceildiv(t, 16), 1),
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    KV_K
+                ](
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_w16_k[layer].unsafe_ptr(),
+                    self.d_w16_v[layer].unsafe_ptr(),
+                    self.d_bias_k[layer].unsafe_ptr(),
+                    self.d_bias_v[layer].unsafe_ptr(),
+                    self.d_kb.unsafe_ptr(),
+                    self.d_vb.unsafe_ptr(),
+                    Int32(self.kv_dim),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.kv_dim, 2), ceildiv(t, prefill_rb), 1),
+                    block_dim=(tri_t, 1, 1),
+                )
             if profile:
                 self.ctx.synchronize()
                 prof[1] += Float64(monotonic_ns() - prof_t0) / 1e6
