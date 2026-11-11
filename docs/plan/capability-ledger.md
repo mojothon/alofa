@@ -3523,3 +3523,12 @@
   - **清理**：q/o MMA 死分支整体移除（一百零五实测负收益 ~2.4ms）；f16_mma_q_gpu / 预取核 / OUTS 实验核删除；gate 变体精简为 dual/down。**门槛守护再次生效**：cb 公式一度写成 `WARP*OUTS*32`（512 列，应为 `*8`=128）——bench 显示 19.87ms 的「假加速」，f32 门 diff 21.1 当场拦下。
   - **战果**：热态 C 23.14→**20.18ms**（-12.8%）、D 26.70→**23.71**（-11.2%）；对一百零三标量基线 30.46/34.11 累计 **-33.7%/-30.5%**。f32 门 PASS（5.8e-3、argmax ✓）、f64 门逐位不变 ✓。
   - **未竟（一百零七）**：①w 打包布局（fragment 载入整型化，目标 10+ TFLOPS）；②attention/comb 段（profile 显示三趟占 time 大头，待细分）；③decode GEMV；④安静态复测。
+
+- **2026-11-11（第一百零七条）** —— ⚡ w 打包布局：fragment 载入连续化，down -42% / dual -49%，端到端 -13.5%（配对 A/B）
+  - **诊断**：原始 `[out_cols, INNER]` 布局下每个 bv fragment = 8 行 × 16B 散段（扇区效率 ~25%），L2 带宽被打满而 mma 空转——这是 3.4 TFLOPS 的真凶（一百零六证明延迟/列宽/CH 都不是）。
+  - **实现**：`pack_w_mma_gpu[INNER, OUTS, WARP]` 把 w 打成 fragment 连续布局（同一 (col_block, k_step, warp, tile) 的 32 lane × 4 half = 连续 256B），一次性 0.24ms/3 矩阵；`f16_mma_down_pk_gpu` / `f16_mma_dual_pk_gpu` 由已验证核**程序化派生**（6 处 fragment 载入替换，mma 序不变）。session 新增 `d_wp_gate/up/down` 副本 + `wp_ready` 惰性打包 + `prefill_wpack` 开关（默认 True）。
+  - **数值**：packed vs raw 逐位恒等（down 0.0 / dual act 0.0），f32 门 diff 5.822e-3 —— 与打包前**完全同值**，f64 门逐位不变。
+  - **数字**：批量吞吐（20 连发单次 sync，剔除 sync 开销）down 351→**204µs**、dual 301→**152µs**；per-call sync 计时会夸大 ~40%（351 vs 真实 204 的差值即固定开销）。
+  - **配对 A/B**（同进程两 session 交替、每次 kv_pos=0、奇数轮换序）：packed **15.66ms** vs raw **18.10ms** = **-13.5%**（逐轮一致 -2.4ms，正是核级收益的兑现）。bench C 20.18/22.83 → **19.78/20.44**、D 23.71/26.64 → 21.39/24.29。
+  - **三个自伤坑**（都被校验网拦住）：①派生脚本把原 dual 核**覆盖**而非插入（缺原核，编译期即暴露）；②替换块缩进重复添加（32 空格，编译期暴露）；③pack 下标把 `*4` 作用到整组而非 lane 组（**恒等校验 maxdiff 37.6/2009 拦下**）。
+  - **未竟（一百零八）**：GEMM 已非主项（down 204 + dual 152 ≈ 356µs/层）——attention 三趟 + comb/短路段是新前沿；另：q2/o 在 packed 布局下可能翻正（原 56 块网格的劣势与 w 载入效率无关），值得用同一 pack 复测。

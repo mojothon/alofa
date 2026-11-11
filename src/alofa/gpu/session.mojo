@@ -55,6 +55,7 @@ from alofa.kernels.cuda.matmul import (
     f16_bmm_q2_gpu, f16_bmm_kv2_gpu,
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
+    f16_mma_down_pk_gpu, f16_mma_dual_pk_gpu, pack_w_mma_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -161,6 +162,12 @@ struct GpuSession:
     var d_w16_gate: List[DeviceBuffer[DType.float16]]
     var d_w16_up: List[DeviceBuffer[DType.float16]]
     var d_w16_down: List[DeviceBuffer[DType.float16]]
+    # 一百零七：gate/up/down 的 mma-fragment 连续打包副本（一次性，
+    # 与 d_w16_* 同尺寸）；标量/f64 路径仍读原始布局。
+    var d_wp_gate: List[DeviceBuffer[DType.float16]]
+    var d_wp_up: List[DeviceBuffer[DType.float16]]
+    var d_wp_down: List[DeviceBuffer[DType.float16]]
+    var wp_ready: Bool
     # q/k/v 偏置的分流句柄（同 List 多下标同病同治）
     var d_bias_q: List[DeviceBuffer[DType.float32]]
     var d_bias_k: List[DeviceBuffer[DType.float32]]
@@ -236,6 +243,10 @@ struct GpuSession:
         self.d_w16_gate = List[DeviceBuffer[DType.float16]]()
         self.d_w16_up = List[DeviceBuffer[DType.float16]]()
         self.d_w16_down = List[DeviceBuffer[DType.float16]]()
+        self.d_wp_gate = List[DeviceBuffer[DType.float16]]()
+        self.d_wp_up = List[DeviceBuffer[DType.float16]]()
+        self.d_wp_down = List[DeviceBuffer[DType.float16]]()
+        self.wp_ready = False
         comptime if not F16_BUILD:
             self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](1)
         self.d_bias_q = List[DeviceBuffer[DType.float32]]()
@@ -335,10 +346,19 @@ struct GpuSession:
                         self.d_w16_o.append(w16)
                     if slot == Q4_SLOT_GATE:
                         self.d_w16_gate.append(w16)
+                        self.d_wp_gate.append(
+                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
+                        )
                     if slot == Q4_SLOT_UP:
                         self.d_w16_up.append(w16)
+                        self.d_wp_up.append(
+                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
+                        )
                     if slot == Q4_SLOT_DOWN:
                         self.d_w16_down.append(w16)
+                        self.d_wp_down.append(
+                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
+                        )
 
         # ---- fp32 小权重：norms（每层两个 + 终 norm）、q/k/v 偏置 ----
         for layer in range(self.n_layers):
@@ -1140,6 +1160,9 @@ struct GpuSession:
         # 一百零五实测）；仅 dual/down 走 MMA。
         prefill_mma_dual: Bool = True,
         prefill_mma_down: Bool = True,
+        # 一百零七：w 打包布局开关（False = 走原 [out_cols, INNER] 布局的
+        # MMA 核，仅供同进程配对 A/B 校准；生产 True）
+        prefill_wpack: Bool = True,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1393,7 +1416,44 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            comptime if prefill_af == DType.float32 and prefill_mma_dual:
+            # 一百零七：首次进 f32 快路径时把 gate/up/down 打成
+            # fragment 连续布局（每层 3 次 launch，共 0.24ms 量级）
+            comptime if prefill_af == DType.float32 and prefill_wpack and (
+                prefill_mma_dual or prefill_mma_down
+            ):
+                if not self.wp_ready:
+                    for pl in range(self.n_layers):
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner, 2, 8]
+                        ](
+                            self.d_w16_gate[pl].unsafe_ptr(),
+                            self.d_wp_gate[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(self.inter, 128),
+                            inner // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner, 2, 8]
+                        ](
+                            self.d_w16_up[pl].unsafe_ptr(),
+                            self.d_wp_up[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(self.inter, 128),
+                            inner // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.ctx.enqueue_function[
+                            pack_w_mma_gpu[inner_ff, 2, 8]
+                        ](
+                            self.d_w16_down[pl].unsafe_ptr(),
+                            self.d_wp_down[pl].unsafe_ptr(),
+                            grid_dim=(ceildiv(self.hidden, 128),
+                            inner_ff // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                    self.wp_ready = True
+            comptime if prefill_af == DType.float32 and (
+                prefill_mma_dual and inner % 16 == 0
+            ):
                 # 一百零五修正：norm2 覆写 d_xnormb —— dual 的 f16 输入
                 # 必须在 norm2 之后重转（norm1 后的转换只服务 q2）
                 self.ctx.enqueue_function[x_to_f16_gpu](
@@ -1403,18 +1463,36 @@ struct GpuSession:
                     grid_dim=((t * inner + 255) // 256, 1, 1),
                     block_dim=(256, 1, 1),
                 )
-                self.ctx.enqueue_function[f16_mma_dual_gpu[inner, 608, 8]](
-                    self.d_xnormb16.unsafe_ptr(),
-                    self.d_w16_gate[layer].unsafe_ptr(),
-                    self.d_w16_up[layer].unsafe_ptr(),
-                    self.d_gateb.unsafe_ptr(),
-                    self.d_upb.unsafe_ptr(),
-                    self.d_actb.unsafe_ptr(),
-                    Int32(self.inter),
-                    Int32(t),
-                    grid_dim=(ceildiv(self.inter, 128), ceildiv(t, 16), 1),
-                    block_dim=(256, 1, 1),
-                )
+                comptime if prefill_wpack:
+                    self.ctx.enqueue_function[
+                        f16_mma_dual_pk_gpu[inner, 608, 8]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_wp_gate[layer].unsafe_ptr(),
+                        self.d_wp_up[layer].unsafe_ptr(),
+                        self.d_gateb.unsafe_ptr(),
+                        self.d_upb.unsafe_ptr(),
+                        self.d_actb.unsafe_ptr(),
+                        Int32(self.inter),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.inter, 128), ceildiv(t, 16), 1),
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_mma_dual_gpu[inner, 608, 8]
+                    ](
+                        self.d_xnormb16.unsafe_ptr(),
+                        self.d_w16_gate[layer].unsafe_ptr(),
+                        self.d_w16_up[layer].unsafe_ptr(),
+                        self.d_gateb.unsafe_ptr(),
+                        self.d_upb.unsafe_ptr(),
+                        self.d_actb.unsafe_ptr(),
+                        Int32(self.inter),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.inter, 128), ceildiv(t, 16), 1),
+                        block_dim=(256, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     DUAL_K
@@ -1436,7 +1514,9 @@ struct GpuSession:
                 lff = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
-            comptime if prefill_af == DType.float32 and prefill_mma_down:
+            comptime if prefill_af == DType.float32 and (
+                prefill_mma_down and inner_ff % 16 == 0
+            ):
                 # 一百零四：down MMA（tensor core，f32 快路径）
                 self.ctx.enqueue_function[x_to_f16_gpu](
                     self.d_actb.unsafe_ptr(),
@@ -1445,15 +1525,30 @@ struct GpuSession:
                     grid_dim=((t * self.inter + 255) // 256, 1, 1),
                     block_dim=(256, 1, 1),
                 )
-                self.ctx.enqueue_function[f16_mma_down_gpu[inner_ff, 608, 2, 8]](
-                    self.d_actb16.unsafe_ptr(),
-                    self.d_w16_down[layer].unsafe_ptr(),
-                    self.d_xb.unsafe_ptr(),
-                    Int32(self.hidden),
-                    Int32(t),
-                    grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
-                    block_dim=(256, 1, 1),
-                )
+                comptime if prefill_wpack:
+                    self.ctx.enqueue_function[
+                        f16_mma_down_pk_gpu[inner_ff, 608, 2, 8]
+                    ](
+                        self.d_actb16.unsafe_ptr(),
+                        self.d_wp_down[layer].unsafe_ptr(),
+                        self.d_xb.unsafe_ptr(),
+                        Int32(self.hidden),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_mma_down_gpu[inner_ff, 608, 2, 8]
+                    ](
+                        self.d_actb16.unsafe_ptr(),
+                        self.d_w16_down[layer].unsafe_ptr(),
+                        self.d_xb.unsafe_ptr(),
+                        Int32(self.hidden),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                        block_dim=(256, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     DOWN_K
