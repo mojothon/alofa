@@ -1374,7 +1374,10 @@ struct GpuSession:
                 prefill_wpack and inner % 16 == 0
             ):
                 self.ctx.enqueue_function[
-                    f16_mma_gemm_pk_gpu[inner, 608, 2, 8, True]
+                    f16_mma_gemm_pk_gpu[
+                        inner, 896 if prefill_tile and inner >= 896 else 608, 2, 8,
+                        True,
+                    ]
                 ](
                     self.d_xnormb16.unsafe_ptr(),
                     self.d_wp_q[layer].unsafe_ptr(),
@@ -1531,7 +1534,9 @@ struct GpuSession:
                     block_dim=(256, 1, 1),
                 )
                 self.ctx.enqueue_function[
-                    f16_mma_down_pk_gpu[inner, 608, 2, 8]
+                    f16_mma_down_pk_gpu[
+                        inner, 896 if prefill_tile and inner >= 896 else 608, 2, 8
+                    ]
                 ](
                     self.d_attnb16.unsafe_ptr(),
                     self.d_wp_o[layer].unsafe_ptr(),
