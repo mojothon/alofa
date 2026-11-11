@@ -877,6 +877,129 @@ struct GpuSession:
 
     # ---- 整步入口 ----
 
+    def generate_batch[
+        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
+        tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
+        attn_t: Int = 512, attn_tiles: Int = 1,
+        prefill_rb: Int = 8,
+        prefill_af: DType = DType.float64,
+        prefill_mma_dual: Bool = True,
+        prefill_mma_down: Bool = True,
+        prefill_wpack: Bool = True,
+        prefill_mma_q: Bool = True,
+        prefill_mma_o: Bool = True,
+        prefill_tile: Bool = True,
+        prefill_gqa: Bool = True,
+        prefill_spl: Bool = True,
+        prefill_kv: Bool = False,
+    ](
+        mut self,
+        flat_prompts: List[Int],
+        lens: List[Int],
+        max_new: Int,
+        eos: Int,
+    ) raises -> List[Int]:
+        """连续批处理 v1（账本一百二十一）：padded lockstep 批生成。
+
+        B 条序列（B<=BMAX）以 lockstep 推进：prompt 相按最长对齐
+        （短序列喂 dummy 且步后回退其 h_posarr——垃圾 KV 落位被真实
+        步覆写，不前进），生成相逐 token。全部走 batch=True 的
+        prefill_step（copy_logits=False，只回 4B×B tokout）。
+
+        返回扁平 [B][max_new]，-1 = 未生成（EOS 早停或步数用尽）。
+        eos=-1 禁用早停。确定性：同输入同输出（无采样）。
+
+        v2 待办：chunked prefill（新序列 prompt 一次注入批 store——
+        需 pos0+h_posarr[b] 的 KVS/attention 变体）与完成槽位回收。
+        """
+        var b = len(lens)
+        if b > BMAX:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "generate_batch cap is 64",
+                "b=" + String(b),
+            )
+        var off = List[Int]()
+        var total = 0
+        var lmax = 0
+        for i in range(b):
+            off.append(total)
+            total += lens[i]
+            if lens[i] > lmax:
+                lmax = lens[i]
+        if len(flat_prompts) != total:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "flat_prompts size mismatch",
+                "",
+            )
+        var out = List[Int]()
+        for i in range(b * max_new):
+            out.append(-1)
+        var done = List[Bool]()
+        var ndone = 0
+        var cur = List[Int]()
+        for i in range(b):
+            done.append(False)
+            cur.append(flat_prompts[off[i]])
+        for i in range(BMAX):
+            self.h_posarr[i] = Int32(0)
+
+        # prompt 相：lockstep，短序列 padding + pos 回退
+        for s in range(lmax):
+            var toks = List[Int]()
+            for i in range(b):
+                if s < lens[i]:
+                    toks.append(flat_prompts[off[i] + s])
+                else:
+                    toks.append(cur[i])
+            _ = self.prefill_step[
+                inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
+                attn_t, attn_tiles, prefill_rb, prefill_af,
+                prefill_mma_dual, prefill_mma_down, prefill_wpack,
+                prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
+                prefill_spl, prefill_kv, True
+            ](toks, False, False, False)
+            self.ctx.synchronize()
+            for i in range(b):
+                if s >= lens[i]:
+                    self.h_posarr[i] = self.h_posarr[i] - 1
+                elif s == lens[i] - 1:
+                    # 本序列最后一个 prompt token 的 argmax = 首 token
+                    var g0 = Int(self.h_tokout[i])
+                    out[i * max_new + 0] = g0
+                    if g0 == eos:
+                        done[i] = True
+                        ndone += 1
+                    else:
+                        cur[i] = g0
+
+        # 生成相
+        for k in range(1, max_new):
+            if ndone == b:
+                break
+            var toks = List[Int]()
+            for i in range(b):
+                toks.append(cur[i])
+            _ = self.prefill_step[
+                inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
+                attn_t, attn_tiles, prefill_rb, prefill_af,
+                prefill_mma_dual, prefill_mma_down, prefill_wpack,
+                prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
+                prefill_spl, prefill_kv, True
+            ](toks, False, False, False)
+            self.ctx.synchronize()
+            for i in range(b):
+                if done[i]:
+                    continue
+                var nt = Int(self.h_tokout[i])
+                out[i * max_new + k] = nt
+                if nt == eos:
+                    done[i] = True
+                    ndone += 1
+                else:
+                    cur[i] = nt
+        return out^
+
+
     def decode_step[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, tri_cols: Int = 0, down_t: Int = 256, o_t: Int = 128,

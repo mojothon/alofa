@@ -3664,3 +3664,10 @@
   - **拐点判读**：B=32→64 每 token 仅再降 10%——GEMM 侧早已摊薄（120-a），剩余成本是 attention 真 KV 流量 + tail。**服务甜点 B=16-32**（B=64 的 25ms 步延迟显著拉大序列间 token 间隔）；吞吐上限 ~11× 封顶，与 119-b 预测（~9×，kv=0 口径）吻合。
   - BMAX 8→32→64 三档扩容（alias 一处 + 缓冲按 BMAX 分配 ~920MB@64）；批门（B=8）两次全绿逐位恒定。
   - 下一刀：① 连续批处理调度层（generate_batch API + 动态进出批——真服务形态，批规模已证明不是瓶颈）；② h_posarr 设备侧自增（32B/步微末）；③ decode 路径（2.228ms 单序列）与批解码双轨并存——服务层统一到批后 decode 单序列路径只留低延迟场景。
+- **2026-11-12（一百二十一）** —— `generate_batch` API：用户可见层打通（padded lockstep v1）
+  - **实现**：GpuSession 新方法（comptime 参数透传 prefill_step，batch=True/copy_logits=False 固定）。prompt 相 lockstep 对齐最长序列（短序列喂 dummy + **步后回退 h_posarr**——垃圾 KV 落位被真实步覆写、pos 不前进），生成相逐 token，EOS 早停（eos=-1 禁用）。返回扁平 [B][max_new]（-1 填充）。确定性：同输入同输出。
+  - **门**（test_generate_batch，3 序列 len 3/6/4 × 5 token）：**parity 零失配**（vs 单序列逐 token prefill 参照，逐位一致——120-a 的 batch t=1 == 单序列 t=1 恒等性贯穿整条生成链）+ 二次调用确定性 ✓。
+  - **参照侧坑**：gen[0] 来自**末 prompt token** 的 argmax——v1 参照误取首 token 的 argmax 导致全体 MISMATCH（对齐后全绿）。批侧从头到尾无 bug。
+  - **Mojo 坑三枚**：①Tuple 字面量不可迭代（第三次踩——List 只能显式 append）；②方法内 raise 需要 `raises` 且调用 raising 方法同样受限；③non-copyable 返回值要 `return out^` 显式移动。
+  - **v2 待办**：chunked prefill（新序列 prompt 一次注入批 store——KVS/attention 需 pos0+h_posarr[b] 变体）+ 完成槽位回收（KV 搬运或 swap-remap）+ 采样（temperature/top-p 进 argmax_rb 位）。
+  - 服务层形态就此完整：prefill 8.75ms / 批解码 0.39-0.77ms/token（B=8-64）/ generate_batch 端到端。
