@@ -3489,3 +3489,10 @@
   - **结论**：保留 kernel+probe 作参照（docstring 已标注勿接入）；融合不是免费午餐——**只有当合并后各 phase 寄存器占用相近时才可能赚**。rs（0 smem 高占用）与 vt2（14KB smem）本就工作在不同占用点。
   - **环境**：GPU 0 又满载（77%/72°C）——安静态复测仍不可得（三项 kernel 优化的安静态绝对值待环境红利）。
   - **未竟（一百零三）**：①f16 GEMM 向 tensor core（WMMA）迁移——FF 段 0.7ms/层的 3-5× 空间，走容差门（数值重组大）；②decode 路径 GEMV；③安静态复测。
+
+- **2026-11-11（第一百零三条）** —— 🧨 MMA bring-up：m16n8k16 fragment 映射验证 + down 形状 WMMA 1.34×（未接入）
+  - **API**：`max.gpu.compute.mma.mma(mut d, a, b, c)`（d=a·b+c，warp 同步，SIMD 宽度定形状）。m16n8k16 f16×f16→f32 fragment：A 每 lane 8 half（(gid,tig·2)/(gid+8,·)/(+8 列)），B 4 half（(k=tig·2,n=gid)/(k=tig·2+1,·)/(+8)/(+9)），C/D 4 f32（(gid,tig·2)/(gid+8,·)）。单步 check **maxdiff 0.0**（4 warp 独立数据）。
+  - **关键 bug（广播模式诊断）**：down kernel 首版 B fragment 用输出列 `col` 而非 tile 内列 `gid`——等价于把 B 第 0 列广播到全部 8 列 ⇒ **got(r,c) = want(r, warp 首列)** 逐点吻合（k 链累加本身正确，值是全和）。修复 `w[(col+gid)*INNER+...]` 后大尺寸稀疏 maxdiff **8.4e-6**（f32 MMA vs f64 参照正常舍入）。
+  - **性能**：down 形状（4864×896, t=128）简单 WMMA **245µs vs fat3 328µs = 1.34×**（4.5 TFLOPS）。错误版反而 143µs（B 读命中列少）——修复后变慢是访存真实成本。距离 tensor core 潜力（100+ TFLOPS）尚远：w 每 lane 散乱全局读、x f32→f16 每 col-block 冗余转换、无流水。**升级路径**：双操作数 smem 驻留 + ldmatrix + k 分块流水。
+  - **经验**：①`ref` 是 Mojo 保留字；`barrier` 在 max.gpu 不在 std.gpu；comptime if 块内声明不外泄作用域；②mma 分离 d/c 传参在单步与链式均正确（无别名 UB）；③runtime 边界 while 包 mma 无碍（@parameter 展开后 143→245µs 是 B 修复所致）；④文档无 fragment 布局——**必须自建单步 check kernel 对照**（本项目方法论的 kernel 级版）。
+  - **未接入原因**：MMA 累加序≠标量路径 ⇒ 破坏 f64 精确锚（门 diff 数值会变，容差内但失去逐位基线）；且 1.34× 值不上 ldmatrix/流水的工程量。**一百零四**：smem 驻留双操作数 + ldmatrix + 流水（目标 FF 段 3-5×），接入时门策略 = 容差门 + 新基线快照。
