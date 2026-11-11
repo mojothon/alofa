@@ -3505,3 +3505,12 @@
   - **数值定位（重要）**：f32 快路径现在含 f16 x 舍入 + MMA f32 累加——kernel 级对 f64 参照 gate/up/up/act 4.8e-6/1.3e-5/4.8e-5、down ACC 0.0；**prefill f32 路径暂无端到端容差门**（decode PARITY 只盖 decode），一百零五应补 prefill f32-vs-f64 容差门。
   - **MMA 现状**：down 7.9 TFLOPS（tensor core 峰值 312 的 2.5%）——瓶颈是 w 全局 fragment 载入延迟；升级路径 = w smem 驻留 + ldmatrix + k 流水（一百零五）。
   - **未竟（一百零五）**：①w smem 驻留/ldmatrix/流水（down 目标 <80µs）；②o/q2/kv2 GEMM 的 MMA 化（q2 188µs、o 97µs）；③prefill f32 容差门；④安静态复测。
+
+- **2026-11-11（第一百零五条）** —— 🎯 f32 容差门建立 + norm2 覆写 bug 修复 + kv_pos 污染事故——MMA 全线转正，热态 C 30.46→23.14ms（-24%）
+  - **f32 端到端容差门**（test_session_prefill_f32）：f32 快路径 vs f64 路径（同 f16 权重），tol=0.02×scale。标量 f32 与 f64 几乎逐位同（**1.0e-5**）——「逐位同构仅精度不同」的量化证实。
+  - **kv_pos 污染事故（方法论级教训）**：gate 连跑变体不自重置 `kv_pos`（chunked-prefill 流水游标，跨 run 接续）⇒ attention 读上次 run 的 KV 残留 ⇒ 全部变体 diff 5.8~20.9 假象、且逐次递增（f64 rerun 2.43→8.45 定位）。**任何连跑 session 的数值实验必须 kv_pos=0**；孤立 kernel probe 无法发现此类接线/状态 bug。
+  - **norm2 覆写 bug（一百零四的隐藏地雷）**：norm1 后的 xnormb16 预转被 norm2 的 rmsnorm 覆写——dual MMA 读到 norm1 旧数据（端到端 19.9、argmax 翻转），而 q2（用 norm1 ✓）/down（经标量 dual ✓）全正常。isolated probe t=8/t=128 全绿（5.5e-6）⇒ 只能是接线。修复 = norm2 后重转（+1 launch ~5µs）。修复后 dual-only 3.4e-3 ✓。
+  - **q/o MMA（一百零五新增）**：f16_mma_q_gpu（bias 尾，从 down kernel 程序化派生）+ o 复用 down kernel（ACC）。isolated 全绿（6.2e-6）；但 896×896 小 GEMM 的 MMA 网格仅 56 块（vs fat3 的 3584），bench 实测负收益 ~2.4ms（26.97 vs 24.55）——**默认关，kernel+开关保留**；救活需行分块更细的网格设计。
+  - **最终配置**：dual/down MMA 默认开（q/o 关）。f32 门 PASS（diff 5.8e-3 vs tol 0.257、argmax ✓）、f64 门逐位不变 ✓。**bench 热态 C 30.46→23.14ms（-24%）、D 34.11→26.69（-22%）**。
+  - **数值预算**：f16 x 舍入的端到端代价 = diff ~6e-3（tol 的 2.3%），argmax 稳定——f64 门逐位基线不破（f64 路径原样）。
+  - **未竟（一百零六）**：①w smem 驻留 + ldmatrix + k 流水（MMA 7.9 TFLOPS → 目标 20+）；②q/o MMA 行分块网格（56 块 → 224+ 块）；③decode 路径 GEMV MMA；④安静态复测。

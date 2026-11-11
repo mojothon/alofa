@@ -55,6 +55,7 @@ from alofa.kernels.cuda.matmul import (
     f16_bmm_q2_gpu, f16_bmm_kv2_gpu,
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
+    f16_mma_q_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -207,6 +208,7 @@ struct GpuSession:
     var d_xnormb: DeviceBuffer[DType.float32]
     var d_xnormb16: DeviceBuffer[DType.float16]
     var d_actb16: DeviceBuffer[DType.float16]
+    var d_attnb16: DeviceBuffer[DType.float16]
     var d_scoresb: DeviceBuffer[DType.float32]
     var d_vpartb: DeviceBuffer[DType.float32]
     var d_attotb: DeviceBuffer[DType.float64]
@@ -474,6 +476,9 @@ struct GpuSession:
         )
         self.d_actb16 = self.ctx.enqueue_create_buffer[DType.float16](
             mb * self.inter
+        )
+        self.d_attnb16 = self.ctx.enqueue_create_buffer[DType.float16](
+            mb * self.q_out
         )
         self.d_scoresb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.n_heads * self.max_tokens
@@ -1133,6 +1138,13 @@ struct GpuSession:
         attn_t: Int = 512, attn_tiles: Int = 1,
         prefill_rb: Int = 8,
         prefill_af: DType = DType.float64,
+        # 一百零五：dual/down MMA 默认开（diff 1e-3 级、norm2 重转修正
+        # 后）；q/o MMA 默认关——896×896 小 GEMM 的 MMA 网格仅 56 块，
+        # 并行度不足，bench 实测负收益 ~2.4ms（26.97 vs 24.55）。
+        prefill_mma_q: Bool = False,
+        prefill_mma_o: Bool = False,
+        prefill_mma_dual: Bool = True,
+        prefill_mma_down: Bool = True,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1234,18 +1246,42 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            self.ctx.enqueue_function[
-                Q_K
-            ](
-                self.d_xnormb.unsafe_ptr(),
-                self.d_w16_q[layer].unsafe_ptr(),
-                self.d_bias_q[layer].unsafe_ptr(),
-                self.d_qb.unsafe_ptr(),
-                Int32(self.q_out),
-                Int32(t),
-                grid_dim=(ceildiv(self.q_out, 4), ceildiv(t, prefill_rb), 1),
-                block_dim=(tri_t, 1, 1),
-            )
+            comptime if prefill_af == DType.float32 and (
+                prefill_mma_q or prefill_mma_dual
+            ):
+                # 一百零五：xnormb f16 预转前置（q MMA 与 dual MMA 共用）
+                self.ctx.enqueue_function[x_to_f16_gpu](
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_xnormb16.unsafe_ptr(),
+                    Int32(t * inner),
+                    grid_dim=((t * inner + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            comptime if prefill_af == DType.float32 and prefill_mma_q:
+                # 一百零五：q MMA（tensor core，bias 尾）
+                self.ctx.enqueue_function[f16_mma_q_gpu[inner, 608]](
+                    self.d_xnormb16.unsafe_ptr(),
+                    self.d_w16_q[layer].unsafe_ptr(),
+                    self.d_bias_q[layer].unsafe_ptr(),
+                    self.d_qb.unsafe_ptr(),
+                    Int32(self.q_out),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.q_out, 128), ceildiv(t, 16), 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    Q_K
+                ](
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_w16_q[layer].unsafe_ptr(),
+                    self.d_bias_q[layer].unsafe_ptr(),
+                    self.d_qb.unsafe_ptr(),
+                    Int32(self.q_out),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.q_out, 4), ceildiv(t, prefill_rb), 1),
+                    block_dim=(tri_t, 1, 1),
+                )
             self.ctx.enqueue_function[
                 KV_K
             ](
@@ -1350,17 +1386,36 @@ struct GpuSession:
                 block_dim=(attn_t, 1, 1),
             )
             # o：真 GEMM 分块 + ACC 残差（八十九）
-            self.ctx.enqueue_function[
-                O_K
-            ](
-                self.d_attnb.unsafe_ptr(),
-                self.d_w16_o[layer].unsafe_ptr(),
-                self.d_xb.unsafe_ptr(),
-                Int32(self.hidden),
-                Int32(t),
-                grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
-                block_dim=(o_t, 1, 1),
-            )
+            comptime if prefill_af == DType.float32 and prefill_mma_o:
+                # 一百零五：o MMA（tensor core，down 同构 ACC）
+                self.ctx.enqueue_function[x_to_f16_gpu](
+                    self.d_attnb.unsafe_ptr(),
+                    self.d_attnb16.unsafe_ptr(),
+                    Int32(t * self.q_out),
+                    grid_dim=((t * self.q_out + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                self.ctx.enqueue_function[f16_mma_down_gpu[inner, 608]](
+                    self.d_attnb16.unsafe_ptr(),
+                    self.d_w16_o[layer].unsafe_ptr(),
+                    self.d_xb.unsafe_ptr(),
+                    Int32(self.hidden),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    O_K
+                ](
+                    self.d_attnb.unsafe_ptr(),
+                    self.d_w16_o[layer].unsafe_ptr(),
+                    self.d_xb.unsafe_ptr(),
+                    Int32(self.hidden),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
+                    block_dim=(o_t, 1, 1),
+                )
             if profile:
                 self.ctx.synchronize()
                 prof[6] += Float64(monotonic_ns() - prof_t0) / 1e6
@@ -1377,8 +1432,9 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            comptime if prefill_af == DType.float32:
-                # 一百零四：dual MMA（tensor core，f32 快路径）
+            comptime if prefill_af == DType.float32 and prefill_mma_dual:
+                # 一百零五修正：norm2 覆写 d_xnormb —— dual 的 f16 输入
+                # 必须在 norm2 之后重转（norm1 后的转换只服务 q2）
                 self.ctx.enqueue_function[x_to_f16_gpu](
                     self.d_xnormb.unsafe_ptr(),
                     self.d_xnormb16.unsafe_ptr(),
@@ -1419,7 +1475,7 @@ struct GpuSession:
                 lff = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
-            comptime if prefill_af == DType.float32:
+            comptime if prefill_af == DType.float32 and prefill_mma_down:
                 # 一百零四：down MMA（tensor core，f32 快路径）
                 self.ctx.enqueue_function[x_to_f16_gpu](
                     self.d_actb.unsafe_ptr(),
