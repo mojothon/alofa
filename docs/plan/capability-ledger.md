@@ -3584,3 +3584,7 @@
   - **⚠️ 两个抓到的坑**：①tile 重载前漏 barrier（上一段 mma 还在读 sxf 就覆写 → 竞态，maxdiff 2.47）；②**归并核 S 与 spl 的 S 不一致会静默丢段**（S=8 配 add4 → diff 15.9、argmax 1199）——已把归并改成 `f32_adds_gpu[S]` 编译期参数并在 docstring 记警告。**教训：split-K 的归并宽度和切分宽度必须同一编译期常量。**
   - 门：f32 diff **0.004680**（比 split 前的 0.006098 还好——分部规整求和的副产物）、argmax 5；f64 逐位不变。守卫 `(inner_ff // 8) % 608 == 0`，不满足自动回退 pk。
   - **负结果同记**：`f16_mma_down_pk2_gpu`（x 双缓冲 + bv 预取）保留未接线（+3%，逐位同）。
+
+- **2026-11-11（一百一十三-a）** —— o 也 split-K（S=4，CH=224），配对 A/B 合计 **-14.9%**
+  - o 形状（INNER=896、OUTS=2）现 56 块占一半 SM，比 down 更缺并行度。扫描：S=2 **47.9µs 反而更差**（每 split 只有 28 步，tile 载入/barrier 占比过高）、**S=4（CH=224，每 split 恰一个 chunk）32.4µs = 1.29×**，逐位恒等 0.0（同 down：f16 精确积 ⇒ f32 求和与序无关）。**S 的甜点在「每 split 恰好整数个 chunk」而非「越多越好」。**
+  - 落地复用 `f16_mma_down_spl_gpu[inner,224,2,8,4]` + `f32_adds_gpu[4]`，partial 复用 `d_downpart` 前 4 面（层间顺序执行无冲突）。守卫 `inner%16==0 且 (inner//4)%224==0`。**配对 A/B（prefill_spl 开关现同时切 down+o）：14.11 vs 16.58 = -14.9%**（四轮稳）。双门全绿（f32 diff 0.005767，o 求和序改变的正常漂移）。

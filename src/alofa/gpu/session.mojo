@@ -1587,19 +1587,43 @@ struct GpuSession:
                     grid_dim=((t * self.hidden + 255) // 256, 1, 1),
                     block_dim=(256, 1, 1),
                 )
-                self.ctx.enqueue_function[
-                    f16_mma_down_pk_gpu[
-                        inner, 896 if prefill_tile and inner >= 896 else 608, 2, 8
-                    ]
-                ](
-                    self.d_attnb16.unsafe_ptr(),
-                    self.d_wp_o[layer].unsafe_ptr(),
-                    self.d_xb.unsafe_ptr(),
-                    Int32(self.hidden),
-                    Int32(t),
-                    grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
-                    block_dim=(256, 1, 1),
-                )
+                if prefill_spl and inner % 16 == 0 and (
+                    inner // 4
+                ) % 224 == 0:
+                    # 一百一十三-a：o 同款 split-K（S=4，56→224 块）；
+                    # partial 复用 d_downpart 前 4 面（层间顺序无冲突）
+                    self.ctx.enqueue_function[
+                        f16_mma_down_spl_gpu[inner, 224, 2, 8, 4]
+                    ](
+                        self.d_attnb16.unsafe_ptr(),
+                        self.d_wp_o[layer].unsafe_ptr(),
+                        self.d_downpart.unsafe_ptr(),
+                        Int32(self.hidden),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 4),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.enqueue_function[f32_adds_gpu[4]](
+                        self.d_xb.unsafe_ptr(),
+                        self.d_downpart.unsafe_ptr(),
+                        Int32(t * self.hidden),
+                        grid_dim=((t * self.hidden + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        f16_mma_down_pk_gpu[
+                            inner, 896 if prefill_tile and inner >= 896 else 608, 2, 8
+                        ]
+                    ](
+                        self.d_attnb16.unsafe_ptr(),
+                        self.d_wp_o[layer].unsafe_ptr(),
+                        self.d_xb.unsafe_ptr(),
+                        Int32(self.hidden),
+                        Int32(t),
+                        grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                        block_dim=(256, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     O_K
