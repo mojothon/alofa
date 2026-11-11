@@ -846,7 +846,18 @@ def attn_dec_gpu[THREADS: Int, TILES: Int, GROUP: Int, SKIP: Int = 0](
     直接复用。tile 0 独写 store 行；当前 token 的 k/v 各块自算（s_k
     入 smem / v_src 直读）免同 launch 跨块竞态（七十三解法）。要求
     head_dim==64、THREADS==512（SLOTS=8 ≥ GROUP=7）、kv_len ≤
-    TILES*64。q_rot 全局不再写（fused 内无人读，省一路往返）。"""
+    TILES*64。q_rot 全局不再写（fused 内无人读，省一路往返）。
+    SKIP（编译期）为相删除计时开关（0=全相，1/2/3 依次删
+    max/exp+V），默认 0。
+
+    **性能判决（一百一十五-a 探针，负结果）**：正确性 maxdiff ~1e-8
+    全绿（comb3 重标度后），但配对计时全面输给三趟——裸核 50-70µs
+    vs 三趟合计 33-45µs（TILES 8/16/32、块数 32→320、grid 维交换、
+    SKIP=1 删 80% 体均不救：**~50µs 基础成本对一切因素不敏感**，
+    连只跑 rope+scores 的残核都要 50µs）。根因未定位（ncu 与本机
+    驱动不兼容：cuFuncGetParamInfo 缺失，profile 路断；疑点剩代码
+    生成/寄存器压力）。保留作负结果参照（同 attn_fused_b 惯例），
+    **勿接入 session**。三趟 tiles=8 仍是 decode attention 最优。"""
 
     comptime HD = 64
     comptime HALF = HD // 2
@@ -854,8 +865,8 @@ def attn_dec_gpu[THREADS: Int, TILES: Int, GROUP: Int, SKIP: Int = 0](
     comptime KC = 8
     comptime CHMAX = THREADS // KC
 
-    var kv_head = Int(block_idx.y)
-    var tile = Int(block_idx.x)
+    var kv_head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
     var tid = Int(thread_idx.x)
     var kv_head_base = kv_head * HD
     var kv_cols = Int(n_kv_heads) * HD
