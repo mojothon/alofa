@@ -39,7 +39,7 @@ from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
-    attn_comb2_b_gpu
+    attn_vt2_h_gpu, attn_comb2_b_gpu
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -1495,21 +1495,40 @@ struct GpuSession:
                     grid_dim=(self.n_heads, attn_tiles, t),
                     block_dim=(attn_t, 1, 1),
                 )
-            self.ctx.enqueue_function[
-                VT2_K
-            ](
-                self.d_scoresb.unsafe_ptr(),
-                pv,
-                self.d_vpartb.unsafe_ptr(),
-                self.d_attotb.unsafe_ptr(),
-                Int32(self.n_heads),
-                Int32(self.n_kv_heads),
-                Int32(self.head_dim),
-                Int32(kv_len),
-                Int32(pos0),
-                grid_dim=(self.n_heads, attn_tiles, t),
-                block_dim=(attn_t, 1, 1),
-            )
+            if prefill_gqa and attn_t // 8 == self.head_dim and (
+                self.n_heads // self.n_kv_heads <= 8
+            ):
+                self.ctx.enqueue_function[
+                    attn_vt2_h_gpu[attn_t, 8, attn_tiles]
+                ](
+                    self.d_scoresb.unsafe_ptr(),
+                    pv,
+                    self.d_vpartb.unsafe_ptr(),
+                    self.d_attotb.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(kv_len),
+                    Int32(pos0),
+                    grid_dim=(self.n_kv_heads, attn_tiles, t),
+                    block_dim=(attn_t, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    VT2_K
+                ](
+                    self.d_scoresb.unsafe_ptr(),
+                    pv,
+                    self.d_vpartb.unsafe_ptr(),
+                    self.d_attotb.unsafe_ptr(),
+                    Int32(self.n_heads),
+                    Int32(self.n_kv_heads),
+                    Int32(self.head_dim),
+                    Int32(kv_len),
+                    Int32(pos0),
+                    grid_dim=(self.n_heads, attn_tiles, t),
+                    block_dim=(attn_t, 1, 1),
+                )
             self.ctx.enqueue_function[
                 COMB_K
             ](

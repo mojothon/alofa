@@ -1420,3 +1420,122 @@ def attn_rs_h_gpu[
                 )
         scores[unsafe_offset=row + jj] = Float32(acc) * scale
         jj += LPR
+
+
+def attn_vt2_h_gpu[
+    THREADS: Int, HMAX: Int = 8, TILES: Int = 8,
+](
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    kv_len: Int32,
+    pos0: Int32,
+) -> None:
+    """K2' 的 **kv_head 分组**版（账本一百一十一）：grid =
+    (n_kv_heads, TILES, B)，一块服务同一 kv head 下的一组 query head
+    （group = n_heads/n_kv_heads 个，本模型 7）。要求
+    THREADS // HMAX == head_dim（每槽 64 线程恰对应 64 个输出维），
+    且 group <= HMAX（多余槽空转但仍参与 barrier）。
+
+    动机（nsys 实测）：VT2 45.5µs/层与 RS 同病——每个 (head,b,tile)
+    块都把同一 kv head 的 v 行整读一遍，7 倍冗余（每层 ~57MB）。分组
+    后同块 7 个槽读相同 v 行（L1 命中），DRAM 流量 ÷group。
+
+    结构：每槽 = THREADS//HMAX = 64 线程 = 1 个 head。gmax 仍全行
+    冗余只读（max 无舍入序自由，值与原版逐位同）；exp/sum 的树从
+    512 宽改 64 宽、PV 从 8 组跨步改单线程整段累加 ⇒ **求和树形改变，
+    结果 ~1e-7 级漂移（非逐位同），由门容差覆盖**。e_s 按槽分条
+    [HMAX][THREADS]（f64，32KB），chunk 上限 THREADS（nsc ≤ 8*512）。"""
+
+    comptime TPP = THREADS // HMAX
+    var b = Int(block_idx.z)
+    var kv_head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var slot = tid // TPP
+    var lane = tid % TPP
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var active = slot < group
+    var head = kv_head * group + slot
+    var hd = Int(head_dim)
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var row = (b * Int(n_heads) + head) * Int(kv_len)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var t0 = tile * chunk
+    var t1 = t0 + chunk
+    if t1 > nsc:
+        t1 = nsc
+
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var stot = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var e_s = stack_allocation[
+        HMAX * THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+
+    # ---- gmax（全行，槽内 64 宽树）----
+    var best = LOWEST_FP32
+    if active:
+        var j = lane
+        while j < nsc:
+            var s = scores[unsafe_offset=row + j]
+            if s > best:
+                best = s
+            j += TPP
+    smax[tid] = best
+    barrier()
+    var stride = TPP // 2
+    while stride > 0:
+        if lane < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var gmax = smax[slot * TPP]
+
+    # ---- exp + sum（本 tile 的 chunk）----
+    var tl = Float64(0)
+    if active:
+        # 跨步覆盖整个 chunk（chunk 可达 THREADS，> TPP 时单遍会漏 key）
+        var jt = t0 + lane
+        while jt < t1:
+            var e = Float64(exp(Float64(scores[unsafe_offset=row + jt] - gmax)))
+            e_s[unsafe_offset=slot * THREADS + (jt - t0)] = e
+            tl += e
+            jt += TPP
+    stot[tid] = tl
+    barrier()
+    stride = TPP // 2
+    while stride > 0:
+        if lane < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    if active and lane == 0:
+        tsum[unsafe_offset=(b * Int(n_heads) + head) * TILES + tile] = stot[
+            slot * TPP
+        ]
+
+    # ---- PV（groups = TPP//hd = 1：每线程一维，整段累加）----
+    var d = lane
+    var acc = Float64(0)
+    if active:
+        var jj = t0
+        while jj < t1:
+            acc += e_s[unsafe_offset=slot * THREADS + (jj - t0)] * Float64(
+                v_store[unsafe_offset=jj * kv_cols + kv_head_base + d]
+            )
+            jj += 1
+        vpart[unsafe_offset=(
+            (b * Int(n_heads) + head) * TILES + tile
+        ) * hd + d] = Float32(acc)
