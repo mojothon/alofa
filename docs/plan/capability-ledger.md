@@ -3496,3 +3496,12 @@
   - **性能**：down 形状（4864×896, t=128）简单 WMMA **245µs vs fat3 328µs = 1.34×**（4.5 TFLOPS）。错误版反而 143µs（B 读命中列少）——修复后变慢是访存真实成本。距离 tensor core 潜力（100+ TFLOPS）尚远：w 每 lane 散乱全局读、x f32→f16 每 col-block 冗余转换、无流水。**升级路径**：双操作数 smem 驻留 + ldmatrix + k 分块流水。
   - **经验**：①`ref` 是 Mojo 保留字；`barrier` 在 max.gpu 不在 std.gpu；comptime if 块内声明不外泄作用域；②mma 分离 d/c 传参在单步与链式均正确（无别名 UB）；③runtime 边界 while 包 mma 无碍（@parameter 展开后 143→245µs 是 B 修复所致）；④文档无 fragment 布局——**必须自建单步 check kernel 对照**（本项目方法论的 kernel 级版）。
   - **未接入原因**：MMA 累加序≠标量路径 ⇒ 破坏 f64 精确锚（门 diff 数值会变，容差内但失去逐位基线）；且 1.34× 值不上 ldmatrix/流水的工程量。**一百零四**：smem 驻留双操作数 + ldmatrix + 流水（目标 FF 段 3-5×），接入时门策略 = 容差门 + 新基线快照。
+
+- **2026-11-11（第一百零四条）** —— ⚡⚡ MMA tensor core 落地：down+dual 接入 f32 快路径，端到端热态 -15~19%
+  - **扫描**（交替 12 rep，V0-V6）：x 预转 f16 + 全局 A（V0）310µs 反而慢于 smem 版 245µs——**A fragment 延迟是主因**；多输出 tile 摊 A 流量是最大杠杆：NT1→NT2 208µs→**NT4 138µs**（V4=smem x+NT4+U2 双链）；U4 无增益、NT8 网格太小变差（174µs）。
+  - **落地结构**：`f16_mma_down_gpu[INNER, CH=608]`（块 16 行×128 列，4 warp×4 tile，x 分块进 smem 19KB，ACC 残加同 fat3）+ `f16_mma_dual_gpu[896, 608]`（每 warp 每矩阵 2 tile，块 64+64 列，尾融合 silu(gate)·up 公式同 dual3）。仅 `prefill_af==float32` 分支走 MMA（+2 个 x→f16 转换 launch）；**f64 精确路径仍走 fat3/dual3 ⇒ 门 diff 逐位不变**（0.005281567/0.006138324 全绿）。
+  - **战果**：down 328→~140µs（**2.3×**）、dual 370→**263µs（1.4×）**；端到端热态 C 30.4/33.2→**24.55/27.79**、D 34.1/36.8→28.91/32.10（-15~19%）；每层省 ~295µs ×12 层 ≈ 3.5ms GPU。
+  - **两个坑**：①down 收缩维是 inter=4864 ⇒ smem x tile 16×4864×2B=152KB 超限（0xc000）——**probe 里用 896 方阵测试没暴露**，分块 CH=608 修复；②分块填充误写成扁平拷贝（缺行跨距 INNER）⇒ maxdiff 爆到 7~37——修正 `(r0+i//CH)*INNER + ch*CH + i%CH`。教训：**probe 必须用生产形状**（896 方阵 pass ≠ 4864 收缩维 pass）。
+  - **数值定位（重要）**：f32 快路径现在含 f16 x 舍入 + MMA f32 累加——kernel 级对 f64 参照 gate/up/up/act 4.8e-6/1.3e-5/4.8e-5、down ACC 0.0；**prefill f32 路径暂无端到端容差门**（decode PARITY 只盖 decode），一百零五应补 prefill f32-vs-f64 容差门。
+  - **MMA 现状**：down 7.9 TFLOPS（tensor core 峰值 312 的 2.5%）——瓶颈是 w 全局 fragment 载入延迟；升级路径 = w smem 驻留 + ldmatrix + k 流水（一百零五）。
+  - **未竟（一百零五）**：①w smem 驻留/ldmatrix/流水（down 目标 <80µs）；②o/q2/kv2 GEMM 的 MMA 化（q2 188µs、o 97µs）；③prefill f32 容差门；④安静态复测。

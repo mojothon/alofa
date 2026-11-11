@@ -54,6 +54,7 @@ from alofa.kernels.cuda.matmul import (
     f16_bmm_fat_gpu, f16_bmm_dual_gpu, f16_bmm_qkv_gpu,
     f16_bmm_q2_gpu, f16_bmm_kv2_gpu,
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
+    x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -204,6 +205,8 @@ struct GpuSession:
     var d_upb: DeviceBuffer[DType.float32]
     var d_actb: DeviceBuffer[DType.float32]
     var d_xnormb: DeviceBuffer[DType.float32]
+    var d_xnormb16: DeviceBuffer[DType.float16]
+    var d_actb16: DeviceBuffer[DType.float16]
     var d_scoresb: DeviceBuffer[DType.float32]
     var d_vpartb: DeviceBuffer[DType.float32]
     var d_attotb: DeviceBuffer[DType.float64]
@@ -465,6 +468,12 @@ struct GpuSession:
         )
         self.d_xnormb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.hidden
+        )
+        self.d_xnormb16 = self.ctx.enqueue_create_buffer[DType.float16](
+            mb * self.hidden
+        )
+        self.d_actb16 = self.ctx.enqueue_create_buffer[DType.float16](
+            mb * self.inter
         )
         self.d_scoresb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.n_heads * self.max_tokens
@@ -1368,37 +1377,78 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            self.ctx.enqueue_function[
-                DUAL_K
-            ](
-                self.d_xnormb.unsafe_ptr(),
-                self.d_w16_gate[layer].unsafe_ptr(),
-                self.d_w16_up[layer].unsafe_ptr(),
-                self.d_gateb.unsafe_ptr(),
-                self.d_upb.unsafe_ptr(),
-                self.d_actb.unsafe_ptr(),
-                Int32(self.inter),
-                Int32(t),
-                grid_dim=(ceildiv(self.inter, 2), ceildiv(t, prefill_rb), 1),
-                block_dim=(dual_t, 1, 1),
-            )
+            comptime if prefill_af == DType.float32:
+                # 一百零四：dual MMA（tensor core，f32 快路径）
+                self.ctx.enqueue_function[x_to_f16_gpu](
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_xnormb16.unsafe_ptr(),
+                    Int32(t * inner),
+                    grid_dim=((t * inner + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                self.ctx.enqueue_function[f16_mma_dual_gpu[inner, 608]](
+                    self.d_xnormb16.unsafe_ptr(),
+                    self.d_w16_gate[layer].unsafe_ptr(),
+                    self.d_w16_up[layer].unsafe_ptr(),
+                    self.d_gateb.unsafe_ptr(),
+                    self.d_upb.unsafe_ptr(),
+                    self.d_actb.unsafe_ptr(),
+                    Int32(self.inter),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.inter, 64), ceildiv(t, 16), 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    DUAL_K
+                ](
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_w16_gate[layer].unsafe_ptr(),
+                    self.d_w16_up[layer].unsafe_ptr(),
+                    self.d_gateb.unsafe_ptr(),
+                    self.d_upb.unsafe_ptr(),
+                    self.d_actb.unsafe_ptr(),
+                    Int32(self.inter),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.inter, 2), ceildiv(t, prefill_rb), 1),
+                    block_dim=(dual_t, 1, 1),
+                )
             if profile:
                 self.ctx.synchronize()
                 prof[7] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lff = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # down：真 GEMM 分块 + ACC 残差（八十九）
-            self.ctx.enqueue_function[
-                DOWN_K
-            ](
-                self.d_actb.unsafe_ptr(),
-                self.d_w16_down[layer].unsafe_ptr(),
-                self.d_xb.unsafe_ptr(),
-                Int32(self.hidden),
-                Int32(t),
-                grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
-                block_dim=(down_t, 1, 1),
-            )
+            comptime if prefill_af == DType.float32:
+                # 一百零四：down MMA（tensor core，f32 快路径）
+                self.ctx.enqueue_function[x_to_f16_gpu](
+                    self.d_actb.unsafe_ptr(),
+                    self.d_actb16.unsafe_ptr(),
+                    Int32(t * self.inter),
+                    grid_dim=((t * self.inter + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                self.ctx.enqueue_function[f16_mma_down_gpu[inner_ff, 608]](
+                    self.d_actb16.unsafe_ptr(),
+                    self.d_w16_down[layer].unsafe_ptr(),
+                    self.d_xb.unsafe_ptr(),
+                    Int32(self.hidden),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[
+                    DOWN_K
+                ](
+                    self.d_actb.unsafe_ptr(),
+                    self.d_w16_down[layer].unsafe_ptr(),
+                    self.d_xb.unsafe_ptr(),
+                    Int32(self.hidden),
+                    Int32(t),
+                    grid_dim=(ceildiv(self.hidden, 4), ceildiv(t, prefill_rb), 1),
+                    block_dim=(down_t, 1, 1),
+                )
             if profile:
                 self.ctx.synchronize()
                 prof[8] += Float64(monotonic_ns() - prof_t0) / 1e6

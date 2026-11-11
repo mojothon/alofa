@@ -17,6 +17,7 @@ from std.math import exp, sqrt
 from std.memory import stack_allocation
 
 from max.gpu import AddressSpace, barrier
+from max.gpu.compute.mma import mma
 
 from alofa.kernels.cpu.quant import Q4_BLOCK, Q4_BYTES, Q4_SCALE_BYTES
 from alofa.kernels.cuda.basic import _fp16_bits_to_f32_device
@@ -2019,3 +2020,369 @@ def f16_bmm_kv2_gpu[THREADS: Int, INNER: Int, OUTS: Int, RB: Int, AF: DType = DT
                         vv = vv + bias_v[unsafe_offset=o]
                         dst_k[unsafe_offset=r * Int(kv_out) + o] = vk
                         dst_v[unsafe_offset=r * Int(kv_out) + o] = vv
+
+
+
+def x_to_f16_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """x 预转 f16（账本一百零四）：MMA 路径的操作数前置转换。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        xh[i] = Float16(x[i])
+def f16_mma_down_gpu[INNER: Int, CH: Int](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """down MMA（账本一百零四，V4 分块版）：tensor core m16n8k16
+    f16×f16→f32。x tile f16 按 CH 元素分块进 smem（16×CH×2B，
+    CH=608 → 19KB），acc 寄存器跨块连续（f32 重组非逐位）；余数
+    tile（INNER % CH）av 直读全局。每 warp 4 个 16×8 输出 tile
+    （块 16 行 × 128 列），k 双链展开 U=2。要求 out_cols % 128 == 0
+    （hidden=896 ✓）、CH % 32 == 0、INNER % 16 == 0、
+    ceildiv(n_rows,16)*16 ≤ 缓冲行数。ACC 残加语义同 fat3(ACC=True)。
+    仅 AF=float32 快路径使用（f64 精确路径仍走 fat3，门逐位不变）。"""
+
+    var cb = Int(block_idx.x) * 128
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], 4](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], 4](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    @parameter
+    for ch in range(INNER // CH):
+        var i = tid
+        while i < 16 * CH:
+            sxf[unsafe_offset=i] = xh[
+                unsafe_offset=(r0 + i // CH) * INNER + ch * CH + i % CH
+            ]
+            i += 128
+        barrier()
+        @parameter
+        for ks in range(CH // 32):
+            @parameter
+            for u in range(2):
+                var k = ch * CH + (ks * 2 + u) * 16
+                var ko = (ks * 2 + u) * 16
+                var av = SIMD[DType.float16, 8](
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 1],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 1],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 8],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 9],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 8],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 9],
+                )
+                @parameter
+                for j in range(4):
+                    var col = cb + warp * 8 + j * 32
+                    var bv = SIMD[DType.float16, 4](
+                        w[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2
+                        ],
+                        w[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1
+                        ],
+                        w[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8
+                        ],
+                        w[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9
+                        ],
+                    )
+                    var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+                    comptime if u % 2 == 0:
+                        mma(dv, av, bv, accA[j])
+                        accA[j] = dv
+                    else:
+                        mma(dv, av, bv, accB[j])
+                        accB[j] = dv
+        barrier()
+
+    @parameter
+    for ks in range((INNER % CH) // 16):
+        var k = (INNER // CH) * CH + ks * 16
+        var av = SIMD[DType.float16, 8](
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 9],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(4):
+            var col = cb + warp * 8 + j * 32
+            var bv = SIMD[DType.float16, 4](
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9],
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+
+    @parameter
+    for j in range(4):
+        var col = cb + warp * 8 + j * 32
+        var acc = accA[j] + accB[j]
+        if r0 + gid < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] + acc[0]
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] + acc[1]
+        if r0 + gid + 8 < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] + acc[2]
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] + acc[3]
+
+
+def f16_mma_dual_gpu[INNER: Int, CH: Int](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    w_a: Pointer[Float16, MutUntrackedOrigin],
+    w_b: Pointer[Float16, MutUntrackedOrigin],
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    dst_act: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """dual MMA（账本一百零四）：down MMA 同构分块（CH=608），每
+    warp 每矩阵 2 个 16×8 tile（块 64 gate 列 + 64 up 列），w_a/w_b
+    各自 fragment。尾融合 dst_act = silu(gate)·up（公式同 dual3）。
+    要求 out_cols % 64 == 0（inter=4864 ✓）。仅 AF=float32 快路径。"""
+
+    var cb = Int(block_idx.x) * 64
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA1 = InlineArray[SIMD[DType.float32, 4], 2](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB1 = InlineArray[SIMD[DType.float32, 4], 2](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accA2 = InlineArray[SIMD[DType.float32, 4], 2](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB2 = InlineArray[SIMD[DType.float32, 4], 2](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    @parameter
+    for ch in range(INNER // CH):
+        var i = tid
+        while i < 16 * CH:
+            sxf[unsafe_offset=i] = xh[
+                unsafe_offset=(r0 + i // CH) * INNER + ch * CH + i % CH
+            ]
+            i += 128
+        barrier()
+        @parameter
+        for ks in range(CH // 32):
+            @parameter
+            for u in range(2):
+                var k = ch * CH + (ks * 2 + u) * 16
+                var ko = (ks * 2 + u) * 16
+                var av = SIMD[DType.float16, 8](
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 1],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 1],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 8],
+                    sxf[unsafe_offset=gid * CH + ko + tig * 2 + 9],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 8],
+                    sxf[unsafe_offset=(gid + 8) * CH + ko + tig * 2 + 9],
+                )
+                @parameter
+                for j in range(2):
+                    var col = cb + warp * 8 + j * 32
+                    var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+                    var bv = SIMD[DType.float16, 4](
+                        w_a[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2
+                        ],
+                        w_a[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1
+                        ],
+                        w_a[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8
+                        ],
+                        w_a[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9
+                        ],
+                    )
+                    comptime if u % 2 == 0:
+                        mma(dv, av, bv, accA1[j])
+                        accA1[j] = dv
+                    else:
+                        mma(dv, av, bv, accB1[j])
+                        accB1[j] = dv
+                    var dv2 = SIMD[DType.float32, 4](0, 0, 0, 0)
+                    var bv2 = SIMD[DType.float16, 4](
+                        w_b[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2
+                        ],
+                        w_b[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1
+                        ],
+                        w_b[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8
+                        ],
+                        w_b[
+                            unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9
+                        ],
+                    )
+                    comptime if u % 2 == 0:
+                        mma(dv2, av, bv2, accA2[j])
+                        accA2[j] = dv2
+                    else:
+                        mma(dv2, av, bv2, accB2[j])
+                        accB2[j] = dv2
+        barrier()
+
+    @parameter
+    for ks in range((INNER % CH) // 16):
+        var k = (INNER // CH) * CH + ks * 16
+        var av = SIMD[DType.float16, 8](
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 9],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(2):
+            var col = cb + warp * 8 + j * 32
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            var bv = SIMD[DType.float16, 4](
+                w_a[unsafe_offset=(col + gid) * INNER + k + tig * 2],
+                w_a[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1],
+                w_a[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8],
+                w_a[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9],
+            )
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA1[j])
+                accA1[j] = dv
+            else:
+                mma(dv, av, bv, accB1[j])
+                accB1[j] = dv
+            var dv2 = SIMD[DType.float32, 4](0, 0, 0, 0)
+            var bv2 = SIMD[DType.float16, 4](
+                w_b[unsafe_offset=(col + gid) * INNER + k + tig * 2],
+                w_b[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1],
+                w_b[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8],
+                w_b[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9],
+            )
+            comptime if ks % 2 == 0:
+                mma(dv2, av, bv2, accA2[j])
+                accA2[j] = dv2
+            else:
+                mma(dv2, av, bv2, accB2[j])
+                accB2[j] = dv2
+
+    @parameter
+    for j in range(2):
+        var col = cb + warp * 8 + j * 32
+        var v1 = accA1[j] + accB1[j]
+        var v2 = accA2[j] + accB2[j]
+        if r0 + gid < Int(n_rows):
+            dst_a[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = v1[0]
+            dst_b[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = v2[0]
+            var g0 = Float64(v1[0])
+            dst_act[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = Float32(
+                g0 / (Float64(1) + exp(-g0)) * Float64(v2[0])
+            )
+            dst_a[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = v1[1]
+            dst_b[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = v2[1]
+            var g1 = Float64(v1[1])
+            dst_act[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = Float32(
+                g1 / (Float64(1) + exp(-g1)) * Float64(v2[1])
+            )
+        if r0 + gid + 8 < Int(n_rows):
+            dst_a[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = v1[2]
+            dst_b[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = v2[2]
+            var g2 = Float64(v1[2])
+            dst_act[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = Float32(
+                g2 / (Float64(1) + exp(-g2)) * Float64(v2[2])
+            )
+            dst_a[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = v1[3]
+            dst_b[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = v2[3]
+            var g3 = Float64(v1[3])
+            dst_act[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = Float32(
+                g3 / (Float64(1) + exp(-g3)) * Float64(v2[3])
+            )
