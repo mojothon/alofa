@@ -56,8 +56,8 @@ from alofa.kernels.cuda.matmul import (
     f16_bmm_q2_gpu, f16_bmm_kv2_gpu,
     f16_bmm_fat3_gpu, f16_bmm_dual3_gpu,
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
-    f16_mma_down_pk_gpu, f16_mma_dual_pk_gpu, f16_mma_gemm_pk_gpu,
-    pack_w_mma_gpu,
+    f16_mma_down_pk_gpu, f16_mma_down_spl_gpu, f16_mma_dual_pk_gpu,
+    f16_mma_gemm_pk_gpu, f32_adds_gpu, pack_w_mma_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
     f16_matmul_qkv_mc_gpu,
@@ -219,6 +219,8 @@ struct GpuSession:
     var d_xnormb16: DeviceBuffer[DType.float16]
     var d_attnb16: DeviceBuffer[DType.float16]
     var d_actb16: DeviceBuffer[DType.float16]
+    # 一百一十二-b：down split-K 的 partial（[8][mb][hidden] f32）
+    var d_downpart: DeviceBuffer[DType.float32]
     var d_scoresb: DeviceBuffer[DType.float32]
     var d_vpartb: DeviceBuffer[DType.float32]
     var d_attotb: DeviceBuffer[DType.float64]
@@ -510,6 +512,10 @@ struct GpuSession:
         )
         self.d_actb16 = self.ctx.enqueue_create_buffer[DType.float16](
             mb * self.inter
+        )
+        # 一百一十二-b：down split-K 的 partial（[8][mb][hidden] f32）
+        self.d_downpart = self.ctx.enqueue_create_buffer[DType.float32](
+            8 * mb * self.hidden
         )
         self.d_scoresb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.n_heads * self.max_tokens
@@ -1190,6 +1196,9 @@ struct GpuSession:
         # 一百零九：scores 按 kv_head 分组（同组 7 个 query head 共享一次
         # k 行读）——nsys 定位 RS 为访存受限，分组后 78→36µs（逐位同）
         prefill_gqa: Bool = True,
+        # 一百一十二-b：down split-K（t=128 时 112 块只够每 SM 1 块 8 warp，
+        # 藏不住冷权重延迟；沿 K 切 8 段 → 896 块，实测 1.96×）
+        prefill_spl: Bool = True,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
@@ -1696,7 +1705,31 @@ struct GpuSession:
                     grid_dim=((t * self.inter + 255) // 256, 1, 1),
                     block_dim=(256, 1, 1),
                 )
-                comptime if prefill_wpack:
+                comptime if prefill_wpack and prefill_spl and (
+                    (inner_ff // 8) % 608 == 0 and inner_ff % 16 == 0
+                ):
+                    # 一百一十二-b：split-K——partial 裸写 + add4 归并残差
+                    self.ctx.enqueue_function[
+                        f16_mma_down_spl_gpu[inner_ff, 608, 1, 8, 8]
+                    ](
+                        self.d_actb16.unsafe_ptr(),
+                        self.d_wp_down[layer].unsafe_ptr(),
+                        self.d_downpart.unsafe_ptr(),
+                        Int32(self.hidden),
+                        Int32(t),
+                        grid_dim=(
+                            ceildiv(self.hidden, 64), ceildiv(t, 16), 8
+                        ),
+                        block_dim=(256, 1, 1),
+                    )
+                    self.ctx.enqueue_function[f32_adds_gpu[8]](
+                        self.d_xb.unsafe_ptr(),
+                        self.d_downpart.unsafe_ptr(),
+                        Int32(t * self.hidden),
+                        grid_dim=((t * self.hidden + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                elif prefill_wpack:
                     self.ctx.enqueue_function[
                         f16_mma_down_pk_gpu[
                             inner_ff, 608, 1 if prefill_tile else 2, 8

@@ -3577,3 +3577,10 @@
   - 生产 `attn_tiles=1` ⇒ COMB 就是 `dst = Σvpart / Σtsum` 的纯缩放。`attn_vt2_h_gpu` 加 `FUSED: Bool` + `dst` 参数：TILES==1 时 chunk 即整行，f64 acc 直接 `acc / stot[slot*TPP]` 尾写 `d_attnb`，跳过 COMB 发射（守卫与分组同）。f64 不经 f32 vpart 中转 ⇒ f32 门 diff 0.005029→0.006098（远小于容差 0.257，argmax 5 不变）。
   - GPU 2 配对 A/B：**14.71 vs 16.87ms = -12.8%**（RS+VT2+COMB 合益）。跨次运行绝对值不可比（上轮 17.98，本轮邻居负载不同），配对内可靠。
   - kernel 签名统一加 `dst`（未融合时传桩），VT2_K 旧路径不变。
+
+- **2026-11-11（一百一十二-b）** —— down **split-K**（`f16_mma_down_spl_gpu` + `f32_adds_gpu[S]`），配对 A/B **-14.6%（-2.5ms）**，最大单刀
+  - **病灶确诊**：t=128 时 down 只有 112 块 ≈ 108 SM，**每 SM 1 块 = 8 warp，占用率 12.5%**，藏不住冷权重 ~600 周期 DRAM 延迟（实测每 mma ~576 周期）。两个假设被证伪：x smem 双缓冲 +3%、bv 寄存器 2 段预取 +0%（ptxas 本就做了）——**不是流水线串行化，是并行度不足**。
+  - **split-K**：grid.z 切 K 成 S=8 段（grid (14,8,8) = 896 块），每块 partial 裸写（不读 dst），`f32_adds_gpu[8]` 归并 + 残差。核级 229→**96.7µs（GPU 2，2.4×）**；e2e 配对 **14.94 vs 17.48 = -14.6%**。partial [8][t][hidden] f32 = 3.6MB 一次性分配。
+  - **⚠️ 两个抓到的坑**：①tile 重载前漏 barrier（上一段 mma 还在读 sxf 就覆写 → 竞态，maxdiff 2.47）；②**归并核 S 与 spl 的 S 不一致会静默丢段**（S=8 配 add4 → diff 15.9、argmax 1199）——已把归并改成 `f32_adds_gpu[S]` 编译期参数并在 docstring 记警告。**教训：split-K 的归并宽度和切分宽度必须同一编译期常量。**
+  - 门：f32 diff **0.004680**（比 split 前的 0.006098 还好——分部规整求和的副产物）、argmax 5；f64 逐位不变。守卫 `(inner_ff // 8) % 608 == 0`，不满足自动回退 pk。
+  - **负结果同记**：`f16_mma_down_pk2_gpu`（x 双缓冲 + bv 预取）保留未接线（+3%，逐位同）。
