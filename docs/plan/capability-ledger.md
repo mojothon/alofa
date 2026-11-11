@@ -3607,3 +3607,8 @@
   - **现成单发路径证伪**：`attn_tiles=0`（`attn_rope_gpu` 一核全包）配对 A/B **反而慢 ~0.3ms**（2.57-2.94 vs 2.35）——grid 只有 14 块 × 512 线程，键扫描延迟链远长于省下的 48 次发射。三趟（tiles=8）是现存最优。
   - **一百一十五 方向**：专造 decode 融合分组核——一次发射，grid `(n_kv_heads, TILES)`，块内 8 个 q-head 槽（rs_h 思路）+ rope+store+scores+softmax+V 一体，~16-32 块足够藏延迟；潜在 **~-0.4ms/步（-17%）**。另记：decode 步 2.35ms vs 权重流下限 ~0.7ms（0.5B×f16 @1.4TB/s）——**decode GEMM 侧离下限 3.4×，长期更大的鱼**。
   - 附带发现：`tri_cols=128` 的 `_mc_` qkv 变体在当前工具链下 **ptxas smem 超限（398KB）编译失败**——decode bench 只能用 `tri_cols=0`（历史 bench 未触雷是因走纯默认参数）。
+- **2026-11-11（一百一十五-a）** —— 专造融合分组 decode 核（`attn_dec_gpu` + `attn_comb3_gpu`）：**正确性 1e-8 全绿，性能证伪——负结果留树，三趟仍王**
+  - 设计：grid `(n_kv_heads, TILES)`，块内 7 个 q-head 槽共享 k/v（GQA ÷7）；scores (key, 8 路 dim 分片) + 3 屏障树；**流式局部 softmax**（tile 局部 max，`attn_comb3_gpu` 带重标度归并——**comb2 直接相加对流式部分和是错的**，探针 maxdiff 0.04 的真凶，修复后 1e-8）；仅 2 发射 vs 三趟 3 发射。
+  - **判决：配对计时全面负值**。裸核 50-70µs vs 三趟合计 33-45µs。四个排除实验：TILES 8/16/32 扫描（V 相串行长度不敏感）；块数 32→320（不变）；grid 维交换（不变）；**相删除 bisect（SKIP 编译期参数）——只跑 rope+scores 的残核仍 ~50µs**。结论：~50µs 基础成本对一切结构因素不敏感，疑点收敛到代码生成/寄存器压力层面；ncu 与本机驱动不兼容（cuFuncGetParamInfo 缺失），profile 路断，根因挂起。
+  - 方法论沉淀：**「发射开销主导」的推断要小心——单发不等于省时**；114-c 单发证伪（14 块延迟链）与 115-a 融合证伪（基础成本异常）是两种不同的失败模式。decode attention 维持三趟 tiles=8；**decode 的主战场移交 115-b（GEMM 离权重流下限 3.4×）**。
+  - 附：comb3 的 w_t 重标度需 smem 单次计算共享（64× f64 exp 冗余已修，但非主因）。

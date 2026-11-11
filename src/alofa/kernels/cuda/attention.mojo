@@ -818,6 +818,269 @@ def attn_comb2_gpu[TILES: Int = 8](
 
 
 
+def attn_dec_gpu[THREADS: Int, TILES: Int, GROUP: Int, SKIP: Int = 0](
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    cos_row: Pointer[Float32, MutUntrackedOrigin],
+    sin_row: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    tmax: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    kv_len: Int32,
+) -> None:
+    """decode 融合分组核（账本一百一十五-a）：三趟的 K1/K2 并一枚——
+    rope(q/k)+v 拷贝+scores+softmax 部分和+V 部分和一次发射，仅
+    comb2 归并另发。一百一十四-c 勘探：attention 段 0.5ms/步且不随
+    kv_len 增长 ⇒ 发射+延迟主导；现成单发 attn_rope 14 块延迟链证伪。
+    grid=(n_kv_heads, TILES)，块内 GROUP 个 q-head 槽共享 k/v（GQA
+    k 流量 ÷GROUP）：scores 按 (key, 8 路 dim 分片) 布点 + 3 屏障树
+    规约；softmax 用流式局部基准（tile 局部 max，合并重标度交给
+    comb2——免全局 gmax 往返，数值差 ~1e-7，门容差覆盖）；V 相
+    (head, dim) 布点串行 keys（chunk 随 TILES 减半）。vpart/tsum
+    布局与 attn_comb2_gpu 完全一致（head = kv_head*GROUP + h），K3'
+    直接复用。tile 0 独写 store 行；当前 token 的 k/v 各块自算（s_k
+    入 smem / v_src 直读）免同 launch 跨块竞态（七十三解法）。要求
+    head_dim==64、THREADS==512（SLOTS=8 ≥ GROUP=7）、kv_len ≤
+    TILES*64。q_rot 全局不再写（fused 内无人读，省一路往返）。"""
+
+    comptime HD = 64
+    comptime HALF = HD // 2
+    comptime SLOTS = THREADS // HD
+    comptime KC = 8
+    comptime CHMAX = THREADS // KC
+
+    var kv_head = Int(block_idx.y)
+    var tile = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var kv_head_base = kv_head * HD
+    var kv_cols = Int(n_kv_heads) * HD
+    var scale = Float32(1.0) / sqrt(Float32(HD))
+    var upto = Int(kv_len) - 1
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var j0 = tile * chunk
+    var j1 = j0 + chunk
+    if j1 > nsc:
+        j1 = nsc
+    var jn = j1 - j0
+
+    var s_q = stack_allocation[
+        SLOTS * HD, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var s_k = stack_allocation[
+        HD, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var s_sc = stack_allocation[
+        CHMAX * SLOTS * KC, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var s_e = stack_allocation[
+        SLOTS * HD, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var s_redf = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var s_red64 = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var s_m = stack_allocation[
+        SLOTS, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    # 1) rope q → smem（每线程自维，配对直读免交换）；rope k_new → s_k
+    #    （tile 0 落 store 行）；v 拷贝（tile 0）。
+    if tid < GROUP * HD:
+        var h = tid // HD
+        var d = tid % HD
+        var hb = (kv_head * GROUP + h) * HD
+        var qv: Float32
+        if d < HALF:
+            var a = q_src[unsafe_offset=hb + d]
+            var b = q_src[unsafe_offset=hb + d + HALF]
+            qv = a * cos_row[unsafe_offset=d] - b * sin_row[unsafe_offset=d]
+        else:
+            var a = q_src[unsafe_offset=hb + d - HALF]
+            var b = q_src[unsafe_offset=hb + d]
+            qv = b * cos_row[unsafe_offset=d] + a * sin_row[unsafe_offset=d]
+        s_q[unsafe_offset=h * HD + d] = qv
+    if tid < HALF:
+        var d = tid
+        var a = k_src[unsafe_offset=kv_head_base + d]
+        var b = k_src[unsafe_offset=kv_head_base + d + HALF]
+        var r1 = a * cos_row[unsafe_offset=d] - b * sin_row[unsafe_offset=d]
+        var r2 = b * cos_row[unsafe_offset=d + HALF] + a * sin_row[
+            unsafe_offset=d + HALF
+        ]
+        s_k[unsafe_offset=d] = r1
+        s_k[unsafe_offset=d + HALF] = r2
+        if tile == 0:
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d] = r1
+            k_store[unsafe_offset=upto * kv_cols + kv_head_base + d + HALF] = r2
+    if tid < HD:
+        if tile == 0:
+            v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = v_src[
+                unsafe_offset=kv_head_base + tid
+            ]
+    barrier()
+
+    # 2) scores：(key, 8 路 dim 分片) 布点，3 屏障树规约到 (jl, h, c=0)。
+    var jl = tid // KC
+    var c = tid % KC
+    if jl < jn:
+        var jj = j0 + jl
+        var kv8: SIMD[DType.float32, 8]
+        if jj == upto:
+            kv8 = s_k.load[8](c * KC)
+        else:
+            kv8 = k_store.load[8](jj * kv_cols + kv_head_base + c * KC)
+        for h in range(GROUP):
+            var qv8 = s_q.load[8](h * HD + c * KC)
+            var p = Float64(0)
+            for dd in range(KC):
+                p += Float64(qv8[dd]) * Float64(kv8[dd])
+            s_sc[unsafe_offset=(jl * SLOTS + h) * KC + c] = Float32(p)
+    barrier()
+    var st = KC // 2
+    while st > 0:
+        if jl < jn and c < st:
+            for h in range(GROUP):
+                s_sc[unsafe_offset=(jl * SLOTS + h) * KC + c] += s_sc[
+                    unsafe_offset=(jl * SLOTS + h) * KC + c + st
+                ]
+        barrier()
+        st //= 2
+
+    # 3) tile 局部 max（流式 softmax 基准）。
+    if SKIP < 1 and tid < GROUP * HD:
+        var h = tid // HD
+        var u = tid % HD
+        var m = LOWEST_FP32
+        var uu = u
+        while uu < jn:
+            var sc = s_sc[unsafe_offset=(uu * SLOTS + h) * KC] * scale
+            if sc > m:
+                m = sc
+            uu += HD
+        s_redf[unsafe_offset=h * HD + u] = m
+    barrier()
+    var st2 = HALF
+    while st2 > 0:
+        if tid < GROUP * st2:
+            var h = tid // st2
+            var u = tid % st2
+            if s_redf[unsafe_offset=h * HD + u + st2] > s_redf[
+                unsafe_offset=h * HD + u
+            ]:
+                s_redf[unsafe_offset=h * HD + u] = s_redf[
+                    unsafe_offset=h * HD + u + st2
+                ]
+        barrier()
+        st2 //= 2
+    if tid < GROUP:
+        s_m[unsafe_offset=tid] = s_redf[unsafe_offset=tid * HD]
+    barrier()
+
+    # 4) exp（局部基准）+ tile 局部和 → tsum。
+    var e = Float64(0)
+    if SKIP < 2 and tid < GROUP * HD:
+        var h = tid // HD
+        var u = tid % HD
+        if u < jn:
+            e = exp(
+                Float64(
+                    s_sc[unsafe_offset=(u * SLOTS + h) * KC] * scale
+                    - s_m[unsafe_offset=h]
+                )
+            )
+            s_e[unsafe_offset=h * HD + u] = e
+    s_red64[unsafe_offset=tid] = e
+    barrier()
+    st2 = CHMAX // 2
+    while st2 > 0:
+        if tid < GROUP * st2:
+            var h = tid // st2
+            var u = tid % st2
+            s_red64[unsafe_offset=h * CHMAX + u] += s_red64[
+                unsafe_offset=h * CHMAX + u + st2
+            ]
+        barrier()
+        st2 //= 2
+    if tid < GROUP:
+        tsum[unsafe_offset=(kv_head * GROUP + tid) * TILES + tile] = s_red64[
+            unsafe_offset=tid * CHMAX
+        ]
+    if tid < GROUP:
+        tmax[unsafe_offset=(kv_head * GROUP + tid) * TILES + tile] = s_m[
+            unsafe_offset=tid
+        ]
+
+    # 5) V 部分和：(head, dim) 布点，串行 tile keys（chunk 随 TILES 减半，
+    #    见探针 TILES 扫描）；当前 token 直读 v_src 免竞态。
+    var h5 = tid // HD
+    var d5 = tid % HD
+    if SKIP < 3 and h5 < GROUP:
+        var acc = Float64(0)
+        var uu = 0
+        while uu < jn:
+            var jj = j0 + uu
+            var vv: Float32
+            if jj == upto:
+                vv = v_src[unsafe_offset=kv_head_base + d5]
+            else:
+                vv = v_store[unsafe_offset=jj * kv_cols + kv_head_base + d5]
+            acc += s_e[unsafe_offset=h5 * HD + uu] * Float64(vv)
+            uu += 1
+        var head = kv_head * GROUP + h5
+        vpart[unsafe_offset=(head * TILES + tile) * HD + d5] = Float32(acc)
+
+
+def attn_comb3_gpu[TILES: Int](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    tmax: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    head_dim: Int32,
+) -> None:
+    """K3''（账本一百一十五-a，流式 softmax 归并）：attn_dec_gpu 的
+    tile 部分和各带局部 max 基准，合并须重标度——M = max m_t，
+    w_t = exp(m_t - M)，dst = (Σ vpart_t·w_t)/(Σ tsum_t·w_t)。
+    comb2 假设全局 gmax 基准一致，直接相加对流式部分和是错的
+    （探针 maxdiff 0.04 的真凶）。"""
+
+    var head = Int(block_idx.x)
+    var d = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    var s_w = stack_allocation[
+        TILES, Float64, address_space = AddressSpace.SHARED
+    ]()
+    # w_t 每 head 全 d 共享——线程 0 算一次入 smem（原版每 d 重复
+    # TILES 次 f64 exp，64× 冗余，f64 exp 软件模拟是计时的主嫌）。
+    if d == 0:
+        var m = LOWEST_FP32
+        for t in range(TILES):
+            var mt = tmax[unsafe_offset=head * TILES + t]
+            if mt > m:
+                m = mt
+        for t in range(TILES):
+            s_w[unsafe_offset=t] = exp(
+                Float64(tmax[unsafe_offset=head * TILES + t] - m)
+            )
+    barrier()
+    if d < hd:
+        var acc = Float64(0)
+        var gsum = Float64(0)
+        for t in range(TILES):
+            var w = s_w[unsafe_offset=t]
+            acc += Float64(vpart[unsafe_offset=(head * TILES + t) * hd + d]) * w
+            gsum += tsum[unsafe_offset=head * TILES + t] * w
+        dst[unsafe_offset=head * hd + d] = Float32(acc / gsum)
+
+
 def kv_store_b_gpu[THREADS: Int](
     q_rot: Pointer[Float32, MutUntrackedOrigin],
     q_src: Pointer[Float32, MutUntrackedOrigin],
