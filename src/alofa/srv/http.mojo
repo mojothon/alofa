@@ -68,6 +68,33 @@ def bytes_to_text(imm raw: List[UInt8], start: Int, stop: Int) -> String:
     return String(unsafe_from_utf8=out)
 
 
+def utf8_tail_safe_len(imm raw: List[UInt8]) -> Int:
+    """尾部完整 UTF-8 边界：最后一个**完整**字符之后的下标。
+
+    多字节字符跨 token 时，前缀解码的字节流尾部可能挂着半个字符——
+    那半个字符这一帧不发（下一帧凑齐再发）。`decode` 的丢尾行为
+    （遇不完整序列 break）与"截到最后完整边界"逐字节等价，所以
+    逐帧拼接仍等于整段 decode（账本一百三十三）。
+    """
+    var end = len(raw)
+    var back = 1
+    while back <= 4 and end - back >= 0:
+        var b = raw[end - back]
+        if (b & 0xC0) != 0x80:
+            var w = 1
+            if (b & 0xE0) == 0xC0:
+                w = 2
+            elif (b & 0xF0) == 0xE0:
+                w = 3
+            elif (b & 0xF8) == 0xF0:
+                w = 4
+            if back >= w:
+                return end
+            return end - back
+        back += 1
+    return end
+
+
 def lower_ascii(imm text: String) -> String:
     """只折叠 A–Z。HTTP 的头名与几个取值是大小写不敏感的，而路径与体不是。"""
     var raw = text.as_bytes()

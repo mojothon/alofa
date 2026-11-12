@@ -172,8 +172,14 @@ struct Tokenizer(Copyable, Movable):
             encode_piece(normalized, pieces[i], pieces[i + 1], self.vocab, self.merges, sink)
             i += 2
 
-    def decode(imm self, imm ids: List[Int]) raises -> String:
-        """Map ids back to text, replacing malformed UTF-8 as the reference does."""
+    def decode_bytes(imm self, imm ids: List[Int]) raises -> List[UInt8]:
+        """Map ids back to raw bytes — no UTF-8 validation, no truncation.
+
+        `decode` 校验 UTF-8 且遇不完整序列丢尾：流式前缀解码需要**字节
+        级**拼接（前缀关系只在字节层成立；decode 的丢尾会让多字节跨
+        token 的首帧破坏前缀性，CJK 真链暴露——账本一百三十三），帧尾
+        的完整边界截断由调用方做（`utf8_tail_safe_len`）。
+        """
         var bytes = List[UInt8]()
         var i = 0
         while i < len(ids):
@@ -189,7 +195,11 @@ struct Tokenizer(Copyable, Movable):
                 bytes.append(self.vocab.blob[k])
                 k += 1
             i += 1
+        return bytes^
 
+    def decode(imm self, imm ids: List[Int]) raises -> String:
+        """Map ids back to text, replacing malformed UTF-8 as the reference does."""
+        var bytes = self.decode_bytes(ids)
         var raw = String(unsafe_from_utf8=bytes)
         var text = List[UInt8]()
         var index = 0

@@ -1248,8 +1248,15 @@ struct GpuSession:
             var sin_row = self.d_sin.unsafe_ptr() + pos * self.head_dim
             # 两个 store 指针先落地局部变量 —— 同一 List 的两个下标表达式
             # 直接进发射会被 aliasing 检查当成潜在同源（账本六十三）。
-            var pk = self.d_k_store[layer].unsafe_ptr()
-            var pv = self.d_v_store[layer].unsafe_ptr()
+            # 一百三十三：KV 统一到**批 store 行 0**——批 store 布局
+            # [b][max_kv][kv_cols]，行 0 段与单路布局 [pos][kv_cols] 逐
+            # 字节同构（pos < max_kv 由 kv_len 检查保证）。旧行为写单路
+            # store（d_k_store），而 prefill_step 批路解码读批 store
+            # ——跨路径 KV 断层：纯流路冷启动读空 store 出数字噪声、
+            # generate_batch 先行"治愈"是残留恰同 prompt 的假象（复现
+            # 器 test_pool_repro.mojo 三个世界钉死）。
+            var pk = self.d_k_store_b[layer].unsafe_ptr()
+            var pv = self.d_v_store_b[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
                 comptime if attn_tiles < 0:
                     # 负 tiles = 旧 K2/K3（八十二，8× 冗余 softmax），留 A/B 复现。
@@ -1617,7 +1624,6 @@ struct GpuSession:
         返回 host logits 指针（末行，下次调用前有效）。
         """
         var t = len(tokens)
-        print("prefill batch=", batch)
         if t == 0:
             raise AlofaError(ERR_INVALID_ARGUMENT, "no tokens given", "")
         if t > PREFILL_MAX_BATCH:
@@ -1969,10 +1975,15 @@ struct GpuSession:
                 ltri = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # attention 三趟 b 版：grid z = t
-            var pk = self.d_k_store[layer].unsafe_ptr()
-            var pv = self.d_v_store[layer].unsafe_ptr()
+            # 一百三十三：pk/pv 一律指批 store 行 0（与 decode_step 同步
+            # 统一）——单路 prefill 的 KV 从此与批路解码步、generate_batch
+            # 共读同一块 store，跨路径链（单路 prefill → 批解码步）成立。
+            # 行 0 段与单路布局 [pos][kv_cols] 逐字节同构（pos < max_kv
+            # 由 kv_len 检查保证）。单路 store（d_k_store）退役保留。
             # store 与 scores 分跨 launch 边界（同 launch 跨 block 写读
             # store 行是竞态：行 b 读 pos0..pos0+b-1，全由本批写入）。
+            var pk = self.d_k_store_b[layer].unsafe_ptr()
+            var pv = self.d_v_store_b[layer].unsafe_ptr()
             if batch:
                 self.ctx.enqueue_function[kv_store_bb_gpu[attn_t]](
                     self.d_qrot_b.unsafe_ptr(),

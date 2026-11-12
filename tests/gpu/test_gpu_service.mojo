@@ -70,13 +70,10 @@ def main() raises:
     var tokenizer = load_tokenizer_json(TOKJSON)
     # 门侧比对用的第二份（第一份被 ^ 移进 svc，Mojo 移动后不可再用）。
     var tok2 = load_tokenizer_json(TOKJSON)
-    # ⚠️ 池参数退回 1（账本一百三十二）：池架构本身全绿，但 session 层
-    # 有既有盲区——「单路 prefill(batch=False) 写的 KV 与批路解码步读的
-    # KV」从未被门独立验过，跨流残留渗入（test_pool_repro.mojo 钉着三
-    # 个世界 + 判别炮数据）。sessions=2 的交替同链判据（⑦）待一百三十
-    # 三修复后恢复复跑。
+    # 池 = 2（一百三十三 KV 统一修复后恢复）：两条流真并发（⑦），
+    # 第三条指名拒绝。
     var svc = GpuService(
-        model, 1, 512, tokenizer^, 151936, 42,
+        model, 2, 512, tokenizer^, 151936, 42,
         WEIGHTS, CONFIG, TOKJSON,
     )
 
@@ -136,13 +133,16 @@ def main() raises:
         print("mismatch NOT caught!")
     except e:
         print("mismatch raised ok")
-    # sessions=1（见上注）：第二条流指名拒绝（与 129 语义一致）。
+    # 池=2：第二条流落到另一个坑，**成功**；第三条才拒。
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 9)
+    print("second stream admitted ok")
     try:
-        svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 9)
+        svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 10)
         sem_ok = False
-        print("second stream NOT rejected!")
+        print("third stream NOT rejected!")
     except e:
-        print("second stream rejected ok")
+        print("third stream rejected ok")
+    svc.stream_end(9)
     svc.stream_end(7)
     svc.stream_end(7)  # 幂等
     # done 后继续问仍 done（max_tokens=3 的短流）
@@ -223,6 +223,57 @@ def main() raises:
     if not c_ok:
         sem_ok = False
 
+    # ---- ⑦ 池并发：两条流交替推进，各自与独跑逐位同链 ----
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 61)   # 坑 0
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 62)          # 坑 1
+    var ia = List[Int]()
+    var ib = List[Int]()
+    var done_a = False
+    var done_b = False
+    while (not done_a) or (not done_b):
+        if not done_a:
+            var fra = svc.stream_next(61)
+            ia.append(svc.streams[0].last)
+            if fra.done:
+                done_a = True
+        if not done_b:
+            var frb = svc.stream_next(62)
+            ib.append(svc.streams[1].last)
+            if frb.done:
+                done_b = True
+    svc.stream_end(61)
+    svc.stream_end(62)
+    var inter_ok = len(ia) == len(chain1) and len(ib) == len(cchain)
+    if inter_ok:
+        for i in range(len(ia)):
+            if ia[i] != chain1[i]:
+                inter_ok = False
+                print("interleave A diverge at", i)
+                break
+    if inter_ok:
+        for i in range(len(ib)):
+            if ib[i] != cchain[i]:
+                inter_ok = False
+                print("interleave B diverge at", i)
+                break
+    print("interleave: a", len(ia), "b", len(ib), " same-as-solo:", inter_ok)
+
+    # complete 在池里占坑：一条流占着 → 用另一条；两条全占 → 指名拒绝。
+    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 71)
+    var comp_busy = svc.complete(PROMPT, 8, 0.0, 1.0)
+    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 72)
+    var busy_rejected = False
+    try:
+        _ = svc.complete(PROMPT, 8, 0.0, 1.0)
+    except e:
+        busy_rejected = True
+    svc.stream_end(71)
+    svc.stream_end(72)
+    print("complete-while-busy:", comp_busy.completion_tokens,
+          "tokens | full-pool complete rejected:", busy_rejected)
+    if not busy_rejected:
+        sem_ok = False
+
     # ---- ③ 采样流式（T=1, top_p=0.9 参数面）：确定 + 异种子变异 ----
     var s1 = _sample_run(svc, 21)
     var s2 = _sample_run(svc, 22)
@@ -249,8 +300,8 @@ def main() raises:
 
     print("parity:", same1, " join:", join_ok, " det:", det,
           " sem_ok:", sem_ok, " eos_ok:", eos_ok, " cjk:", c_ok,
-          " sdet:", sdet, " svar:", svar)
-    if same1 and det and sem_ok and eos_ok and c_ok and sdet and svar:
+          " inter:", inter_ok, " sdet:", sdet, " svar:", svar)
+    if same1 and det and sem_ok and eos_ok and c_ok and inter_ok and sdet and svar:
         print("*** GPU SERVICE GATE PASS ***")
     else:
         print("*** GPU SERVICE GATE FAIL ***")

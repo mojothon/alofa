@@ -45,7 +45,7 @@ from max.gpu.host import DeviceContext
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
-from alofa.srv.http import bytes_of_text, bytes_to_text
+from alofa.srv.http import bytes_to_text, utf8_tail_safe_len
 from alofa.srv.openai import NO_REQUEST, Completion, Service
 from alofa.srv.sse import StreamToken
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
@@ -367,14 +367,18 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.streams[slot].last = tok
         self.streams[slot].count += 1
         self.streams[slot].pos += 1
-        # 整段前缀解码减已发字节（CPU 路 `_new_text` 同法）。
-        var full = bytes_of_text(self.tokenizer.decode(self.streams[slot].out))
+        # 整段前缀解码减已发字节——**字节级**（一百三十三）：decode 会把
+        # 尾部不完整 UTF-8 丢掉，破坏前缀性（多字节跨 token 的首帧即翻
+        # 车，CJK 真链暴露）；decode_bytes 纯拼接 + 帧尾边界截断，帧内
+        # 恒完整，逐帧拼接恒等于整段 decode。
+        var full = self.tokenizer.decode_bytes(self.streams[slot].out)
+        var safe = utf8_tail_safe_len(full)
         var emitted = self.streams[slot].emitted
-        if emitted > len(full):
+        if emitted > safe:
             # 不该发生（前缀只会变长）。真发生了就从头对齐。
             emitted = 0
-        var text = bytes_to_text(full, emitted, len(full))
-        self.streams[slot].emitted = len(full)
+        var text = bytes_to_text(full, emitted, safe)
+        self.streams[slot].emitted = safe
         if self.streams[slot].count >= self.streams[slot].steps:
             return StreamToken(text, True, False)
         return StreamToken(text, False, False)

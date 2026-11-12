@@ -74,7 +74,7 @@ from std.ffi import dlsym, external_call
 from std.memory import Pointer
 from alofa.srv.config import env_int, env_str, ServeConfig
 from alofa.srv.engine_thread import alloc_churn, Twinable, heap_place
-from alofa.srv.http import bytes_of_text, bytes_to_text
+from alofa.srv.http import bytes_of_text, bytes_to_text, utf8_tail_safe_len
 from alofa.srv.loop import MAX_CONNS, Loop
 from alofa.srv.master import run_workers
 from alofa.core.ffi.mem import raise_stack_limit
@@ -1055,14 +1055,19 @@ struct ModelService(Service, Twinable):
         会**不等于**非流式那份。整段前缀解码的代价是每步重解一遍（步数 ≤ 256，
         几十 KB），换来的是两边逐字节一致。
         """
-        var full = bytes_of_text(self.tokenizer.decode(self.stream_out))
+        # 一百三十三：改字节级拼接 —— decode 遇不完整 UTF-8 丢尾，多字节
+        # 跨 token 的首帧会破坏前缀性（GPU 路 CJK 真链暴露，同病同修）；
+        # decode_bytes 纯拼接 + 帧尾边界截断（utf8_tail_safe_len），帧内
+        # 恒完整，拼接恒等于整段 decode。
+        var full = self.tokenizer.decode_bytes(self.stream_out)
+        var safe = utf8_tail_safe_len(full)
         var sent = self.stream_emitted
-        if sent > len(full):
+        if sent > safe:
             # 不该发生（前缀只会变长）。真发生了就从头对齐，而不是带着一个错的
             # 偏移量继续 —— 那个偏移会让后面每一帧都错。
             sent = 0
-        self.stream_emitted = len(full)
-        return bytes_to_text(full, sent, len(full))
+        self.stream_emitted = safe
+        return bytes_to_text(full, sent, safe)
 
 
 comptime _OpaquePtr = Pointer[UInt8, MutUntrackedOrigin]
