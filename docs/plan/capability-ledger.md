@@ -3703,3 +3703,8 @@
   - **判据四项**：①3 session 共享单 ctx 各自完整 generate_batch（125 前必崩形态）✓；②**跨 session 同输入同输出**（parity 零失配，220/16/15 已知链吻合——多路复用无状态串扰）✓；③**穿插负载后确定性保持**（b/c 跑其他负载不影响 a 的输出——session 私有 KV/激活隔离成立）✓；④大负载轮转（B=8×24 token，rep 平移 prompt，a/b/c 各一轮）全部 192/192 有效 token、链各异 ✓。
   - **结论**：125 的共享 ctx 多路复用在真实混合负载下成立。单进程 3 session（~28.5GB/40GB 卡）× 各自 B=8 连续批处理 = 可部署形态。剩余瓶颈是权重各持一份（~9.5GB/session）——跨 session 权重共享（一百二十七候选①）可把 3 session 压到 ~12GB。
   - **坑册**：host 函数参数类型注解（本阶段第 N 次）——Mojo 无隐式推断，def 参数一律要注。
+- **2026-11-12（一百二十七）** —— per-session 显存决算：**9.5GB 误读修正，真实 3.36GB/session**——权重共享立项前提证伪，降级
+  - **⚠️ 账目修正**：125/126 账目里"~9.5GB/session"是 GPU4 读数的延续误读（27.9GB 是 vLLM Worker 占用，从未是我们的 3 session）。**源码字节决算**（Qwen2.5-0.5B，BMAX=64，mb=128）：权重类 2.49GB（w16 716 + wp 705 + embed 545 + embed16 272 + q4 201 + wp_qkv 50 MB）+ KV 类 0.82GB（批 store 805MB 主导）+ 激活类 0.05GB = **3.36GB/session**。3 session = 10.08GB。
+  - **权重共享收益重估**：3 session 10.08→6.60GB（省 34%）；40GB 卡密度从 ~11 session → ~17 session。**中收益、高工程量**（Mojo 非拷贝 DeviceBuffer 跨 session 共享需手动生命周期管理，double-free 雷区）——**降级到 KV 压缩之后**。126"密度翻倍"判断作废。
+  - **环境坑册（重要）**：**AsyncRT 用 VMM（cuMemCreate/Map）惰性提交物理页**——nvidia-smi 对我们的进程报 ~0MiB（probe_mem 实证：三负载 192/192 正常运行、采样窗口内 GPU3 恒 17MiB），但同卡他方进程（非 VMM 路径）正常显示。**本环境 nvidia-smi 不可用于自家显存记账**； VirtualMemory 决算（源码尺寸求和）才是可靠手段。显存余量判断从此用决算公式：`N_session × 3.36GB + KV 变量项`。
+  - probe_mem 探针（1 session 负载 → 停顿 → 3 session 负载 → 停顿）留档。
