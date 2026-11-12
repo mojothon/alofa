@@ -205,6 +205,7 @@ struct ModelService(Service, Twinable):
     # 活⇒写者在 decide/forward 或 pick；崩⇒写者在 choices 写或 settle。
     var cut_decide: Bool
     var stream_temp: Float64
+    var stream_topp: Float64
     var stream_started: Bool
     # 在途那条流的**请求号**（`NO_REQUEST` = 没有）。这一整块状态只属于它 ——
     # `stream_next` / `stream_end` 每次都核对，号对不上就红而不是"接着给另一条流
@@ -322,6 +323,7 @@ struct ModelService(Service, Twinable):
         self.cut_decide = env_str("ALOFA_ET_CUT_DECIDE", "0") == "1"
         self.engine.cut_fwd = env_str("ALOFA_ET_CUT_FWD", "0") == "1"
         self.stream_temp = 0.0
+        self.stream_topp = 1.0
         self.stream_started = False
         self.stream_request = NO_REQUEST
         self.stream_touched = 0
@@ -425,7 +427,11 @@ struct ModelService(Service, Twinable):
         return heap_place(twin^)
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         self.model.reset()
         var ids = self.tokenizer.encode(prompt)
@@ -454,6 +460,7 @@ struct ModelService(Service, Twinable):
         var n_vocab = self.vocab
         var params = SampleParams()
         params.temperature = temperature
+        params.top_p = top_p
 
         var logits = self.model.prefill[BACKEND_AVX2](ids)
         for t in range(steps):
@@ -564,6 +571,10 @@ struct ModelService(Service, Twinable):
         self.stream_last = 0
         self.stream_emitted = 0
         self.stream_temp = temperature
+        # top_p 存在字段上、在 _pick 里落到 params：批路（910 行那处采样）
+        # 与流式共用同一份 params，批路不带 topp——在它那处显式回 1.0，
+        # 不让上一条流的选择漏进去。
+        self.stream_topp = top_p
         self.stream_started = False
         self.params.temperature = temperature
         self.rng = Rng(UInt64(self.seed))
@@ -908,6 +919,8 @@ struct ModelService(Service, Twinable):
         for j in range(self.b_n[slot]):
             hist.append(self.b_out[slot * MAX_GEN + j])
         self.params.temperature = self.b_temp[slot]
+        # 批路不带 topp（上一条流的 top_p 不许漏进这里）。
+        self.params.top_p = 1.0
         self.sampler.build(logits, self.vocab, self.params, List[LogitBias](), hist)
         var rng = Rng(self.b_rng[slot])
         var u = rng.next_uniform()
@@ -1028,6 +1041,7 @@ struct ModelService(Service, Twinable):
         """从一行 logits 里取一个 id：贪心或按温度采样（与非流式同一个分支）。"""
         if self.stream_temp <= 0.0:
             return self.model.argmax(logits)
+        self.params.top_p = self.stream_topp
         self.sampler.build(
             logits, self.vocab, self.params, List[LogitBias](), self.stream_out
         )

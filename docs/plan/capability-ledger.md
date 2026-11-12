@@ -3720,3 +3720,10 @@
   - **HTTP 冒烟**（GPU3 实机，端口 8123）：非流式 OpenAI JSON 全字段（usage 39+24 tokens，"France is a country in Europe. The capital of France is Paris."）+ SSE 逐帧流 ✓。**GPU 路至此是可被任意 OpenAI 客户端调用的服务**。
   - **坑册**：①flare 网络层 `dlopen("build/libflare_tls.so")` 是**字面相对路径**——裸 bash（无 pixi 激活）跑服务需 repo 根 `build/` 软链到 `$PIXI_ENV/lib/libflare_tls.so`（远端已建）；②tokenizer 经 `^` 移入构造器后不可再用——门里比对要第二份 `load_tokenizer_json`；③Mojo 自由函数返回 List 需 `return l^`（ImplicitlyCopyable 缺席第 N 次）。
   - **v0 限制（明账）**：窗口 comptime 固定 512（形状实参编译期，env 改不动）；top_p 未接 OpenAI 参数面（s_topp 字段直写，门里验证过语义）；引擎线程路未接（spawn_twin 已实现，多线程共用 ctx 的并发安全未验证）；eos 终止未接（GPU_EOS=200000 哨兵，max_tokens 是唯一终点）。
+- **2026-11-13（一百三十）** —— 参数面补全：**top_p 接 OpenAI 参数面 + eos 终止**
+  - **top_p**：`Service` trait 两方法加 `top_p: Float64`（三实现协同改：GpuService / CPU ModelService / 无权重 Stub×5）；`ChatRequest` 解析 `top_p`（默认 1.0）+ 校验 (0,1] 越界指名 400（实机 curl `top_p=1.5` 验过）。CPU 路：complete 走 `SampleParams.top_p`（Sampler 本就支持）、流式经 `_pick` 落地；⚠️ **批路与流式共用同一份 params——批路采样处显式回 1.0**，不许上一条流的 top_p 漏进去。GPU 路：解码步 tail 直透。
+  - **eos**：`GpuService.eos` 可写字段，默认 `<|im_end|>`=151645（fixture special.tsv 第 3 行钉着十六进制；真正导出层建好前先钉值）。流式：采出 eos 直接收流、**不吐文本**、done 后仍 done。complete 侧挖出一个**真语义**：generate_batch 停行时把 **eos 本身**记进行里、其后剩余步以 `NO_TOKEN(=-1)` 填充——两样都滤掉后 complete 与流式**严格同链同文本**（门实测 2==2）。
+  - **门**：GPU SERVICE GATE 全绿（parity/det/sem + 新增 eos 判据：链中一枚冒充 eos → 流第 3 帧收、complete tokens==2；top_p 走参数面的采样确定性）；test_openai（解析/校验/替身）PASS；CPU 回归 test_http_server / test_loop_server / test_workers 全 PASS。
+  - **挖出存量红（非本次回归，静态考古定案）**：`test_workers` 期望 `content:"S:hi"`——`cba53a8`（9月23 10:41）把 ChatML 渲染挪进解析器，Service 收到的 prompt 是完整 ChatML，Stub 原样回显；该门自那以后没再跑过（不在常规门集里），期望停在渲染前。本次顺手修正为渲染后语义（`S:<|im_start|>system` + user 段）。**教训：不在常规门集里的门会静默腐烂——test_workers 该进回归集。**
+  - **HTTP 冒烟**：temp=1.0/top_p=0.9 走参数面 200 ✓；top_p=1.5 → 指名 400 ✓；temp=0 max_tokens=48 未吐 im_end → finish_reason=length（正确——eos 生效与否取决于模型是否吐出，代码路已单元级钉死）。
+  - **遗留**：eos 从 tokenizer/config 导出的导出层（现为钉值）；GPU 流式 `_new_text` 式增量解码（多字节跨 token 的逐帧文本，现为单 token decode——BPE 多字节字符跨 token 时流式帧可能出现乱码碎片，整段拼接仍正确；CPU 路的整段前缀解码法是正解，待搬）。

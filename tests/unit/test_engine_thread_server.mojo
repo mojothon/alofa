@@ -188,7 +188,11 @@ struct SlowStub(Service, Twinable):
         self.ends = 0
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         if prompt.find("slow") >= 0:
             _ = external_call["usleep", Int32](Int32(SLOW_MS * 1000))
@@ -207,6 +211,7 @@ struct SlowStub(Service, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         self.stream_max = max_tokens

@@ -70,7 +70,11 @@ struct Stub(Service, Twinable):
         self.ends = 0
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         var n = max_tokens
         if self.give >= 0:
@@ -86,6 +90,7 @@ struct Stub(Service, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         self.stream_max = max_tokens
@@ -258,7 +263,10 @@ def main() raises:
         assert_true(
             chat.find("HTTP/1.1 200 OK\r\n") == 0, "not a 200: " + chat
         )
-        assert_true(chat.find("\"content\":\"S:hi\"") >= 0, chat)
+        assert_true(
+            chat.find("\"content\":\"S:<|im_start|>system") >= 0, chat
+        )
+        assert_true(chat.find("<|im_start|>user\\nhi<|im_end|>") >= 0, chat)
         assert_true(chat.find("\"finish_reason\":\"length\"") >= 0, chat)
         assert_framed(chat, "keep-alive")
 

@@ -6,14 +6,17 @@ GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
    decode 的文本逐位一致（complete 不回 token 序列，decode 是双方向
    都过 tokenizer 的可比面；BPE 不双射不影响"同链 ⇒ 同文本"）；
 ② 流式贪心重放逐位确定（同 prompt 两次）；
-③ 采样流式（T=1, top_p=0.9）同种子逐位复现、异种子变异；
+③ 采样流式（T=1, top_p=0.9 **走参数面**）同种子逐位复现、异种子
+   变异；
 ④ 协议语义：错号 stream_next 指名红；拒第二条流；done 后继续问仍
-   done=True；stream_end 幂等。
+   done=True；stream_end 幂等；
+⑤ eos 终止：把链中一枚冒充 eos，流在第 3 帧收、不吐文本、done 后
+   仍 done；complete 同一把刀。
 """
 
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
-from alofa.srv.gpu_service import GpuService
+from alofa.srv.gpu_service import DEFAULT_EOS, GpuService
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
 
 comptime WEIGHTS = "tests/fixtures/qwen2.5-0.5b/weights"
@@ -24,9 +27,8 @@ comptime MAXNEW = 24
 
 
 def _sample_run(mut svc: GpuService, rid: Int) raises -> List[Int]:
-    """T=1, top_p=0.9 的一条流，收 token 序列。"""
-    svc.stream_begin(PROMPT, 16, 1.0, rid)
-    svc.s_topp = 0.9
+    """T=1, top_p=0.9（**参数面**）的一条流，收 token 序列。"""
+    svc.stream_begin(PROMPT, 16, 1.0, 0.9, rid)
     var s = List[Int]()
     while True:
         var fr = svc.stream_next(rid)
@@ -49,11 +51,11 @@ def main() raises:
     )
 
     # ---- ① 流式贪心 vs complete（文本可比面）----
-    var comp = svc.complete(PROMPT, MAXNEW, 0.0)
+    var comp = svc.complete(PROMPT, MAXNEW, 0.0, 1.0)
     print("complete tokens:", comp.completion_tokens)
     print("complete text:", comp.text)
 
-    svc.stream_begin(PROMPT, MAXNEW, 0.0, 0)
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 0)
     var chain1 = List[Int]()
     while True:
         var fr = svc.stream_next(0)
@@ -70,7 +72,7 @@ def main() raises:
               "vs complete", comp.completion_tokens)
 
     # ---- ② 重放逐位确定 ----
-    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1)
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 1)
     var chain2 = List[Int]()
     while True:
         var fr = svc.stream_next(1)
@@ -89,7 +91,7 @@ def main() raises:
 
     # ---- ④ 协议语义 ----
     var sem_ok = True
-    svc.stream_begin(PROMPT, MAXNEW, 0.0, 7)
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 7)
     try:
         _ = svc.stream_next(8)
         sem_ok = False
@@ -97,7 +99,7 @@ def main() raises:
     except e:
         print("mismatch raised ok")
     try:
-        svc.stream_begin(PROMPT, MAXNEW, 0.0, 9)
+        svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 9)
         sem_ok = False
         print("second stream NOT rejected!")
     except e:
@@ -105,7 +107,7 @@ def main() raises:
     svc.stream_end(7)
     svc.stream_end(7)  # 幂等
     # done 后继续问仍 done（max_tokens=3 的短流）
-    svc.stream_begin(PROMPT, 3, 0.0, 11)
+    svc.stream_begin(PROMPT, 3, 0.0, 1.0, 11)
     var tail_done = True
     var n_done_at = -1
     for i in range(6):
@@ -120,7 +122,46 @@ def main() raises:
     if n_done_at != 2 or not tail_done:
         sem_ok = False
 
-    # ---- ③ 采样流式（T=1, top_p=0.9）：确定 + 异种子变异 ----
+    # ---- ⑤ eos 终止：链中一枚冒充 eos ----
+    var eos_ok = True
+    svc.eos = chain1[2]
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 31)
+    var echain = List[Int]()
+    var e_done_at = -1
+    for i in range(MAXNEW + 2):
+        var fre = svc.stream_next(31)
+        if fre.done and e_done_at < 0:
+            e_done_at = i
+        if not fre.done:
+            echain.append(svc.s_last)
+    var e_text = tok2.decode(echain)
+    # 参照前缀（List 切片出 Span，decode 只收 List）。
+    var pref = List[Int]()
+    for i in range(len(echain)):
+        pref.append(chain1[i])
+    var pre2 = List[Int]()
+    pre2.append(chain1[0])
+    pre2.append(chain1[1])
+    # 之后再问仍 done
+    var fre2 = svc.stream_next(31)
+    if not fre2.done:
+        eos_ok = False
+    svc.stream_end(31)
+    var eos_complete = svc.complete(PROMPT, MAXNEW, 0.0, 1.0)
+    print("eos stream: done at", e_done_at, "len", len(echain),
+          "text prefix ok:", e_text == tok2.decode(pref),
+          "| complete tokens:", eos_complete.completion_tokens,
+          "(expect", len(echain), ")")
+    if e_done_at != 2 or len(echain) != 2:
+        eos_ok = False
+    var ctok = eos_complete.completion_tokens
+    if ctok != len(echain) and ctok != len(echain) + 1:
+        eos_ok = False
+    if e_text != tok2.decode(pre2):
+        eos_ok = False
+    svc.eos = DEFAULT_EOS
+
+    # ---- ③ 采样流式（T=1, top_p=0.9 参数面）：确定 + 异种子变异 ----
     var s1 = _sample_run(svc, 21)
     var s2 = _sample_run(svc, 22)
     var sdet = len(s1) == len(s2)
@@ -145,8 +186,8 @@ def main() raises:
           " lens:", len(s1), len(s2), len(s3))
 
     print("parity:", same1, " det:", det, " sem_ok:", sem_ok,
-          " sdet:", sdet, " svar:", svar)
-    if same1 and det and sem_ok and sdet and svar:
+          " eos_ok:", eos_ok, " sdet:", sdet, " svar:", svar)
+    if same1 and det and sem_ok and eos_ok and sdet and svar:
         print("*** GPU SERVICE GATE PASS ***")
     else:
         print("*** GPU SERVICE GATE FAIL ***")

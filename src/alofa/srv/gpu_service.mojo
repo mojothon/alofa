@@ -55,9 +55,11 @@ alias GPU_MAX_TOKENS = 512
 alias GPU_MB = 1
 alias GPU_ATTN_TILES = 8
 
-# 「永远打不到」的 eos 哨兵（与各门同值）：门里不测 eos 终止，服务侧
-# 先不接 eos 分支——max_tokens 是唯一终点。
-alias GPU_EOS = 200000
+# eos 默认值：Qwen2.5 chat 的 `<|im_end|>`（= 151645，fixture
+# special.tsv 第 3 行钉着十六进制 3c7c696d5f656e647c3e）。它是**可写字段**
+# （门里用"取链中一枚冒充 eos"来钉终止分支），不是编译期常量——真正
+# 的 eos 该从 tokenizer/配置里导出，导出层建好前先用这个值。
+alias DEFAULT_EOS = 151645
 
 
 struct GpuService(Service, Movable, Deinitable, Twinable):
@@ -83,6 +85,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var s_seed: Int
     var s_started: Bool
     var s_pos: Int
+    var eos: Int
 
     def __init__(
         out self,
@@ -113,6 +116,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.s_seed = seed
         self.s_started = False
         self.s_pos = 0
+        self.eos = DEFAULT_EOS
 
     def spawn_twin(self, index: Int) raises -> Int:
         """engine 线程路的那份"自己"：自己的 session（q4 重传）+ 共享
@@ -135,7 +139,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     # ---- Service 协议 ----------------------------------------------------
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         """非流式：一次 `generate_batch` 到终点（连续批处理 v2，单行）。"""
         var ids = self.tokenizer.encode(prompt)
@@ -159,14 +167,23 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             ids^,
             lens^,
             max_tokens,
-            GPU_EOS,
+            self.eos,
             List[Int](),
             List[Int](),
             Float32(temperature),
             Int32(self.seed),
+            Float32(top_p),
         )
-        var n_out = len(out)
-        var text = self.tokenizer.decode(out)
+        # eos 停行之后，generate_batch 把** eos 本身**记进该行（其后剩余步
+        # 以 NO_TOKEN(=-1) 填充，executor 的哨兵）——两样都不进 decode：
+        # eos 的文本是控制序列，不是内容；决算只数真 token。这样
+        # complete 与流式（eos 那帧不吐文本）严格同链同文本。
+        var real = List[Int]()
+        for i in range(len(out)):
+            if out[i] >= 0 and out[i] != self.eos:
+                real.append(out[i])
+        var n_out = len(real)
+        var text = self.tokenizer.decode(real^)
         return Completion(text, len(ids), n_out)
 
     def stream_begin(
@@ -174,6 +191,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         """只准备，不走前向（前向在第一次 stream_next——那里还能回 400）。"""
@@ -207,7 +225,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.s_count = 0
         self.s_last = 0
         self.s_temp = Float32(temperature)
-        self.s_topp = 1.0
+        self.s_topp = Float32(top_p)
         self.s_seed = self.seed
         self.s_started = False
         self.s_pos = 0
@@ -259,6 +277,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         )
         self.session.ctx.synchronize()
         tok = Int(self.session.h_tokout[0])
+        if tok == self.eos:
+            # eos 不吐（它的文本是控制序列，不是内容）：直接收流。
+            # done 后继续问仍 done=True（协议契约）。
+            self.s_count = self.s_steps
+            return StreamToken("", True, False)
         self.s_last = tok
         self.s_count += 1
         self.s_pos += 1

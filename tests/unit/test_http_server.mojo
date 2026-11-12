@@ -82,7 +82,11 @@ struct Stub(Service, Twinable):
         self.ends = 0
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         var n = max_tokens
         if self.give >= 0:
@@ -98,6 +102,7 @@ struct Stub(Service, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         self.stream_max = max_tokens

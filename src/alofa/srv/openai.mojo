@@ -145,7 +145,11 @@ trait Service:
     """
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         ...
 
@@ -154,6 +158,7 @@ trait Service:
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         """开始一次流式生成：**只做校验与准备，不走前向**。
@@ -187,6 +192,7 @@ struct ChatRequest(Movable):
     var prompt: String
     var max_tokens: Int
     var temperature: Float64
+    var top_p: Float64
     var stream: Bool
 
     def __init__(out self):
@@ -194,6 +200,8 @@ struct ChatRequest(Movable):
         self.prompt = ""
         self.max_tokens = DEFAULT_MAX_TOKENS
         self.temperature = DEFAULT_TEMPERATURE
+        # OpenAI 默认 1.0 = 不截断（与 HF 同口径，见 runtime/sampler.mojo）。
+        self.top_p = 1.0
         self.stream = False
 
 
@@ -529,6 +537,10 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
             var digits = List[UInt8]()
             _read_number_text(raw, at, digits)
             request.temperature = parse_float64(String(unsafe_from_utf8=digits))
+        elif name == "top_p":
+            var digits = List[UInt8]()
+            _read_number_text(raw, at, digits)
+            request.top_p = parse_float64(String(unsafe_from_utf8=digits))
         elif name == "stream":
             request.stream = _read_bool(raw, at)
         else:
@@ -573,6 +585,12 @@ def parse_chat_request(imm body: String) raises -> ChatRequest:
             ERR_INVALID_ARGUMENT,
             "temperature must not be negative",
             "value=" + String(request.temperature),
+        )
+    if request.top_p <= 0.0 or request.top_p > 1.0:
+        raise AlofaError(
+            ERR_INVALID_ARGUMENT,
+            "top_p must be in (0, 1]",
+            "value=" + String(request.top_p),
         )
 
     # prompt 的形状交给渲染器（见文件头「`role` 是怎么变成 prompt 的」）。这里不再
@@ -856,7 +874,7 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
             return self.begin_stream(chat, request)
 
         var completion = self.service.complete(
-            chat.prompt, chat.max_tokens, chat.temperature
+            chat.prompt, chat.max_tokens, chat.temperature, chat.top_p
         )
         var model = self.model
         if chat.model.byte_length() > 0:
@@ -899,7 +917,8 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         if env_str("ALOFA_ET_CUT_SVC", "0") != "1":
             try:
                 self.service.stream_begin(
-                    chat.prompt, chat.max_tokens, chat.temperature, request
+                    chat.prompt, chat.max_tokens, chat.temperature, chat.top_p,
+                    request,
                 )
             except err:
                 # `stream_begin` 只做校验，所以这里的错都是**请求**的错（prompt 分词

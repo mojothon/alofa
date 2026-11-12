@@ -79,7 +79,11 @@ struct Stub(Service, Twinable):
         self.refuse = refuse
 
     def complete(
-        mut self, prompt: String, max_tokens: Int, temperature: Float64
+        mut self,
+        prompt: String,
+        max_tokens: Int,
+        temperature: Float64,
+        top_p: Float64,
     ) raises -> Completion:
         self.calls += 1
         var n = max_tokens
@@ -100,6 +104,7 @@ struct Stub(Service, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         self.begins += 1
