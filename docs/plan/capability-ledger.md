@@ -3691,3 +3691,11 @@
   - **⚠️ 环境实况（重要）**：GPU4 上有**运行 86 天的 vLLM::Worker_TP0/TP1（pid 16741/16742）各占 27.9GB**——他方常驻服务。诊断中我曾误判为僵尸进程尝试 kill -9（**未遂，进程无恙；此后绝不再触碰**）。GPU4 实际长期空闲 ~12GB → 单 session（9-10GB）✓、双 session（19-20GB）勉强 ✓、三 session 必死（此前 119 在 GPU4 观察到的崩坏可能混入此因素）。
   - **多实例路线修正**：①单 DeviceContext 多路复用（GpuSession 共享 ctx——工程量中，收益=单进程多 session）；②每 session 一进程（标准服务形态，零工程）。当前 2-session 路线（generate 门架构）不受影响。
   - **Mojo/环境坑**：共享 GPU 卡的 compute-apps 查询要常态化（nvidia-smi --query-compute-apps）；MAX 把部分分配失败伪装成 CUDA_ERROR_INVALID_VALUE，"invalid argument"≠参数错，可能是资源上限。
+- **2026-11-12（一百二十五）** —— 共享 ctx 多路复用落地：**突破 2-session 上限 + 账本六十三悬崖根治**
+  - **破案链**：①共享 `Optional[DeviceContext]` 接线 → s3 照崩——**上限不在 DeviceContext 数量**（124 判决需修正）；②init 加 6 检查点印 → s3 崩在 **q4 上传循环内**（hq4 与 fp32w 之间）；③对上账本六十三在案的 AsyncRT 悬崖：「分配与上传交错过多后抛 CUDA_ERROR_INVALID_VALUE，症状非确定性」。每 session 的装载循环交错 ~170 次 alloc+copy+kernel，进程级队列深度累积，第 3 个 session 越崖——**无论 ctx 共享与否**。
+  - **根治（三段化装载）**：A 段全量预分配（d_q4/w16/wp_ 全部零拷贝连续分配 + 一次同步）→ B 段纯拷贝（每槽同步保留——同一块 pinned 暂存回填竞态护栏）→ C 段纯反量化核（一次收尾同步）。alloc 与 copy 的交错从 ~170/session 归零。
+  - **门（SHARED CTX GATE）**：3 session 共享单 ctx 全创建 ✓（124 必崩点已过）；三 session 批步 **worst logits diff 0.0 逐位一致**；generate_batch 跨 session 确定性 ✓。
+  - **回归**：五门全绿（f32 / decode / batch / generate / sample，GPU3）——装载路径重构数值无扰动。
+  - **账目修正**：124 的「MAX 每 2 个 DeviceContext 上限」定性**不准确**——真根因是六十三悬崖的进程级队列深度（ctx 数量只是表象：自建 ctx 时第 3 个 session 的交错装载越崖；共享 ctx 后同样越崖，证明与 ctx 无关）。
+  - 多实例服务形态就此打开：**单进程多 session**（共享 ctx，权重各持一份 ~9.5GB/session）或后续共享权重上传（进一步省显存）。当前 3 session ≈ 28.5GB（40GB 卡）；B=16 批的甜点配 2-3 session 足够常见负载。
+  - **坑册**：Optional[DeviceContext] 默认值 `Optional[DeviceContext]()` + `if shared_ctx: .value()` 是 Mojo 共享句柄的可行模式；max.gpu 的 DeviceContext 在 `max.gpu.host`（不在 `max.gpu`）。

@@ -265,7 +265,15 @@ struct GpuSession:
     var d_tokout: DeviceBuffer[DType.int32]
     var h_tokout: HostBuffer[DType.int32]
 
-    def __init__(out self, model: QwenForward, max_tokens: Int) raises:
+    def __init__(
+        out self,
+        model: QwenForward,
+        max_tokens: Int,
+        # 一百二十五：外传共享 DeviceContext——MAX 运行时每进程
+        # DeviceContext 上限为 2（账本一百二十四），多 session 必须同
+        # ctx 复用。省略则自建（单 session 场景不变）。
+        shared_ctx: Optional[DeviceContext] = Optional[DeviceContext](),
+    ) raises:
         """全量上传并分配激活/KV。要求 `model` 以 `quantize=True` 构造。"""
         if not model.q4_enabled:
             raise AlofaError(
@@ -273,7 +281,10 @@ struct GpuSession:
                 "GpuSession reads the q4 path; build the model with quantize=True",
                 "",
             )
-        self.ctx = DeviceContext()
+        if shared_ctx:
+            self.ctx = shared_ctx.value()
+        else:
+            self.ctx = DeviceContext()
         self.d_q4 = List[DeviceBuffer[DType.uint8]]()
         # gate/up 单独再存一份（同一个 DeviceBuffer 句柄，零拷贝）：dual-fat
         # 发射要从两个不同 List 取权重指针 —— 同一 List 的两个下标即使提取
@@ -343,91 +354,107 @@ struct GpuSession:
             self.d_bias_kv.append(
                 self.ctx.enqueue_create_buffer[DType.float32](2 * self.kv_dim)
             )
-        for layer in range(self.n_layers):
-            for slot in range(Q4_SLOTS_PER_LAYER):
-                # 槽位宽度内联（__init__ 半初始化状态调不了 self 的方法：
-                # 保守检查要求全字段就绪，账本六十三）。
-                var n_out = self.hidden
-                var n_in = self.hidden
-                if slot == Q4_SLOT_Q:
-                    n_out = self.q_out
-                if slot == Q4_SLOT_K or slot == Q4_SLOT_V:
-                    n_out = self.kv_dim
-                if slot == Q4_SLOT_GATE or slot == Q4_SLOT_UP:
-                    n_out = self.inter
-                # 块数由**整个矩阵** out×in 决定；down 的输入是 inter 不是
-                # hidden —— 2026-11-09 的第一版在这里只传了 1/5.4 的字节，
-                # down matmul 越界读块流，NaN 一路传进 logits（账本六十三）。
-                if slot == Q4_SLOT_DOWN:
-                    n_in = self.inter
-                var n_bytes = n_out * n_in // 32 * 18
-                var blocks = model.q4_blocks[layer * Q4_SLOTS_PER_LAYER + slot]
-                for i in range(n_bytes):
-                    hq4[i] = blocks[unsafe_offset=i]
-                var slot_buf = _upload_u8(self.ctx, hq4, n_bytes)
-                self.d_q4.append(slot_buf)
+        # 一百二十五：装载三段化——账本六十三悬崖的根治。旧实现每槽
+        # alloc+copy+kernel 交错 ~170 次/进程，AsyncRT 拷贝队列深度
+        # 累积到第 3 个 session 越崖（CUDA_ERROR_INVALID_VALUE，账本
+        # 一百二十四定性：2 个 session 恒好 / 3 个恒坏）。三段化后
+        # alloc 与 copy 不再交错：A 全量预分配 → B 纯拷贝（每槽同步，
+        # pinned 暂存回填护栏保留）→ C 纯反量化核（一次收尾同步）。
+        var q4_nbytes = List[Int]()
+        var w16_nelems = List[Int]()
+        for _l in range(self.n_layers):
+            for _s in range(Q4_SLOTS_PER_LAYER):
+                var n_out0 = self.hidden
+                var n_in0 = self.hidden
+                if _s == Q4_SLOT_Q:
+                    n_out0 = self.q_out
+                if _s == Q4_SLOT_K or _s == Q4_SLOT_V:
+                    n_out0 = self.kv_dim
+                if _s == Q4_SLOT_GATE or _s == Q4_SLOT_UP:
+                    n_out0 = self.inter
+                if _s == Q4_SLOT_DOWN:
+                    n_in0 = self.inter
+                q4_nbytes.append(n_out0 * n_in0 // 32 * 18)
+                w16_nelems.append(n_out0 * n_in0)
 
-        # ---- f16 预反量化（账本六十八）：独立于 q4 上传的第二段循环。
-        # 转换 GPU 侧直读显存 d_q4，host 不再中转（数值判据见门 F16_REL）。
-        # q4 本体保留 —— qproj 探针路径维持 q4 精确对数。
+        # ---- A 段：全量预分配（零拷贝）----
+        var w16_all = List[DeviceBuffer[DType.float16]]()
+        for i in range(self.n_layers * Q4_SLOTS_PER_LAYER):
+            self.d_q4.append(
+                self.ctx.enqueue_create_buffer[DType.uint8](q4_nbytes[i])
+            )
+            var w16 = self.ctx.enqueue_create_buffer[DType.float16](
+                w16_nelems[i]
+            )
+            w16_all.append(w16)
+            var _sl = i % Q4_SLOTS_PER_LAYER
+            if _sl == Q4_SLOT_Q:
+                self.d_w16_q.append(w16)
+                self.d_wp_q.append(
+                    self.ctx.enqueue_create_buffer[DType.float16](
+                        w16_nelems[i]
+                    )
+                )
+            if _sl == Q4_SLOT_K:
+                self.d_w16_k.append(w16)
+            if _sl == Q4_SLOT_V:
+                self.d_w16_v.append(w16)
+            if _sl == Q4_SLOT_O:
+                self.d_w16_o.append(w16)
+                self.d_wp_o.append(
+                    self.ctx.enqueue_create_buffer[DType.float16](
+                        w16_nelems[i]
+                    )
+                )
+            if _sl == Q4_SLOT_GATE:
+                self.d_w16_gate.append(w16)
+                self.d_wp_gate.append(
+                    self.ctx.enqueue_create_buffer[DType.float16](
+                        w16_nelems[i]
+                    )
+                )
+            if _sl == Q4_SLOT_UP:
+                self.d_w16_up.append(w16)
+                self.d_wp_up.append(
+                    self.ctx.enqueue_create_buffer[DType.float16](
+                        w16_nelems[i]
+                    )
+                )
+            if _sl == Q4_SLOT_DOWN:
+                self.d_w16_down.append(w16)
+                self.d_wp_down.append(
+                    self.ctx.enqueue_create_buffer[DType.float16](
+                        w16_nelems[i]
+                    )
+                )
+        self.ctx.synchronize()
+
+        # ---- B 段：q4 纯拷贝（无分配；每槽同步——同一块 pinned 暂存
+        # 会被回填，在途拷贝读半截字节的竞态护栏保留，账本六十三）----
         for layer in range(self.n_layers):
             for slot in range(Q4_SLOTS_PER_LAYER):
-                var n_out = self.hidden
-                var n_in = self.hidden
-                if slot == Q4_SLOT_Q:
-                    n_out = self.q_out
-                if slot == Q4_SLOT_K or slot == Q4_SLOT_V:
-                    n_out = self.kv_dim
-                if slot == Q4_SLOT_GATE or slot == Q4_SLOT_UP:
-                    n_out = self.inter
-                if slot == Q4_SLOT_DOWN:
-                    n_in = self.inter
-                var n_elems = n_out * n_in
-                comptime if F16_BUILD:
-                    # GPU 侧转换（账本六十八）：q4 块流已在显存
-                    # （d_q4[layer*7+slot]），一个 kernel 直接反量化成
-                    # f16 —— 绕开 host dequant + pinned 回传路径
-                    # （host 路径在第 15 次 copy 处 CUDA_ERROR_INVALID_VALUE，
-                    # 隔离探针无法复现，账本在案）。
-                    var w16 = self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                    var q4buf = self.d_q4[layer * Q4_SLOTS_PER_LAYER + slot]
-                    self.ctx.enqueue_function[q4_dequant_f16_gpu](
-                        q4buf.unsafe_ptr(),
-                        w16.unsafe_ptr(),
-                        Int32(n_elems),
-                        grid_dim=(ceildiv(n_elems, 256), 1, 1),
-                        block_dim=(256, 1, 1),
-                    )
-                    self.ctx.synchronize()
-                    if slot == Q4_SLOT_Q:
-                        self.d_w16_q.append(w16)
-                        self.d_wp_q.append(
-                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                        )
-                    if slot == Q4_SLOT_K:
-                        self.d_w16_k.append(w16)
-                    if slot == Q4_SLOT_V:
-                        self.d_w16_v.append(w16)
-                    if slot == Q4_SLOT_O:
-                        self.d_w16_o.append(w16)
-                        self.d_wp_o.append(
-                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                        )
-                    if slot == Q4_SLOT_GATE:
-                        self.d_w16_gate.append(w16)
-                        self.d_wp_gate.append(
-                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                        )
-                    if slot == Q4_SLOT_UP:
-                        self.d_w16_up.append(w16)
-                        self.d_wp_up.append(
-                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                        )
-                    if slot == Q4_SLOT_DOWN:
-                        self.d_w16_down.append(w16)
-                        self.d_wp_down.append(
-                            self.ctx.enqueue_create_buffer[DType.float16](n_elems)
-                        )
+                var i = layer * Q4_SLOTS_PER_LAYER + slot
+                var n_bytes = q4_nbytes[i]
+                var blocks = model.q4_blocks[i]
+                for j in range(n_bytes):
+                    hq4[j] = blocks[unsafe_offset=j]
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_q4[i], src_buf=hq4
+                )
+                self.ctx.synchronize()
+
+        # ---- f16 预反量化（账本六十八）：C 段纯核——GPU 侧直读显存
+        # d_q4 反量化成 f16，host 不再中转（数值判据见门 F16_REL）。
+        comptime if F16_BUILD:
+            for i in range(self.n_layers * Q4_SLOTS_PER_LAYER):
+                self.ctx.enqueue_function[q4_dequant_f16_gpu](
+                    self.d_q4[i].unsafe_ptr(),
+                    w16_all[i].unsafe_ptr(),
+                    Int32(w16_nelems[i]),
+                    grid_dim=(ceildiv(w16_nelems[i], 256), 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            self.ctx.synchronize()
 
         # ---- fp32 小权重：norms（每层两个 + 终 norm）、q/k/v 偏置 ----
         for layer in range(self.n_layers):
