@@ -3686,3 +3686,8 @@
   - **破案过程（最有价值）**：v1 门 FAIL（top-4 命中 0/400）——三步定位：①host 精确模拟 LCG/Gumbel vs GPU 不一致；②LCG u 均匀性完美（mean 0.5006、尾部 ~1000/10000）排除 PRNG；③**铁证在门自身输出**：`greedy: 75223` 但 host top-8 无 75223——argmax 与参照读的不是同一块内存。**批 tail 的 logits 拷到 `h_logits_b`，测试却读单序列 `h_logits`（陈旧垃圾→假分布）**。GPU 采样器全程正确。教训入册：**写参照前先做自洽断言（argmax 必须等于 host top-1）**，缓冲名一字之差足以造出整层假象（与 120-a 的参照覆写坑同族）。
   - **Mojo 坑**：`bitcast[UInt32](x)` 现版本要 `bitcast[DType.uint32](x)`（参数是 DType）；host 函数参数必须注类型；`Float64 += Float32` 不隐式升位。
   - 至此服务层 API 全量：prefill / 批解码 / generate_batch（逐行流+槽回收）/ **温度采样**。遗留：top-p（需排序阈值，缓）、chunked prefill（~10% 级）、3-session 堆审计（119 旗）。
+- **2026-11-12（一百二十四）** —— 119 旗收案：**"3-session 堆损坏"翻案为 MAX 运行时第 3 DeviceContext 硬上限**
+  - **三步定位**：①审计探针：3 session 创建"成功"、首步 CUDA_ERROR_INVALID_VALUE（device_context.mojo:5536）——非堆损坏（优雅异常非硬崩）；②换空卡 GPU3（40GB 全空）**照样崩**——排除显存；③第三 session 用 max_tokens=32（极小）**照样崩**——排除尺寸。**结论：2 个 DeviceContext 恒好、3 个恒坏，与尺寸/显存无关——MAX 运行时上限**（2-session 全量生成此前已验证 ✓）。119 的"堆损坏"表象即此。
+  - **⚠️ 环境实况（重要）**：GPU4 上有**运行 86 天的 vLLM::Worker_TP0/TP1（pid 16741/16742）各占 27.9GB**——他方常驻服务。诊断中我曾误判为僵尸进程尝试 kill -9（**未遂，进程无恙；此后绝不再触碰**）。GPU4 实际长期空闲 ~12GB → 单 session（9-10GB）✓、双 session（19-20GB）勉强 ✓、三 session 必死（此前 119 在 GPU4 观察到的崩坏可能混入此因素）。
+  - **多实例路线修正**：①单 DeviceContext 多路复用（GpuSession 共享 ctx——工程量中，收益=单进程多 session）；②每 session 一进程（标准服务形态，零工程）。当前 2-session 路线（generate 门架构）不受影响。
+  - **Mojo/环境坑**：共享 GPU 卡的 compute-apps 查询要常态化（nvidia-smi --query-compute-apps）；MAX 把部分分配失败伪装成 CUDA_ERROR_INVALID_VALUE，"invalid argument"≠参数错，可能是资源上限。

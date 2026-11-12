@@ -81,7 +81,9 @@ GEMM ×5 / gather / rmsnorm / LMHEAD 全部 row 通用零改动直通 t=B。
 
 ## 六、遗留（按优先级）
 
-1. **3-session 堆损坏审计**（119 立旗）——多实例部署前提
+1. ~~3-session 堆损坏审计~~ **已收案（124）**：非堆损坏非显存——
+   MAX 运行时第 3 个 DeviceContext 硬上限（2 恒好 / 3 恒坏，
+   尺寸无关）。多实例路线改为**单 ctx 多路复用**或**每 session 一进程**
 2. top-p 采样（排序阈值 pass）
 3. chunked prefill（~10% 级，已降级）
 4. KV store 复用/压缩（9GB/session 之坑）
