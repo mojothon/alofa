@@ -10,7 +10,7 @@ Float64 累加、先 rsqrt 再乘。任何自己发明的顺序都会把真正�
 """
 
 from std.gpu import global_idx, thread_idx, block_idx, grid_dim
-from std.math import log, sqrt
+from std.math import exp, log, sqrt
 from std.memory import bitcast, stack_allocation
 
 from max.gpu import AddressSpace, barrier
@@ -438,6 +438,136 @@ def argmax_rb_gpu(
         stride //= 2
     if tid == 0:
         out_idx[unsafe_offset=b] = sidx[unsafe_offset=0]
+def sample_topp_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    out_idx: Pointer[Int32, MutUntrackedOrigin],
+    vocab: Int32,
+    temp: Float32,
+    top_p: Float32,
+    seed: Int32,
+) -> None:
+    """行 top-p（nucleus）温度采样（账本一百二十八）。
+
+    无排序二分阈值：M(τ)=Σ_{logit≥τ} exp((logit-m)/T)/Z 随 τ 单调
+    递减（m=行最大 logit 稳定常数，Z 全词表一趟归一）；24 趟二分找
+    最大 τ 使归一化质量 M(τ) ≥ top_p —— 最小 nucleus = {logit ≥ τ*}。核内 Gumbel-max
+    （score=logit+T·G）相对分数自动完成核内重归一 ≡ softmax(logits/T)
+    在核上的归一化采样。top_p=1 退化为 sample_rb（核=全词表）。
+    """
+    var b = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var base = b * Int(vocab)
+
+    # 行最大（稳定常数；核必含 argmax：logit==m ≥ 任何收敛 τ）
+    var mx = Float32(-3.402823466e38)
+    var i = tid
+    while i < Int(vocab):
+        var v = x[unsafe_offset=base + i]
+        if v > mx:
+            mx = v
+        i += 256
+    var sm = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    sm[unsafe_offset=tid] = mx
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            var v2 = sm[unsafe_offset=tid + stride]
+            var v1 = sm[unsafe_offset=tid]
+            if v2 > v1:
+                sm[unsafe_offset=tid] = v2
+        barrier()
+        stride //= 2
+    var m = sm[unsafe_offset=0]
+
+    # 全词表归一化 Z = Σ exp((logit-m)/T)（一趟）
+    var zacc = Float32(0)
+    i = tid
+    while i < Int(vocab):
+        zacc += exp((x[unsafe_offset=base + i] - m) / temp)
+        i += 256
+    sm[unsafe_offset=tid] = zacc
+    barrier()
+    var zs = 128
+    while zs > 0:
+        if tid < zs:
+            sm[unsafe_offset=tid] += sm[unsafe_offset=tid + zs]
+        barrier()
+        zs //= 2
+    var zinv = Float32(1) / sm[unsafe_offset=0]
+
+    # 二分 τ：归一化质量 acc·zinv ≥ top_p → lo=τ（核可更小）；否则 hi=τ
+    var lo = m - Float32(80) * temp
+    var hi = m
+    var it = 0
+    while it < 24:
+        var tau = (lo + hi) / Float32(2)
+        var acc = Float32(0)
+        i = tid
+        while i < Int(vocab):
+            var v = x[unsafe_offset=base + i]
+            if v >= tau:
+                acc += exp((v - m) / temp)
+            i += 256
+        sm[unsafe_offset=tid] = acc
+        barrier()
+        var s2 = 128
+        while s2 > 0:
+            if tid < s2:
+                sm[unsafe_offset=tid] += sm[unsafe_offset=tid + s2]
+            barrier()
+            s2 //= 2
+        if sm[unsafe_offset=0] * zinv >= top_p:
+            lo = tau
+        else:
+            hi = tau
+        it += 1
+
+    # 核内 Gumbel-max（与 sample_rb 同款 LCG/并列语义）
+    var best = Float32(-3.402823466e38)
+    var bi = Int32(-1)
+    var state = bitcast[DType.uint32](seed) ^ (UInt32(b) * 2654435761) ^ (
+        UInt32(tid) * 40503
+    )
+    i = tid
+    while i < Int(vocab):
+        var v = x[unsafe_offset=base + i]
+        if v >= lo:
+            state = state * 1664525 + 1013904223
+            var ux = (state >> 8) & 16777215
+            var u = (Float32(ux) + Float32(0.5)) / Float32(16777216)
+            var sc = v + temp * (-log(-log(u)))
+            if sc > best:
+                best = sc
+                bi = Int32(i)
+        i += 256
+    var sv = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var si = stack_allocation[
+        256, Int32, address_space = AddressSpace.SHARED
+    ]()
+    sv[unsafe_offset=tid] = best
+    si[unsafe_offset=tid] = bi
+    barrier()
+    var s3 = 128
+    while s3 > 0:
+        if tid < s3:
+            var v2 = sv[unsafe_offset=tid + s3]
+            var i2 = si[unsafe_offset=tid + s3]
+            var v1 = sv[unsafe_offset=tid]
+            var i1 = si[unsafe_offset=tid]
+            if (v2 > v1) or ((v2 == v1) and (i2 < i1)):
+                sv[unsafe_offset=tid] = v2
+                si[unsafe_offset=tid] = i2
+        barrier()
+        s3 //= 2
+    if tid == 0:
+        out_idx[unsafe_offset=b] = si[unsafe_offset=0]
+
+
 def sample_rb_gpu(
     x: Pointer[Float32, MutUntrackedOrigin],
     out_idx: Pointer[Int32, MutUntrackedOrigin],

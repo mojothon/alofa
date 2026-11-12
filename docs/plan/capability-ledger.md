@@ -3708,3 +3708,8 @@
   - **权重共享收益重估**：3 session 10.08→6.60GB（省 34%）；40GB 卡密度从 ~11 session → ~17 session。**中收益、高工程量**（Mojo 非拷贝 DeviceBuffer 跨 session 共享需手动生命周期管理，double-free 雷区）——**降级到 KV 压缩之后**。126"密度翻倍"判断作废。
   - **环境坑册（重要）**：**AsyncRT 用 VMM（cuMemCreate/Map）惰性提交物理页**——nvidia-smi 对我们的进程报 ~0MiB（probe_mem 实证：三负载 192/192 正常运行、采样窗口内 GPU3 恒 17MiB），但同卡他方进程（非 VMM 路径）正常显示。**本环境 nvidia-smi 不可用于自家显存记账**； VirtualMemory 决算（源码尺寸求和）才是可靠手段。显存余量判断从此用决算公式：`N_session × 3.36GB + KV 变量项`。
   - probe_mem 探针（1 session 负载 → 停顿 → 3 session 负载 → 停顿）留档。
+- **2026-11-12（一百二十八）** —— top-p（nucleus）采样落地：`sample_topp_gpu`，无排序二分阈值
+  - **实现**：`M(τ)=Σ_{logit≥τ} exp((logit-m)/T)/Z` 随 τ 单调递减（m=行最大，**Z 全词表一趟归一**）；24 趟二分找最大 τ 使 M(τ) ≥ top_p——最小 nucleus = {logit ≥ τ*}；核内 Gumbel-max（相对分数自动核内重归一 ≡ softmax(logits/T) 核上采样）。argmax 必在核内（logit=m ≥ 任意收敛 τ）。`prefill_step` 加 `sample_topp=1.0`（>temp>0 才生效；=1 走 sample_rb 原路径），`generate_batch` 透传 `top_p`。
+  - **⚠️ 首战双 bug（门抓得好）**：①**未归一化质量**——首版二分比 `Σexp(v-m) ≥ top_p` 而 raw 和天然 ≥0.9（单 top-1 就是 1.0），搜索恒朝 max 收敛、核坍缩成 {top-1..2}；修法：先算全词表 Z 再比 `acc/Z`。②**门参照读了陈旧 h_logits_b**——`copy_logits=False` 时批 tail 压根不做 D2H（123 门 400 次"侥幸通过"实为与平分布容差巧合），参照调用必须 `sync_tail=True + copy_logits=True`。教训：**采样类门的参照链（device→host→期望分布）每一环都要可验证**，参照调用参数漏一个就整层假象（与 123 缓冲名坑同族）。
+  - **门**（N=400，T=1，top_p=0.9）：①**核成员零越界 0/400**（边界 ε=0.01 logit 容差；host 核归一化质量 0.9000）✓；②top-6 经验 vs 核内重归一期望全部 ±0.10（0.0475 vs 0.0343 等）✓；③同种子确定/异种子变异 ✓；④top_p=1.0 退化为全词表采样，top-4 分布对齐 ±0.10 ✓。回归：batch/generate/sample 三门全绿。
+  - **坑册**：**长门（N 次 prefill_step 采样调用）会推进 kv_pos 撞 512 上限**（out_of_range: kv store is full）——多段门之间须 `kv_pos=0` + `h_posarr` 清零回绕。123 门 400 次侥幸在限内。
