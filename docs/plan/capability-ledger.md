@@ -3699,3 +3699,7 @@
   - **账目修正**：124 的「MAX 每 2 个 DeviceContext 上限」定性**不准确**——真根因是六十三悬崖的进程级队列深度（ctx 数量只是表象：自建 ctx 时第 3 个 session 的交错装载越崖；共享 ctx 后同样越崖，证明与 ctx 无关）。
   - 多实例服务形态就此打开：**单进程多 session**（共享 ctx，权重各持一份 ~9.5GB/session）或后续共享权重上传（进一步省显存）。当前 3 session ≈ 28.5GB（40GB 卡）；B=16 批的甜点配 2-3 session 足够常见负载。
   - **坑册**：Optional[DeviceContext] 默认值 `Optional[DeviceContext]()` + `if shared_ctx: .value()` 是 Mojo 共享句柄的可行模式；max.gpu 的 DeviceContext 在 `max.gpu.host`（不在 `max.gpu`）。
+- **2026-11-12（一百二十六）** —— 单进程多 session e2e：**服务形态压验全绿**
+  - **判据四项**：①3 session 共享单 ctx 各自完整 generate_batch（125 前必崩形态）✓；②**跨 session 同输入同输出**（parity 零失配，220/16/15 已知链吻合——多路复用无状态串扰）✓；③**穿插负载后确定性保持**（b/c 跑其他负载不影响 a 的输出——session 私有 KV/激活隔离成立）✓；④大负载轮转（B=8×24 token，rep 平移 prompt，a/b/c 各一轮）全部 192/192 有效 token、链各异 ✓。
+  - **结论**：125 的共享 ctx 多路复用在真实混合负载下成立。单进程 3 session（~28.5GB/40GB 卡）× 各自 B=8 连续批处理 = 可部署形态。剩余瓶颈是权重各持一份（~9.5GB/session）——跨 session 权重共享（一百二十七候选①）可把 3 session 压到 ~12GB。
+  - **坑册**：host 函数参数类型注解（本阶段第 N 次）——Mojo 无隐式推断，def 参数一律要注。
