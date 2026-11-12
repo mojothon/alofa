@@ -24,7 +24,7 @@ from flare.net import IpAddr, SocketAddr
 
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
-from alofa.srv.config import ServeConfig, env_str
+from alofa.srv.config import ServeConfig, env_int, env_str
 from alofa.srv.gpu_service import GpuService
 from alofa.srv.loop import Loop
 from alofa.srv.openai import ChatHandler
@@ -42,27 +42,31 @@ def main() raises:
     # ⚠️ GPU v0 窗口固定 512：prefill_step/generate_batch 的形状实参里
     # max_tokens 是 comptime（`srv/gpu_service.mojo`），环境变量改不动它。
     comptime WINDOW = 512
+    # 池大小（账本一百三十二）：N 条 session 共享权重与 ctx，并发的是
+    # 「进展」不是吞吐（每次前向 t=1）。显存 ≈ N × 3.36 GB（决算式见
+    # 账本一百二十七），默认 1 = 一百二十九的单流行为不变。
+    var n_sessions = env_int("ALOFA_GPU_SESSIONS", 1, 1, 8)
 
     print(
         "alofa serve (gpu) — single process, HTTP with SSE streaming,"
-        " GpuSession q4/f16 backend, serial generation"
+        " GpuSession q4/f16 backend, session pool, interleaved streams"
     )
     var model = QwenForward(gpu_weights, gpu_config, WINDOW, True)
-    var session = GpuSession(model, WINDOW)
     var tokenizer = load_tokenizer_json(cfg.tokenizer_json)
     var svc = GpuService(
-        session^,
+        model,
+        n_sessions,
+        WINDOW,
         tokenizer^,
         151936,
-        WINDOW,
         cfg.seed,
         gpu_weights,
         gpu_config,
         cfg.tokenizer_json,
     )
     print(
-        "  model loaded: " + cfg.model_name
-        + " (gpu q4 path, window " + String(WINDOW) + ")"
+        "  model loaded: " + cfg.model_name + " (gpu q4 path, window "
+        + String(WINDOW) + ", session pool " + String(n_sessions) + ")"
     )
     if cfg.engine_threads != 0:
         print(

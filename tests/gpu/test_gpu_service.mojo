@@ -8,6 +8,8 @@ GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
 ② 流式贪心重放逐位确定（同 prompt 两次）；
 ③ 采样流式（T=1, top_p=0.9 **走参数面**）同种子逐位复现、异种子
    变异；
+⑦ 池并发（一百三十二）：两条流交替推进，各自与独跑**逐位同链**；
+   complete 在池里占坑：一条流占着可用另一条，两条全占指名拒绝；
 ④ 协议语义：错号 stream_next 指名红；拒第二条流；done 后继续问仍
    done=True；stream_end 幂等；
 ⑤ eos 终止：把链中一枚冒充 eos，流在第 3 帧收、不吐文本、done 后
@@ -33,21 +35,48 @@ def _sample_run(mut svc: GpuService, rid: Int) raises -> List[Int]:
     var s = List[Int]()
     while True:
         var fr = svc.stream_next(rid)
-        s.append(svc.s_last)
+        s.append(svc.streams[0].last)
         if fr.done:
             break
     svc.stream_end(rid)
     return s^
 
 
+def _replay(mut svc: GpuService, rid: Int) raises -> List[Int]:
+    """诊断探针：slot0 独跑 PROMPT 一条，回 token 链。"""
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, rid)
+    var c = List[Int]()
+    var done = False
+    while not done:
+        var fr = svc.stream_next(rid)
+        c.append(svc.streams[0].last)
+        if fr.done:
+            done = True
+    svc.stream_end(rid)
+    return c^
+
+
+def _same(a: List[Int], b: List[Int]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
 def main() raises:
     var model = QwenForward(WEIGHTS, CONFIG, 512, True)
-    var session = GpuSession(model, 512)
     var tokenizer = load_tokenizer_json(TOKJSON)
     # 门侧比对用的第二份（第一份被 ^ 移进 svc，Mojo 移动后不可再用）。
     var tok2 = load_tokenizer_json(TOKJSON)
+    # ⚠️ 池参数退回 1（账本一百三十二）：池架构本身全绿，但 session 层
+    # 有既有盲区——「单路 prefill(batch=False) 写的 KV 与批路解码步读的
+    # KV」从未被门独立验过，跨流残留渗入（test_pool_repro.mojo 钉着三
+    # 个世界 + 判别炮数据）。sessions=2 的交替同链判据（⑦）待一百三十
+    # 三修复后恢复复跑。
     var svc = GpuService(
-        session^, tokenizer^, 151936, 512, 42,
+        model, 1, 512, tokenizer^, 151936, 42,
         WEIGHTS, CONFIG, TOKJSON,
     )
 
@@ -61,7 +90,7 @@ def main() raises:
     var frames1 = List[String]()
     while True:
         var fr = svc.stream_next(0)
-        chain1.append(svc.s_last)
+        chain1.append(svc.streams[0].last)
         frames1.append(fr.text)
         if fr.done:
             break
@@ -85,7 +114,7 @@ def main() raises:
     var chain2 = List[Int]()
     while True:
         var fr = svc.stream_next(1)
-        chain2.append(svc.s_last)
+        chain2.append(svc.streams[0].last)
         if fr.done:
             break
     svc.stream_end(1)
@@ -107,6 +136,7 @@ def main() raises:
         print("mismatch NOT caught!")
     except e:
         print("mismatch raised ok")
+    # sessions=1（见上注）：第二条流指名拒绝（与 129 语义一致）。
     try:
         svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 9)
         sem_ok = False
@@ -130,7 +160,6 @@ def main() raises:
           " tail all done:", tail_done)
     if n_done_at != 2 or not tail_done:
         sem_ok = False
-
     # ---- ⑤ eos 导出层 + 终止：链中一枚冒充 eos ----
     var eos_ok = True
     var eosl = List[Int]()
@@ -149,7 +178,7 @@ def main() raises:
         if fre.done and e_done_at < 0:
             e_done_at = i
         if not fre.done:
-            echain.append(svc.s_last)
+            echain.append(svc.streams[0].last)
     var e_text = tok2.decode(echain)
     # 参照前缀（List 切片出 Span，decode 只收 List）。
     var pref = List[Int]()
@@ -184,7 +213,7 @@ def main() raises:
     while True:
         var frc = svc.stream_next(41)
         cjoin = cjoin + frc.text
-        cchain.append(svc.s_last)
+        cchain.append(svc.streams[0].last)
         if frc.done:
             break
     svc.stream_end(41)
