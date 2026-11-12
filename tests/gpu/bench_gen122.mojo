@@ -40,7 +40,7 @@ def main() raises:
                     lmax = lens[i]
             var steps = lmax + GEN - 1
             var useful = total + b * GEN
-            var pad = Float64(steps * b - total) / Float64(steps * b)
+            var pad = Float64(steps * b - total - b * GEN) / Float64(steps * b)
 
             var best = 1e30
             var g0 = 0
@@ -49,7 +49,7 @@ def main() raises:
                 var out = a.generate_batch[
                     INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
                     DType.float32
-                ](flat, lens, GEN, 200000)
+                ](flat, lens, GEN, 200000, List[Int](), List[Int]())
                 var ms = Float64(monotonic_ns() - t0) / 1e6
                 if ms < best:
                     best = ms
@@ -57,5 +57,5 @@ def main() raises:
             print("B=", b, " total ms:", best,
                   " ms/step:", best / Float64(steps),
                   " useful tok/s:", Float64(useful) / (best * 1e-3),
-                  " pad_waste:", pad,
+                  " idle_waste:", pad,
                   " gen0:", g0)

@@ -3675,3 +3675,8 @@
   - **数据**（异质 prompt 6-16 × 生成 24，同 run 交错）：B=8 = 242ms 总 / 6.21ms/步 / **1173 有效 tok/s**；B=16 = 337ms / 8.65ms/步 / **1675 tok/s**。步成本与裸批 bench 完全吻合（6.21 vs 6.19；8.65 vs 8.63）——generate_batch API 层零开销，成本全在批步本身。
   - **基线发现**：异质长度下 padded lockstep 的 padding 行占比 **~70%**（prompt 相内）。chunked prefill 的理论收益 = prompt 相占比（41% 步）× 70% ≈ **~29% 行步削减**（~15-20% e2e）——值得做但非倍数级；倍数级收益在**槽位回收**（完成序列即时替换新序列，当前必须整批重启）。
   - chunked prefill 工程面：KVS/attention 核加 `pos0 + h_posarr[b]` 行变体（prompt 一次注入批 store），attention 的 rs/vt2 需处理**行间不同 KV 长度**（现有 _bb 假设每行 1 token）。
+- **2026-11-12（一百二十二-b）** —— generate_batch v2：逐行流 + **槽位回收零 KV 搬运** + ⚠️ 修正 122-a 的 70% 误算
+  - **⚠️ 账目修正**：122-a 的"padded 浪费 70%"是公式错——把**生成 token 误计入浪费**（分母 steps×B，分子只减了 prompt tokens）。真实 padding ≈**10%**（dummy prompt 行）；v1/v2 的 useful tok/s（1173/1675）本就一致且正确。**chunked prefill 的收益预期从 ~29% 行步砍到 ~10%**——优先级降到采样/调度之后。
+  - **v2 实现**：逐行 token 流（每行独立 prompt→生成链，gen[0] = 末 prompt token 步的 tokout；全程无 padding 行，只有完成后的 idle 尾 ~9%）+ **join 队列槽位回收**——完成序列让槽，新序列 pos 归零注入。**回收零 KV 搬运**：attention 只读 [0..pos]，旧行被新序列按 pos 顺序覆写（119-b 遗产：pos_arr 语义的红利）。
+  - **门**：parity PASS + 确定性 ✓ + **join parity 零失配**（joiner 502 198 2870 vs 单序列参照逐位一致——若有 KV 污染必偏）。测试侧两坑：①join 测试误传 3 序列 flat/lens（out 行基址错位，读到了 seq2 的行）；②gate 参照 v1 的 gen[0] 对齐坑延续。
+  - 服务形态就此闭环：**常驻批 + 动态进出 = 真·连续批处理**。剩余缺口：采样（temperature/top-p）与 chunked prefill（~10% 级，缓）。

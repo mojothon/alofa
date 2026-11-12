@@ -898,59 +898,78 @@ struct GpuSession:
         lens: List[Int],
         max_new: Int,
         eos: Int,
+        join_flat: List[Int],
+        join_lens: List[Int],
     ) raises -> List[Int]:
-        """连续批处理 v1（账本一百二十一）：padded lockstep 批生成。
+        """连续批处理 v2（账本一百二十二-b）：逐行 token 流 +
+        完成槽位回收。
 
-        B 条序列（B<=BMAX）以 lockstep 推进：prompt 相按最长对齐
-        （短序列喂 dummy 且步后回退其 h_posarr——垃圾 KV 落位被真实
-        步覆写，不前进），生成相逐 token。全部走 batch=True 的
-        prefill_step（copy_logits=False，只回 4B×B tokout）。
+        每行独立推进 prompt→生成流：喂 prompt 剩余 token（耗尽步
+        的 tokout 即 gen[0]），此后链式生成；EOS 或预算用尽即完成
+        ——join 队列非空时槽位立即让给新序列（h_posarr 归零；新
+        序列按 pos 顺序覆写旧行，attention 只读 [0..pos] 故无污
+        染——回收零 KV 搬运）。全程无 padding 行。步数 =
+        max_i(plen_i + 生成数 + 接续链)。
 
-        返回扁平 [B][max_new]，-1 = 未生成（EOS 早停或步数用尽）。
-        eos=-1 禁用早停。确定性：同输入同输出（无采样）。
-
-        v2 待办：chunked prefill（新序列 prompt 一次注入批 store——
-        需 pos0+h_posarr[b] 的 KVS/attention 变体）与完成槽位回收。
+        返回扁平 [B+jb][max_new]：初始行 i 在 [i]，第 jt 个 joiner
+        在 [B+jt]；未接入的 joiner 行保持 -1。eos=-1 禁用早停。
+        确定性：同输入同输出。
         """
         var b = len(lens)
+        var jb = len(join_lens)
         if b > BMAX:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "generate_batch cap is 64",
                 "b=" + String(b),
             )
-        var off = List[Int]()
-        var total = 0
-        var lmax = 0
-        for i in range(b):
-            off.append(total)
-            total += lens[i]
-            if lens[i] > lmax:
-                lmax = lens[i]
-        if len(flat_prompts) != total:
-            raise AlofaError(
-                ERR_INVALID_ARGUMENT, "flat_prompts size mismatch",
-                "",
-            )
-        var out = List[Int]()
-        for i in range(b * max_new):
-            out.append(-1)
-        var done = List[Bool]()
-        var ndone = 0
+        var poff = List[Int]()
+        var plen = List[Int]()
+        var pidx = List[Int]()
+        var psrc = List[Int]()
+        var genc = List[Int]()
         var cur = List[Int]()
+        var fin = List[Bool]()
+        var obase = List[Int]()
+        var total = 0
         for i in range(b):
-            done.append(False)
-            cur.append(flat_prompts[off[i]])
+            poff.append(total)
+            total += lens[i]
+            plen.append(lens[i])
+            pidx.append(0)
+            psrc.append(0)
+            genc.append(0)
+            cur.append(0)
+            fin.append(False)
+            obase.append(i * max_new)
+        var joff = List[Int]()
+        var jtotal = 0
+        for i in range(jb):
+            joff.append(jtotal)
+            jtotal += join_lens[i]
+        var out = List[Int]()
+        for i in range((b + jb) * max_new):
+            out.append(-1)
         for i in range(BMAX):
             self.h_posarr[i] = Int32(0)
 
-        # prompt 相：lockstep，短序列 padding + pos 回退
-        for s in range(lmax):
+        var jt = 0
+        var nfin = 0
+        while nfin < b:
+            # 1) 逐行取下一 token（prompt 优先，否则生成链上一环）
             var toks = List[Int]()
+            var fp = List[Bool]()
             for i in range(b):
-                if s < lens[i]:
-                    toks.append(flat_prompts[off[i] + s])
+                if (not fin[i]) and pidx[i] < plen[i]:
+                    if psrc[i] == 0:
+                        toks.append(flat_prompts[poff[i] + pidx[i]])
+                    else:
+                        toks.append(join_flat[poff[i] + pidx[i]])
+                    pidx[i] += 1
+                    fp.append(True)
                 else:
                     toks.append(cur[i])
+                    fp.append(False)
+            # 2) 批步
             _ = self.prefill_step[
                 inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
                 attn_t, attn_tiles, prefill_rb, prefill_af,
@@ -959,44 +978,43 @@ struct GpuSession:
                 prefill_spl, prefill_kv, True
             ](toks, False, False, False)
             self.ctx.synchronize()
+            # 3) 逐行消化 tokout
             for i in range(b):
-                if s >= lens[i]:
-                    self.h_posarr[i] = self.h_posarr[i] - 1
-                elif s == lens[i] - 1:
-                    # 本序列最后一个 prompt token 的 argmax = 首 token
-                    var g0 = Int(self.h_tokout[i])
-                    out[i * max_new + 0] = g0
-                    if g0 == eos:
-                        done[i] = True
-                        ndone += 1
-                    else:
-                        cur[i] = g0
-
-        # 生成相
-        for k in range(1, max_new):
-            if ndone == b:
-                break
-            var toks = List[Int]()
-            for i in range(b):
-                toks.append(cur[i])
-            _ = self.prefill_step[
-                inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
-                attn_t, attn_tiles, prefill_rb, prefill_af,
-                prefill_mma_dual, prefill_mma_down, prefill_wpack,
-                prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
-                prefill_spl, prefill_kv, True
-            ](toks, False, False, False)
-            self.ctx.synchronize()
-            for i in range(b):
-                if done[i]:
+                if fin[i]:
                     continue
-                var nt = Int(self.h_tokout[i])
-                out[i * max_new + k] = nt
-                if nt == eos:
-                    done[i] = True
-                    ndone += 1
+                var tv = Int(self.h_tokout[i])
+                var hit = tv == eos
+                if fp[i]:
+                    # 本步消费的是 prompt token
+                    if pidx[i] == plen[i]:
+                        # 恰为末 prompt token → gen[0]
+                        out[obase[i] + 0] = tv
+                        genc[i] = 1
+                        if (not hit) and max_new > 1:
+                            cur[i] = tv
+                    else:
+                        continue
                 else:
-                    cur[i] = nt
+                    # 生成链：cur = gen[genc-1] → 本步产 gen[genc]
+                    out[obase[i] + genc[i]] = tv
+                    genc[i] = genc[i] + 1
+                    if (not hit) and genc[i] < max_new:
+                        cur[i] = tv
+                # 完成判定（EOS 或预算用尽）→ joiner 接槽或退场
+                if hit or genc[i] >= max_new:
+                    if jt < jb:
+                        poff[i] = joff[jt]
+                        plen[i] = join_lens[jt]
+                        pidx[i] = 0
+                        psrc[i] = 1
+                        genc[i] = 0
+                        cur[i] = 0
+                        obase[i] = (b + jt) * max_new
+                        jt += 1
+                        self.h_posarr[i] = Int32(0)
+                    else:
+                        fin[i] = True
+                        nfin += 1
         return out^
 
 

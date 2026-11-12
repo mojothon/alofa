@@ -41,10 +41,10 @@ def main() raises:
 
     var out1 = a.generate_batch[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32
-    ](flat, lens, MAXNEW, EOS)
+    ](flat, lens, MAXNEW, EOS, List[Int](), List[Int]())
     var out2 = a.generate_batch[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32
-    ](flat, lens, MAXNEW, EOS)
+    ](flat, lens, MAXNEW, EOS, List[Int](), List[Int]())
 
     # 参照：单序列 t=1 prefill 逐 token 链
     var mismatch = 0
@@ -93,6 +93,67 @@ def main() raises:
               out1[i * MAXNEW + 2], out1[i * MAXNEW + 3],
               out1[i * MAXNEW + 4])
     if mismatch == 0 and det:
+        print("*** PARITY PASS ***")
+    else:
+        print("*** PARITY FAIL ***")
+
+    # 一百二十二-b：join 接槽 parity——2 初始序列（len 3/4）
+    # max_new=3，1 个 joiner（len 5）在首序列完成后接管槽位。
+    # 若回收槽位有 KV 污染，joiner 的 token 链会偏离参照。
+    var jflat = List[Int]()
+    jflat.append(500)
+    jflat.append(501)
+    jflat.append(502)
+    jflat.append(503)
+    jflat.append(504)
+    var jlens = List[Int]()
+    jlens.append(5)
+    # 2 初始序列（b=2）：joiner 落在 out 行 [2+jt]=[6..8]
+    var flat2 = List[Int]()
+    flat2.append(100)
+    flat2.append(101)
+    flat2.append(102)
+    flat2.append(200)
+    flat2.append(201)
+    flat2.append(202)
+    flat2.append(203)
+    var lens2 = List[Int]()
+    lens2.append(3)
+    lens2.append(4)
+    var out3 = a.generate_batch[
+        INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8, DType.float32
+    ](flat2, lens2, 3, EOS, jflat, jlens)
+    # 参照：joiner 单序列逐 token 链（3 个生成 token）
+    b.kv_pos = 0
+    var prevj = 0
+    var jmismatch = 0
+    for j in range(5 - 1 + 3):
+        var toks = List[Int]()
+        if j < 5:
+            toks.append(jflat[j])
+        else:
+            toks.append(prevj)
+        _ = b.prefill_step[
+            INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
+            DType.float32
+        ](toks)
+        b.ctx.synchronize()
+        var hv2 = Float32(-1e30)
+        var hi2 = 0
+        for v in range(151936):
+            if b.h_logits[v] > hv2:
+                hv2 = b.h_logits[v]
+                hi2 = v
+        prevj = hi2
+        if j >= 4:
+            var k = j - 4
+            if hi2 != out3[2 * 3 + k]:
+                jmismatch += 1
+                print("JOIN MISMATCH k", k,
+                      "batch:", out3[2 * 3 + k], "ref:", hi2)
+    print("join parity mismatch:", jmismatch,
+          " joiner tokens:", out3[6], out3[7], out3[8])
+    if mismatch == 0 and det and jmismatch == 0:
         print("*** GENERATE GATE PASS ***")
     else:
         print("*** GENERATE GATE FAIL ***")
