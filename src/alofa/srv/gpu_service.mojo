@@ -33,6 +33,7 @@ from max.gpu.host import DeviceContext
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
+from alofa.srv.http import bytes_of_text, bytes_to_text
 from alofa.srv.openai import NO_REQUEST, Completion, Service
 from alofa.srv.sse import StreamToken
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
@@ -75,8 +76,14 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var tokenizer_json: String
 
     # 在途流状态（单流：整块状态只属于一条流，号对不上就红）。
+    # `s_out`/`s_emitted` 服务于**整段前缀解码**（与 CPU 路 `_new_text`
+    # 同法）：多字节字符可能跨两个 token，单 token 解码会把不完整的
+    # UTF-8 丢掉——流式拼出来的文本就会不等于非流式那份。每步重解
+    # 整段前缀（步数 ≤ 512，几十 KB），换来两边逐字节一致。
     var s_request: Int
     var s_prompt: List[Int]
+    var s_out: List[Int]
+    var s_emitted: Int
     var s_steps: Int
     var s_count: Int
     var s_last: Int
@@ -108,6 +115,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.tokenizer_json = tokenizer_json
         self.s_request = NO_REQUEST
         self.s_prompt = List[Int]()
+        self.s_out = List[Int]()
+        self.s_emitted = 0
         self.s_steps = 0
         self.s_count = 0
         self.s_last = 0
@@ -116,7 +125,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.s_seed = seed
         self.s_started = False
         self.s_pos = 0
-        self.eos = DEFAULT_EOS
+        # eos 走导出层（tokenizer 的 added tokens 里查 `<|im_end|>`），
+        # 钉值只是查不到时的兜底——换 fixture 不再静默死在错的 id 上。
+        var exported = self.tokenizer.special_id("<|im_end|>")
+        self.eos = exported if exported >= 0 else DEFAULT_EOS
 
     def spawn_twin(self, index: Int) raises -> Int:
         """engine 线程路的那份"自己"：自己的 session（q4 重传）+ 共享
@@ -221,6 +233,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             self.session.h_posarr[i] = Int32(0)
         self.session.ctx.synchronize()
         self.s_prompt = ids^
+        self.s_out = List[Int]()
+        self.s_emitted = 0
         self.s_steps = steps
         self.s_count = 0
         self.s_last = 0
@@ -282,10 +296,17 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             # done 后继续问仍 done=True（协议契约）。
             self.s_count = self.s_steps
             return StreamToken("", True, False)
+        self.s_out.append(tok)
         self.s_last = tok
         self.s_count += 1
         self.s_pos += 1
-        var text = self.tokenizer.decode(_make_one(tok))
+        # 整段前缀解码减已发字节（CPU 路 `_new_text` 同法）。
+        var full = bytes_of_text(self.tokenizer.decode(self.s_out))
+        if self.s_emitted > len(full):
+            # 不该发生（前缀只会变长）。真发生了就从头对齐。
+            self.s_emitted = 0
+        var text = bytes_to_text(full, self.s_emitted, len(full))
+        self.s_emitted = len(full)
         if self.s_count >= self.s_steps:
             return StreamToken(text, True, False)
         return StreamToken(text, False, False)
@@ -296,7 +317,4 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             self.s_request = NO_REQUEST
 
 
-def _make_one(tok: Int) -> List[Int]:
-    var l = List[Int]()
-    l.append(tok)
-    return l^
+

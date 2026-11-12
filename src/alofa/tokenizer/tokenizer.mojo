@@ -116,6 +116,25 @@ struct Tokenizer(Copyable, Movable):
             slot += 1
         return SpecialMatch(best_id, best_length)
 
+    def special_id(imm self, imm text: String) -> Int:
+        """The id of the added token whose content is exactly `text`, or
+        `NO_TOKEN` if no added token matches.
+
+        The eos export path (`srv/gpu_service.mojo` looks up `<|im_end|>`)
+        goes through here: a pinned id dies silently when the fixture
+        changes; a lookup fails loudly at the call site.
+        """
+        var slot = 0
+        while slot < len(self.special_ids):
+            var content_start = self.special_starts[slot]
+            var content_end = self.special_starts[slot + 1]
+            if content_end - content_start == text.byte_length() and _equal_range(
+                text, 0, self.special_blob, content_start, content_end
+            ):
+                return self.special_ids[slot]
+            slot += 1
+        return NO_TOKEN
+
     def encode(imm self, imm text: String, mut sink: List[Int]) raises:
         """Tokenize `text` without prepending anything.
 

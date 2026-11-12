@@ -3727,3 +3727,8 @@
   - **挖出存量红（非本次回归，静态考古定案）**：`test_workers` 期望 `content:"S:hi"`——`cba53a8`（9月23 10:41）把 ChatML 渲染挪进解析器，Service 收到的 prompt 是完整 ChatML，Stub 原样回显；该门自那以后没再跑过（不在常规门集里），期望停在渲染前。本次顺手修正为渲染后语义（`S:<|im_start|>system` + user 段）。**教训：不在常规门集里的门会静默腐烂——test_workers 该进回归集。**
   - **HTTP 冒烟**：temp=1.0/top_p=0.9 走参数面 200 ✓；top_p=1.5 → 指名 400 ✓；temp=0 max_tokens=48 未吐 im_end → finish_reason=length（正确——eos 生效与否取决于模型是否吐出，代码路已单元级钉死）。
   - **遗留**：eos 从 tokenizer/config 导出的导出层（现为钉值）；GPU 流式 `_new_text` 式增量解码（多字节跨 token 的逐帧文本，现为单 token decode——BPE 多字节字符跨 token 时流式帧可能出现乱码碎片，整段拼接仍正确；CPU 路的整段前缀解码法是正解，待搬）。
+- **2026-11-13（一百三十一）** —— 卫生三刀：**eos 导出层 + 流式整段前缀解码 + srv 端到端门聚合**
+  - **eos 导出层**：`Tokenizer.special_id(text)`（added tokens 里按字节精确查，复用 `_equal_range`，查不到回 NO_TOKEN）——`GpuService` 的 eos 从**钉值**改为构造时查 `<|im_end|>`（151645），钉值降为查不到时的兜底。换 fixture 不再静默死在错的 id 上。
+  - **流式整段前缀解码**：`GpuService` 搬 CPU 路 `_new_text` 同法（`s_out` 前缀重解 − `s_emitted` 已发字节）——多字节字符跨 token 的乱码帧根除。门新增 ①英文 24 帧 join==decode ✓ ②**CJK prompt**（多字节重灾区）16 帧 join==decode ✓。此前单 token 解码恰好在英文 ASCII fixture 上没暴露——CJK 单独钉住。
+  - **srv 门聚合**：`pixi run test-srv` = test-http + test-loop + test-workers + test-engine（四条真 socket 端到端门一个入口）。它们要 build+跑二进制（fork 在 JIT 下崩编译器），进不了 run_tests.sh 清单——不聚合就是 test_workers 腐烂两个月的土壤。本轮四门全绿验证（engine 门是 trait 改动后首次重跑）。⚠️ 远端裸 shell 没有 pixi 可执行文件——聚合任务面向开发机/CI；远端手工跑仍走 mojo build 直跑（本门即如此验的）。
+  - **门**：GPU SERVICE GATE 全绿（原七判据 + join==decode×2 + eos 导出断言）。

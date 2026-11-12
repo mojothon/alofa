@@ -2,9 +2,9 @@
 GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
 
 判据：
-① 流式贪心 vs `complete`（generate_batch 单行）同链：token 序列经
-   decode 的文本逐位一致（complete 不回 token 序列，decode 是双方向
-   都过 tokenizer 的可比面；BPE 不双射不影响"同链 ⇒ 同文本"）；
+① 流式贪心 vs `complete`（generate_batch 单行）同链：**逐帧文本拼接**
+   与整段 decode 逐位一致（整段前缀解码后，多字节字符跨 token 也不再
+   产生乱码帧——CJK prompt 单独钉）；
 ② 流式贪心重放逐位确定（同 prompt 两次）；
 ③ 采样流式（T=1, top_p=0.9 **走参数面**）同种子逐位复现、异种子
    变异；
@@ -23,6 +23,7 @@ comptime WEIGHTS = "tests/fixtures/qwen2.5-0.5b/weights"
 comptime CONFIG = "tests/fixtures/qwen2.5-0.5b/config.tsv"
 comptime TOKJSON = "tests/fixtures/qwen2.5-0.5b/tokenizer.json"
 comptime PROMPT = "Once upon a time, in a land far away,"
+comptime CJK = "给我讲一个简短的睡前故事。"
 comptime MAXNEW = 24
 
 
@@ -57,17 +58,25 @@ def main() raises:
 
     svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 0)
     var chain1 = List[Int]()
+    var frames1 = List[String]()
     while True:
         var fr = svc.stream_next(0)
         chain1.append(svc.s_last)
+        frames1.append(fr.text)
         if fr.done:
             break
     svc.stream_end(0)
     svc.stream_end(0)  # 幂等
     var stream_text = tok2.decode(chain1)
+    # 逐帧拼接必须逐字节等于整段 decode（前缀解码法的全部意义）。
+    var joined = String("")
+    for i in range(len(frames1)):
+        joined = joined + frames1[i]
+    var join_ok = joined == stream_text
     var same1 = len(chain1) == comp.completion_tokens and stream_text == comp.text
-    print("stream1 len:", len(chain1), "text:", stream_text)
-    if not same1:
+    print("stream1 len:", len(chain1), "join==decode:", join_ok,
+          "text:", stream_text)
+    if not (same1 and join_ok):
         print("  PARITY MISMATCH: stream len", len(chain1),
               "vs complete", comp.completion_tokens)
 
@@ -122,8 +131,15 @@ def main() raises:
     if n_done_at != 2 or not tail_done:
         sem_ok = False
 
-    # ---- ⑤ eos 终止：链中一枚冒充 eos ----
+    # ---- ⑤ eos 导出层 + 终止：链中一枚冒充 eos ----
     var eos_ok = True
+    var eosl = List[Int]()
+    eosl.append(svc.eos)
+    var eos_text = tok2.decode(eosl)
+    var eos_export_ok = svc.eos == 151645 and eos_text.find("<|im_end|>") == 0
+    print("eos exported:", svc.eos, "text:", eos_text)
+    if not eos_export_ok:
+        eos_ok = False
     svc.eos = chain1[2]
     svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 31)
     var echain = List[Int]()
@@ -161,6 +177,23 @@ def main() raises:
         eos_ok = False
     svc.eos = DEFAULT_EOS
 
+    # ---- ⑥ CJK 多字节跨 token：逐帧拼接仍逐字节等于整段 decode ----
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 41)
+    var cjoin = String("")
+    var cchain = List[Int]()
+    while True:
+        var frc = svc.stream_next(41)
+        cjoin = cjoin + frc.text
+        cchain.append(svc.s_last)
+        if frc.done:
+            break
+    svc.stream_end(41)
+    var c_ok = cjoin == tok2.decode(cchain)
+    print("cjk stream len:", len(cchain), "join==decode:", c_ok,
+          "text:", cjoin)
+    if not c_ok:
+        sem_ok = False
+
     # ---- ③ 采样流式（T=1, top_p=0.9 参数面）：确定 + 异种子变异 ----
     var s1 = _sample_run(svc, 21)
     var s2 = _sample_run(svc, 22)
@@ -185,9 +218,10 @@ def main() raises:
     print("sample det:", sdet, " seed-varies:", svar,
           " lens:", len(s1), len(s2), len(s3))
 
-    print("parity:", same1, " det:", det, " sem_ok:", sem_ok,
-          " eos_ok:", eos_ok, " sdet:", sdet, " svar:", svar)
-    if same1 and det and sem_ok and eos_ok and sdet and svar:
+    print("parity:", same1, " join:", join_ok, " det:", det,
+          " sem_ok:", sem_ok, " eos_ok:", eos_ok, " cjk:", c_ok,
+          " sdet:", sdet, " svar:", svar)
+    if same1 and det and sem_ok and eos_ok and c_ok and sdet and svar:
         print("*** GPU SERVICE GATE PASS ***")
     else:
         print("*** GPU SERVICE GATE FAIL ***")
