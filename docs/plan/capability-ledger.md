@@ -3680,3 +3680,9 @@
   - **v2 实现**：逐行 token 流（每行独立 prompt→生成链，gen[0] = 末 prompt token 步的 tokout；全程无 padding 行，只有完成后的 idle 尾 ~9%）+ **join 队列槽位回收**——完成序列让槽，新序列 pos 归零注入。**回收零 KV 搬运**：attention 只读 [0..pos]，旧行被新序列按 pos 顺序覆写（119-b 遗产：pos_arr 语义的红利）。
   - **门**：parity PASS + 确定性 ✓ + **join parity 零失配**（joiner 502 198 2870 vs 单序列参照逐位一致——若有 KV 污染必偏）。测试侧两坑：①join 测试误传 3 序列 flat/lens（out 行基址错位，读到了 seq2 的行）；②gate 参照 v1 的 gen[0] 对齐坑延续。
   - 服务形态就此闭环：**常驻批 + 动态进出 = 真·连续批处理**。剩余缺口：采样（temperature/top-p）与 chunked prefill（~10% 级，缓）。
+- **2026-11-12（一百二十三）** —— 采样落地：`sample_rb_gpu`（Gumbel-max 温度采样），三门全绿
+  - **实现**：`argmax_rb` 机械变体 + 每线程 LCG（NR 数值配方）逐元素出 u，`argmax(logit + T·(-log(-log(u))))` **精确等价 softmax(logits/T) 采样**（Gumbel-max 恒等式）；temp=0 走原 argmax 分支（逐位同）。`prefill_step` 加 runtime `sample_temp/sample_seed`（tail 分支选核），`generate_batch` 透传 `temperature/seed`。u=(x+0.5)/2^24 严格内 (0,1)，并列取小下标。
+  - **门**（N=400，T=1，seed 1000+n）：①temp=0 与贪心逐位一致 ✓；②同种子确定 / 异种子变异 ✓；③**经验分布对齐 host softmax**（top-4 全部 ±0.10 内，理论 0.031/0.023/0.019/0.015 vs 经验 0.043/0.020/0.028/0.018——裸 token 无上下文，真实分布本就平）。
+  - **破案过程（最有价值）**：v1 门 FAIL（top-4 命中 0/400）——三步定位：①host 精确模拟 LCG/Gumbel vs GPU 不一致；②LCG u 均匀性完美（mean 0.5006、尾部 ~1000/10000）排除 PRNG；③**铁证在门自身输出**：`greedy: 75223` 但 host top-8 无 75223——argmax 与参照读的不是同一块内存。**批 tail 的 logits 拷到 `h_logits_b`，测试却读单序列 `h_logits`（陈旧垃圾→假分布）**。GPU 采样器全程正确。教训入册：**写参照前先做自洽断言（argmax 必须等于 host top-1）**，缓冲名一字之差足以造出整层假象（与 120-a 的参照覆写坑同族）。
+  - **Mojo 坑**：`bitcast[UInt32](x)` 现版本要 `bitcast[DType.uint32](x)`（参数是 DType）；host 函数参数必须注类型；`Float64 += Float32` 不隐式升位。
+  - 至此服务层 API 全量：prefill / 批解码 / generate_batch（逐行流+槽回收）/ **温度采样**。遗留：top-p（需排序阈值，缓）、chunked prefill（~10% 级）、3-session 堆审计（119 旗）。

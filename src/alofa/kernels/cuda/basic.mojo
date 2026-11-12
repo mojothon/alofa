@@ -10,7 +10,7 @@ Float64 累加、先 rsqrt 再乘。任何自己发明的顺序都会把真正�
 """
 
 from std.gpu import global_idx, thread_idx, block_idx, grid_dim
-from std.math import sqrt
+from std.math import log, sqrt
 from std.memory import bitcast, stack_allocation
 
 from max.gpu import AddressSpace, barrier
@@ -438,6 +438,63 @@ def argmax_rb_gpu(
         stride //= 2
     if tid == 0:
         out_idx[unsafe_offset=b] = sidx[unsafe_offset=0]
+def sample_rb_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    out_idx: Pointer[Int32, MutUntrackedOrigin],
+    vocab: Int32,
+    temp: Float32,
+    seed: Int32,
+) -> None:
+    """行温度采样（账本一百二十三）：grid=(B,)，Gumbel-max 技巧
+    ——argmax(logit + T·G) 精确等价 softmax(logits/T) 采样。
+    每线程 LCG（state 由 seed/row/tid 派生）逐元素出 u，
+    Gumbel g=-log(-log(u))；temp=0 走纯 argmax（与 argmax_rb 同）。
+    并列取小下标（首现语义一致）。"""
+    var b = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var base = b * Int(vocab)
+    var best = Float32(-3.402823466e38)
+    var bi = Int32(-1)
+    var state = bitcast[DType.uint32](seed) ^ (UInt32(b) * 2654435761) ^ (
+        UInt32(tid) * 40503
+    )
+    var i = tid
+    while i < Int(vocab):
+        var v = x[unsafe_offset=base + i]
+        if temp > Float32(0):
+            state = state * 1664525 + 1013904223
+            var ux = (state >> 8) & 16777215
+            var u = (Float32(ux) + Float32(0.5)) / Float32(16777216)
+            v = v + temp * (-log(-log(u)))
+        if v > best:
+            best = v
+            bi = Int32(i)
+        i += 256
+    var sval = stack_allocation[
+        256, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var sidx = stack_allocation[
+        256, Int32, address_space = AddressSpace.SHARED
+    ]()
+    sval[unsafe_offset=tid] = best
+    sidx[unsafe_offset=tid] = bi
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            var v2 = sval[unsafe_offset=tid + stride]
+            var i2 = sidx[unsafe_offset=tid + stride]
+            var v1 = sval[unsafe_offset=tid]
+            var i1 = sidx[unsafe_offset=tid]
+            if (v2 > v1) or ((v2 == v1) and (i2 < i1)):
+                sval[unsafe_offset=tid] = v2
+                sidx[unsafe_offset=tid] = i2
+        barrier()
+        stride //= 2
+    if tid == 0:
+        out_idx[unsafe_offset=b] = sidx[unsafe_offset=0]
+
+
 def argmax_f32_gpu(
     x: Pointer[Float32, MutUntrackedOrigin],
     part_val: Pointer[Float32, MutUntrackedOrigin],

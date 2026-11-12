@@ -41,7 +41,7 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
     attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
     attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -900,6 +900,8 @@ struct GpuSession:
         eos: Int,
         join_flat: List[Int],
         join_lens: List[Int],
+        temperature: Float32 = 0.0,
+        seed: Int32 = 0,
     ) raises -> List[Int]:
         """连续批处理 v2（账本一百二十二-b）：逐行 token 流 +
         完成槽位回收。
@@ -976,7 +978,7 @@ struct GpuSession:
                 prefill_mma_dual, prefill_mma_down, prefill_wpack,
                 prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
                 prefill_spl, prefill_kv, True
-            ](toks, False, False, False)
+            ](toks, False, False, False, temperature, seed)
             self.ctx.synchronize()
             # 3) 逐行消化 tokout
             for i in range(b):
@@ -1558,6 +1560,9 @@ struct GpuSession:
         # 一百二十-b：False 时批 tail 跳过 B×vocab logits D2H（sample
         # 模式，只回 tokout 4B×B）
         copy_logits: Bool = True,
+        # 一百二十三：>0 走 sample_rb（Gumbel-max 温度采样），=0 纯 argmax
+        sample_temp: Float32 = 0.0,
+        sample_seed: Int32 = 0,
         layer_gap_us: Int = 0, layer_gap_every: Int = 1
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
@@ -2385,13 +2390,24 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.vocab, 8), t, 1),
                 block_dim=(256, 1, 1),
             )
-            self.ctx.enqueue_function[argmax_rb_gpu](
-                self.d_logits_b.unsafe_ptr(),
-                self.d_tokout.unsafe_ptr(),
-                Int32(self.vocab),
-                grid_dim=(t, 1, 1),
-                block_dim=(256, 1, 1),
-            )
+            if sample_temp > Float32(0):
+                self.ctx.enqueue_function[sample_rb_gpu](
+                    self.d_logits_b.unsafe_ptr(),
+                    self.d_tokout.unsafe_ptr(),
+                    Int32(self.vocab),
+                    sample_temp,
+                    sample_seed,
+                    grid_dim=(t, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[argmax_rb_gpu](
+                    self.d_logits_b.unsafe_ptr(),
+                    self.d_tokout.unsafe_ptr(),
+                    Int32(self.vocab),
+                    grid_dim=(t, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
             if copy_logits:
                 self.ctx.enqueue_copy(
                     dst_buf=self.h_logits_b, src_buf=self.d_logits_b
