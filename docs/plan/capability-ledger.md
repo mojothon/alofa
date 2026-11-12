@@ -3671,3 +3671,7 @@
   - **Mojo 坑三枚**：①Tuple 字面量不可迭代（第三次踩——List 只能显式 append）；②方法内 raise 需要 `raises` 且调用 raising 方法同样受限；③non-copyable 返回值要 `return out^` 显式移动。
   - **v2 待办**：chunked prefill（新序列 prompt 一次注入批 store——KVS/attention 需 pos0+h_posarr[b] 变体）+ 完成槽位回收（KV 搬运或 swap-remap）+ 采样（temperature/top-p 进 argmax_rb 位）。
   - 服务层形态就此完整：prefill 8.75ms / 批解码 0.39-0.77ms/token（B=8-64）/ generate_batch 端到端。
+- **2026-11-12（一百二十二-a）** —— generate_batch 服务级 e2e bench：API 零开销 + **padded 浪费 70% 定基线**
+  - **数据**（异质 prompt 6-16 × 生成 24，同 run 交错）：B=8 = 242ms 总 / 6.21ms/步 / **1173 有效 tok/s**；B=16 = 337ms / 8.65ms/步 / **1675 tok/s**。步成本与裸批 bench 完全吻合（6.21 vs 6.19；8.65 vs 8.63）——generate_batch API 层零开销，成本全在批步本身。
+  - **基线发现**：异质长度下 padded lockstep 的 padding 行占比 **~70%**（prompt 相内）。chunked prefill 的理论收益 = prompt 相占比（41% 步）× 70% ≈ **~29% 行步削减**（~15-20% e2e）——值得做但非倍数级；倍数级收益在**槽位回收**（完成序列即时替换新序列，当前必须整批重启）。
+  - chunked prefill 工程面：KVS/attention 核加 `pos0 + h_posarr[b]` 行变体（prompt 一次注入批 store），attention 的 rs/vt2 需处理**行间不同 KV 长度**（现有 _bb 假设每行 1 token）。
