@@ -3755,3 +3755,17 @@
   - **门**：GPU SERVICE GATE PASS 八判据（合批交替同链 inter True + batched 统计 > 0 + 异 prompt 合批 mb==c1 逐位同）；最小诊断门 test_rowprobe（row_base 正确性/行 0 确定性/跨 prompt 状态/合批 t=2/异 prompt 合批/合批后状态，十三刀全绿）；session 三门（prefill/decode/heap_multi）PASS；HTTP pool=2 冒烟正常。
   - **遗留**：①complete 与并发流互斥（generate_batch 清全表 posarr）——并发场景下非流式请求 400 率取决于时序，v1 让 complete 也走合批路径；②padding 行浪费（t=max_active+1，空闲行白跑）——紧致压缩 + 早退核是纯性能刀；③合批 prefill 的性能口径未测（tick 相位混合的 prefill 是逐 token 步，单流长 prompt 比单路整段 prefill 慢——单路 prefill(batch=False) 在服务层退役，session 门仍用）。
   - **教训落账**：**"每 tick 一帧"的多行推进模型里，帧的归属必须显式排队**——单槽状态 + 跨行推进循环 = 静默丢帧；**同一 token 的两种语义（链上游 vs 已领）必须两个字段**——合并写法的症状是"喂错 token"级的链漂移。
+- **2026-11-13（一百三十五）** —— **合批性能口径**：v0 跨流合批的收益基线定案（`bench_batch135.mojo`）
+  - **session 层摊薄曲线**（`prefill_step` 批路 argmax，每步墙钟，预热 5 + 测 30 步）：
+
+    | t（行） | 每步 | per-row | 摊薄效率 vs 串行 |
+    |---|---|---|---|
+    | 1 | 5.10 ms | 5.10 ms | 1.00× |
+    | 2 | 4.27 ms | 2.13 ms | **2.39×** |
+    | 4 | 4.90 ms | 1.22 ms | **4.16×** |
+    | 8 | 6.15 ms | 0.77 ms | **6.63×** |
+
+    **t 行合批的前向成本几乎不随 t 涨**（t=1→8 只 +20%）——权重读主导确认（与 125/126 f16 结论同源）；t=8 摊薄效率 83%，剩余是 GEMM 分块与 attention 行扩张的边际。
+  - **服务层端到端**（两流 EN 24 帧 / CJK 16 帧，pool=8）：串行 230.2 ms（A 136.3 + B 93.9）vs 交替合批 **141.3 ms = 1.63×**。理论核对：34 真前向 × 4.27 ms（t=2）≈ 145 ms——**tick 效率完美**（实测 141 ms ≈ 理论下限）；`n_ticks=92` 里多余的是空转 tick（无活跃行 return，不前向）——调度粒度开销极小，不是前向浪费。
+  - **基线结论**：v0 合批收益 = 1.63×@2 流（含全部调度开销）；session 层上限 6.63×@8 行——收益随并发数向摊薄上限逼近，**4 并发即可期待 ~3.5×，8 并发 ~6×**（服务层，含开销）。
+  - **口径教训落账**：`n_ticks` 计数包含空转 tick（无活跃行 early-return），**吞吐口径必须用"真前向次数"**（batched 计数也要分：合批 t=1 的独跑也计入 batched）——下次给 Session 加 `n_forwards`（真 launch 计数）与 `n_forward_rows`（行·步总数）两个干净口径。
