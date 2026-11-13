@@ -260,58 +260,43 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         temperature: Float64,
         top_p: Float64,
     ) raises -> Completion:
-        """非流式：一次 `generate_batch` 到终点（连续批处理 v2，单行）。
-        它清全表 posarr 并从行 0 起排布——**需要整个 session**：有任何
-        活跃流就指名拒绝（`ERR_CAPACITY`）。"""
-        if self._any_active():
-            raise AlofaError(
-                ERR_CAPACITY,
-                "gpu rows are busy (complete needs the whole session)",
-                "rows=" + String(self.n_rows),
-            )
-        self.streams[0].request = COMPLETE_MARKER
+        """非流式：占一行自驱动到终点（一百三十七）。
+
+        旧实现独占整个 session（generate_batch 清全表 posarr 从行 0
+        起排布），流活跃时指名拒绝——HTTP 非流式与流式互斥是正确性债。
+        本刀 complete 改为 `stream_begin` -> `stream_next` 循环 ->
+        `stream_end` 的封装：它就是 tick 批行池里的一条普通活跃行，
+        **与并发流共存**（行满才拒），采样语义由 per-row 核保证（t=1
+        时种子派生与旧路径逐位同）。
+
+        拼接语义：逐帧领到 done，各帧是 UTF-8 安全边界的增量切片，
+        拼接 == 整段 decode（⑥ 判据）；eos 帧不吐文本（与流式同），
+        completion_tokens 用本行 `out` 的真 token 枚数。"""
         var ids = self.tokenizer.encode(prompt)
-        if len(ids) == 0:
-            self.streams[0].request = NO_REQUEST
+        var n_in = len(ids)
+        if n_in == 0:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "prompt tokenizes to nothing", ""
             )
-        if len(ids) >= self.max_tokens:
-            self.streams[0].request = NO_REQUEST
+        if n_in >= self.max_tokens:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT,
                 "prompt exceeds the KV window",
-                "prompt=" + String(len(ids)) + " cap=" + String(self.max_tokens),
+                "prompt=" + String(n_in) + " cap=" + String(self.max_tokens),
             )
-        var lens = List[Int]()
-        lens.append(len(ids))
-        var out = self.session.generate_batch[
-            GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM, GPU_HEAD_DIM,
-            GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB, GPU_ATTN_TILES,
-            DType.float32
-        ](
-            ids^,
-            lens^,
-            max_tokens,
-            self.eos,
-            List[Int](),
-            List[Int](),
-            Float32(temperature),
-            Int32(self.seed),
-            Float32(top_p),
-        )
-        self.streams[0].request = NO_REQUEST
-        # eos 停行之后，generate_batch 把 **eos 本身**记进该行（其后剩余
-        # 步以 NO_TOKEN(=-1) 填充，executor 的哨兵）——两样都不进 decode：
-        # eos 的文本是控制序列，不是内容；决算只数真 token。这样
-        # complete 与流式（eos 那帧不吐文本）严格同链同文本。
-        var real = List[Int]()
-        for i in range(len(out)):
-            if out[i] >= 0 and out[i] != self.eos:
-                real.append(out[i])
-        var n_out = len(real)
-        var text = self.tokenizer.decode(real^)
-        return Completion(text, len(ids), n_out)
+        self.stream_begin(prompt, max_tokens, temperature, top_p,
+                          COMPLETE_MARKER)
+        var cslot = self._slot_of(COMPLETE_MARKER)
+        var text = String("")
+        var done = False
+        while not done:
+            var fr = self.stream_next(COMPLETE_MARKER)
+            text += fr.text
+            if fr.done:
+                done = True
+        var n_out = len(self.streams[cslot].out)
+        self.stream_end(COMPLETE_MARKER)
+        return Completion(text, n_in, n_out)
 
     def stream_begin(
         mut self,

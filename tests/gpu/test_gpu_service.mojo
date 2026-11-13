@@ -11,7 +11,7 @@ GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
 ⑦ 合批并发（一百三十四/一百三十六）：单 session 两批行，两条流
    交替问——tick 一次推进全部活跃行（**任意采样参数组合**，
    per-row 核），各自与独跑**逐位同链**，且**真合批**；流活跃时
-   complete 指名拒绝；
+   complete 与并发流共存（一百三十七：complete 走 tick 池）；
 ④ 协议语义：错号 stream_next 指名红；拒第二条流；done 后继续问仍
    done=True；stream_end 幂等；
 ⑤ eos 终止：把链中一枚冒充 eos，流在第 3 帧收、不吐文本、done 后
@@ -328,19 +328,47 @@ def main() raises:
         print("  NO batched tick despite two argmax streams!")
         inter_ok = False
 
-    # complete 需要整个 session（generate_batch 清全表 posarr）：
-    # 空闲时正常；有流活跃时指名拒绝。
-    var comp_busy = svc.complete(PROMPT, 8, 0.0, 1.0)
+    # complete 走合批路径（一百三十七）：占一行进 tick 池，与并发流
+    # **共存**（行满才拒），不再是互斥语义。判据三层：
+    #   a) 空闲 complete 正常；
+    #   b) 流活跃时 complete **成功**，且文本与独跑逐位同
+    #      （temp0.8 种子重放：st.seed 固定、count 从 0 起步）；
+    #   c) complete 自驱动期间同一 tick 池里的流 71 与它的独跑参照
+    #      逐位同链（complete 的 next 循环推进全池——合批语义）。
+    var comp_idle = svc.complete(PROMPT, 8, 0.8, 1.0)
+    # 71 流独跑参照（4 帧贪心）。
+    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 72)
+    var cchain4 = List[Int]()
+    while True:
+        var fr7 = svc.stream_next(72)
+        cchain4.append(svc.streams[svc._slot_of(72)].last)
+        if fr7.done:
+            break
+    svc.stream_end(72)
+    # busy complete：流 71 活跃期间 complete 挤入池中。
     svc.stream_begin(PROMPT, 4, 0.0, 1.0, 71)
+    var slot71 = svc._slot_of(71)
     var busy_rejected = False
+    var comp_busy_text = String("")
     try:
-        _ = svc.complete(PROMPT, 8, 0.0, 1.0)
+        var comp_busy = svc.complete(PROMPT, 8, 0.8, 1.0)
+        comp_busy_text = comp_busy.text
     except e:
         busy_rejected = True
+    # complete 自驱动已推完 71 流的帧——领完并对比参照。
+    var s71 = List[Int]()
+    var d71 = False
+    while not d71:
+        var fr71 = svc.stream_next(71)
+        s71.append(svc.streams[slot71].last)
+        if fr71.done:
+            d71 = True
     svc.stream_end(71)
-    print("complete: idle-ok", comp_busy.completion_tokens,
-          "tokens | while-stream rejected:", busy_rejected)
-    if not busy_rejected:
+    var busy_ok = (not busy_rejected) and comp_busy_text == comp_idle.text
+    var s71_ok = _same(s71, cchain4)
+    print("complete: idle", comp_idle.completion_tokens, "tokens |",
+          "while-stream ok:", busy_ok, "| stream71 chain ok:", s71_ok)
+    if not busy_ok or not s71_ok:
         sem_ok = False
 
     # ---- ③ 采样流式（T=1, top_p=0.9 参数面）：确定 + 异种子变异 ----

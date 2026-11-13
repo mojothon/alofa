@@ -3776,3 +3776,9 @@
   - **门**：GATE PASS 九判据——⑦ 交替段升级为**混合参数同批**（A temp0 argmax 分支 + B temp0.8 Gumbel 分支），各自与独跑逐位同链 + `n_single==0` 断言。**门小坑**：B 独跑参照（51）落 slot 0，门收集写死 `streams[1]` 收的是空闲行——按 `_slot_of(rid)` 收集修正（服务层语义「begin 返回实际行」本就该这么用）。
   - **回归**：session 三门 PASS（零破坏）；135 基准复跑——per-row 核 t=1 每步 5.17ms vs 旧 5.10ms（**+1%，零代价**），摊薄曲线不变（t=8 6.69×），端到端 1.63× 保持；CPU 全回归 PASS。
   - **口径意义**：OpenAI API 的真实流量里 temperature>0 是常态——此前带参流逐行推进，服务在真实流量下退化回 132 的串行；本刀后**真实流量全量合批**，135 的摊薄上限（t=8 6.63×）对采样流量同样成立。
+- **2026-11-13（一百三十七）** —— **complete 走合批路径**：非流式与流式的互斥消除
+  - **改造**：`complete` 从「独占 session 跑 `generate_batch`（清全表 posarr，流活跃时指名拒绝）」改为 **`stream_begin` → `stream_next` 循环 → `stream_end` 的封装**——complete 就是 tick 批行池里的一条普通活跃行（伪请求 `COMPLETE_MARKER`），**与并发流共存**（行满才拒）。`_any_active` 至此无调用者。HTTP/OpenAI 层零改动（透传）。
+  - **语义对齐**（per-row 核就位后自然成立）：t=1 时 per-row 种子派生与 `generate_batch` 逐位同；eos 帧不吐文本（`n_out = len(st.out)` 真 token 枚数）；逐帧拼接 == 整段 decode（⑥ 判据）。
+  - **门**：GATE PASS 九判据——busy complete 判据反转三层：a) 空闲正常；b) 流活跃时 complete **成功**且文本与独跑逐位同（temp0.8 种子重放）；c) complete 自驱动期间同池流 71 与它的独跑参照逐位同链（complete 的 next 循环推进**全池**——合批语义顺带再证）。
+  - **回归**：session 三门 PASS；CPU 全回归 8/8。
+  - **架构意义**：HTTP 层的 complete 端点在真实流量里不再与流式互斥——混合负载（非流式问答 + 流式会话并存）下批行池统一调度，135/136 的摊薄收益对非流式流量同样成立。`generate_batch` 在服务层退役（session 层保留，session 门仍用）。
