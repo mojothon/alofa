@@ -8,8 +8,9 @@ GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
 ② 流式贪心重放逐位确定（同 prompt 两次）；
 ③ 采样流式（T=1, top_p=0.9 **走参数面**）同种子逐位复现、异种子
    变异；
-⑦ 池并发（一百三十二）：两条流交替推进，各自与独跑**逐位同链**；
-   complete 在池里占坑：一条流占着可用另一条，两条全占指名拒绝；
+⑦ 合批并发（一百三十四）：单 session 两批行，两条流交替问——
+   tick 一次推进全部活跃行，各自与独跑**逐位同链**，且**真合批**
+   （batched tick 计数 > 0）；流活跃时 complete 指名拒绝；
 ④ 协议语义：错号 stream_next 指名红；拒第二条流；done 后继续问仍
    done=True；stream_end 幂等；
 ⑤ eos 终止：把链中一枚冒充 eos，流在第 3 帧收、不吐文本、done 后
@@ -70,8 +71,8 @@ def main() raises:
     var tokenizer = load_tokenizer_json(TOKJSON)
     # 门侧比对用的第二份（第一份被 ^ 移进 svc，Mojo 移动后不可再用）。
     var tok2 = load_tokenizer_json(TOKJSON)
-    # 池 = 2（一百三十三 KV 统一修复后恢复）：两条流真并发（⑦），
-    # 第三条指名拒绝。
+    # 批行池 = 2（一百三十四：单 session 两批行，tick 合批）：
+    # 两条流交替推进各与独跑逐位同链（⑦），第三条指名拒绝。
     var svc = GpuService(
         model, 2, 512, tokenizer^, 151936, 42,
         WEIGHTS, CONFIG, TOKJSON,
@@ -99,6 +100,26 @@ def main() raises:
     for i in range(len(frames1)):
         joined = joined + frames1[i]
     var join_ok = joined == stream_text
+    if not join_ok:
+        # 诊断：首差异字节 + 各自长度 + 帧长序列头几枚。
+        var jb = joined.as_bytes()
+        var db = stream_text.as_bytes()
+        var n = len(jb) if len(jb) < len(db) else len(db)
+        var diff_at = -1
+        for i in range(n):
+            if jb[i] != db[i]:
+                diff_at = i
+                break
+        print("  JOIN DIAG: joined_len", len(jb), "decode_len", len(db),
+              "first_diff_at", diff_at)
+        var flens = String("")
+        for i in range(len(frames1)):
+            if i > 6:
+                break
+            flens = flens + String(len(frames1[i].as_bytes())) + ","
+        print("  frame byte lens:", flens)
+        print("  svc out len:", len(svc.streams[0].out),
+              "chain1 len:", len(chain1))
     var same1 = len(chain1) == comp.completion_tokens and stream_text == comp.text
     print("stream1 len:", len(chain1), "join==decode:", join_ok,
           "text:", stream_text)
@@ -257,20 +278,51 @@ def main() raises:
                 print("interleave B diverge at", i)
                 break
     print("interleave: a", len(ia), "b", len(ib), " same-as-solo:", inter_ok)
+    print("  ticks:", svc.n_ticks, "batched:", svc.n_batched,
+          "single:", svc.n_single)
+    # 诊断：交替之后 B 独占重放——== cchain 则行 1 无残留、分歧在
+    # 合批前向本身（行间数值泄漏）；!= cchain 则行 1 带残渣。
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 81)
+    var ib2 = List[Int]()
+    var d_b2 = False
+    while not d_b2:
+        var fr8 = svc.stream_next(81)
+        ib2.append(svc.streams[1].last)
+        if fr8.done:
+            d_b2 = True
+    svc.stream_end(81)
+    print("  B solo-rerun == cchain:", _same(ib2, cchain),
+          " len:", len(ib2), "vs", len(cchain))
+    # 判别：同状态再重放一次——两次互异 = 同状态不确定性（device 残留
+    # /竞态）；两次相同但 != cchain = cchain 段的状态依赖。
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 82)
+    var ib3 = List[Int]()
+    var d_b3 = False
+    while not d_b3:
+        var fr9 = svc.stream_next(82)
+        ib3.append(svc.streams[0].last)
+        if fr9.done:
+            d_b3 = True
+    svc.stream_end(82)
+    print("  B rerun2 == rerun1:", _same(ib3, ib2),
+          " == cchain:", _same(ib3, cchain))
+    if svc.n_batched == 0:
+        # temp=0 的两条流交替必须真合批（一次前向推两行）。
+        print("  NO batched tick despite two argmax streams!")
+        inter_ok = False
 
-    # complete 在池里占坑：一条流占着 → 用另一条；两条全占 → 指名拒绝。
-    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 71)
+    # complete 需要整个 session（generate_batch 清全表 posarr）：
+    # 空闲时正常；有流活跃时指名拒绝。
     var comp_busy = svc.complete(PROMPT, 8, 0.0, 1.0)
-    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 72)
+    svc.stream_begin(PROMPT, 4, 0.0, 1.0, 71)
     var busy_rejected = False
     try:
         _ = svc.complete(PROMPT, 8, 0.0, 1.0)
     except e:
         busy_rejected = True
     svc.stream_end(71)
-    svc.stream_end(72)
-    print("complete-while-busy:", comp_busy.completion_tokens,
-          "tokens | full-pool complete rejected:", busy_rejected)
+    print("complete: idle-ok", comp_busy.completion_tokens,
+          "tokens | while-stream rejected:", busy_rejected)
     if not busy_rejected:
         sem_ok = False
 

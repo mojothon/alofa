@@ -3744,3 +3744,14 @@
   - **顺手挖出第二病（字节级流式）**：修复后 CJK 流输出**真中文**，暴露 131 前缀解码法的边界——`decode` 遇尾部不完整 UTF-8 直接丢尾，破坏前缀性（多字节跨 token 的首帧翻车；131 的 CJK 判据 True 只是当时链的首枚恰完整）。修复：tokenizer 加 `decode_bytes`（纯字节拼接），两路流式（GPU `stream_next` + CPU `_new_text`）改字节级前缀 + 帧尾完整边界截断（`utf8_tail_safe_len`，与 decode 的丢尾逐字节等价 ⇒ 拼接恒等于整段 decode）。英文门不受影响（ASCII 恒完整）。
   - **门**：复现器全绿（F5/F8==F1、F7==F4，漂移根除）；**GPU SERVICE GATE PASS 八判据**（含恢复的池交替同链 inter True + complete 占坑拒绝）；session 三门（prefill/decode/heap_multi）PASS；**CPU 全回归 PASS**（_new_text 同改）；HTTP pool=2 真并发冒烟（双请求落两坑 200 + SSE 正常）。
   - **教训落账**：跨路径共享状态（KV store）的"每条路自洽"不等于"全链一致"——**任何一条前向路径的 KV 写目标必须有门钉它与消费方一致**；修复本身就是把"自洽"升级成"统一"。
+- **2026-11-13（一百三十四）** —— **跨流合批**：单 session 批行池 + tick 相位混合推进，八门全绿
+  - **架构**：合批的正确形态不是跨 session（一次 batch 前向只读一个 session 的 store），而是**单 session 的 N 个批行**——`GpuStream` 下标 = `store_b` 批行号（行间 KV 天然隔离，133 统一后的布局），API 不变（`stream_begin/next/end` 签名照旧，`n_sessions` 参数语义变"并发行容量"）。推进模型 = `generate_batch` 同构的**相位混合 tick**：一次前向推进所有活跃行各一步（prompt 相位喂 `prompt[pidx]`、生成相位喂 `cur`、空闲行 padding），尾枚 prompt token 那步的 tokout 就是 gen[0]。`stream_next` 需要帧时触发 tick，帧队列存好等各自来领——单线程 reactor 交替问 N 条流，实际前向次数 ≈ max(各流步数) 而非总和（门实测 152 tick 摊 40 帧）。
+  - **session 层配套**：`prefill_step` 加 `row_base` 运行时参（store_b/posarr/scores 三处行偏移，核不改）——任意行子集可前向，稀疏 slot 不再错位。
+  - **合批范围 v0**：全 argmax（temp=0）才合批——采样参数是整批标量 + Gumbel 种子按紧密行号派生（`seed ^ b*C`），行号随编排漂移会破坏重放语义；带采样参数的流逐行 t=1（`row_base=slot` 保种子）。per-row 参数核是下一刀。
+  - **门挖出三个新坑（全修）**：
+    1. **done 帧吞文本**：`stream_next` 的 done 分支返回空串——末帧的最后几枚 token 字节被永远吞掉（帧尾截断的半字符再无下一帧补发）。「不吐文本」只属于 eos 帧。实测 join 恰为 decode 的前缀（107 vs 111 字节）。
+    2. **帧单槽覆盖**：帧不是队列时，别的行的领帧循环一次跨多步会覆盖本行中间帧——实测 B 丢前两帧（mb == c1[2:] 完美左移）。帧改队列（`frame_ends`/`frame_dones`/`frame_tokens` + 消费游标），文本按 `[prev_end, end)` 现切。
+    3. **链上游与门语义分离**：生成相位组行喂的 token 必须是 `cur`（收行时推进）而不是 `last`——last 已改为"出队时更新"（= 已领的最新一枚，门的逐位同链收集靠它）；喂 last 会把陈旧 token 喂进模型（实测 B 第 2 枚 220 = 对 token 0 的响应）。
+  - **门**：GPU SERVICE GATE PASS 八判据（合批交替同链 inter True + batched 统计 > 0 + 异 prompt 合批 mb==c1 逐位同）；最小诊断门 test_rowprobe（row_base 正确性/行 0 确定性/跨 prompt 状态/合批 t=2/异 prompt 合批/合批后状态，十三刀全绿）；session 三门（prefill/decode/heap_multi）PASS；HTTP pool=2 冒烟正常。
+  - **遗留**：①complete 与并发流互斥（generate_batch 清全表 posarr）——并发场景下非流式请求 400 率取决于时序，v1 让 complete 也走合批路径；②padding 行浪费（t=max_active+1，空闲行白跑）——紧致压缩 + 早退核是纯性能刀；③合批 prefill 的性能口径未测（tick 相位混合的 prefill 是逐 token 步，单流长 prompt 比单路整段 prefill 慢——单路 prefill(batch=False) 在服务层退役，session 门仍用）。
+  - **教训落账**：**"每 tick 一帧"的多行推进模型里，帧的归属必须显式排队**——单槽状态 + 跨行推进循环 = 静默丢帧；**同一 token 的两种语义（链上游 vs 已领）必须两个字段**——合并写法的症状是"喂错 token"级的链漂移。

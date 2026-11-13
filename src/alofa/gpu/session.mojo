@@ -1601,7 +1601,12 @@ struct GpuSession:
         # 一百二十八：<1 启用 top-p nucleus（配合 sample_temp>0）；
         # =1 全词表（同 sample_rb）
         sample_topp: Float32 = 1.0,
-        layer_gap_us: Int = 0, layer_gap_every: Int = 1
+        layer_gap_us: Int = 0, layer_gap_every: Int = 1,
+        # 一百三十四：批路的**起始行号**——行 b（grid z）实际读写
+        # store_b/posarr/scores 的行 row_base+b。合批服务把每条流钉在
+        # 自己的批行上（slot≠0 的流单步前向不再错位）；padding 补齐或
+        # 紧密压缩两种编排都直接可用。默认 0 = 原行为。
+        row_base: Int = 0,
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -1984,17 +1989,20 @@ struct GpuSession:
             # store 行是竞态：行 b 读 pos0..pos0+b-1，全由本批写入）。
             var pk = self.d_k_store_b[layer].unsafe_ptr()
             var pv = self.d_v_store_b[layer].unsafe_ptr()
+            var row_off = row_base * self.max_tokens * self.kv_dim
+            var row_pos = self.d_posarr.unsafe_ptr() + row_base
+            var score_off = row_base * self.n_heads * self.max_tokens
             if batch:
                 self.ctx.enqueue_function[kv_store_bb_gpu[attn_t]](
                     self.d_qrot_b.unsafe_ptr(),
                     self.d_qb.unsafe_ptr(),
                     self.d_kb.unsafe_ptr(),
                     self.d_vb.unsafe_ptr(),
-                    self.d_k_store_b[layer].unsafe_ptr(),
-                    self.d_v_store_b[layer].unsafe_ptr(),
+                    self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                    self.d_v_store_b[layer].unsafe_ptr() + row_off,
                     self.d_cos.unsafe_ptr(),
                     self.d_sin.unsafe_ptr(),
-                    self.d_posarr.unsafe_ptr(),
+                    row_pos,
                     Int32(self.n_heads),
                     Int32(self.n_kv_heads),
                     Int32(self.head_dim),
@@ -2046,9 +2054,9 @@ struct GpuSession:
                     attn_rs_h_bb_gpu[attn_t, 8, True]
                 ](
                     self.d_qrot_b.unsafe_ptr(),
-                    self.d_k_store_b[layer].unsafe_ptr(),
-                    self.d_scoresb.unsafe_ptr(),
-                    self.d_posarr.unsafe_ptr(),
+                    self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                    self.d_scoresb.unsafe_ptr() + score_off,
+                    row_pos,
                     Int32(self.n_heads),
                     Int32(self.n_kv_heads),
                     Int32(self.head_dim),
@@ -2091,11 +2099,11 @@ struct GpuSession:
                 self.ctx.enqueue_function[
                     attn_vt2_h_bb_gpu[attn_t, 8, attn_tiles, attn_tiles == 1]
                 ](
-                    self.d_scoresb.unsafe_ptr(),
-                    self.d_v_store_b[layer].unsafe_ptr(),
+                    self.d_scoresb.unsafe_ptr() + score_off,
+                    self.d_v_store_b[layer].unsafe_ptr() + row_off,
                     self.d_vpartb.unsafe_ptr(),
                     self.d_attotb.unsafe_ptr(),
-                    self.d_posarr.unsafe_ptr(),
+                    row_pos,
                     Int32(self.n_heads),
                     Int32(self.n_kv_heads),
                     Int32(self.head_dim),
@@ -2410,7 +2418,6 @@ struct GpuSession:
                 prof_t0 = monotonic_ns()
 
         if batch:
-            print("BATCH TAIL t=", t)
             # 一百二十：B 行终 norm + B 行 lm_head + 行 argmax
             self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),

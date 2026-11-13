@@ -1,43 +1,48 @@
-"""GPU 后端的 `Service` 实现：把 **session 池**（N 份 `GpuSession` 共享
-同一份权重与同一个 `DeviceContext`，账本一百二十五/一百二十六）接到
-`ChatHandler` 的 OpenAI/SSE 之下——HTTP、`/v1/chat/completions`、流式
-SSE 全部复用 srv 层，本模块只回答「怎么生成、怎么并发」。
+"""GPU 后端的 `Service` 实现：**批行池 + tick 合批**（账本一百三十四）
+接到 `ChatHandler` 的 OpenAI/SSE 之下——HTTP、`/v1/chat/completions`、
+流式 SSE 全部复用 srv 层，本模块只回答「怎么生成、怎么并发」。
 
-并发模型（一百三十二）
-----------------------
-**池，不是线程**。reactor 循环一次只调一个 `stream_next`，但池里 N 条
-session 各自持有独立的 KV 与流相位——`stream_begin` 从池里取一条空闲
-session，第二条流落在另一条 session 上，两条流**交替推进、互不覆盖**
-（126 验过：共享 ctx 的多 session KV 独立、穿插确定性逐位成立）。
-吞吐还是串行的（每次前向 t=1，GPU 把调用排成队），并发的是**进展**：
-一条 20 s 的生成不再把其它请求挡在池外。跨流合批（一次前向推 N 条
-流各一枚，t=N 行摊薄权重读）是下一步，不在本层。
+并发模型（一百三十二 → 一百三十四两步演化）
+-------------------------------------------
+**池（132）**：N 份 GpuSession 各持独立 KV——并发的是进展不是吞吐
+（每次前向 t=1）。133 修掉跨路径 KV 断层后，池交替同链成立。
 
-池满的策略：`stream_begin` / `complete` 取不到空闲 session 就**指名
-拒绝**（`ERR_CAPACITY`）——`stream_begin` 的错发生在响应头之前，
-`ChatHandler` 把它回成 400，客户端可以立刻重试；不做排队帧（waiting
-那条路要动 loop 的队列语义，留给合批那一轮一起做）。
+**批行池 + tick（134，本层）**：合批的正确形态不是跨 session（一次
+batch 前向只读一个 session 的 store），而是**单 session 的 N 个批行**
+——`GpuStream` 的下标就是 `store_b` 的批行号（行间 KV 天然隔离，正是
+133 统一后的布局；`prefill_step` 的 `row_base` 参让任意行子集可前向）。
 
-流式相位与 CPU 路同构（`stream_begin` 只准备，前向留在第一次
-`stream_next`——那是唯一还能把请求的错回成 400 的地方）：
+推进模型 = `generate_batch` 同构的**相位混合 tick**：
 
-* prefill：prompt 去尾一枚，`prefill_step(batch=False)` 一段算完
-  （prompt 尾枚留给解码步，这样首 token 与后续 token 走**同一条**
-  采样路径）；
-* 解码步：`prefill_step(batch=True, t=1)`，位置在 `h_posarr[0]`
-  （批路的位置语义是逐行的，不读 `kv_pos`——账本一百二十九）；
+* `_tick()` 一次前向推进所有活跃行各一步：prompt 相位的行喂
+  `prompt[pidx]`（KV 落位 pidx），生成相位的行喂 `last`（链式）；
+  空闲行 padding（喂 0、pos 0，tokout 丢弃）。尾枚 prompt token 那
+  步的 tokout 就是 gen[0]——首帧与后续帧走**同一条**链，与
+  `generate_batch` 逐位同构（parity 门钉）。
+* `stream_next` 需要帧时触发 tick：帧存进行状态（`frame_ready`），
+  其他行同 tick 产生的帧等它们自己来领——单线程 reactor 交替问
+  N 条流，实际前向次数 ≈ max(各流步数) 而不是总和。
+* **合批条件**：活跃行全部 temp==0（argmax 无参数分歧、行号无关
+  确定）。temp>0 的采样参数是整批标量、Gumbel 种子按紧密行号派生
+  （`seed ^ b*C`）——行号随编排漂移会破坏重放语义，故带采样参数的
+  流退化为逐行 t=1（`row_base=slot`，种子语义与 129 逐位一致）。
+  per-row 参数核（temp/seed/topp 数组化）是合批的下一刀。
+
+池满策略不变：`stream_begin` 取不到空闲行就指名拒绝（`ERR_CAPACITY`
+——响应头之前，`ChatHandler` 回 400）。`complete` 需要整个 session
+（`generate_batch` 清全表 posarr 并从行 0 起排布）——有任何活跃流时
+同样指名拒绝。
+
+流式相位（131/133 的语义全部保留）：
+
 * 每步种子 = `seed + count`：同一条流逐步去相关，重放（同种子）逐位
-  复现。
+  复现（逐行模式下 `row_base=slot` 不改核内行号 b=0，种子不变）。
+* 采样全在 GPU tail（temp=0 argmax / Gumbel-max / nucleus）。
+* 文本帧走**字节级整段前缀解码**（`decode_bytes` + `utf8_tail_safe_len`
+  帧尾边界截断，账本一百三十三）：多字节跨 token 不产生乱码帧。
 
-采样全在 GPU tail（`sample_temp` / `sample_topp`，账本一百二十三/
-一百二十八）：temp=0 走 argmax，temp>0 走 Gumbel-max，top_p<1 走
-nucleus 截断。文本帧走**整段前缀解码**（与 CPU 路 `_new_text` 同法，
-账本一百三十一）：多字节字符跨 token 不产生乱码帧。
-
-eos 走导出层（`Tokenizer.special_id("<|im_end|>")`，账本一百三十一）；
-`spawn_twin`（engine 线程路）给孪生体**一条**自己的 session（不放大
-池——N 线程 × M session = N×M 份 KV，账没有这么记的）并共享同一个
-`DeviceContext`——多线程共用一条 ctx 的并发安全尚未验证。
+`spawn_twin`（engine 线程路）给孪生体一个**单行**的自己（一份 KV）
+并共享同一 ctx——多线程共用一条 ctx 的并发安全尚未验证。
 """
 
 from max.gpu.host import DeviceContext
@@ -78,11 +83,14 @@ alias COMPLETE_MARKER = -2
 
 
 struct GpuStream(Movable):
-    """池里一个坑位的**流相位**。`request == NO_REQUEST` 即空闲。
+    """批行池里一个**行位**的流相位。`request == NO_REQUEST` 即空闲。
 
-    一条流的全部可变状态都住在这里——池化之后不再有"整块状态只属于
-    一条流"的单份字段，找流靠 `request` 号（号对不上就红，协议契约
-    与单流版一致）。
+    行号即 `store_b` 的批行号——一条流的所有 KV 都住 store_b 的这一
+    行，行间互不越界（133 统一后的布局天然保证）。找流靠 `request`
+    号（号对不上就红，协议契约与单流版一致）。
+
+    `frame_*` 是 tick 存下的待领帧：tick 推进所有活跃行，每行把产出
+    存好，`stream_next` 来领——交替问流时一 tick 伺候全部。
     """
 
     var request: Int
@@ -97,6 +105,26 @@ struct GpuStream(Movable):
     var seed: Int
     var started: Bool
     var pos: Int
+    # 生成链上游（下一 tick 喂给模型的 token）：收行时推进。⚠️ 与
+    # `last` 分离——last 是「已领的最新一枚」（出队时更新，门的逐位
+    # 同链收集靠它），tick 的组行跨多步时若读 last 会喂进陈旧 token
+    # （134 门实测：B 第 2 枚 220 = 对 token 0 的响应）。
+    var cur: Int
+    # prompt 游标：pidx < plen = prompt 相位（喂 prompt[pidx]）；
+    # pidx == plen = 生成相位（喂 last）。尾枚步的 tokout 是 gen[0]。
+    var pidx: Int
+    # 帧队列（⚠️ 不能是单槽）：tick 推进所有活跃行，一行一帧；当
+    # 别的行的领帧循环一次跨多步时，本行的中间帧会被覆盖（134 门
+    # 实测 B 丢前两帧）。队列存每帧的 emitted 终值（字节）与 done
+    # 标志；`stream_next` 按游标出队，文本用 [prev_end, end) 从整段
+    # 前缀里现切——out 不变时 decode_bytes 恒定，切片即帧。
+    var frame_ends: List[Int]
+    var frame_dones: List[Bool]
+    # 每帧对应的 token（eos 帧记推进前的 last——`last` 的语义是
+    # 「已领的最新一枚」，由 `stream_next` 出队时更新；收行时直接
+    # 推 last 会让它跑到帧前面，门的逐位同链收集就错了）。
+    var frame_tokens: List[Int]
+    var frame_head: Int
 
     def __init__(out self):
         self.request = NO_REQUEST
@@ -111,17 +139,27 @@ struct GpuStream(Movable):
         self.seed = 0
         self.started = False
         self.pos = 0
+        self.cur = 0
+        self.pidx = 0
+        self.frame_ends = List[Int]()
+        self.frame_dones = List[Bool]()
+        self.frame_tokens = List[Int]()
+        self.frame_head = 0
 
 
 struct GpuService(Service, Movable, Deinitable, Twinable):
-    var sessions: List[GpuSession]
+    var session: GpuSession
     var streams: List[GpuStream]
-    var n_sessions: Int
+    var n_rows: Int
     var tokenizer: Tokenizer
     var vocab: Int
     var max_tokens: Int
     var seed: Int
     var eos: Int
+    # 合批口径（门钉「真合批发生」）：tick 总数 / 合批 tick / 逐行步。
+    var n_ticks: Int
+    var n_batched: Int
+    var n_single: Int
     # spawn_twin 要用的三个路径（与 ModelService 同款：存路径不存模型，
     # 孪生体按同一份权重重开）。
     var weights_dir: String
@@ -140,17 +178,20 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         config_path: String,
         tokenizer_json: String,
     ) raises:
-        # N 份 session **共享同一份权重**（model 借用）与**同一个
-        # ctx**（每进程 DeviceContext 上限 2，账本一百二十四/一百二十五
-        # ——多路复用必须同 ctx）。
-        self.sessions = List[GpuSession]()
+        # 单 session、N 个批行（参数名留 n_sessions 兼容 serve_gpu 的
+        # ALOFA_GPU_SESSIONS——语义已是「并发行容量」）。行间 KV 隔离
+        # 由 store_b 的 [row][pos][kv] 布局天然保证（133）。
         var ctx = DeviceContext()
-        for _i in range(n_sessions):
-            self.sessions.append(GpuSession(model, max_tokens, ctx))
+        self.session = GpuSession(model, max_tokens, ctx)
         self.streams = List[GpuStream]()
-        for _i in range(n_sessions):
+        var n_rows = n_sessions
+        if n_rows > GPU_BMAX:
+            n_rows = GPU_BMAX
+        if n_rows < 1:
+            n_rows = 1
+        for _i in range(n_rows):
             self.streams.append(GpuStream())
-        self.n_sessions = n_sessions
+        self.n_rows = n_rows
         self.tokenizer = tokenizer^
         self.vocab = vocab
         self.max_tokens = max_tokens
@@ -159,13 +200,16 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 钉值只是查不到时的兜底——换 fixture 不再静默死在错的 id 上。
         var exported = self.tokenizer.special_id("<|im_end|>")
         self.eos = exported if exported >= 0 else DEFAULT_EOS
+        self.n_ticks = 0
+        self.n_batched = 0
+        self.n_single = 0
         self.weights_dir = weights_dir
         self.config_path = config_path
         self.tokenizer_json = tokenizer_json
 
     def _slot_of(self, request: Int) -> Int:
         var slot = 0
-        while slot < self.n_sessions:
+        while slot < self.n_rows:
             if self.streams[slot].request == request:
                 return slot
             slot += 1
@@ -173,16 +217,24 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
 
     def _free_slot(self) -> Int:
         var slot = 0
-        while slot < self.n_sessions:
+        while slot < self.n_rows:
             if self.streams[slot].request == NO_REQUEST:
                 return slot
             slot += 1
         return -1
 
+    def _any_active(self) -> Bool:
+        """有流占着行（complete 需要整个 session，见下）。"""
+        var slot = 0
+        while slot < self.n_rows:
+            if self.streams[slot].request != NO_REQUEST:
+                return True
+            slot += 1
+        return False
+
     def spawn_twin(self, index: Int) raises -> Int:
-        """engine 线程路的那份"自己"：**一条**自己的 session（不放大
-        池——N 线程 × M session = N×M 份 KV）+ 共享 ctx。多线程共用
-        一条 ctx 未验证——与 engines>=1 的实验旗一致。"""
+        """engine 线程路的那份"自己"：**单行**的自己（一份 KV）+ 共享
+        ctx。多线程共用一条 ctx 未验证——与 engines>=1 的实验旗一致。"""
         var model = QwenForward(
             self.weights_dir, self.config_path, self.max_tokens, True
         )
@@ -209,23 +261,23 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         top_p: Float64,
     ) raises -> Completion:
         """非流式：一次 `generate_batch` 到终点（连续批处理 v2，单行）。
-        在池里占一个坑（`COMPLETE_MARKER`），算完就还。"""
-        var slot = self._free_slot()
-        if slot < 0:
+        它清全表 posarr 并从行 0 起排布——**需要整个 session**：有任何
+        活跃流就指名拒绝（`ERR_CAPACITY`）。"""
+        if self._any_active():
             raise AlofaError(
                 ERR_CAPACITY,
-                "all gpu sessions are busy",
-                "sessions=" + String(self.n_sessions),
+                "gpu rows are busy (complete needs the whole session)",
+                "rows=" + String(self.n_rows),
             )
-        self.streams[slot].request = COMPLETE_MARKER
+        self.streams[0].request = COMPLETE_MARKER
         var ids = self.tokenizer.encode(prompt)
         if len(ids) == 0:
-            self.streams[slot].request = NO_REQUEST
+            self.streams[0].request = NO_REQUEST
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "prompt tokenizes to nothing", ""
             )
         if len(ids) >= self.max_tokens:
-            self.streams[slot].request = NO_REQUEST
+            self.streams[0].request = NO_REQUEST
             raise AlofaError(
                 ERR_INVALID_ARGUMENT,
                 "prompt exceeds the KV window",
@@ -233,7 +285,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             )
         var lens = List[Int]()
         lens.append(len(ids))
-        var out = self.sessions[slot].generate_batch[
+        var out = self.session.generate_batch[
             GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM, GPU_HEAD_DIM,
             GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB, GPU_ATTN_TILES,
             DType.float32
@@ -248,7 +300,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             Int32(self.seed),
             Float32(top_p),
         )
-        self.streams[slot].request = NO_REQUEST
+        self.streams[0].request = NO_REQUEST
         # eos 停行之后，generate_batch 把 **eos 本身**记进该行（其后剩余
         # 步以 NO_TOKEN(=-1) 填充，executor 的哨兵）——两样都不进 decode：
         # eos 的文本是控制序列，不是内容；决算只数真 token。这样
@@ -269,15 +321,14 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         top_p: Float64,
         request: Int,
     ) raises:
-        """从池里占一个坑，只准备，不走前向（前向在第一次 stream_next
-        ——那里还能回 400）。池满 = 指名拒绝。"""
+        """占一个批行，只准备，不走前向（前向在第一次 stream_next
+        ——那里还能回 400）。行满 = 指名拒绝。"""
         var slot = self._free_slot()
         if slot < 0:
             raise AlofaError(
                 ERR_CAPACITY,
-                "all gpu sessions are busy",
-                "asked=" + String(request)
-                + " sessions=" + String(self.n_sessions),
+                "all gpu rows are busy",
+                "asked=" + String(request) + " rows=" + String(self.n_rows),
             )
         var ids = self.tokenizer.encode(prompt)
         if len(ids) == 0:
@@ -293,11 +344,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         var steps = max_tokens
         if steps > self.max_tokens - len(ids):
             steps = self.max_tokens - len(ids)
-        # KV 回绕：这条 session 的上一条流的 KV 全部作废（池内复用）。
-        self.sessions[slot].kv_pos = 0
-        for i in range(GPU_BMAX):
-            self.sessions[slot].h_posarr[i] = Int32(0)
-        self.sessions[slot].ctx.synchronize()
+        # 只清**本行**的 posarr（批行池里别的行可能是活跃流的——清全表
+        # 是 132 池模型的遗产，本层严禁）。h_posarr 是 host pinned，
+        # 写入即时生效，forward 时随整块上传。
+        self.session.h_posarr[slot] = Int32(0)
         var st = GpuStream()
         st.request = request
         st.prompt = ids^
@@ -307,6 +357,181 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         st.seed = self.seed
         self.streams[slot] = st^
 
+    def _frame_of(mut self, slot: Int) raises -> String:
+        """出队一帧：`emitted` 前移到队头帧的 end，文本 = 两 end 之间
+        的字节（字节级 + 帧尾边界截断在入队时已完成，账本一百三十
+        三）。"""
+        var end = self.streams[slot].frame_ends[self.streams[slot].frame_head]
+        var prev = self.streams[slot].emitted
+        if prev > end:
+            # 不该发生（end 只会前移）。真发生了就从头对齐。
+            prev = 0
+        var text = bytes_to_text(
+            self.tokenizer.decode_bytes(self.streams[slot].out), prev, end
+        )
+        self.streams[slot].emitted = end
+        return text
+
+    def _forward_rows(
+        mut self, first_slot: Int, slots: List[Int], batched: Bool
+    ) raises:
+        """一次前向推进 `slots`（行 k ↔ slot first_slot+k；None 位置
+        的行由调用方以 padding 补齐）。`batched` = 全 argmax（无参数
+        分歧）；False = 单行带自己的采样参数。
+
+        ⚠️ 就地变异：List 下标不能 move-out（origin 规则）——流状态
+        全走 `self.streams[slot].x` 可变引用。
+        """
+        var t = len(slots)
+        # 组行：prompt 相位喂 prompt[pidx]，生成相位喂 last；padding
+        # 行喂 0（tokout 丢弃）。posarr[slot] = pos（喂 token 的位置）。
+        var toks = List[Int]()
+        var fed_gen = List[Bool]()
+        var k = 0
+        while k < t:
+            var slot = slots[k]
+            if slot >= 0:
+                if self.streams[slot].pidx < len(self.streams[slot].prompt):
+                    toks.append(self.streams[slot].prompt[self.streams[slot].pidx])
+                    fed_gen.append(
+                        self.streams[slot].pidx == len(self.streams[slot].prompt) - 1
+                    )
+                else:
+                    toks.append(self.streams[slot].cur)
+                    fed_gen.append(True)
+                self.session.h_posarr[first_slot + k] = Int32(
+                    self.streams[slot].pos
+                )
+            else:
+                # padding 行：喂 0、pos 0——KV 写它自己行位的位置 0，
+                # 不越入别的行（store_b 行隔离）。
+                toks.append(0)
+                fed_gen.append(False)
+                self.session.h_posarr[first_slot + k] = Int32(0)
+            k += 1
+        if batched:
+            # 全 argmax：无参数分歧，行号无关确定。
+            _ = self.session.prefill_step[
+                GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
+                GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
+                GPU_ATTN_TILES,
+                DType.float32, True, True, True, True, True, True, True,
+                True, False, True
+            ](toks^, False, False, False, 0.0, Int32(0), 1.0)
+        else:
+            # 单行带自己的采样参数（row_base=slot，核内行号 b=0——
+            # 种子派生与 129 逐位一致，重放语义保持）。
+            var slot = slots[0]
+            _ = self.session.prefill_step[
+                GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
+                GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
+                GPU_ATTN_TILES,
+                DType.float32, True, True, True, True, True, True, True,
+                True, False, True
+            ](
+                toks^, False, False, False,
+                self.streams[slot].temp,
+                Int32(self.streams[slot].seed + self.streams[slot].count),
+                self.streams[slot].topp,
+                0, 1,  # layer_gap 默认
+                first_slot,
+            )
+        self.session.ctx.synchronize()
+        # 收行：prompt 相位步（非尾枚）的 tokout 丢弃；尾枚步与生成步
+        # 的 tokout 是生成 token，产帧。
+        k = 0
+        while k < t:
+            var slot = slots[k]
+            if slot >= 0 and fed_gen[k]:
+                var tv = Int(self.session.h_tokout[first_slot + k])
+                if tv == self.eos:
+                    # eos 不吐（它的文本是控制序列，不是内容）：直接收流。
+                    # 帧队列照样入队（done 帧的 end 不前移 ⇒ 空文本）；
+                    # token 记推进前的 last（eos 不进链，与 129 语义同）。
+                    self.streams[slot].count = self.streams[slot].steps
+                    self.streams[slot].frame_ends.append(
+                        self.streams[slot].emitted
+                    )
+                    self.streams[slot].frame_dones.append(True)
+                    self.streams[slot].frame_tokens.append(
+                        self.streams[slot].last
+                    )
+                else:
+                    self.streams[slot].out.append(tv)
+                    self.streams[slot].cur = tv
+                    self.streams[slot].count += 1
+                    self.streams[slot].pos += 1
+                    if self.streams[slot].pidx < len(self.streams[slot].prompt):
+                        # 尾枚步：prompt 游标收尾。
+                        self.streams[slot].pidx = len(self.streams[slot].prompt)
+                    # 帧尾边界截断在此完成：end = 最后一个完整
+                    # UTF-8 字符边界。⚠️ 只入队 end，**不动 emitted**
+                    # ——emitted 是"已发给客户端的字节"，只在出队时
+                    # 前移；入队就推进会吞掉 [prev, end) 的帧文本
+                    # （切片变空，134 门实测）。
+                    var full = self.tokenizer.decode_bytes(
+                        self.streams[slot].out
+                    )
+                    var safe = utf8_tail_safe_len(full)
+                    self.streams[slot].frame_ends.append(safe)
+                    self.streams[slot].frame_dones.append(
+                        self.streams[slot].count >= self.streams[slot].steps
+                    )
+                    self.streams[slot].frame_tokens.append(tv)
+            elif slot >= 0:
+                # prompt 相位步：只推游标与位置（KV 已写）。
+                self.streams[slot].pidx += 1
+                self.streams[slot].pos += 1
+            k += 1
+
+    def _tick(mut self) raises:
+        """推进所有活跃行各一步。全 argmax → 合批（t = 最大活跃行号+1，
+        padding 补齐，row_base=0）；有采样参数 → 逐行（每行 t=1，
+        row_base=slot）。"""
+        self.n_ticks += 1
+        # 活跃 = 占着行且未交完（done 的行不再推进）。
+        var act = List[Int]()
+        var max_slot = -1
+        var any_topp = False
+        var i = 0
+        while i < self.n_rows:
+            var st_active = (
+                self.streams[i].request != NO_REQUEST
+                and self.streams[i].count < self.streams[i].steps
+            )
+            if st_active:
+                act.append(i)
+                max_slot = i
+                if self.streams[i].temp > 0.0:
+                    any_topp = True
+            i += 1
+        if max_slot < 0:
+            return
+        if not any_topp:
+            # 合批：行号 = slot 直接对齐（0..max_slot，含 padding）。
+            self.n_batched += 1
+            var slots = List[Int]()
+            var k = 0
+            var ai = 0
+            while k <= max_slot:
+                if ai < len(act) and act[ai] == k:
+                    slots.append(k)
+                    ai += 1
+                else:
+                    slots.append(-1)  # padding
+                k += 1
+            self._forward_rows(0, slots^, True)
+        else:
+            # 逐行：采样参数是整批标量 + 种子按紧密行号派生——行号漂移
+            # 会破坏重放语义，退化为每行 t=1（row_base=slot 保种子）。
+            var ai = 0
+            while ai < len(act):
+                var one = List[Int]()
+                one.append(act[ai])
+                self.n_single += 1
+                self._forward_rows(act[ai], one^, False)
+                ai += 1
+
     def stream_next(mut self, request: Int) raises -> StreamToken:
         var slot = self._slot_of(request)
         if slot < 0:
@@ -315,79 +540,40 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 "stream phase mismatch",
                 "asked=" + String(request) + " (not in the pool)",
             )
-        # ⚠️ 就地变异：List 下标不能 move-out（origin 规则）——读写字段
-        # 都直接走 `self.streams[slot].x` 这个可变引用。
-        if self.streams[slot].count >= self.streams[slot].steps:
-            # 交完了还被问：仍然回答"结束"（路由可能多问一次）。
+        # 无待领帧且流未完 → tick（会顺带推进别的活跃行——合批的
+        # 意义所在）。帧队列保证本行的每一帧都在，不管别的行被 tick
+        # 跨越了多少步。
+        while (
+            self.streams[slot].frame_head >= len(self.streams[slot].frame_ends)
+            and self.streams[slot].count < self.streams[slot].steps
+        ):
+            self._tick()
+        if self.streams[slot].frame_head >= len(self.streams[slot].frame_ends):
+            # 交完了（帧全领完）还被问：仍然回答"结束"。
             return StreamToken("", True, False)
-        var tok = 0
-        if not self.streams[slot].started:
-            # prefill：prompt 去尾一枚（尾枚走解码步，与后续同一条采样路）。
-            var n = len(self.streams[slot].prompt)
-            if n > 1:
-                var pre = List[Int]()
-                for i in range(n - 1):
-                    pre.append(self.streams[slot].prompt[i])
-                _ = self.sessions[slot].prefill_step[
-                    GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
-                    GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
-                    GPU_ATTN_TILES,
-                    DType.float32, True, True, True, True, True, True, True,
-                    True, False, False
-                ](pre^, False, True, False)
-                self.sessions[slot].ctx.synchronize()
-            self.streams[slot].pos = n - 1
-            # 首 token 的解码步喂的是 prompt 尾枚（不是 0）。
-            self.streams[slot].last = self.streams[slot].prompt[n - 1]
-            self.streams[slot].started = True
-        # 解码步：批路 t=1，位置写 h_posarr[0]（批路不读 kv_pos）。
-        var one = List[Int]()
-        one.append(self.streams[slot].last)
-        self.sessions[slot].h_posarr[0] = Int32(self.streams[slot].pos)
-        _ = self.sessions[slot].prefill_step[
-            GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
-            GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
-            GPU_ATTN_TILES,
-            DType.float32, True, True, True, True, True, True, True,
-            True, False, True
-        ](
-            one^, False, False, False,
-            self.streams[slot].temp,
-            Int32(self.streams[slot].seed + self.streams[slot].count),
-            self.streams[slot].topp,
-        )
-        self.sessions[slot].ctx.synchronize()
-        tok = Int(self.sessions[slot].h_tokout[0])
-        if tok == self.eos:
-            # eos 不吐（它的文本是控制序列，不是内容）：直接收流。
-            # done 后继续问仍 done=True（协议契约）。
-            self.streams[slot].count = self.streams[slot].steps
-            return StreamToken("", True, False)
-        self.streams[slot].out.append(tok)
-        self.streams[slot].last = tok
-        self.streams[slot].count += 1
-        self.streams[slot].pos += 1
-        # 整段前缀解码减已发字节——**字节级**（一百三十三）：decode 会把
-        # 尾部不完整 UTF-8 丢掉，破坏前缀性（多字节跨 token 的首帧即翻
-        # 车，CJK 真链暴露）；decode_bytes 纯拼接 + 帧尾边界截断，帧内
-        # 恒完整，逐帧拼接恒等于整段 decode。
-        var full = self.tokenizer.decode_bytes(self.streams[slot].out)
-        var safe = utf8_tail_safe_len(full)
-        var emitted = self.streams[slot].emitted
-        if emitted > safe:
-            # 不该发生（前缀只会变长）。真发生了就从头对齐。
-            emitted = 0
-        var text = bytes_to_text(full, emitted, safe)
-        self.streams[slot].emitted = safe
-        if self.streams[slot].count >= self.streams[slot].steps:
-            return StreamToken(text, True, False)
-        return StreamToken(text, False, False)
+        var fd = self.streams[slot].frame_dones[self.streams[slot].frame_head]
+        var text = self._frame_of(slot)
+        # last = 本帧 token（不是收行时的最新 tick——tick 会跨多步，
+        # 门按 last 收集逐位同链，last 必须跟着领帧走）。
+        self.streams[slot].last = self.streams[slot].frame_tokens[
+            self.streams[slot].frame_head
+        ]
+        self.streams[slot].frame_head += 1
+        # ⚠️ done 帧也带文本：末帧的最后几枚 token 的字节就在这一段
+        # 里——返回空串会把它们永远吞掉。「不吐文本」只属于 eos 帧
+        # （eos 入队时 end 不前移 ⇒ 空文本）。134 门实测：末帧 4 字节
+        # 被吞，join 恰为 decode 的前缀。
+        return StreamToken(text, fd, False)
 
     def stream_end(mut self, request: Int) raises:
-        """把坑还回池里。幂等：号不在池里就什么也不做（走完自己收 +
+        """把行还回池里。幂等：号不在池里就什么也不做（走完自己收 +
         对端断开再收是常态）。"""
         var slot = self._slot_of(request)
         if slot >= 0:
             self.streams[slot].request = NO_REQUEST
             self.streams[slot].prompt = List[Int]()
             self.streams[slot].out = List[Int]()
+            self.streams[slot].frame_ends = List[Int]()
+            self.streams[slot].frame_dones = List[Bool]()
+            self.streams[slot].frame_tokens = List[Int]()
+            self.streams[slot].frame_head = 0
