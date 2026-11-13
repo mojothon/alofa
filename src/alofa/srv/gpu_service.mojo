@@ -402,40 +402,41 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 self.session.h_posarr[first_slot + k] = Int32(
                     self.streams[slot].pos
                 )
+                # per-row 采样参数（一百三十六）：padding 行给 temp=0
+                # （核内 argmax 分支，tokout 丢弃）；活跃行种子 = 流种子
+                # + 该步 count——与旧逐行 t=1 传参逐位同（种子 host 直
+                # 传、行号无关），重放语义保持。
+                self.session.h_stemp[first_slot + k] = self.streams[slot].temp
+                self.session.h_stopps[first_slot + k] = self.streams[slot].topp
+                self.session.h_sseeds[first_slot + k] = Int32(
+                    self.streams[slot].seed + self.streams[slot].count
+                )
             else:
                 # padding 行：喂 0、pos 0——KV 写它自己行位的位置 0，
                 # 不越入别的行（store_b 行隔离）。
                 toks.append(0)
                 fed_gen.append(False)
                 self.session.h_posarr[first_slot + k] = Int32(0)
+                self.session.h_stemp[first_slot + k] = Float32(0)
+                self.session.h_stopps[first_slot + k] = Float32(1)
+                self.session.h_sseeds[first_slot + k] = Int32(0)
             k += 1
-        if batched:
-            # 全 argmax：无参数分歧，行号无关确定。
-            _ = self.session.prefill_step[
-                GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
-                GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
-                GPU_ATTN_TILES,
-                DType.float32, True, True, True, True, True, True, True,
-                True, False, True
-            ](toks^, False, False, False, 0.0, Int32(0), 1.0)
-        else:
-            # 单行带自己的采样参数（row_base=slot，核内行号 b=0——
-            # 种子派生与 129 逐位一致，重放语义保持）。
-            var slot = slots[0]
-            _ = self.session.prefill_step[
-                GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
-                GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
-                GPU_ATTN_TILES,
-                DType.float32, True, True, True, True, True, True, True,
-                True, False, True
-            ](
-                toks^, False, False, False,
-                self.streams[slot].temp,
-                Int32(self.streams[slot].seed + self.streams[slot].count),
-                self.streams[slot].topp,
-                0, 1,  # layer_gap 默认
-                first_slot,
-            )
+        # per-row 采样（一百三十六）：一个 launch 吃任意 temp/top_p
+        # 组合——argmax 是 temp=0 的核内特例（与 argmax_rb 逐位同），
+        # 种子 host 直传与行号解耦，**合批条件彻底消失**：任何活跃行
+        # 组合一次前向，每行与它单独前向逐位同。
+        _ = self.session.prefill_step[
+            GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
+            GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
+            GPU_ATTN_TILES,
+            DType.float32, True, True, True, True, True, True, True,
+            True, False, True
+        ](
+            toks^, False, False, False, 0.0, Int32(0), 1.0,
+            0, 1,  # layer_gap 默认
+            first_slot,
+            True,  # per_row_sampling
+        )
         self.session.ctx.synchronize()
         # 收行：prompt 相位步（非尾枚）的 tokout 丢弃；尾枚步与生成步
         # 的 tokout 是生成 token，产帧。
@@ -492,7 +493,6 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 活跃 = 占着行且未交完（done 的行不再推进）。
         var act = List[Int]()
         var max_slot = -1
-        var any_topp = False
         var i = 0
         while i < self.n_rows:
             var st_active = (
@@ -502,35 +502,23 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             if st_active:
                 act.append(i)
                 max_slot = i
-                if self.streams[i].temp > 0.0:
-                    any_topp = True
             i += 1
         if max_slot < 0:
             return
-        if not any_topp:
-            # 合批：行号 = slot 直接对齐（0..max_slot，含 padding）。
-            self.n_batched += 1
-            var slots = List[Int]()
-            var k = 0
-            var ai = 0
-            while k <= max_slot:
-                if ai < len(act) and act[ai] == k:
-                    slots.append(k)
-                    ai += 1
-                else:
-                    slots.append(-1)  # padding
-                k += 1
-            self._forward_rows(0, slots^, True)
-        else:
-            # 逐行：采样参数是整批标量 + 种子按紧密行号派生——行号漂移
-            # 会破坏重放语义，退化为每行 t=1（row_base=slot 保种子）。
-            var ai = 0
-            while ai < len(act):
-                var one = List[Int]()
-                one.append(act[ai])
-                self.n_single += 1
-                self._forward_rows(act[ai], one^, False)
+        # 合批（一百三十六：per-row 采样核让合批条件彻底消失——任意
+        # temp/top_p 组合一批搞定，每行与它单独前向逐位同）。
+        self.n_batched += 1
+        var slots = List[Int]()
+        var k = 0
+        var ai = 0
+        while k <= max_slot:
+            if ai < len(act) and act[ai] == k:
+                slots.append(k)
                 ai += 1
+            else:
+                slots.append(-1)  # padding
+            k += 1
+        self._forward_rows(0, slots^, True)
 
     def stream_next(mut self, request: Int) raises -> StreamToken:
         var slot = self._slot_of(request)

@@ -3769,3 +3769,10 @@
   - **服务层端到端**（两流 EN 24 帧 / CJK 16 帧，pool=8）：串行 230.2 ms（A 136.3 + B 93.9）vs 交替合批 **141.3 ms = 1.63×**。理论核对：34 真前向 × 4.27 ms（t=2）≈ 145 ms——**tick 效率完美**（实测 141 ms ≈ 理论下限）；`n_ticks=92` 里多余的是空转 tick（无活跃行 return，不前向）——调度粒度开销极小，不是前向浪费。
   - **基线结论**：v0 合批收益 = 1.63×@2 流（含全部调度开销）；session 层上限 6.63×@8 行——收益随并发数向摊薄上限逼近，**4 并发即可期待 ~3.5×，8 并发 ~6×**（服务层，含开销）。
   - **口径教训落账**：`n_ticks` 计数包含空转 tick（无活跃行 early-return），**吞吐口径必须用"真前向次数"**（batched 计数也要分：合批 t=1 的独跑也计入 batched）——下次给 Session 加 `n_forwards`（真 launch 计数）与 `n_forward_rows`（行·步总数）两个干净口径。
+- **2026-11-13（一百三十六）** —— **per-row 采样参数核**：合批条件彻底消失，合批覆盖面从 argmax 扩到全部流量
+  - **核**：`sample_topp_row_gpu`（grid=(B,)，行参数读数组）——行内三分支：temp=0 → 纯 argmax（与 argmax_rb 逐位同）；temp>0 & top_p≥1 → 全词表 Gumbel；否则 nucleus 二分。**种子 host 直传（seeds[b]），不再派生自行号**——采样结果与行号解耦，padding/压缩/行号漂移不再碰重放语义；t=1 时与旧核逐位同（b=0 时 b·C 派生项为零）。
+  - **session**：`prefill_step` 加 `per_row_sampling` 参 + `h_stemp/h_stopps/h_sseeds` pinned 三元组（host 真源，forward 随整块上传——与 h_posarr 同风格）。
+  - **GpuService**：`_tick` 的「全 argmax 才合批 / 带参逐行」分叉删除——**任何活跃行组合一次前向**，padding 行 temp=0（tokout 丢弃），活跃行种子 = 流种子 + 该步 count（与旧逐行传参逐位同）。`n_single` 恒 0（门断言）。
+  - **门**：GATE PASS 九判据——⑦ 交替段升级为**混合参数同批**（A temp0 argmax 分支 + B temp0.8 Gumbel 分支），各自与独跑逐位同链 + `n_single==0` 断言。**门小坑**：B 独跑参照（51）落 slot 0，门收集写死 `streams[1]` 收的是空闲行——按 `_slot_of(rid)` 收集修正（服务层语义「begin 返回实际行」本就该这么用）。
+  - **回归**：session 三门 PASS（零破坏）；135 基准复跑——per-row 核 t=1 每步 5.17ms vs 旧 5.10ms（**+1%，零代价**），摊薄曲线不变（t=8 6.69×），端到端 1.63× 保持；CPU 全回归 PASS。
+  - **口径意义**：OpenAI API 的真实流量里 temperature>0 是常态——此前带参流逐行推进，服务在真实流量下退化回 132 的串行；本刀后**真实流量全量合批**，135 的摊薄上限（t=8 6.63×）对采样流量同样成立。

@@ -41,7 +41,7 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
     attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
     attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -264,6 +264,14 @@ struct GpuSession:
     var h_logits_b: HostBuffer[DType.float32]
     var d_tokout: DeviceBuffer[DType.int32]
     var h_tokout: HostBuffer[DType.int32]
+    # 一百三十六：per-row 采样参数（批行池合批用）——host 真源，host 写
+    # 即时生效，forward 时随整块上传。种子 host 算好直传，与行号解耦。
+    var d_stemp: DeviceBuffer[DType.float32]
+    var h_stemp: HostBuffer[DType.float32]
+    var d_stopps: DeviceBuffer[DType.float32]
+    var h_stopps: HostBuffer[DType.float32]
+    var d_sseeds: DeviceBuffer[DType.int32]
+    var h_sseeds: HostBuffer[DType.int32]
 
     def __init__(
         out self,
@@ -667,6 +675,12 @@ struct GpuSession:
         )
         self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
         self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
+        self.d_stemp = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
+        self.h_stemp = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
+        self.d_stopps = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
+        self.h_stopps = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
+        self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
+        self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.ctx.synchronize()
         for i in range(BMAX):
             self.h_posarr[i] = Int32(0)
@@ -1607,6 +1621,10 @@ struct GpuSession:
         # 自己的批行上（slot≠0 的流单步前向不再错位）；padding 补齐或
         # 紧密压缩两种编排都直接可用。默认 0 = 原行为。
         row_base: Int = 0,
+        # 一百三十六：per-row 采样——True 时忽略整批标量参数，行 b 用
+        # h_stemp/h_stopps/h_sseeds[b]（host 直写，forward 时整块上传）。
+        # 一个 launch 吃任意 temp/top_p 组合（核内每行自选分支）。
+        per_row_sampling: Bool = False,
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -2439,7 +2457,27 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.vocab, 8), t, 1),
                 block_dim=(256, 1, 1),
             )
-            if sample_temp > Float32(0):
+            if per_row_sampling:
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_stemp, src_buf=self.h_stemp
+                )
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_stopps, src_buf=self.h_stopps
+                )
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_sseeds, src_buf=self.h_sseeds
+                )
+                self.ctx.enqueue_function[sample_topp_row_gpu](
+                    self.d_logits_b.unsafe_ptr(),
+                    self.d_tokout.unsafe_ptr(),
+                    Int32(self.vocab),
+                    self.d_stemp.unsafe_ptr(),
+                    self.d_stopps.unsafe_ptr(),
+                    self.d_sseeds.unsafe_ptr(),
+                    grid_dim=(t, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            elif sample_temp > Float32(0):
                 if sample_topp < Float32(1):
                     self.ctx.enqueue_function[sample_topp_gpu](
                         self.d_logits_b.unsafe_ptr(),

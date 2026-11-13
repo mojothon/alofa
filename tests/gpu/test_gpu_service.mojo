@@ -8,9 +8,10 @@ GpuSession 后端实现，`ChatHandler`/HTTP/OpenAI/SSE 全复用）。
 ② 流式贪心重放逐位确定（同 prompt 两次）；
 ③ 采样流式（T=1, top_p=0.9 **走参数面**）同种子逐位复现、异种子
    变异；
-⑦ 合批并发（一百三十四）：单 session 两批行，两条流交替问——
-   tick 一次推进全部活跃行，各自与独跑**逐位同链**，且**真合批**
-   （batched tick 计数 > 0）；流活跃时 complete 指名拒绝；
+⑦ 合批并发（一百三十四/一百三十六）：单 session 两批行，两条流
+   交替问——tick 一次推进全部活跃行（**任意采样参数组合**，
+   per-row 核），各自与独跑**逐位同链**，且**真合批**；流活跃时
+   complete 指名拒绝；
 ④ 协议语义：错号 stream_next 指名红；拒第二条流；done 后继续问仍
    done=True；stream_end 幂等；
 ⑤ eos 终止：把链中一枚冒充 eos，流在第 3 帧收、不吐文本、done 后
@@ -245,8 +246,20 @@ def main() raises:
         sem_ok = False
 
     # ---- ⑦ 池并发：两条流交替推进，各自与独跑逐位同链 ----
+    # B 独跑（temp0.8）参照：一百三十六起 B 带采样参数合批。
+    svc.stream_begin(CJK, 16, 0.8, 1.0, 51)
+    var slot51 = svc._slot_of(51)
+    var cchain8 = List[Int]()
+    while True:
+        var frs = svc.stream_next(51)
+        cchain8.append(svc.streams[slot51].last)
+        if frs.done:
+            break
+    svc.stream_end(51)
+    # 一百三十六：A=temp0（argmax 分支）、B=temp0.8（Gumbel 分支）
+    # ——**混合参数同一批**，各与独跑逐位同链。
     svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 61)   # 坑 0
-    svc.stream_begin(CJK, 16, 0.0, 1.0, 62)          # 坑 1
+    svc.stream_begin(CJK, 16, 0.8, 1.0, 62)          # 坑 1
     var ia = List[Int]()
     var ib = List[Int]()
     var done_a = False
@@ -264,7 +277,7 @@ def main() raises:
                 done_b = True
     svc.stream_end(61)
     svc.stream_end(62)
-    var inter_ok = len(ia) == len(chain1) and len(ib) == len(cchain)
+    var inter_ok = len(ia) == len(chain1) and len(ib) == len(cchain8)
     if inter_ok:
         for i in range(len(ia)):
             if ia[i] != chain1[i]:
@@ -273,13 +286,17 @@ def main() raises:
                 break
     if inter_ok:
         for i in range(len(ib)):
-            if ib[i] != cchain[i]:
+            if ib[i] != cchain8[i]:
                 inter_ok = False
                 print("interleave B diverge at", i)
                 break
     print("interleave: a", len(ia), "b", len(ib), " same-as-solo:", inter_ok)
     print("  ticks:", svc.n_ticks, "batched:", svc.n_batched,
           "single:", svc.n_single)
+    if svc.n_single != 0:
+        # 一百三十六：合批条件已消失——采样流不应再走逐行路径。
+        print("  single-stepped forward still exists!")
+        inter_ok = False
     # 诊断：交替之后 B 独占重放——== cchain 则行 1 无残留、分歧在
     # 合批前向本身（行间数值泄漏）；!= cchain 则行 1 带残渣。
     svc.stream_begin(CJK, 16, 0.0, 1.0, 81)
