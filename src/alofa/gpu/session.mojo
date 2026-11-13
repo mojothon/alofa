@@ -272,6 +272,11 @@ struct GpuSession:
     var h_stopps: HostBuffer[DType.float32]
     var d_sseeds: DeviceBuffer[DType.int32]
     var h_sseeds: HostBuffer[DType.int32]
+    # 一百三十八：干净吞吐口径——n_ticks 混空转 tick（无活跃行
+    # early-return），n_batched 混 padding 行；真前向次数与行·步总数
+    # 在 prefill_step 入口计数（batched/单路/服务层全走这里）。
+    var n_forwards: Int
+    var n_forward_rows: Int
 
     def __init__(
         out self,
@@ -681,6 +686,8 @@ struct GpuSession:
         self.h_stopps = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
         self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
         self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
+        self.n_forwards = 0
+        self.n_forward_rows = 0
         self.ctx.synchronize()
         for i in range(BMAX):
             self.h_posarr[i] = Int32(0)
@@ -1649,6 +1656,11 @@ struct GpuSession:
         var t = len(tokens)
         if t == 0:
             raise AlofaError(ERR_INVALID_ARGUMENT, "no tokens given", "")
+        # 一百三十八：真前向口径（launch 次数 × 行·步总数）——批次路
+        # 与单路、服务层与会话门全走这里，n_ticks/n_batched 混的空转
+        # 与 padding 在这两个数上不再失真。
+        self.n_forwards += 1
+        self.n_forward_rows += t
         if t > PREFILL_MAX_BATCH:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT,

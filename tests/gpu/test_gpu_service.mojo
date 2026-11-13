@@ -260,6 +260,10 @@ def main() raises:
     # ——**混合参数同一批**，各与独跑逐位同链。
     svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 61)   # 坑 0
     svc.stream_begin(CJK, 16, 0.8, 1.0, 62)          # 坑 1
+    # 一百三十八：真前向口径基线（n_ticks 混空转、n_batched 混
+    # padding——n_forwards/n_forward_rows 是 launch 级干净数）。
+    var fw0 = svc.session.n_forwards
+    var fwr0 = svc.session.n_forward_rows
     var ia = List[Int]()
     var ib = List[Int]()
     var done_a = False
@@ -291,8 +295,16 @@ def main() raises:
                 print("interleave B diverge at", i)
                 break
     print("interleave: a", len(ia), "b", len(ib), " same-as-solo:", inter_ok)
+    var fw = svc.session.n_forwards - fw0
+    var fwr = svc.session.n_forward_rows - fwr0
     print("  ticks:", svc.n_ticks, "batched:", svc.n_batched,
-          "single:", svc.n_single)
+          "single:", svc.n_single, "| real forwards:", fw,
+          "row-steps:", fwr)
+    # 真前向必须显著小于串行总和（两流 prompt 相位 26 步 + 生成相位
+    # max(24,16)=24 步 ≈ 34 理论；串行 sum = 40 帧 + 26 prompt 步）。
+    if fw >= 40:
+        print("  real forwards not batched below serial sum!")
+        inter_ok = False
     if svc.n_single != 0:
         # 一百三十六：合批条件已消失——采样流不应再走逐行路径。
         print("  single-stepped forward still exists!")

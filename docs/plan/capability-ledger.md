@@ -3782,3 +3782,8 @@
   - **门**：GATE PASS 九判据——busy complete 判据反转三层：a) 空闲正常；b) 流活跃时 complete **成功**且文本与独跑逐位同（temp0.8 种子重放）；c) complete 自驱动期间同池流 71 与它的独跑参照逐位同链（complete 的 next 循环推进**全池**——合批语义顺带再证）。
   - **回归**：session 三门 PASS；CPU 全回归 8/8。
   - **架构意义**：HTTP 层的 complete 端点在真实流量里不再与流式互斥——混合负载（非流式问答 + 流式会话并存）下批行池统一调度，135/136 的摊薄收益对非流式流量同样成立。`generate_batch` 在服务层退役（session 层保留，session 门仍用）。
+- **2026-11-13（一百三十八）** —— **计数器卫生**：真前向口径落地（135 遗留口径债清账）
+  - **改造**：session 加 `n_forwards`（launch 次数）/`n_forward_rows`（行·步总数），`prefill_step` 入口计数——批次路/单路、会话门/服务层全走此处，`n_ticks` 混的空转与 `n_batched` 混的 padding 不再失真。
+  - **门**：交替段取基线后断言——两流（EN 24 帧 + CJK 16 帧）交替合批**真前向 34 < 串行 sum 40+**（断言钉死），行·步 58（34 前向 × 平均 1.7 行，摊薄证据直接可见）；`n_ticks=223` vs 真前向 34——**6.6× 的空转噪声**，正证此口径的必要性。
+  - **顺带改判**：原候选「紧致行压缩 + padding 早退核」经核算**降级搁置**——批路 ~50 个 launch 行维遍布 GEMM/KV/attention/lm_head，mask 早退要动 ~30 个核签名；收益上限 ~0.15ms/行 × padding 行数（135 曲线的行边际），first-fit 行分配 + t=max_active+1 尾收窄已覆盖大半空洞浪费，first-fit 下洞只存在于流完成时序间隙。**结论：改造面与收益不成比例，除非行边际大幅上升（如长上下文 attention 行成本主导时）再议。**
+  - **回归**：session 三门 PASS、CPU 全回归 0 FAIL。
