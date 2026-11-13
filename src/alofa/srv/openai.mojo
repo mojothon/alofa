@@ -177,6 +177,10 @@ trait Service:
         """
         ...
 
+    def stats_json(mut self) -> String:
+        """观测面（一百三十九）：吞吐口径计数器进 /health。"""
+        ...
+
     def stream_end(mut self, request: Int) raises:
         """把 `request` 这条流占的东西还回来（提前收尾那条路；走完的那条自己收）。
 
@@ -751,15 +755,18 @@ def error_json(imm message: String, imm kind: String, imm code: String) -> Strin
     )
 
 
-def health_json(imm model: String, max_tokens: Int) -> String:
+def health_json(imm model: String, max_tokens: Int, stats: String) -> String:
     """`/health` 的响应体。`notes` 里那句是"还没有 chat template"的自白 —— 它必须
-    能被不读源码的人看见。"""
+    能被不读源码的人看见。`stats` 是服务的吞吐口径计数器（可为空串）。"""
+    var s = ""
+    if stats.byte_length() > 0:
+        s = "," + stats
     return (
         "{\"status\":\"ok\","
         + "\"model\":\"" + escape_json(model) + "\","
         + "\"max_tokens\":" + String(max_tokens) + ","
         + "\"streaming\":true,"
-        + "\"notes\":\"" + PROMPT_NOTE + "\"}"
+        + "\"notes\":\"" + PROMPT_NOTE + "\"" + s + "}"
     )
 
 
@@ -826,7 +833,10 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
     def handle(mut self, request: Int, req: HttpRequest) raises -> HttpResponse:
         var path = req.path()
         if path == "/health":
-            return json_response(200, health_json(self.model, MAX_MAX_TOKENS), False)
+            return json_response(
+                200, health_json(self.model, MAX_MAX_TOKENS, self.service.stats_json()),
+                False,
+            )
 
         if path != "/v1/chat/completions":
             return json_response(

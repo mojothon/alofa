@@ -3787,3 +3787,14 @@
   - **门**：交替段取基线后断言——两流（EN 24 帧 + CJK 16 帧）交替合批**真前向 34 < 串行 sum 40+**（断言钉死），行·步 58（34 前向 × 平均 1.7 行，摊薄证据直接可见）；`n_ticks=223` vs 真前向 34——**6.6× 的空转噪声**，正证此口径的必要性。
   - **顺带改判**：原候选「紧致行压缩 + padding 早退核」经核算**降级搁置**——批路 ~50 个 launch 行维遍布 GEMM/KV/attention/lm_head，mask 早退要动 ~30 个核签名；收益上限 ~0.15ms/行 × padding 行数（135 曲线的行边际），first-fit 行分配 + t=max_active+1 尾收窄已覆盖大半空洞浪费，first-fit 下洞只存在于流完成时序间隙。**结论：改造面与收益不成比例，除非行边际大幅上升（如长上下文 attention 行成本主导时）再议。**
   - **回归**：session 三门 PASS、CPU 全回归 0 FAIL。
+- **2026-11-13（一百三十九）** —— **HTTP/OpenAI 层并发压测**：合批收益的穿透验收（真发现）
+  - **压测形态**：`serve_gpu`（pool=8，端口 8139）+ stdlib 线程池客户端（流式 SSE 逐帧计 TTFT / 非流式 JSON），5 场景（solo/conc2/conc4/conc8/mixed 混合）。
+  - **吞吐曲线**：solo **28.8 tok/s** → conc2 31.4（**1.09×**）→ conc4 52.7（**1.83×**）→ conc8 47.0（1.63×）；mixed 31.8。
+  - **观测面**（本刀新增）：Service trait 加 `stats_json()`，`/health` 带 `rows/ticks/batched/forwards/row_steps` 五口径——压测后 forwards=5163、row_steps=13413、**平均批宽 2.6 行**（远低于池 8）。
+  - **分层结论**：
+    1. **HTTP 帧循环开销 ~27ms/帧是主导成本**（solo：每 token 33ms 里前向仅 5ms）——前向时间占比 ~15%，HTTP 层的每帧固定开销（poll 唤醒/SSE 序列化/flush/客户端节奏）稀释一切前向收益。
+    2. **conc2 的 1.09× 是帧开销不摊薄的直接后果**；conc4/8 的 1.8× 来自多流共享每轮开销（tick 一次推 N 行，N 流分摊帧成本）。
+    3. **tick 节奏被动耦合领帧节奏**：「无帧才 tick」下 tick 频率 = 最慢流的领帧频率（27ms）——客户端慢领导致 tick 稀疏，批次宽度永远拼不满。服务层门级 1.63×@2（135）与 HTTP 层 1.09×@2 的差距全部在此。
+  - **行动项**：① tick 与领帧解耦（loop 每轮驱动 tick 至帧队列有余量，或后台 tick 线程）——让批次宽度跟上池内活跃数；② 帧开销削减（SSE 预序列化、poll 唤醒路径）——HTTP 层 27ms→5ms 则 conc8 直接吃满摊薄上限。
+  - **运维坑落账**：serve_gpu 起 nohup **必须带 `LD_LIBRARY_PATH`**（漏掉则 CUDA_ERROR_INVALID_VALUE 于 GpuService 构造，且报错点与真因无关——排查时用 boot 最小门 test_serve_boot.mojo 二分定位，前台跑全绿即环境差异）。
+  - **回归**：session 三门 PASS（stats_json 改动零行为）；压测全程无失败请求。

@@ -426,6 +426,10 @@ struct ModelService(Service, Twinable):
         )
         return heap_place(twin^)
 
+    def stats_json(mut self) -> String:
+        """观测面：CPU 路暂无批计数，返回空（/health 不带 stats 段）。"""
+        return ""
+
     def complete(
         mut self,
         prompt: String,

@@ -253,6 +253,16 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
 
     # ---- Service 协议 ----------------------------------------------------
 
+    def stats_json(mut self) -> String:
+        """观测面（一百三十九）：tick/batched/真前向/行·步四口径进 /health。"""
+        return (
+            "\"rows\":" + String(self.n_rows)
+            + ",\"ticks\":" + String(self.n_ticks)
+            + ",\"batched\":" + String(self.n_batched)
+            + ",\"forwards\":" + String(self.session.n_forwards)
+            + ",\"row_steps\":" + String(self.session.n_forward_rows)
+        )
+
     def complete(
         mut self,
         prompt: String,
