@@ -3848,3 +3848,12 @@
   - **修**：`stream_pending` 的上限从 `n_rows` 改为 **2×活跃行数**（pending 判定循环里顺手数活跃）——引擎至多领先客户端两帧/流，阈值随并发自动伸缩。
   - **压测**：solo 1.00× / conc2 **1.21×** / conc4 **1.68×**（反超无守门 1.51×）/ conc8 **2.47×** / conc16 **3.31×**（219.8 tok/s，复现 3.26）——**曲线完全单调**。门 ⑦b 三判定不变 PASS（池 2 行、活跃 1、backlog 16 > 2 ✓）；CPU 全回归 EXIT=0。
   - **战报同步**：`batching-report.md` 收益曲线重绘为 142/144/145 三列对照；142 的「loop 天花板」行动项关闭（证伪）。
+- **2026-11-13（一百四十六）** —— **守门后 soak 复跑 + TTFT/延迟 SLO 画像**：稳定性再验收 + 分位数据
+  - **soak 复跑（25 分钟混合负载）PASS**：**11620 成功 / 2904 个 4xx（预期）/ 0 错误**；每分钟 451-466 平稳；RSS 恒定 2.00GB、fds 56-58、GPU 恒定 3767MiB——守门改动（领帧节奏变化）零稳定性影响。运维坑：nohup 里 soak 与服务启动抢跑会 SIGABRT（后台形态偶发），**延迟 30s 启动即可**；前台复跑全绿。
+  - **SLO 画像**（`slo_146.py`，p50/p90/p99，短 prompt ~10 tok / 长 prompt ~200 tok）：
+    - **短 prompt**：TTFT solo **1ms** → c4 174ms → c8 355ms → c16 592ms（p50，随并发线性涨 = 帧间隔 × 排队位置）；p99 ≈ 2×p50（尾延迟健康，c16 1117ms）；吞吐 72.7→188.3 tok/s（与 pressure 一致）。
+    - **长 prompt**：solo E2E 1.31s（200 prompt 步 × 5ms）；**c8 TTFT p50 1324ms / c16 3122ms、p99 8275ms**——**长 prompt 是 TTFT 杀手**（prompt 步深排队）；吞吐 c8 29.6 tok/s（prompt 步占 92%，合批对 prompt 相位同样生效——每请求成本与理论自洽）。
+    - **口径注意**：本 TTFT = 首 SSE 帧（含响应头），内容首 token ≈ E2E − 16×帧间隔；c16 的 592ms 主要在帧轮转排队。
+  - **chunked prefill 价值实证**：长 prompt c16 的 p99 8.3s 尾延迟来自 prompt 步整段独占 next 循环——prompt 步进 tick 混合 gen 后排队深度可 ÷ 池，是 147 候选的最大延迟收益点。
+  - **已知瑕疵**：SLO 首跑在 soak 刚结束时偶发挂起（timeout 杀掉后复跑即好）——疑似残留连接/线程竞态，脚本瑕疵非服务问题，待查。
+  - **回归**：soak GATE DONE + SOAK-EXIT=0；SLO 全场景 err=0。
