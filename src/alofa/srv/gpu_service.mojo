@@ -533,17 +533,23 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         if self.streams[slot].count >= self.streams[slot].steps:
             return False  # 走完了：让它自然结束
         var backlog = 0
+        var active = 0
         var i = 0
         while i < self.n_rows:
             backlog += (
                 len(self.streams[i].frame_ends) - self.streams[i].frame_head
             )
+            if (
+                self.streams[i].request != NO_REQUEST
+                and self.streams[i].count < self.streams[i].steps
+            ):
+                active += 1
             i += 1
-        # 上限 = 行数：每行平均 1 帧待领，客户端就开始落后于引擎了。
-        # （solo 不受影响：单行自己最多积压 1-2 帧，n_rows=1 时 2 > 1
-        # 会触发——但 solo 的 gen 帧被即时领走，prompt 相位无帧可积，
-        # backlog 始终 0。）
-        return backlog >= self.n_rows
+        # 上限随活跃流数标定（一百四十五）：固定 n_rows 在低并发下
+        # 误伤——conc4 的 4 流各积压 3-4 帧就贴着 16 的阈值，偶发触发
+        # 打断 tick 节奏（实测 1.51×→1.26×）。2×活跃 = 引擎至多领先
+        # 客户端两帧/流；solo（1 活跃，积压 ≤1 < 2）永不触发。
+        return backlog > 2 * active
 
     def stream_next(mut self, request: Int) raises -> StreamToken:
         var slot = self._slot_of(request)
