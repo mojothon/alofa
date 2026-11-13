@@ -28,6 +28,8 @@ comptime AF_INET = 2
 comptime SOCK_STREAM = 1
 comptime SOL_SOCKET = 1
 comptime SO_REUSEPORT = 15
+comptime IPPROTO_TCP = 6
+comptime TCP_NODELAY = 1
 
 # --- open flags (Linux x86-64) ---------------------------------------------
 comptime O_RDONLY = 0
@@ -108,6 +110,20 @@ def enable_reuseport(fd: Int32) -> Int32:
     var one = Int32(1)
     return external_call["setsockopt", Int32](
         fd, Int32(SOL_SOCKET), Int32(SO_REUSEPORT), Pointer(to=one), UInt32(4)
+    )
+
+
+def set_tcp_nodelay(fd: Int32) -> Int32:
+    """`setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1)` → 0, or -1 on failure.
+
+    一百四十：SSE 流式响应的每一帧都是小包——Nagle 会把它们压到延迟 ACK
+    的节奏上（~40ms 量级、多连接放大），流式帧延迟因此非线性变差。flare
+    的 TcpStream 不暴露该选项（它的 `RawSocket` 有，但 `_socket` 私有），
+    所以在 ffi 层直接设。
+    """
+    var one = Int32(1)
+    return external_call["setsockopt", Int32](
+        fd, Int32(IPPROTO_TCP), Int32(TCP_NODELAY), Pointer(to=one), UInt32(4)
     )
 
 

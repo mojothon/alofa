@@ -60,7 +60,11 @@ from flare.runtime.reuseport import bind_reuseport
 from flare.tcp import TcpListener, TcpStream, accept_fd
 
 from alofa.core.error import ERR_IO, AlofaError
-from alofa.core.ffi.posix import monotonic_ms, set_nonblocking
+from alofa.core.ffi.posix import (
+    monotonic_ms,
+    set_nonblocking,
+    set_tcp_nodelay,
+)
 from alofa.srv.conn import (
     TAKEN_CLOSED,
     TAKEN_NEED_MORE,
@@ -1036,6 +1040,11 @@ struct Loop(Movable):
             if set_nonblocking(fd) != 0:
                 conn.close()
                 continue
+            # 一百四十：SSE 小帧必须关 Nagle（flare 明示"NODELAY 由调用方
+            # 设"——alofa 此前从未设）。开着它每帧撞延迟 ACK 协商（~40ms
+            # 量级、多连接放大），139 压测的帧间隔 9ms→100ms 非线性放大
+            # 正是这个；关掉后帧延迟回落到 poll 轮周期。
+            _ = set_tcp_nodelay(fd)  # 设不上不致命（仅延迟变差），连接照收
             var slot = self.adopt(conn^, fd)
             if slot < 0:
                 continue  # 登记不上（`adopt` 已经把它关掉并打过招呼了）

@@ -117,6 +117,10 @@ struct Stub(Service, Twinable):
         self.stream_max = max_tokens
         self.stream_step = 0
 
+    def stats_json(mut self) -> String:
+        """观测面（一百三十九）：替身不产计数，空串 = /health 不带 stats 段。"""
+        return ""
+
     def stream_end(mut self, request: Int) raises:
         """幂等：号对不上就什么也不做（契约见 `srv/openai.mojo` 的 `Service`）。
 

@@ -3798,3 +3798,20 @@
   - **行动项**：① tick 与领帧解耦（loop 每轮驱动 tick 至帧队列有余量，或后台 tick 线程）——让批次宽度跟上池内活跃数；② 帧开销削减（SSE 预序列化、poll 唤醒路径）——HTTP 层 27ms→5ms 则 conc8 直接吃满摊薄上限。
   - **运维坑落账**：serve_gpu 起 nohup **必须带 `LD_LIBRARY_PATH`**（漏掉则 CUDA_ERROR_INVALID_VALUE 于 GpuService 构造，且报错点与真因无关——排查时用 boot 最小门 test_serve_boot.mojo 二分定位，前台跑全绿即环境差异）。
   - **回归**：session 三门 PASS（stats_json 改动零行为）；压测全程无失败请求。
+- **2026-11-13（一百四十）** —— **TCP_NODELAY**：一行修复，HTTP 层吞吐全面上台阶（139 行动项②的根因）
+  - **根因**：flare 明示「TCP_NODELAY 由调用方设置」——**alofa 从未设置**。SSE 流式每帧都是小包，Nagle 把它们压到延迟 ACK 的节奏上（~40ms 量级协商延迟、多连接非线性放大）——139 的「帧间隔 9ms→100ms 随并发放大」主要就是它。
+  - **修**：`accept_ready` 里对每条新连接 `setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)`——flare 的 `TcpStream` 不暴露该选项（`_socket` 私有），在 `core/ffi/posix.mojo` 直接封一层（与 `enable_reuseport` 同风格）。
+  - **压测对照**（同一脚本、同一 pool=8）：
+
+    | 场景 | 139（Nagle） | 140（NODELAY） | Δ |
+    |---|---|---|---|
+    | solo | 28.8 tok/s | **42.1** | **+46%** |
+    | conc2 | 31.4（1.09×） | 52.7（1.25×） | +68% |
+    | conc4 | 52.7 | 60.9 | +16% |
+    | conc8 | 47.0（1.63×） | **64.7**（1.54×） | **+38%** |
+    | mixed | 31.8 | 46.6 | +47% |
+
+    TTFT：conc2 589→367ms、conc8 1043→747ms。**加速比降低是预期**（solo 基线同步受益，帧延迟对单流收益最大）；绝对吞吐全面上涨才是要的。
+  - **顺带核算（139 遗疑清账）**：`row_steps/tokens ≈ 5.9` 的「批宽饥饿」疑云其实是**分段加权**——solo/conc2/conc4/conc8 各段批宽 = 1/2/4/8（活动行数真实反映并发），全场景平均 2.6 只是低并发段占比所致；conc8 段批宽 ≈ 8，**无饥饿**。tick 冗余前向仅 ~23%（多流 done 时序所致），不值得再动。
+  - **回归**：test_openai 33/33（顺带补 Stub 缺的 `stats_json`——139 加 trait 方法时漏了替身）；CPU 全回归 EXIT=0、0 FAIL。
+  - **剩余空间**：conc8 64.7 tok/s vs session 摊薄上限 ~190 tok/s（6.63××28.8）——还有 ~3×，主要在 TTFT 里的 prompt 相位与帧循环的 poll 轮周期；留作后续观测。
