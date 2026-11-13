@@ -1301,6 +1301,11 @@ struct Loop(Movable):
             return
         if self.conns[slot].backpressure():
             return
+        # 一百四十四：先问"现在问帧是不是白问"。池级帧积压超限时，问帧
+        # 会逼引擎再推一批（padding 跟着涨）——跳过这一轮，让客户端先把
+        # 积压领走。True 不是结束：绝不能走下面的空串关流路。
+        if handler.stream_pending(slot):
+            return
         var frame: String
         try:
             frame = handler.stream_next(slot)

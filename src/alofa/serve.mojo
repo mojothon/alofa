@@ -586,6 +586,10 @@ struct ModelService(Service, Twinable):
         self.stream_request = request
         self.stream_touched = monotonic_ns()
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        """CPU 单流无池级积压概念，恒 False。"""
+        return False
+
     def stream_next(mut self, request: Int) raises -> StreamToken:
         """走一步，返回这一步**新增**的文本。
 

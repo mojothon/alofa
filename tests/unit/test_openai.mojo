@@ -117,6 +117,10 @@ struct Stub(Service, Twinable):
         self.stream_max = max_tokens
         self.stream_step = 0
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        """替身无池，恒 False。"""
+        return False
+
     def stats_json(mut self) -> String:
         """观测面（一百三十九）：替身不产计数，空串 = /health 不带 stats 段。"""
         return ""

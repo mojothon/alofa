@@ -515,6 +515,36 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             k += 1
         self._forward_rows(0, slots^, True)
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        """一百四十四：tick 引擎的背压。本行无帧可领、且全池待领帧
+        积压超限时返回 True——调用方（loop）跳过这轮，让客户端先把
+        积压领走。没有这条守门，prompt 相位的 next 会连发 tick 把
+        全池帧队列推爆：积压的行「done 未收尾」久占行位，活跃度塌陷，
+        padding 占比飙升（conc16 实测 85% 的行·步在推 padding）。
+
+        恒不死锁：有帧可领的行永远不 pending（先判本行），积压必有
+        主（帧在队里就有人能领）；积压清零即解除。
+        """
+        var slot = self._slot_of(request)
+        if slot < 0:
+            return False
+        if self.streams[slot].frame_head < len(self.streams[slot].frame_ends):
+            return False  # 本行有帧：领了就是，谈不上 pending
+        if self.streams[slot].count >= self.streams[slot].steps:
+            return False  # 走完了：让它自然结束
+        var backlog = 0
+        var i = 0
+        while i < self.n_rows:
+            backlog += (
+                len(self.streams[i].frame_ends) - self.streams[i].frame_head
+            )
+            i += 1
+        # 上限 = 行数：每行平均 1 帧待领，客户端就开始落后于引擎了。
+        # （solo 不受影响：单行自己最多积压 1-2 帧，n_rows=1 时 2 > 1
+        # 会触发——但 solo 的 gen 帧被即时领走，prompt 相位无帧可积，
+        # backlog 始终 0。）
+        return backlog >= self.n_rows
+
     def stream_next(mut self, request: Int) raises -> StreamToken:
         var slot = self._slot_of(request)
         if slot < 0:

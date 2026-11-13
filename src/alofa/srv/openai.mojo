@@ -169,6 +169,13 @@ trait Service:
         """
         ...
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        """帧队列积压守门（一百四十四）：True = 现在问帧会白问，先别问。
+
+        默认语义由实现给：没有池级积压概念的实现恒 False。
+        """
+        ...
+
     def stream_next(mut self, request: Int) raises -> StreamToken:
         """走一步，返回这一步的文本；`done=True` 表示生成结束。
 
@@ -952,6 +959,10 @@ struct ChatHandler[S: Service & Deinitable & Movable & Twinable](Handler, Twinab
         # 体是空的：帧不在响应里。流式响应没有 `Content-Length`（长度未知），
         # 靠关连接定界，所以 `close=True` 是这条响应的分帧方式，不是建议。
         return HttpResponse(200, "", SSE_CONTENT_TYPE, True)
+
+    def stream_pending(mut self, request: Int) -> Bool:
+        """转发给服务（一百四十四）：池积压超限则这轮不问帧。"""
+        return self.service.stream_pending(request)
 
     def stream_next(mut self, request: Int) raises -> String:
         """流的下一帧；空串 = 流结束（服务循环据此停手）。

@@ -112,7 +112,29 @@ def run_scene(name, nthreads, nreq_each, temp, nonstream_frac=0.0):
     print(f"{name:8s} thr={nthreads} reqs={total_jobs} tok={ntok} "
           f"wall={wall:.2f}s tps={tps:.1f} ttft={mean_ttft * 1000:.0f}ms "
           f"lat={mean_lat:.2f}s", flush=True)
+    # 一百四十四：分段口径——场景内 forwards/row_steps 增量与 padding 比。
+    # row_steps/tok 高 = 大量前向算力在推 padding/错峰行；批宽 =
+    # row_steps/forwards。每流步数 ≈ tok + tok×(prompt/gen 比)，理论批宽
+    # 上限 = 池大小；实测批宽远小于并发数 = 行编排/领帧节奏有浪费。
+    try:
+        h = json.loads(urllib.request.urlopen(
+            BASE + "/health", timeout=10).read())
+        fw = h.get("forwards", 0) - SCENE_FW[0]
+        rs = h.get("row_steps", 0) - SCENE_RS[0]
+        SCENE_FW[0] = h.get("forwards", 0)
+        SCENE_RS[0] = h.get("row_steps", 0)
+        bw = rs / fw if fw else 0
+        rstep_per_tok = rs / ntok if ntok else 0
+        print(f"         seg: forwards={fw} row_steps={rs} "
+              f"batch-width={bw:.2f} row-steps/tok={rstep_per_tok:.2f}",
+              flush=True)
+    except Exception:
+        pass
     return tps
+
+
+SCENE_FW = [0]
+SCENE_RS = [0]
 
 
 def main():

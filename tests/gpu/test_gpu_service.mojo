@@ -245,6 +245,69 @@ def main() raises:
     if not c_ok:
         sem_ok = False
 
+    var g7b_ok = True
+    # ---- ⑦b 帧积压守门（一百四十四）：构造"71 积压 16 帧 + 73 在
+    # prompt 相位无帧"的状态，pending(73) 必须为 True；领完 71 清积压
+    # 后必须解除；守门不改变任何流的输出内容。
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 71)
+    var b7_slot71 = svc._slot_of(71)
+    # 72 用自己的 next 驱动 tick，71 从不领帧（它的 gen 帧全程堆积）。
+    svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 72)
+    var guard_rounds = 0
+    while svc.streams[b7_slot71].count < svc.streams[b7_slot71].steps:
+        _ = svc.stream_next(72)
+        guard_rounds += 1
+        if guard_rounds > 400:
+            break
+    # 71 已走完：16+ 帧积压在队列里，71 的行不再活跃。
+    svc.stream_end(72)  # 让出行的行位给 73（门池只有 2 行）
+    # 73 begin：prompt 相位、无帧可领、池积压超限 → pending True。
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 73)
+    var b7_slot73 = svc._slot_of(73)
+    var saw_pending = svc.stream_pending(73)
+    if not saw_pending:
+        print("  gate: backlog guard never fired!")
+        g7b_ok = False
+    # 领完 71 的积压：守门必须解除。
+    while True:
+        var fr71 = svc.stream_next(71)
+        if fr71.done:
+            break
+    svc.stream_end(71)
+    var pending_after = svc.stream_pending(73)
+    if pending_after:
+        print("  gate: pending stuck after backlog drained!")
+        g7b_ok = False
+    # 73 走完，与 74 独跑逐位比（守门只挡"问"，不动内容）。
+    var chain73 = List[Int]()
+    while True:
+        var fr73 = svc.stream_next(73)
+        chain73.append(svc.streams[b7_slot73].last)
+        if fr73.done:
+            break
+    svc.stream_end(73)
+    svc.stream_end(72)
+    svc.stream_begin(CJK, 16, 0.0, 1.0, 74)
+    var b7_slot74 = svc._slot_of(74)
+    var chain74 = List[Int]()
+    while True:
+        var fr74 = svc.stream_next(74)
+        chain74.append(svc.streams[b7_slot74].last)
+        if fr74.done:
+            break
+    svc.stream_end(74)
+    var g_ok = len(chain73) == len(chain74)
+    if g_ok:
+        for i in range(len(chain73)):
+            if chain73[i] != chain74[i]:
+                g_ok = False
+                print("  gate 73 diverges at", i)
+                break
+    print("gate 7b backlog-guard: pending-seen", saw_pending,
+          "cleared", not pending_after, "bit-same", g_ok,
+          "len", len(chain73), len(chain74))
+    g7b_ok = g7b_ok and g_ok
+
     # ---- ⑦ 池并发：两条流交替推进，各自与独跑逐位同链 ----
     # B 独跑（temp0.8）参照：一百三十六起 B 带采样参数合批。
     svc.stream_begin(CJK, 16, 0.8, 1.0, 51)
@@ -410,7 +473,8 @@ def main() raises:
     print("parity:", same1, " join:", join_ok, " det:", det,
           " sem_ok:", sem_ok, " eos_ok:", eos_ok, " cjk:", c_ok,
           " inter:", inter_ok, " sdet:", sdet, " svar:", svar)
-    if same1 and det and sem_ok and eos_ok and c_ok and inter_ok and sdet and svar:
+    if (same1 and det and sem_ok and eos_ok and c_ok and inter_ok
+            and sdet and svar and g7b_ok):
         print("*** GPU SERVICE GATE PASS ***")
     else:
         print("*** GPU SERVICE GATE FAIL ***")

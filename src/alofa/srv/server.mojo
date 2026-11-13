@@ -84,6 +84,15 @@ trait Handler:
     def handle(mut self, request: Int, req: HttpRequest) raises -> HttpResponse:
         ...
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        """这条流现在问帧是不是白问（一百四十四：tick 引擎的背压）。
+
+        服务内部的帧队列积压超限时，问帧只会逼引擎再推一批（padding
+        跟着涨）。True = 先别问，下一轮再来；调用方必须把 True 当作
+        "没有帧、但流没结束"——绝不能当空串关流。
+        """
+        ...
+
     def stream_next(mut self, request: Int) raises -> String:
         """流的下一帧；空串 = 流结束。
 
