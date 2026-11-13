@@ -116,14 +116,17 @@ def run_scene(name, nthreads, nreq_each, temp, nonstream_frac=0.0):
 
 
 def main():
+    # 一百四十二：档位可从命令行覆盖（默认原五场景）——池上限复测爬坡时
+    # 传自定义档，如 `python3 pressure_139.py 1 8 16`。
+    import sys
+    levels = [int(x) for x in sys.argv[1:]] or [1, 2, 4, 8]
     base = run_scene("solo", 1, 8, 0.0)
-    t2 = run_scene("conc2", 2, 8, 0.0)
-    t4 = run_scene("conc4", 4, 8, 0.0)
-    t8 = run_scene("conc8", 8, 8, 0.0)
+    tps = {}
+    for n in levels[1:]:
+        tps[n] = run_scene(f"conc{n}", n, 8, 0.0)
     print("---- speedup vs solo ----")
-    print(f"conc2 {t2 / base:.2f}x  conc4 {t4 / base:.2f}x  "
-          f"conc8 {t8 / base:.2f}x")
-    run_scene("mixed", 8, 4, 0.0, nonstream_frac=0.5)
+    print("  ".join(f"conc{n} {v / base:.2f}x" for n, v in tps.items()))
+    run_scene("mixed", levels[-1], 4, 0.0, nonstream_frac=0.5)
     print("PRESSURE GATE DONE")
 
 

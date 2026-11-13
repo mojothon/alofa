@@ -42,10 +42,11 @@ def main() raises:
     # ⚠️ GPU v0 窗口固定 512：prefill_step/generate_batch 的形状实参里
     # max_tokens 是 comptime（`srv/gpu_service.mojo`），环境变量改不动它。
     comptime WINDOW = 512
-    # 池大小（账本一百三十二）：N 条 session 共享权重与 ctx，并发的是
-    # 「进展」不是吞吐（每次前向 t=1）。显存 ≈ N × 3.36 GB（决算式见
-    # 账本一百二十七），默认 1 = 一百二十九的单流行为不变。
-    var n_sessions = env_int("ALOFA_GPU_SESSIONS", 1, 1, 8)
+    # 池大小：132 时是 N 条独立 session（显存 ≈ N × 3.36GB，上限 8）；
+    # 134 重写后 N = **单 session 的批行池容量**（n_rows，上限 GPU_BMAX=64），
+    # 权重/KV 只有一份，显存与 N 无关——上限随之放宽到 64。默认 1 =
+    # 一百二十九的单流行为不变。
+    var n_sessions = env_int("ALOFA_GPU_SESSIONS", 1, 1, 64)
 
     print(
         "alofa serve (gpu) — single process, HTTP with SSE streaming,"

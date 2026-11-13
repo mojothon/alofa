@@ -117,9 +117,8 @@ def snapshot():
     try:
         import os
         import subprocess as sp
-        pid = sp.check_output(
-            ["pgrep", "-f", "mojo run -I src src/alofa/serve_gpu"],
-            timeout=10).decode().split()[0]
+        pid = sp.check_output(["pgrep", "-x", "mojo"], timeout=10
+                              ).decode().split()[0]
         with open(f"/proc/{pid}/status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):

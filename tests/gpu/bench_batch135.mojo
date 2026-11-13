@@ -47,7 +47,7 @@ def main() raises:
     # ---- 口径 1：session 层 t=1/2/4/8 每步延迟 ----
     print("== session-layer step delay (argmax, ms/step) ==")
     var base = Float64(0)
-    for t in [1, 2, 4, 8]:
+    for t in [1, 2, 4, 8, 16]:
         var toks = List[Int]()
         for _b in range(t):
             toks.append(100)
