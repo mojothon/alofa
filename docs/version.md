@@ -8,7 +8,9 @@ GPU 服务层合批时代：单 session 批行池 + tick 统一调度；per-row 
 （任意 temp/top_p 一批）；complete 与流式统一进池；HTTP 层实测收益峰
 conc8 1.66×（session 层 t=16 摊薄 10.85×）；TCP_NODELAY 修复（+38-46%）；
 25 分钟 soak 零失败无泄漏；**帧积压守门**（tick 引擎背压）把 HTTP 收益
-曲线从「峰 conc8 1.66×」修成单调升（conc16 **3.31×**，219.8 tok/s）。
+曲线从「峰 conc8 1.66×」修成单调升（conc16 **3.31×**，219.8 tok/s）；
+**chunked prefill 进 tick**（prompt 步切片混合 gen）把长 prompt 的
+TTFT p99 从 8.3s 压到 2.6s（**-68%**）、吞吐 +70%。
 战报：`docs/plan/batching-report.md`。
 
 ## 0.1.0（2026-11-12，账本一百一十九 → 一百二十三）

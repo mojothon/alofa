@@ -57,6 +57,23 @@ B=16-32 拐点结论同源）。t=16 的 per-row 0.54ms 与 123 的 B=16 0.539ms
 **conc16 细节**：forwards 2677→1210（冗余前向 -55%）、row-steps/tok 12.80→
 6.94（padding 浪费 -46%）、批宽 11.0 行、lat 2.24s→1.07s。
 
+**chunked prefill 进 tick**（147，`PREFILL_CHUNK_TICKS = 8`）：prompt 相位的
+stream_next 至多驱动 8 次 tick，走满无帧回 waiting（上层回 SSE 注释帧）。
+切片让 prompt 步与 gen 步在同一 tick 交错、批宽更饱满——协议零新增
+（token.waiting + sse_comment 本就存在；complete 对 waiting 幂等；CPU 路不
+返回 waiting）。
+
+| 场景（SLO 口径） | 146 | 147 | Δ |
+|---|---|---|---|
+| **long-c16 TTFT p99** | 8275ms | **2627ms** | **-68%** |
+| long-c16 TTFT p50 | 3122ms | 1348ms | -57% |
+| **long-c16 吞吐** | 35.7 | **60.7 tok/s** | **+70%** |
+| long-c8 TTFT p50 | 1324ms | 574ms | -57% |
+| short-c4 / short-c8 吞吐 | — | — | +29-36% |
+
+守门（背压）+ 切片（公平调度）是同一根因的两刀：背压挡「引擎领先过远」，
+切片挡「一段 prompt 独占引擎」。
+
 ## 四、吞吐口径（/health 五字段）
 
 ```
@@ -91,7 +108,7 @@ rows / ticks / batched / forwards / row_steps
 ## 七、遗留行动项
 
 1. **KV 按需分配**——830MB 固定 → 按 pos 增长（平均利用率 ~20%）
-2. **prompt 相位 TTFT**——chunked prefill 进 tick（守门后 prompt 步节奏已变，值得重审）
+2. ~~prompt 相位 TTFT~~——147 的 chunked prefill 落地，long-c16 p99 -68%，此项关闭
 3. **紧致行压缩**——降级搁置（~30 核签名改动 vs 0.15ms/行边际），行边际
    大涨（长上下文）时再议
 4. ~~loop 帧处理成本削减~~——144/145 的守门已把「loop 天花板」证伪并打破，
@@ -100,3 +117,5 @@ rows / ticks / batched / forwards / row_steps
 ## 八、版本
 
 0.2.0：GPU 服务层合批时代。0.1.0 = 119-123 的可服务底座（单流）。
+144-147（守门 + 活跃标定 + chunked prefill）为 0.2.0 内的引擎节奏突破：
+HTTP 加速比曲线单调化（3.31×@conc16）、长 prompt TTFT p99 -68%。
