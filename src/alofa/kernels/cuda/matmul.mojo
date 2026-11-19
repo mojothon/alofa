@@ -3269,6 +3269,7 @@ def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
     dst_a: Pointer[Float32, MutUntrackedOrigin],
     dst_b: Pointer[Float32, MutUntrackedOrigin],
     dst_act: Pointer[Float32, MutUntrackedOrigin],
+    dst_act16: Pointer[Float16, MutUntrackedOrigin],
     out_cols: Int32,
     n_rows: Int32,
 ) -> None:
@@ -3417,11 +3418,13 @@ def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
                 unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
             ] = v2[0]
             var g0 = Float64(v1[0])
+            var a0 = Float32(g0 / (Float64(1) + exp(-g0)) * Float64(v2[0]))
             dst_act[
                 unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
-            ] = Float32(
-                g0 / (Float64(1) + exp(-g0)) * Float64(v2[0])
-            )
+            ] = a0
+            dst_act16[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = Float16(a0)
             dst_a[
                 unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
             ] = v1[1]
@@ -3429,11 +3432,13 @@ def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
                 unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
             ] = v2[1]
             var g1 = Float64(v1[1])
+            var a1 = Float32(g1 / (Float64(1) + exp(-g1)) * Float64(v2[1]))
             dst_act[
                 unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
-            ] = Float32(
-                g1 / (Float64(1) + exp(-g1)) * Float64(v2[1])
-            )
+            ] = a1
+            dst_act16[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = Float16(a1)
         if r0 + gid + 8 < Int(n_rows):
             dst_a[
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
@@ -3442,11 +3447,13 @@ def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
             ] = v2[2]
             var g2 = Float64(v1[2])
+            var a2 = Float32(g2 / (Float64(1) + exp(-g2)) * Float64(v2[2]))
             dst_act[
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
-            ] = Float32(
-                g2 / (Float64(1) + exp(-g2)) * Float64(v2[2])
-            )
+            ] = a2
+            dst_act16[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = Float16(a2)
             dst_a[
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
             ] = v1[3]
@@ -3454,11 +3461,13 @@ def f16_mma_dual_pk_gpu[INNER: Int, CH: Int, WARP: Int](
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
             ] = v2[3]
             var g3 = Float64(v1[3])
+            var a3 = Float32(g3 / (Float64(1) + exp(-g3)) * Float64(v2[3]))
             dst_act[
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
-            ] = Float32(
-                g3 / (Float64(1) + exp(-g3)) * Float64(v2[3])
-            )
+            ] = a3
+            dst_act16[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = Float16(a3)
 
 
 def f16_mma_dual_gpu[INNER: Int, CH: Int, WARP: Int](

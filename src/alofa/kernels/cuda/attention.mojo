@@ -1949,12 +1949,17 @@ def attn_vt2_h_gpu[
     kv_len: Int32,
     pos0: Int32,
     dst: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
 ) -> None:
     """K2' 的 **kv_head 分组**版（账本一百一十一）：grid =
     (n_kv_heads, TILES, B)，一块服务同一 kv head 下的一组 query head
     （group = n_heads/n_kv_heads 个，本模型 7）。要求
     THREADS // HMAX == head_dim（每槽 64 线程恰对应 64 个输出维），
     且 group <= HMAX（多余槽空转但仍参与 barrier）。
+
+    一百五十六：`dst16` 在 FUSED 尾写时直出 f16 镜像（o MMA GEMM 的
+    预转操作数）——o 链的独立 `x_to_f16` 发射由此消失；dst16 恒传
+    `d_attnb16`（恒分配镜像缓冲），非 FUSED 路径不读它、保留 x_to_f16。
 
     动机（nsys 实测）：VT2 45.5µs/层与 RS 同病——每个 (head,b,tile)
     块都把同一 kv head 的 v 行整读一遍，7 倍冗余（每层 ~57MB）。分组
@@ -2055,9 +2060,9 @@ def attn_vt2_h_gpu[
             )
             jj += 1
         comptime if FUSED and TILES == 1:
-            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = (
-                Float32(acc / stot[slot * TPP])
-            )
+            var av = Float32(acc / stot[slot * TPP])
+            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = av
+            dst16[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = Float16(av)
         else:
             vpart[unsafe_offset=(
                 (b * Int(n_heads) + head) * TILES + tile

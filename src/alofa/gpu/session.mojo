@@ -2169,6 +2169,7 @@ struct GpuSession:
                         Int32(kv_len),
                         Int32(pos0),
                         self.d_attnb.unsafe_ptr(),
+                        self.d_attnb16.unsafe_ptr(),
                         grid_dim=(self.n_kv_heads, attn_tiles, t),
                         block_dim=(attn_t, 1, 1),
                     )
@@ -2186,6 +2187,7 @@ struct GpuSession:
                         Int32(kv_len),
                         Int32(pos0),
                         self.d_attnb.unsafe_ptr(),
+                        self.d_attnb16.unsafe_ptr(),
                         grid_dim=(self.n_kv_heads, attn_tiles, t),
                         block_dim=(attn_t, 1, 1),
                     )
@@ -2226,13 +2228,20 @@ struct GpuSession:
                 prefill_wpack and inner % 16 == 0
             ):
                 # o 是残差累加（ACC=True）——几何与 down 同，直接复用
-                self.ctx.enqueue_function[x_to_f16_gpu](
-                    self.d_attnb.unsafe_ptr(),
-                    self.d_attnb16.unsafe_ptr(),
-                    Int32(t * self.hidden),
-                    grid_dim=((t * self.hidden + 255) // 256, 1, 1),
-                    block_dim=(256, 1, 1),
-                )
+                # 一百五十六：FUSED 尾写直出 f16 时 x_to_f16 删除；
+                # 非 FUSED 路径（COMB 写回）保留独立预转。
+                if not (
+                    prefill_gqa and attn_t // 8 == self.head_dim
+                    and self.n_heads // self.n_kv_heads <= 8
+                    and attn_tiles == 1
+                ):
+                    self.ctx.enqueue_function[x_to_f16_gpu](
+                        self.d_attnb.unsafe_ptr(),
+                        self.d_attnb16.unsafe_ptr(),
+                        Int32(t * self.hidden),
+                        grid_dim=((t * self.hidden + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
                 if prefill_spl and inner % 16 == 0 and (
                     inner // 4
                 ) % 224 == 0:
@@ -2320,6 +2329,7 @@ struct GpuSession:
                         self.d_gateb.unsafe_ptr(),
                         self.d_upb.unsafe_ptr(),
                         self.d_actb.unsafe_ptr(),
+                        self.d_actb16.unsafe_ptr(),
                         Int32(self.inter),
                         Int32(t),
                         grid_dim=(ceildiv(self.inter, 128), ceildiv(t, 16), 1),
@@ -2366,13 +2376,18 @@ struct GpuSession:
                 prefill_mma_down and inner_ff % 16 == 0
             ):
                 # 一百零四：down MMA（tensor core，f32 快路径）
-                self.ctx.enqueue_function[x_to_f16_gpu](
-                    self.d_actb.unsafe_ptr(),
-                    self.d_actb16.unsafe_ptr(),
-                    Int32(t * self.inter),
-                    grid_dim=((t * self.inter + 255) // 256, 1, 1),
-                    block_dim=(256, 1, 1),
-                )
+                # 一百五十六：dual_pk 直出 f16 时 x_to_f16 删除；非 pk
+                # dual（wpack=False）保留独立预转。
+                comptime if not (
+                    prefill_mma_dual and prefill_wpack and inner % 16 == 0
+                ):
+                    self.ctx.enqueue_function[x_to_f16_gpu](
+                        self.d_actb.unsafe_ptr(),
+                        self.d_actb16.unsafe_ptr(),
+                        Int32(t * self.inter),
+                        grid_dim=((t * self.inter + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
                 comptime if prefill_wpack and prefill_spl and (
                     (inner_ff // 8) % 608 == 0 and inner_ff % 16 == 0
                 ):

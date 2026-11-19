@@ -3929,3 +3929,9 @@
   - **设计取舍**：先试核内 bitcast 判空——bitcast 签名不合（dtype 参数型）、Pointer 无参构造也不存在，判空方案双重不可行；改为全调用点传真 buffer（0 判空分支、写带宽增加可忽略）。
   - **验证**：GPU 门 PASS 十判据；conc32 **448.1 tok/s vs 基线 433.6（+3.3%）**、solo 66.0→68.6（+4%）；6.53× 持平（solo 同涨）。
   - **下一刀（156 候选）**：① split-K 收口融合（f32_mergb/mergb2/adds 进 GEMM 尾，~3 发射/层）；② o/down 链的 x_to_f16 同款直出（COMB/act 写回核加 f16 输出，再省 2 发射/层）；③ 发射数预算表逐层核对（-2 后每层 ~25 发射）。
+- **2026-11-19（一百五十六）** —— **减发射第二刀：VT2 尾写 + dual_pk 尾写直出 f16**
+  - **改动**：① `attn_vt2_h_gpu`（FUSED 版，o 链写者）签名加 `dst16`，FUSED 尾写直出 f16 镜像——o 链独立 `x_to_f16` 删除；② `f16_mma_dual_pk_gpu` 签名加 `dst_act16`，4 个 swiglu 写点提成 var 直出 f16——down 链独立 `x_to_f16` 删除。两处删除均条件化：o 链按 FUSED 活跃条件（**普通 if，非 comptime——条件含 self.head_dim 运行时值，comptime if 会拒**），down 链按 dual_pk 启用条件（comptime 可判定）。非活跃路径保留独立预转。bb 版 VT2（批解码路径）同构未动，留 157。
+  - **验证**：GPU 门 PASS 十判据；conc32 **453.8 tok/s**（155 基线 448.1，+1.3%）、solo 70.7（+3%）；两刀合计 **433.6→453.8 = +4.7%**。
+  - **折损分析**：理论 -0.41ms（56 发射）只兑现 +1.3%——删掉的发射位于段间 gap，部分 gap 被流水线天然吸收（154 的 percall-sync 口径高估了发射净成本）；真正硬成本是每发射的 host 调用 ~7.4µs 的固定部分。
+  - **156 过程坑**：matmul.mojo 混合行尾（dual_pk 段 LF、老段 CRLF）——python 字符串替换需 LF/CRLF 双模式回退 + 函数体范围锚定（dual_gpu 非 pk 版与 pk 版写点逐字同构，全文件替换会误伤）；comptime if 条件不能含 self.* 运行时值。
+  - **157 候选**：① split-K 收口融合（mergb/mergb2/adds 进 GEMM 尾，~3 发射/层）；② bb 版 VT2 + 批解码链同款直出（generate_batch 路径）；③ profile=2 复核剩余发射清单（~23/层），定发射数地板。
