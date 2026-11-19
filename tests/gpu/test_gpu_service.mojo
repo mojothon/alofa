@@ -180,7 +180,7 @@ def main() raises:
     var tail_done = True
     var n_done_at = -1
     var nfr3 = 0
-    for i in range(10):
+    for i in range(24):
         var fr3 = svc.stream_next(11)
         if fr3.waiting:
             continue

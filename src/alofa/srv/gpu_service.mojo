@@ -83,7 +83,7 @@ alias COMPLETE_MARKER = -2
 # 一百四十七：单个 stream_next 至多驱动的 tick 数（prompt 相位切片）。
 # 8 步 ≈ 40ms 前向预算/next——切片之间其它流的帧被领走，排队深度
 # 随池内行数摊开而不是被一段 prompt 独占。
-alias PREFILL_CHUNK_TICKS = 8
+alias PREFILL_CHUNK_TICKS = 1
 
 
 struct GpuStream(Movable):
