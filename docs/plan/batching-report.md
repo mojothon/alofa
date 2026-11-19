@@ -116,6 +116,8 @@ rows / ticks / batched / forwards / row_steps
 
 ## 八、版本
 
+0.2.1：引擎节奏突破（144-149，守门 + 活跃标定 + chunked prefill K=1）——
+加速比曲线完全单调（3.31×@conc16）、长 prompt c16 TTFT p50 -88% / p99 -67%、
+吞吐 68.4 tok/s。
+
 0.2.0：GPU 服务层合批时代。0.1.0 = 119-123 的可服务底座（单流）。
-144-147（守门 + 活跃标定 + chunked prefill）为 0.2.0 内的引擎节奏突破：
-HTTP 加速比曲线单调化（3.31×@conc16）、长 prompt TTFT p99 -68%。

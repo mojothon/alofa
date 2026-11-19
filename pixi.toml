@@ -9,7 +9,7 @@ channels = [
 description = "an inference engine in pure Mojo."
 name = "alofa"
 platforms = ["linux-64"]  # TODO: add other platforms "osx-arm64",
-version = "0.2.0"
+version = "0.2.1"
 
 
 [tasks]
