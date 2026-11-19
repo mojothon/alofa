@@ -3917,3 +3917,10 @@
 
   - **发现**：① **rmsnorm 30µs/次**（[32,896] 归约应 <5µs）——批行版发射形状/线程占据率有明显问题，**-1ms/tick ≈ +20% 吞吐的靶子**；② attention 仅 6%（107 GQA 分组红利兑现，无需再动）；③ GEMM 56% 是理论地板（可 MMA 形状再扫但边际小）。
   - **下一刀候选**：批行 rmsnorm 核（占据率/发射形状）——优先于一切。
+- **2026-11-19（一百五十四）** —— **发射开销剖析**：tick 是 launch-bound，153 的段语义误读修正
+  - **微基准**（bench_launch154，借 GpuSession buffer）：裸 rmsnorm 发射 **7-8µs/次与形状无关**（批行 8.26 vs 单行 7.42 vs 批 buffer rows=1 7.42——rows/形状不进入发射成本）。
+  - **段语义修正（推翻 153 的解读）**：逐段还原 prefill_step 的 10 个 prof 段——**tri 段不是 rmsnorm，是 QKV 投影全家桶**（rmsnorm + x_to_f16 + Q GEMM spl/mergb + KV GEMM + cat2，每层 6-7 发射）；o 段含 attention 合并 + o GEMM 链；rmsnorm 本体仅 ~8µs × 56 = 0.45ms（8%）。153 的「rmsnorm 30µs/次」实为「tri 段 30µs = 6-7 次发射之和」。
+  - **真构成**：每层 ~27 次发射 × 28 层 + tail ≈ **760 发射/tick**；760 × 7.4µs = **5.6ms = tick 实测**——**完美自洽：tick 几乎全是 host 发射开销，GPU kernel 本体被流水线完全隐藏**。151 的「前向 100% 打满」实为「发射链 100% 打满」。
+  - **kv2 A/B**（113 留的 K/V 合一 GEMM 开关）：门 PASS 十判据 + conc32 438.4 tok/s vs 基线 433.6——**持平**。原因：省 1 次 K/V 发射的同时每层引入 cat2 重拼发射（k/v 权重运行时拼接），净发射数不降。默认回滚 False；要吃到收益需把 cat2 一次性化到 load 期。
+  - **优化杠杆重定向**：不是「优化 rmsnorm 核」而是**减发射数**——① x_to_f16 融合进 GEMM 头（3-4 次/层 ≈ 0.74ms）；② split-K 收口（mergb/mergb2/adds）融合进 GEMM 尾（~3 次/层 ≈ 0.62ms）；③ kv2 的 cat2 一次性化。合计弹药 ~1.4ms（25%）。116 时代 decode 的融合三件套方法论直接复用。
+  - **语法坑**：struct 持 DeviceContext + 自建 buffer 的析构崩溃（NormBench 式）；两层链 `self.s.ctx` 触发 enqueue_function capturing 特化失败（ctx 必须直属字段）；GpuSession 借用需 `mut` 参数（账本六十二）+ mut self 与 mut 参数不可 alias 同源 buffer。

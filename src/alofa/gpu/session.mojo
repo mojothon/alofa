@@ -1617,6 +1617,7 @@ struct GpuSession:
         batch: Bool = False,
     ](
         mut self, tokens: List[Int], profile: Bool = False, sync_tail: Bool = True,
+        prof_nosync: Bool = False,
         # 一百二十-b：False 时批 tail 跳过 B×vocab logits D2H（sample
         # 模式，只回 tokout 4B×B）
         copy_logits: Bool = True,
@@ -1732,7 +1733,8 @@ struct GpuSession:
             block_dim=(64, 1, 1),
         )
         if profile:
-            self.ctx.synchronize()
+            if not prof_nosync:
+                self.ctx.synchronize()
             prof[0] += Float64(monotonic_ns() - prof_t0) / 1e6
             prof_t0 = monotonic_ns()
 
@@ -2009,7 +2011,8 @@ struct GpuSession:
                     block_dim=(tri_t, 1, 1),
                 )
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[1] += Float64(monotonic_ns() - prof_t0) / 1e6
                 ltri = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
@@ -2064,22 +2067,26 @@ struct GpuSession:
                     block_dim=(attn_t, 1, 1),
                 )
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[5] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[4] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[3] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[2] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
@@ -2280,7 +2287,8 @@ struct GpuSession:
                     block_dim=(o_t, 1, 1),
                 )
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[6] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lo = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
@@ -2355,7 +2363,8 @@ struct GpuSession:
                     block_dim=(dual_t, 1, 1),
                 )
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[7] += Float64(monotonic_ns() - prof_t0) / 1e6
                 lff = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
@@ -2436,7 +2445,8 @@ struct GpuSession:
                     block_dim=(down_t, 1, 1),
                 )
             if profile:
-                self.ctx.synchronize()
+                if not prof_nosync:
+                    self.ctx.synchronize()
                 prof[8] += Float64(monotonic_ns() - prof_t0) / 1e6
                 ldown = Float64(monotonic_ns() - prof_t0) / 1e6
             if profile:
@@ -2552,7 +2562,8 @@ struct GpuSession:
             )
             self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         if profile:
-            self.ctx.synchronize()
+            if not prof_nosync:
+                self.ctx.synchronize()
             prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
             prof_t0 = monotonic_ns()
         if sync_tail:

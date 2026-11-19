@@ -167,6 +167,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var n_single: Int
     # 一百五十三：前向 kernel 构成剖析开关与池级累计。
     var profiling: Bool
+    var prof_mode: Int
     var prof_n: Int
     var prof_sum: InlineArray[Float64, 10]
     # spawn_twin 要用的三个路径（与 ModelService 同款：存路径不存模型，
@@ -214,7 +215,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.n_single = 0
         # 一百五十三：前向 kernel 构成剖析（ALOFA_PROFILE=1）——tick 传
         # profile=True，每 50 tick 打印分段均值（ms/tick）。
-        self.profiling = env_int("ALOFA_PROFILE", 0, 0, 1) == 1
+        self.prof_mode = env_int("ALOFA_PROFILE", 0, 0, 2)
+        self.profiling = self.prof_mode >= 1
         self.prof_n = 0
         self.prof_sum = InlineArray[Float64, 10](fill=Float64(0))
         self.weights_dir = weights_dir
@@ -441,7 +443,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             DType.float32, True, True, True, True, True, True, True,
             True, False, True
         ](
-            toks^, self.profiling, False, False, 0.0, Int32(0), 1.0,
+            toks^, self.profiling, False, False, self.prof_mode == 2, 0.0,
+            Int32(0), 1.0,
             0, 1,  # layer_gap 默认
             first_slot,
             True,  # per_row_sampling
