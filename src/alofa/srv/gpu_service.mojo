@@ -80,6 +80,10 @@ alias DEFAULT_EOS = 151645
 # `complete()` 在池里占坑的标记：它没有 `request` 号可挂，用这个
 # 区别于 NO_REQUEST（空闲）与任何流号。拿 -1 会跟 NO_REQUEST 撞。
 alias COMPLETE_MARKER = -2
+# 一百四十七：单个 stream_next 至多驱动的 tick 数（prompt 相位切片）。
+# 8 步 ≈ 40ms 前向预算/next——切片之间其它流的帧被领走，排队深度
+# 随池内行数摊开而不是被一段 prompt 独占。
+alias PREFILL_CHUNK_TICKS = 8
 
 
 struct GpuStream(Movable):
@@ -562,11 +566,26 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 无待领帧且流未完 → tick（会顺带推进别的活跃行——合批的
         # 意义所在）。帧队列保证本行的每一帧都在，不管别的行被 tick
         # 跨越了多少步。
+        # 一百四十七：prompt 相位的切片上限——一个 next 至多走
+        # PREFILL_CHUNK 步 tick，走满仍未帧就回 waiting（上层回 SSE
+        # 注释帧）。没有它，prompt 流的 next 会连发 tick 走完整段
+        # prompt（~200 步），把池里其它行的帧队列推爆、别的流在它
+        # 身后深排队（SLO 实测长 prompt c16 p99 TTFT 8.3s）。
+        var chunk = 0
         while (
             self.streams[slot].frame_head >= len(self.streams[slot].frame_ends)
             and self.streams[slot].count < self.streams[slot].steps
+            and chunk < PREFILL_CHUNK_TICKS
         ):
             self._tick()
+            chunk += 1
+        if (
+            self.streams[slot].frame_head >= len(self.streams[slot].frame_ends)
+            and self.streams[slot].count < self.streams[slot].steps
+        ):
+            # 切片走满还没到生成相位（或池被别的行占着推进慢）：让路。
+            # waiting 不是结束——上层发注释帧保活，下一轮再来。
+            return StreamToken("", False, True)
         if self.streams[slot].frame_head >= len(self.streams[slot].frame_ends):
             # 交完了（帧全领完）还被问：仍然回答"结束"。
             return StreamToken("", True, False)

@@ -3857,3 +3857,19 @@
   - **chunked prefill 价值实证**：长 prompt c16 的 p99 8.3s 尾延迟来自 prompt 步整段独占 next 循环——prompt 步进 tick 混合 gen 后排队深度可 ÷ 池，是 147 候选的最大延迟收益点。
   - **已知瑕疵**：SLO 首跑在 soak 刚结束时偶发挂起（timeout 杀掉后复跑即好）——疑似残留连接/线程竞态，脚本瑕疵非服务问题，待查。
   - **回归**：soak GATE DONE + SOAK-EXIT=0；SLO 全场景 err=0。
+- **2026-11-19（一百四十七）** —— **chunked prefill 进 tick**：prompt 相位切片，长 prompt 尾延迟 -68%
+  - **修**：`PREFILL_CHUNK_TICKS = 8`——stream_next 的 tick 循环加切片上限，走满无帧回 `waiting`（`StreamToken("", False, True)`）。没有它，prompt 流的 next 连发 tick 走完整段 prompt（~200 步），其它流在它身后深排队。**协议零新增**：`token.waiting` 字段与 ChatHandler 的 `sse_comment` 路径早已有（排队语义），complete 封装对 waiting 幂等（text 空不 done 继续循环），CPU 路不返回 waiting 不用动。恒不死锁：eos 收行时 count 置 steps（waiting 分支被排除）。
+  - **门适配八处**：切片让 next 边界与帧不再一一对应——所有收集循环加 `if fr.waiting: continue`（⑦ 交替段用 `if not fr.waiting:` 包裹——continue 会跳过同轮的 B 分支）。**门坑三则**：① 正则批量 patch 损坏 3 处（append 变量 ≠ fr 变量名，frib2/frib3 式错引用）；② frames1 是独立循环曾漏 patch（首帧 0 字节、join 111 vs 112）；③ **短流/eos 判据的 done-at 期望值基于「每次 next 走完整段」旧语义——切片后 waiting 轮消耗循环计数，done-at 读数漂移**——判据改按有效帧数计数（waiting 轮消耗 next 不消耗帧）。
+  - **门十判据 PASS** + CPU 全回归 EXIT=0。运维坑：GPU 3 被其它任务占 38GB（OOM 假象——报错点在 device_context 而非代码），换卡 4。
+  - **SLO 对照**（146 → 147，卡 4）：
+
+    | 场景 | 146 | 147 | Δ |
+    |---|---|---|---|
+    | short-c16 吞吐 | 188.3 | 218.8 tok/s | +16% |
+    | **long-c8 TTFT p50** | 1324ms | **574ms** | **-57%** |
+    | long-c8 吞吐 | 29.6 | 43.1 tok/s | +46% |
+    | **long-c16 TTFT p50** | 3122ms | **1348ms** | **-57%** |
+    | **long-c16 TTFT p99** | **8275ms** | **2627ms** | **-68%** |
+    | long-c16 吞吐 | 35.7 | 60.7 tok/s | **+70%** |
+
+    长 prompt 吞吐 60.7 tok/s 自洽（prompt 步合批生效：每请求 216 步 ÷ 批宽 × 5ms）。短 prompt 的 c4/c8 也 +29-36%（切片让 prompt 步与 gen 步在同 tick 交错，批宽更饱满）。146 实证的「chunked prefill 价值」完全兑现。

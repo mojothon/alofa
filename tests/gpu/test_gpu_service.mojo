@@ -37,6 +37,8 @@ def _sample_run(mut svc: GpuService, rid: Int) raises -> List[Int]:
     var s = List[Int]()
     while True:
         var fr = svc.stream_next(rid)
+        if fr.waiting:
+            continue
         s.append(svc.streams[0].last)
         if fr.done:
             break
@@ -51,6 +53,8 @@ def _replay(mut svc: GpuService, rid: Int) raises -> List[Int]:
     var done = False
     while not done:
         var fr = svc.stream_next(rid)
+        if fr.waiting:
+            continue
         c.append(svc.streams[0].last)
         if fr.done:
             done = True
@@ -89,6 +93,8 @@ def main() raises:
     var frames1 = List[String]()
     while True:
         var fr = svc.stream_next(0)
+        if fr.waiting:
+            continue
         chain1.append(svc.streams[0].last)
         frames1.append(fr.text)
         if fr.done:
@@ -133,6 +139,8 @@ def main() raises:
     var chain2 = List[Int]()
     while True:
         var fr = svc.stream_next(1)
+        if fr.waiting:
+            continue
         chain2.append(svc.streams[0].last)
         if fr.done:
             break
@@ -171,11 +179,17 @@ def main() raises:
     svc.stream_begin(PROMPT, 3, 0.0, 1.0, 11)
     var tail_done = True
     var n_done_at = -1
-    for i in range(6):
+    var nfr3 = 0
+    for i in range(10):
         var fr3 = svc.stream_next(11)
+        if fr3.waiting:
+            continue
+        # 一百四十七：切片后 next 边界不再与帧一一对应——按**有效帧**
+        # 计数（waiting 轮消耗的是 next 不是帧）。
+        nfr3 += 1
         if fr3.done and n_done_at < 0:
-            n_done_at = i
-        if i >= 3 and not fr3.done:
+            n_done_at = nfr3 - 1
+        if nfr3 >= 3 and not fr3.done:
             tail_done = False
     svc.stream_end(11)
     print("short stream: first done at frame", n_done_at,
@@ -195,10 +209,14 @@ def main() raises:
     svc.stream_begin(PROMPT, MAXNEW, 0.0, 1.0, 31)
     var echain = List[Int]()
     var e_done_at = -1
+    var nfre = 0
     for i in range(MAXNEW + 2):
         var fre = svc.stream_next(31)
+        if fre.waiting:
+            continue
+        nfre += 1
         if fre.done and e_done_at < 0:
-            e_done_at = i
+            e_done_at = nfre - 1
         if not fre.done:
             echain.append(svc.streams[0].last)
     var e_text = tok2.decode(echain)
@@ -234,6 +252,8 @@ def main() raises:
     var cchain = List[Int]()
     while True:
         var frc = svc.stream_next(41)
+        if frc.waiting:
+            continue
         cjoin = cjoin + frc.text
         cchain.append(svc.streams[0].last)
         if frc.done:
@@ -282,6 +302,8 @@ def main() raises:
     var chain73 = List[Int]()
     while True:
         var fr73 = svc.stream_next(73)
+        if fr73.waiting:
+            continue
         chain73.append(svc.streams[b7_slot73].last)
         if fr73.done:
             break
@@ -292,6 +314,8 @@ def main() raises:
     var chain74 = List[Int]()
     while True:
         var fr74 = svc.stream_next(74)
+        if fr74.waiting:
+            continue
         chain74.append(svc.streams[b7_slot74].last)
         if fr74.done:
             break
@@ -315,6 +339,8 @@ def main() raises:
     var cchain8 = List[Int]()
     while True:
         var frs = svc.stream_next(51)
+        if frs.waiting:
+            continue
         cchain8.append(svc.streams[slot51].last)
         if frs.done:
             break
@@ -334,14 +360,16 @@ def main() raises:
     while (not done_a) or (not done_b):
         if not done_a:
             var fra = svc.stream_next(61)
-            ia.append(svc.streams[0].last)
-            if fra.done:
-                done_a = True
+            if not fra.waiting:
+                ia.append(svc.streams[0].last)
+                if fra.done:
+                    done_a = True
         if not done_b:
             var frb = svc.stream_next(62)
-            ib.append(svc.streams[1].last)
-            if frb.done:
-                done_b = True
+            if not frb.waiting:
+                ib.append(svc.streams[1].last)
+                if frb.done:
+                    done_b = True
     svc.stream_end(61)
     svc.stream_end(62)
     var inter_ok = len(ia) == len(chain1) and len(ib) == len(cchain8)
@@ -379,6 +407,8 @@ def main() raises:
     var d_b2 = False
     while not d_b2:
         var fr8 = svc.stream_next(81)
+        if fr8.waiting:
+            continue
         ib2.append(svc.streams[1].last)
         if fr8.done:
             d_b2 = True
@@ -392,6 +422,8 @@ def main() raises:
     var d_b3 = False
     while not d_b3:
         var fr9 = svc.stream_next(82)
+        if fr9.waiting:
+            continue
         ib3.append(svc.streams[0].last)
         if fr9.done:
             d_b3 = True
@@ -416,6 +448,8 @@ def main() raises:
     var cchain4 = List[Int]()
     while True:
         var fr7 = svc.stream_next(72)
+        if fr7.waiting:
+            continue
         cchain4.append(svc.streams[svc._slot_of(72)].last)
         if fr7.done:
             break
@@ -435,6 +469,8 @@ def main() raises:
     var d71 = False
     while not d71:
         var fr71 = svc.stream_next(71)
+        if fr71.waiting:
+            continue
         s71.append(svc.streams[slot71].last)
         if fr71.done:
             d71 = True
