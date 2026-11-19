@@ -735,6 +735,7 @@ struct GpuSession:
             self.d_x.unsafe_ptr(),
             self.d_norms[idx].unsafe_ptr(),
             self.d_normed.unsafe_ptr(),
+            self.d_xnormb16.unsafe_ptr(),
             Int32(self.hidden),
             Int32(1),
             self.eps,
@@ -836,6 +837,7 @@ struct GpuSession:
             dx.unsafe_ptr(),
             self.d_norms[0].unsafe_ptr(),
             dnormed.unsafe_ptr(),
+            self.d_xnormb16.unsafe_ptr(),
             Int32(self.hidden),
             Int32(1),
             self.eps,
@@ -1420,6 +1422,7 @@ struct GpuSession:
                         self.d_x.unsafe_ptr(),
                         self.d_norms[2 * layer + 1].unsafe_ptr(),
                         self.d_xnorm.unsafe_ptr(),
+                        self.d_xnormb16.unsafe_ptr(),
                         Int32(inner),
                         Int32(1),
                         self.eps,
@@ -1846,27 +1849,21 @@ struct GpuSession:
             var ldown = 0.0
             # tri：norm 前置单发（t 行一次，树序重组差在门容差内）+
             # 真 GEMM 分块（八十九）：权重每 RB 行一次读，x 走 L2。
+            # 一百五十五：直出 f16 镜像（d_xnormb16），后面的独立
+            # x_to_f16 发射删除——发射开销主导的 tick 里每层省一发。
             self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
                 self.d_norms[2 * layer].unsafe_ptr(),
                 self.d_xnormb.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 Int32(inner),
                 Int32(t),
                 self.eps,
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            comptime if prefill_af == DType.float32 and (
-                prefill_mma_q or prefill_mma_dual
-            ):
-                # 一百零五：xnormb f16 预转前置（q MMA 与 dual MMA 共用）
-                self.ctx.enqueue_function[x_to_f16_gpu](
-                    self.d_xnormb.unsafe_ptr(),
-                    self.d_xnormb16.unsafe_ptr(),
-                    Int32(t * inner),
-                    grid_dim=((t * inner + 255) // 256, 1, 1),
-                    block_dim=(256, 1, 1),
-                )
+            # 一百零五：xnormb f16 预转前置（q MMA 与 dual MMA 共用）——
+            # 一百五十五：x_to_f16 删除，rmsnorm 已直出 f16。
             comptime if prefill_af == DType.float32 and prefill_mma_q and (
                 prefill_wpack and inner % 16 == 0
             ):
@@ -2293,28 +2290,24 @@ struct GpuSession:
                 lo = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
+            # 一百五十五：直出 f16 镜像——一百零五修正的场景（norm2 覆写
+            # d_xnormb 后 dual 的 f16 输入必须重转）由直出天然满足。
             self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
                 self.d_norms[2 * layer + 1].unsafe_ptr(),
                 self.d_xnormb.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 Int32(inner),
                 Int32(t),
                 self.eps,
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
+            # 一百五十五：x_to_f16 重转删除，rmsnorm 已直出 f16（norm2
+            # 覆写 d_xnormb 的场景由直出天然满足）。
             comptime if prefill_af == DType.float32 and (
                 prefill_mma_dual and inner % 16 == 0
             ):
-                # 一百零五修正：norm2 覆写 d_xnormb —— dual 的 f16 输入
-                # 必须在 norm2 之后重转（norm1 后的转换只服务 q2）
-                self.ctx.enqueue_function[x_to_f16_gpu](
-                    self.d_xnormb.unsafe_ptr(),
-                    self.d_xnormb16.unsafe_ptr(),
-                    Int32(t * inner),
-                    grid_dim=((t * inner + 255) // 256, 1, 1),
-                    block_dim=(256, 1, 1),
-                )
                 comptime if prefill_wpack:
                     self.ctx.enqueue_function[
                         f16_mma_dual_pk_gpu[
@@ -2467,6 +2460,7 @@ struct GpuSession:
                 self.d_xb.unsafe_ptr(),
                 self.d_norms[2 * self.n_layers].unsafe_ptr(),
                 self.d_normedb.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 Int32(self.hidden),
                 Int32(t),
                 self.eps,
@@ -2544,6 +2538,7 @@ struct GpuSession:
                 self.d_xb.unsafe_ptr() + (t - 1) * self.hidden,
                 self.d_norms[2 * self.n_layers].unsafe_ptr(),
                 self.d_normed.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 Int32(self.hidden),
                 Int32(1),
                 self.eps,

@@ -23,6 +23,7 @@ def rmsnorm_gpu(
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float32, MutUntrackedOrigin],
     dst: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
     cols: Int32,
     rows: Int32,
     eps: Float32,
@@ -38,6 +39,12 @@ def rmsnorm_gpu(
     树形归约与标量的顺序求和有合法重组差（与 q4 champion 同一性质），门的
     相对容差 1e-5 覆盖余量巨大。发射约定：`grid_dim=(rows,1,1)`、
     `block_dim=(256,1,1)`。
+
+    一百五十五：写回阶段直出 f16 镜像（下游 MMA GEMM 的预转操作数）——
+    norm1/norm2 后的独立 `x_to_f16` 发射由此消失（每层省 2 发射，发射开销
+    主导的 tick 里 ~0.4ms）。`dst16` 恒有效：不需要 f16 的调用点传
+    `d_xnormb16`（恒分配的镜像缓冲，写前若干元素、无下游读者、无害）。
+    f16 值 = Float16(f32 写回值)，与 x_to_f16_gpu 的转换逐位同序。
     """
     var row = Int(block_idx.x)
     if row >= Int(rows):
@@ -70,9 +77,9 @@ def rmsnorm_gpu(
     )
     i = tid
     while i < n:
-        dst[unsafe_offset=base + i] = Float32(
-            Float64(x[unsafe_offset=base + i]) * scale * Float64(w[unsafe_offset=i])
-        )
+        var v = Float32(Float64(x[unsafe_offset=base + i]) * scale * Float64(w[unsafe_offset=i]))
+        dst[unsafe_offset=base + i] = v
+        dst16[unsafe_offset=base + i] = Float16(v)
         i += 256
 
 

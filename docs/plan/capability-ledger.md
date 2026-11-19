@@ -3924,3 +3924,8 @@
   - **kv2 A/B**（113 留的 K/V 合一 GEMM 开关）：门 PASS 十判据 + conc32 438.4 tok/s vs 基线 433.6——**持平**。原因：省 1 次 K/V 发射的同时每层引入 cat2 重拼发射（k/v 权重运行时拼接），净发射数不降。默认回滚 False；要吃到收益需把 cat2 一次性化到 load 期。
   - **优化杠杆重定向**：不是「优化 rmsnorm 核」而是**减发射数**——① x_to_f16 融合进 GEMM 头（3-4 次/层 ≈ 0.74ms）；② split-K 收口（mergb/mergb2/adds）融合进 GEMM 尾（~3 次/层 ≈ 0.62ms）；③ kv2 的 cat2 一次性化。合计弹药 ~1.4ms（25%）。116 时代 decode 的融合三件套方法论直接复用。
   - **语法坑**：struct 持 DeviceContext + 自建 buffer 的析构崩溃（NormBench 式）；两层链 `self.s.ctx` 触发 enqueue_function capturing 特化失败（ctx 必须直属字段）；GpuSession 借用需 `mut` 参数（账本六十二）+ mut self 与 mut 参数不可 alias 同源 buffer。
+- **2026-11-19（一百五十五）** —— **减发射第一刀：rmsnorm 直出 f16 镜像**
+  - **改动**：`rmsnorm_gpu` 加 `dst16` 参数，写回阶段直出 f16 镜像（f16 值 = Float16(f32 写回值)，与 x_to_f16_gpu 转换逐位同序）；prefill norm1/norm2 传 `d_xnormb16`，独立 `x_to_f16` 发射删除（每层 2 发射，56 发射/tick ≈ 0.41ms 理论）。其余 5 个调用点（decode _norm/enqueue_rmsnorm/dual_nx norm2/tail×2）统一传 `d_xnormb16`（恒分配 mb×hidden，写前若干元素、decode 链 f16 无读者、无害）。
+  - **设计取舍**：先试核内 bitcast 判空——bitcast 签名不合（dtype 参数型）、Pointer 无参构造也不存在，判空方案双重不可行；改为全调用点传真 buffer（0 判空分支、写带宽增加可忽略）。
+  - **验证**：GPU 门 PASS 十判据；conc32 **448.1 tok/s vs 基线 433.6（+3.3%）**、solo 66.0→68.6（+4%）；6.53× 持平（solo 同涨）。
+  - **下一刀（156 候选）**：① split-K 收口融合（f32_mergb/mergb2/adds 进 GEMM 尾，~3 发射/层）；② o/down 链的 x_to_f16 同款直出（COMB/act 写回核加 f16 输出，再省 2 发射/层）；③ 发射数预算表逐层核对（-2 后每层 ~25 发射）。
