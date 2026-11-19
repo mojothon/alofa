@@ -50,6 +50,7 @@ from max.gpu.host import DeviceContext
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
+from alofa.srv.config import env_int
 from alofa.srv.http import bytes_to_text, utf8_tail_safe_len
 from alofa.srv.openai import NO_REQUEST, Completion, Service
 from alofa.srv.sse import StreamToken
@@ -164,6 +165,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var n_ticks: Int
     var n_batched: Int
     var n_single: Int
+    # 一百五十三：前向 kernel 构成剖析开关与池级累计。
+    var profiling: Bool
+    var prof_n: Int
+    var prof_sum: InlineArray[Float64, 10]
     # spawn_twin 要用的三个路径（与 ModelService 同款：存路径不存模型，
     # 孪生体按同一份权重重开）。
     var weights_dir: String
@@ -207,6 +212,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.n_ticks = 0
         self.n_batched = 0
         self.n_single = 0
+        # 一百五十三：前向 kernel 构成剖析（ALOFA_PROFILE=1）——tick 传
+        # profile=True，每 50 tick 打印分段均值（ms/tick）。
+        self.profiling = env_int("ALOFA_PROFILE", 0, 0, 1) == 1
+        self.prof_n = 0
+        self.prof_sum = InlineArray[Float64, 10](fill=Float64(0))
         self.weights_dir = weights_dir
         self.config_path = config_path
         self.tokenizer_json = tokenizer_json
@@ -431,11 +441,30 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             DType.float32, True, True, True, True, True, True, True,
             True, False, True
         ](
-            toks^, False, False, False, 0.0, Int32(0), 1.0,
+            toks^, self.profiling, False, False, 0.0, Int32(0), 1.0,
             0, 1,  # layer_gap 默认
             first_slot,
             True,  # per_row_sampling
         )
+        if self.profiling:
+            for pi in range(10):
+                self.prof_sum[pi] += self.session.last_prof[pi]
+            self.prof_n += 1
+            if self.prof_n == 50:
+                print("prof152 avg/tick (ms) over 50 ticks:")
+                print("  gather=", self.prof_sum[0] / 50.0)
+                print("  tri=", self.prof_sum[1] / 50.0)
+                print("  kvs=", self.prof_sum[2] / 50.0)
+                print("  scores=", self.prof_sum[3] / 50.0)
+                print("  vt2=", self.prof_sum[4] / 50.0)
+                print("  comb=", self.prof_sum[5] / 50.0)
+                print("  o=", self.prof_sum[6] / 50.0)
+                print("  ff=", self.prof_sum[7] / 50.0)
+                print("  down=", self.prof_sum[8] / 50.0)
+                print("  tail=", self.prof_sum[9] / 50.0)
+                for pi in range(10):
+                    self.prof_sum[pi] = 0.0
+                self.prof_n = 0
         self.session.ctx.synchronize()
         # 收行：prompt 相位步（非尾枚）的 tokout 丢弃；尾枚步与生成步
         # 的 tokout 是生成 token，产帧。

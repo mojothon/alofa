@@ -277,6 +277,9 @@ struct GpuSession:
     # 在 prefill_step 入口计数（batched/单路/服务层全走这里）。
     var n_forwards: Int
     var n_forward_rows: Int
+    # 一百五十三：profile 模式的最近一次分段（ms）——调用方开启
+    # prefill_step(profile=True) 后可读此字段做池级均值统计。
+    var last_prof: InlineArray[Float64, 10]
 
     def __init__(
         out self,
@@ -687,6 +690,7 @@ struct GpuSession:
         self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
         self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.n_forwards = 0
+        self.last_prof = InlineArray[Float64, 10](fill=Float64(0))
         self.n_forward_rows = 0
         self.ctx.synchronize()
         for i in range(BMAX):
@@ -2554,6 +2558,8 @@ struct GpuSession:
         if sync_tail:
             self.ctx.synchronize()
         if profile:
+            for pi in range(10):
+                self.last_prof[pi] = prof[pi]
             print("prof gather:", prof[0], "ms")
             print("prof tri:", prof[1], "ms")
             print("prof kvs:", prof[2], "ms")

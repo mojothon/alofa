@@ -3903,3 +3903,17 @@
   - **独立 draft / Medusa / 无验证外推**：均 ✗（无更小 draft、无训练管线、破坏逐位同门）。continuous batching 已由 tick 引擎天然实现。
   - **新入口**：前向 kernel 优化（5.6ms 构成剖析）是吞吐侧下一个真实入口——先 profile 再动手。
   - 评估全文：`docs/plan/speculative-eval.md`。
+- **2026-11-19（一百五十三）** —— **前向 kernel profile**：rmsnorm 是意外的第二大头
+  - **基建**：`ALOFA_PROFILE=1` 环境开关——tick 传 profile=True（分段同步计时），session 存 `last_prof`，service 每 50 tick 打印池级均值。profile=0 路径零改动（门 PASS 回归）。
+  - **conc32 构成**（50 tick 均值，总 5.62ms/tick，与 151 的 5.6ms 自洽）：
+
+    | 分段 | ms/tick | 占比 |
+    |---|---|---|
+    | **tri（rmsnorm）** | **1.69** | **~30%** |
+    | o / ff / down（GEMM） | 1.07 / 1.27 / 0.81 | 合计 **56%** |
+    | tail（head+argmax+D2H） | 0.45 | 8% |
+    | comb（attn 合并） | 0.25 | 4% |
+    | scores+vt2+kvs+gather | ~0.10 | ~2% |
+
+  - **发现**：① **rmsnorm 30µs/次**（[32,896] 归约应 <5µs）——批行版发射形状/线程占据率有明显问题，**-1ms/tick ≈ +20% 吞吐的靶子**；② attention 仅 6%（107 GQA 分组红利兑现，无需再动）；③ GEMM 56% 是理论地板（可 MMA 形状再扫但边际小）。
+  - **下一刀候选**：批行 rmsnorm 核（占据率/发射形状）——优先于一切。
