@@ -3970,3 +3970,10 @@
   - **小刀**：156 的 VT2 f16 直出漏了 **bb 变体**（batch 生产路径）——`attn_vt2_h_bb_gpu` 补 dst16 直出 + bb 调用传参 + x_to_f16 条件修正（原条件 `attn_t//8==head_dim` 恒 False，生产每层多一发冗余预转）。**长生成 3451→3482（+1%）、短压 1117→1134.6（+1.6%）**；门 PASS 十判据。
   - **工程教训**：patch 脚本中途 SystemExit 丢盘——成功的 sub 不落盘（bb 调用 patch 静默丢失，门报 num_args=10 才暴露）；多调用区参数尾同构（`d_attnb + grid=(n_kv_heads, attn_tiles, t)` 在 4 处出现）——**锚必须含调用特有参数**（d_attotb/row_pos）。
   - **163 候选**：① **head pack 化**（pack_w_mma 布局 + head_pk 直写核，820→理论 ~250µs，tick +7%）；② 卫星核合并（mergb/adds 尾融进 GEMM 或下一发射）；③ dual_pk 58µs 的 CH×双缓冲深挖（ff 段 1.63ms）。
+- **2026-11-20（一百六十三）** —— **head pack 化：lm_head fragment 连续布局（+8.3%）**
+  - **定靶**：162 孤立口径 head 直读 807µs vs 理论下限 78µs——每 bv fragment 是 8×16B 散段（扇区效率 ~25%），262MB embed 权重读是 tick 内最大单核之一。
+  - **核**：`f16_mma_head_pk_gpu[INNER, CH, OUTS, WARP]` = down_pk 的直写版（bv 从 pack_w_mma_gpu fragment 连续布局读，每 warp 256B 连续段；尾部 `= acc` 直写 logits）。与直读版 mma 序逐位同（门 parity 不变）。
+  - **接线三坑**：①init 无 comptime inner——pack 挪到 prefill_step 的 wp pack 区（F16_BUILD 内）；②占位 buffer 必须在 init 两条路径都赋值（否则「uninitialized at implicit return」）；③**decode 可能先于任何 prefill**（服务首条消息即单 token 生成）——独立 `embedp_ready` 标志 + decode_step LMHEAD 前就地补 pack。
+  - **A/B**：probe 同轮对照 head 直读 807µs → pk 489µs（1.65×；距理论 4× 有余，fragment 连续后剩余瓶颈在 x smem 重读与 logits 写）。
+  - **取数**：**长生成 3482→3711 tok/s（+6.6%）、短压 1134.6→1228.6（+8.3%）、solo 76.4**。soak 10min PASS（ok/min 830-862 稳、err=0、rss 恒定）。
+  - **164 候选**：①head_pk 剩余 489µs 深挖（x smem 双缓冲 / OUTS=4）；②卫星核合并（mergb/adds 尾融进 GEMM）；③dual_pk 58µs CH×双缓冲深挖（ff 段 1.63ms）；④发射间隙 2.3ms（graph 类，已封存）。

@@ -59,7 +59,7 @@ from alofa.kernels.cuda.matmul import (
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
     f16_mma_down_pk_gpu, f16_mma_down_spl_gpu, f16_mma_dual_pk_gpu,
     f16_mma_gemm_pk_gpu, f16_mma_gemm2_pk_gpu, f32_adds_gpu,
-    f16_mma_head_gpu,
+    f16_mma_head_gpu, f16_mma_head_pk_gpu,
     pack_w_mma_gpu, cat2_f16_gpu, cat2_f32_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
@@ -195,6 +195,10 @@ struct GpuSession:
     var d_kvraw: DeviceBuffer[DType.float16]
     # lm_head 权重的 f16 副本（d_embed 本体留给 gather）
     var d_embed16: DeviceBuffer[DType.float16]
+    # 一百六十三：lm_head 的 pack 布局副本（fragment 连续，扇区效率
+    # 25%→100%）——载入后一次性打包，静态权重。
+    var d_embedp: DeviceBuffer[DType.float16]
+    var embedp_ready: Bool
     # F16_BUILD=False 时置空句柄（conservative 检查要求全字段初始化）
 
     var d_norms: List[DeviceBuffer[DType.float32]]
@@ -336,8 +340,12 @@ struct GpuSession:
         self.d_bias_kv = List[DeviceBuffer[DType.float32]]()
         self.wp_ready = False
         self.qkvp_ready = False
+        # 一百六十三：embedp 独立 ready（decode 可能先于 prefill——
+        # 占位 buffer 会在首条 decode 越界）。
+        self.embedp_ready = False
         comptime if not F16_BUILD:
             self.d_embed16 = self.ctx.enqueue_create_buffer[DType.float16](1)
+            self.d_embedp = self.ctx.enqueue_create_buffer[DType.float16](1)
         self.d_bias_q = List[DeviceBuffer[DType.float32]]()
         self.d_bias_k = List[DeviceBuffer[DType.float32]]()
         self.d_bias_v = List[DeviceBuffer[DType.float32]]()
@@ -541,6 +549,9 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.synchronize()
+            # 一百六十三：占位（真缓冲在 wp pack 区赋值——那里才有
+            # comptime inner；不占位则 F16_BUILD 路径 init 返回未初始化）。
+            self.d_embedp = self.ctx.enqueue_create_buffer[DType.float16](1)
 
         # ---- KV store（device 侧，每层 k/v）与激活缓冲 ----
         var n_kv_row = max_tokens * self.kv_dim
@@ -1536,12 +1547,27 @@ struct GpuSession:
 
         if skip & SKIP_HEAD == 0:
             self._norm(2 * self.n_layers)
+            # 一百六十三：decode 可能先于任何 prefill 调用（服务首条
+            # 消息即单 token 生成）——embedp 就地补 pack。
+            comptime if F16_BUILD:
+                if not self.embedp_ready:
+                    self.d_embedp = self.ctx.enqueue_create_buffer[DType.float16](
+                        self.vocab * inner
+                    )
+                    self.ctx.enqueue_function[pack_w_mma_gpu[inner, 2, 8]](
+                        self.d_embed16.unsafe_ptr(),
+                        self.d_embedp.unsafe_ptr(),
+                        grid_dim=(ceildiv(self.vocab, 128), inner // 16, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                    self.ctx.synchronize()
+                    self.embedp_ready = True
             # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
             # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
             # norm 单发更慢，头部保持分离发射。
-            self.ctx.enqueue_function[f16_mma_head_gpu[inner, 608, 2, 8]](
+            self.ctx.enqueue_function[f16_mma_head_pk_gpu[inner, 608, 2, 8]](
                 self.d_xnormb16.unsafe_ptr(),
-                self.d_embed16.unsafe_ptr(),
+                self.d_embedp.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
                 Int32(self.vocab),
                 Int32(1),
@@ -1736,7 +1762,8 @@ struct GpuSession:
         alias DOWN_K = f16_bmm_fat3_gpu[down_t, inner_ff, 4, prefill_rb, True, prefill_af]
         # 一百六十一：MMA 直写版——fat 核（53.6 万块/56% 空转/f64）换
         # tensor core；权重行主 d_embed16 免 pack，x 用 rmsnorm 直出 f16。
-        alias LMHEAD_K = f16_mma_head_gpu[inner, 608, 2, 8]
+        # 一百六十三：pack 布局版（w 从 d_embedp fragment 连续读）。
+        alias LMHEAD_K = f16_mma_head_pk_gpu[inner, 608, 2, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -1861,6 +1888,20 @@ struct GpuSession:
                             inner // 16, 1),
                             block_dim=(128, 1, 1),
                         )
+                    # 一百六十三：lm_head pack（fragment 连续布局，
+                    # head 直读版扇区效率 25%——孤立口径 807→489µs）。
+                    comptime if F16_BUILD:
+                        self.d_embedp = self.ctx.enqueue_create_buffer[DType.float16](
+                            self.vocab * inner
+                        )
+                        self.ctx.enqueue_function[pack_w_mma_gpu[inner, 2, 8]](
+                            self.d_embed16.unsafe_ptr(),
+                            self.d_embedp.unsafe_ptr(),
+                            grid_dim=(ceildiv(self.vocab, 128),
+                            inner // 16, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.embedp_ready = True
                 self.wp_ready = True
 
         for layer in range(self.n_layers):
@@ -2546,7 +2587,7 @@ struct GpuSession:
             )
             self.ctx.enqueue_function[LMHEAD_K](
                 self.d_xnormb16.unsafe_ptr(),
-                self.d_embed16.unsafe_ptr(),
+                self.d_embedp.unsafe_ptr(),
                 self.d_logits_b.unsafe_ptr(),
                 Int32(self.vocab),
                 Int32(t),
@@ -2633,7 +2674,7 @@ struct GpuSession:
             )
             self.ctx.enqueue_function[LMHEAD_K](
                 self.d_xnormb16.unsafe_ptr(),
-                self.d_embed16.unsafe_ptr(),
+                self.d_embedp.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
                 Int32(self.vocab),
                 Int32(1),

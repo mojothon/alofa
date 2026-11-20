@@ -14,6 +14,7 @@ from alofa.kernels.cuda.matmul import (
     f16_mma_dual_pk_gpu,
     f16_mma_down_pk_gpu,
     f16_mma_head_gpu,
+    f16_mma_head_pk_gpu,
     f32_adds_gpu,
     f32_mergb_gpu,
 )
@@ -438,6 +439,37 @@ def main() raises:
     print("down_spl_down =", best, "us")
 
     print("probe162b done")
+
+    # ==== 一百六十三：head pack 化 A/B ====
+    var dwp_e = ctx.enqueue_create_buffer[DType.float16](151936 * INNER)
+    ctx.enqueue_function[pack_w_mma_gpu[INNER, 2, 8]](
+        dembed.unsafe_ptr(), dwp_e.unsafe_ptr(),
+        grid_dim=(151936 // 128, INNER // 16, 1), block_dim=(128, 1, 1),
+    )
+    ctx.synchronize()
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 608, 2, 8]](
+                dx16.unsafe_ptr(), dwp_e.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 608, 2, 8]](
+                dx16.unsafe_ptr(), dwp_e.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("head_pk =", best, "us")
+
+    print("probe163 done")
 
 
 def probe_variants() -> None:
