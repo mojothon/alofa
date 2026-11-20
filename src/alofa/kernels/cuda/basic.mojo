@@ -930,3 +930,75 @@ def hbm_probe_f16_gpu[THREADS: Int](
         stride //= 2
     if tid == 0:
         sink[unsafe_offset=bid] = sred[unsafe_offset=0]
+
+
+def f32_adds_rmsnorm_f16_gpu[S: Int, COLS: Int](
+    xb: Pointer[Float32, MutUntrackedOrigin],
+    part: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
+    rows: Int32,
+    eps: Float32,
+) -> None:
+    """残加 + RMSNorm 串联融合（账本一百六十七）：一行一个 block，
+    块内先做 `xb[i] = xb[i] + Σ_s part[s][i]`（与 f32_adds_v4_gpu
+    逐元素同序），结果驻留 shared memory，再走 rmsnorm_gpu 同构的
+    256 线程树形归约（同 stride、同 f64 累加序）与双写回——
+    **数值逐位同**于 adds→rmsnorm 两发串联。省一轮 xb 的写+读
+    （0.2MB/层 DRAM 往返）与一次发射。grid=(rows,1,1)、
+    block=(256,1,1)。要求 COLS 为编译期（smem 静态分配），
+    rows*COLS 即 n；S 必须与 spl 的 S 一致。"""
+    var row = Int(block_idx.x)
+    if row >= Int(rows):
+        return
+    var tid = Int(thread_idx.x)
+    var base = row * COLS
+    var nn = Int(rows) * COLS
+
+    var smem = stack_allocation[
+        COLS, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    var i = tid
+    while i < COLS:
+        var acc = xb[unsafe_offset=base + i]
+        for s in range(S):
+            acc += part[unsafe_offset=s * nn + base + i]
+        smem[unsafe_offset=i] = acc
+        i += 256
+    barrier()
+
+    var local = Float64(0)
+    i = tid
+    while i < COLS:
+        var v = Float64(smem[unsafe_offset=i])
+        local += v * v
+        i += 256
+
+    var red = stack_allocation[
+        256, Float64, address_space = AddressSpace.SHARED
+    ]()
+    red[unsafe_offset=tid] = local
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            red[unsafe_offset=tid] = (
+                red[unsafe_offset=tid] + red[unsafe_offset=tid + stride]
+            )
+        barrier()
+        stride //= 2
+
+    var scale = Float64(1.0) / sqrt(
+        red[unsafe_offset=0] / Float64(COLS) + Float64(eps)
+    )
+    i = tid
+    while i < COLS:
+        var v = Float32(
+            Float64(smem[unsafe_offset=i]) * scale * Float64(w[unsafe_offset=i])
+        )
+        xb[unsafe_offset=base + i] = smem[unsafe_offset=i]
+        dst[unsafe_offset=base + i] = v
+        dst16[unsafe_offset=base + i] = Float16(v)
+        i += 256

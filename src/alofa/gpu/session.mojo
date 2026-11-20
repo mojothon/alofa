@@ -41,7 +41,7 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
     attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
     attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, f32_adds_rmsnorm_f16_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -2361,12 +2361,21 @@ struct GpuSession:
                     to2 = monotonic_ns()
                     if profile and not prof_nosync:
                         self.ts_o_g += Float64(to2 - to1) / 1e6
-                    # 一百六十五：SIMD4 版（同轮 probe -34%）。
-                    self.ctx.enqueue_function[f32_adds_v4_gpu[4]](
+                    # 一百六十七：残加+rmsnorm2 融合（单发射、残加
+                    # 结果驻留 smem——省一轮 xb 写读 + 一次发射；
+                    # 数值逐位同于 adds→norm 串联）。norm2 的独立
+                    # 发射由下方 comptime if 消除。
+                    self.ctx.enqueue_function[
+                        f32_adds_rmsnorm_f16_gpu[4, inner]
+                    ](
                         self.d_xb.unsafe_ptr(),
                         self.d_downpart.unsafe_ptr(),
-                        Int32(t * self.hidden),
-                        grid_dim=((t * self.hidden // 4 + 255) // 256, 1, 1),
+                        self.d_norms[2 * layer + 1].unsafe_ptr(),
+                        self.d_xnormb.unsafe_ptr(),
+                        self.d_xnormb16.unsafe_ptr(),
+                        Int32(t),
+                        self.eps,
+                        grid_dim=(t, 1, 1),
                         block_dim=(256, 1, 1),
                     )
                 else:
@@ -2407,17 +2416,23 @@ struct GpuSession:
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
             # 一百五十五：直出 f16 镜像——一百零五修正的场景（norm2 覆写
             # d_xnormb 后 dual 的 f16 输入必须重转）由直出天然满足。
-            self.ctx.enqueue_function[rmsnorm_gpu](
-                self.d_xb.unsafe_ptr(),
-                self.d_norms[2 * layer + 1].unsafe_ptr(),
-                self.d_xnormb.unsafe_ptr(),
-                self.d_xnormb16.unsafe_ptr(),
-                Int32(inner),
-                Int32(t),
-                self.eps,
-                grid_dim=(t, 1, 1),
-                block_dim=(256, 1, 1),
-            )
+            # 一百六十七：o 链 spl 分支已把 norm2 融进残加核——此发射
+            # 在该路径编译期消除。
+            comptime if not (
+                prefill_spl and inner % 16 == 0
+                and (inner // 4) % 224 == 0
+            ):
+                self.ctx.enqueue_function[rmsnorm_gpu](
+                    self.d_xb.unsafe_ptr(),
+                    self.d_norms[2 * layer + 1].unsafe_ptr(),
+                    self.d_xnormb.unsafe_ptr(),
+                    self.d_xnormb16.unsafe_ptr(),
+                    Int32(inner),
+                    Int32(t),
+                    self.eps,
+                    grid_dim=(t, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
             # 一百五十五：x_to_f16 重转删除，rmsnorm 已直出 f16（norm2
             # 覆写 d_xnormb 的场景由直出天然满足）。
             comptime if prefill_af == DType.float32 and (
