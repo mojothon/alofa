@@ -3944,3 +3944,69 @@ def f16_mma_head_pk_gpu[INNER: Int, CH: Int, OUTS: Int, WARP: Int](
             dst[
                 unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
             ] = acc[3]
+
+
+def f32_adds_v4_gpu[S: Int](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    part: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """adds 的 SIMD4 版（账本一百六十五）：每线程 4 连续元素，
+    load/store[4] 借宽——原版 1 元素/线程在 25088 元素上要 98 块
+    ×256 线程恰好 1:1，DRAM 延迟主导；v4 版 grid 缩到 1/4、每线程
+    两条 16B 事务。要求 n % 4 == 0（out_cols 是 128 倍数 ✓）。
+    逐元素 IEEE 加法序与标量版逐位相同。grid = ceildiv(n//4, 256)。"""
+    var i4 = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
+    var nn = Int(n)
+    if i4 < nn:
+        var acc = SIMD[DType.float32, 4](0, 0, 0, 0)
+        for s in range(S):
+            acc += part.load[4](s * nn + i4)
+        dst.store[4](i4, dst.load[4](i4) + acc)
+
+
+def f32_mergb_v4_gpu[S: Int](
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    part: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n: Int32,
+) -> None:
+    """mergb 的 SIMD4 版（账本一百六十五）：结构同 adds_v4——
+    Σ_s SIMD 累加 + bias SIMD 载入（4 连续 i 的 i%out_cols 也连续，
+    要求 out_cols % 4 == 0 ✓）。grid = ceildiv(n//4, 256)。"""
+    var i4 = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
+    var nn = Int(n)
+    if i4 < nn:
+        var acc = SIMD[DType.float32, 4](0, 0, 0, 0)
+        for s in range(S):
+            acc += part.load[4](s * nn + i4)
+        var c = i4 % Int(out_cols)
+        var bv = bias.load[4](c)
+        dst.store[4](i4, acc + bv)
+
+
+def f32_mergb2_v4_gpu[S: Int](
+    dst_a: Pointer[Float32, MutUntrackedOrigin],
+    part_a: Pointer[Float32, MutUntrackedOrigin],
+    dst_b: Pointer[Float32, MutUntrackedOrigin],
+    part_b: Pointer[Float32, MutUntrackedOrigin],
+    bias: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n: Int32,
+) -> None:
+    """mergb2 的 SIMD4 版（账本一百六十五）：k/v 双路并行 SIMD
+    累加——两路 load[4] 交错发出，DRAM 延迟重叠。bias 双段各一载。
+    grid = ceildiv(n//4, 256)。"""
+    var i4 = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
+    var nn = Int(n)
+    if i4 < nn:
+        var aa = SIMD[DType.float32, 4](0, 0, 0, 0)
+        var ab = SIMD[DType.float32, 4](0, 0, 0, 0)
+        for s in range(S):
+            aa += part_a.load[4](s * nn + i4)
+            ab += part_b.load[4](s * nn + i4)
+        var c = i4 % Int(out_cols)
+        var cb = Int(out_cols) + c
+        dst_a.store[4](i4, aa + bias.load[4](c))
+        dst_b.store[4](i4, ab + bias.load[4](cb))

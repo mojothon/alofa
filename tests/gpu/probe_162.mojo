@@ -16,7 +16,11 @@ from alofa.kernels.cuda.matmul import (
     f16_mma_head_gpu,
     f16_mma_head_pk_gpu,
     f32_adds_gpu,
+    f32_adds_v4_gpu,
     f32_mergb_gpu,
+    f32_mergb_v4_gpu,
+    f32_mergb2_gpu,
+    f32_mergb2_v4_gpu,
 )
 
 
@@ -52,6 +56,7 @@ def main() raises:
 
     var dq = ctx.enqueue_create_buffer[DType.float32](T * QOUT)
     var dk = ctx.enqueue_create_buffer[DType.float32](T * KVD)
+    var dv = ctx.enqueue_create_buffer[DType.float32](T * KVD)
     var dqb = ctx.enqueue_create_buffer[DType.float32](QOUT)
     var dkb = ctx.enqueue_create_buffer[DType.float32](2 * KVD)
     var dqpart = ctx.enqueue_create_buffer[DType.float32](8 * T * QOUT)
@@ -624,6 +629,145 @@ def main() raises:
     print("mergb4_q =", best, "us")
 
     print("probe164 done")
+
+    # ==== 一百六十五：卫星核 SIMD4 向量化 A/B ====
+    # mergb2 旧版基线
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_mergb2_gpu[8]](
+                dk.unsafe_ptr(), dkpart.unsafe_ptr(),
+                dv.unsafe_ptr(), dvpart.unsafe_ptr(),
+                dkb.unsafe_ptr(),
+                Int32(KVD), Int32(T * KVD),
+                grid_dim=((T * KVD + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_mergb2_gpu[8]](
+                dk.unsafe_ptr(), dkpart.unsafe_ptr(),
+                dv.unsafe_ptr(), dvpart.unsafe_ptr(),
+                dkb.unsafe_ptr(),
+                Int32(KVD), Int32(T * KVD),
+                grid_dim=((T * KVD + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("mergb2_8_old =", best, "us")
+
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_mergb2_v4_gpu[8]](
+                dk.unsafe_ptr(), dkpart.unsafe_ptr(),
+                dv.unsafe_ptr(), dvpart.unsafe_ptr(),
+                dkb.unsafe_ptr(),
+                Int32(KVD), Int32(T * KVD),
+                grid_dim=((T * KVD // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_mergb2_v4_gpu[8]](
+                dk.unsafe_ptr(), dkpart.unsafe_ptr(),
+                dv.unsafe_ptr(), dvpart.unsafe_ptr(),
+                dkb.unsafe_ptr(),
+                Int32(KVD), Int32(T * KVD),
+                grid_dim=((T * KVD // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("mergb2_8_v4 =", best, "us")
+
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_mergb_v4_gpu[8]](
+                dq.unsafe_ptr(), dqpart.unsafe_ptr(), dqb.unsafe_ptr(),
+                Int32(QOUT), Int32(T * QOUT),
+                grid_dim=((T * QOUT // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_mergb_v4_gpu[8]](
+                dq.unsafe_ptr(), dqpart.unsafe_ptr(), dqb.unsafe_ptr(),
+                Int32(QOUT), Int32(T * QOUT),
+                grid_dim=((T * QOUT // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("mergb8_v4 =", best, "us")
+
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_adds_v4_gpu[4]](
+                dxb.unsafe_ptr(), dopart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_adds_v4_gpu[4]](
+                dxb.unsafe_ptr(), dopart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("adds4_v4 =", best, "us")
+
+    # adds8 旧/新（down 段 S=8）
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_adds_gpu[8]](
+                dxb.unsafe_ptr(), dqpart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_adds_gpu[8]](
+                dxb.unsafe_ptr(), dqpart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("adds8_old =", best, "us")
+
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_adds_v4_gpu[8]](
+                dxb.unsafe_ptr(), dqpart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_adds_v4_gpu[8]](
+                dxb.unsafe_ptr(), dqpart.unsafe_ptr(), Int32(T * HID),
+                grid_dim=((T * HID // 4 + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("adds8_v4 =", best, "us")
+
+    print("probe165 done")
 
 
 def probe_variants() -> None:

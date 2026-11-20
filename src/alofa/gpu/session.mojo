@@ -59,6 +59,7 @@ from alofa.kernels.cuda.matmul import (
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
     f16_mma_down_pk_gpu, f16_mma_down_spl_gpu, f16_mma_dual_pk_gpu,
     f16_mma_gemm_pk_gpu, f16_mma_gemm2_pk_gpu, f32_adds_gpu,
+    f32_adds_v4_gpu,
     f16_mma_head_gpu, f16_mma_head_pk_gpu,
     pack_w_mma_gpu, cat2_f16_gpu, cat2_f32_gpu,
         f16_matmul_dual_nx_gpu,
@@ -68,7 +69,7 @@ from alofa.kernels.cuda.matmul import (
     q4_matmul_fused_gpu,
     q4_matmul_qkv_gpu,
     f16_mma_gemm2_spl_gpu,
-    f32_mergb2_gpu, f32_mergb_gpu,
+    f32_mergb2_gpu, f32_mergb_gpu, f32_mergb_v4_gpu,
     f16_matmul_qkv_fat_gpu,
     cat3_f16_gpu,
 )
@@ -1960,13 +1961,15 @@ struct GpuSession:
                         ),
                         block_dim=(256, 1, 1),
                     )
-                    self.ctx.enqueue_function[f32_mergb_gpu[8]](
+                    # 一百六十五：SIMD4 版（每线程 4 连续元素，
+                    # 两条 16B 事务；同轮 probe -32%）。
+                    self.ctx.enqueue_function[f32_mergb_v4_gpu[8]](
                         self.d_qb.unsafe_ptr(),
                         self.d_qpart.unsafe_ptr(),
                         self.d_bias_q[layer].unsafe_ptr(),
                         Int32(self.q_out),
                         Int32(t * self.q_out),
-                        grid_dim=((t * self.q_out + 255) // 256, 1, 1),
+                        grid_dim=((t * self.q_out // 4 + 255) // 256, 1, 1),
                         block_dim=(256, 1, 1),
                     )
                 else:
@@ -2358,11 +2361,12 @@ struct GpuSession:
                     to2 = monotonic_ns()
                     if profile and not prof_nosync:
                         self.ts_o_g += Float64(to2 - to1) / 1e6
-                    self.ctx.enqueue_function[f32_adds_gpu[4]](
+                    # 一百六十五：SIMD4 版（同轮 probe -34%）。
+                    self.ctx.enqueue_function[f32_adds_v4_gpu[4]](
                         self.d_xb.unsafe_ptr(),
                         self.d_downpart.unsafe_ptr(),
                         Int32(t * self.hidden),
-                        grid_dim=((t * self.hidden + 255) // 256, 1, 1),
+                        grid_dim=((t * self.hidden // 4 + 255) // 256, 1, 1),
                         block_dim=(256, 1, 1),
                     )
                 else:
