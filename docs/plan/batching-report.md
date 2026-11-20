@@ -116,6 +116,10 @@ rows / ticks / batched / forwards / row_steps
 
 ## 八、版本
 
+0.2.2：发射剖析与减发射时代（150-158，profile 基建 + launch-bound 定性 +
+减发射两刀 27→23 发射/层）——conc32 433.6→453.8 tok/s（+4.7%）、加速比
+6.55× 保持；kv2/CUDA graph 双归档；soak 复验零错误。
+
 0.2.1：引擎节奏突破（144-149，守门 + 活跃标定 + chunked prefill K=1）——
 加速比曲线完全单调（3.31×@conc16）、长 prompt c16 TTFT p50 -88% / p99 -67%、
 吞吐 68.4 tok/s。

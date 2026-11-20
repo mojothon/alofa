@@ -3947,3 +3947,8 @@
   - **墙二（静态图 vs 动态参数，更根本）**：即便入口可达，graph 实例化后 replay 的 kernel 参数是捕获时固化的——alofa 每 tick 的 kv_len（每请求递增）、pos 数组、score buffer 偏移全在变；CUDA graph 需固定指针+固定形状，除非参数 indirect 化（kernel 从 device buffer 读参数）——addFunctionDirect 是否支持 indirect 未证实。改造成本：全 kernel 签名参数化重写。
   - **结论**：CUDA graph 在当前 MAX/AsyncRT 版本**不可低成本落地**——暂停归档；若未来版本暴露 public graph API（特别是 indirect 参数支持）再启动。
   - **发射 bound 的剩余路线**（158+）：① 双 DeviceContext（=双 stream）跨 tick 流水——当前 tick 的 down/ff 尾段与下一 tick 的 gather/调度重叠，架构改动中等；② 接受 453.8 tok/s 现状（两时代 +4.7%），转下一个产品级目标（batching-report 或版本发布）。
+- **2026-11-20（一百五十九）** —— **v0.2.2 发版：稳定性收束**
+  - **soak 25 分钟复验**（soak_141，155/156 核签名大改后首跑）：**18269 成功 / 4566 bad（非法请求预期 4xx）/ err=0**；RSS 恒定 2.0GB、fds 57-58、GPU 18.3GB 稳定、每分钟 ok 700-770 无衰减、零死锁窗口——**减发射两刀无回归**。
+  - **CPU 套件**：run_tests.sh 41 套件无失败（首跑报 `unable to locate module 'std'` 系远程 mojo 未带 MODULAR_HOME 环境——补全 export 后全绿；CPU 门必须在 pixi 环境跑）。
+  - **宣称值**：conc32 **450.6 tok/s**（450±，与 156 的 443.2/453.8 同噪声带）、solo 71.7、加速比 6.27×。
+  - **发版**：pixi.toml / src/recipe.yaml（两处）/ docs/version.md（0.2.2 条目）/ batching-report.md——150-158 = 发射剖析与减发射时代。
