@@ -368,11 +368,14 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
             )
             nk += THREADS
         barrier()
-    var sacc = stack_allocation[OUTS * THREADS, Float64, address_space = AddressSpace.SHARED]()
+    # 一百六十：f64→f32 累加——OUTS 粗化后 64 路 f64 累加器寄存器溢出
+    # 实测回归（1413→915 tok/s）；f32 减半寄存器且 f16 判据族容差覆盖
+    # （down 链 MMA 同为 f32 累加）。
+    var sacc = stack_allocation[OUTS * THREADS, Float32, address_space = AddressSpace.SHARED]()
     @parameter
     for oo in range(OUTS):
         var o = o0 + oo
-        var a = Float64(0)
+        var a = Float32(0)
         if o < Int(out_cols):
             var w_base = o * Int(INNER)
             k = tid * 8
@@ -380,7 +383,7 @@ def linear_fat_f16_gpu[THREADS: Int, INNER: Int, OUTS: Int, NORM: Bool = False](
                 var wv = w.load[8](w_base + k)
                 @parameter
                 for j in range(8):
-                    a += Float64(sx[unsafe_offset=k + j]) * Float64(Float32(wv[j]))
+                    a += sx[unsafe_offset=k + j] * Float32(wv[j])
                 k += THREADS * 8
         sacc[unsafe_offset=oo * THREADS + tid] = a
     barrier()

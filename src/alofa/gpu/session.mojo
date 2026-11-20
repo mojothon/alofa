@@ -276,6 +276,12 @@ struct GpuSession:
     # early-return），n_batched 混 padding 行；真前向次数与行·步总数
     # 在 prefill_step 入口计数（batched/单路/服务层全走这里）。
     var n_forwards: Int
+    # 一百六十：tail 段子解剖（profile=1 口径）——lmhead/samp/copy 三子段，
+    # 每 50 tick 打印；LMHEAD 粗化 [128, inner, 32] + f32 累加同批落地。
+    var ts_n: Int
+    var ts_lm: Float64
+    var ts_samp: Float64
+    var ts_copy: Float64
     var n_forward_rows: Int
     # 一百五十三：profile 模式的最近一次分段（ms）——调用方开启
     # prefill_step(profile=True) 后可读此字段做池级均值统计。
@@ -690,6 +696,10 @@ struct GpuSession:
         self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
         self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.n_forwards = 0
+        self.ts_n = 0
+        self.ts_lm = 0.0
+        self.ts_samp = 0.0
+        self.ts_copy = 0.0
         self.last_prof = InlineArray[Float64, 10](fill=Float64(0))
         self.n_forward_rows = 0
         self.ctx.synchronize()
@@ -1518,15 +1528,15 @@ struct GpuSession:
             # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
             # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
             # norm 单发更慢，头部保持分离发射。
-            self.ctx.enqueue_function[linear_fat_f16_gpu[256, inner, 8]](
+            self.ctx.enqueue_function[linear_fat_f16_gpu[128, inner, 32]](
                 self.d_normed.unsafe_ptr(),
                 self.d_embed16.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
                 self.d_ws.unsafe_ptr(),
                 self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 8), 1, 1),
-                block_dim=(256, 1, 1),
+                grid_dim=(ceildiv(self.vocab, 32), 1, 1),
+                block_dim=(128, 1, 1),
             )
         else:
             self.ctx.enqueue_function[noop_gpu](
@@ -1714,7 +1724,7 @@ struct GpuSession:
         alias O_K = f16_bmm_fat3_gpu[o_t, inner, 4, prefill_rb, True, prefill_af]
         alias DUAL_K = f16_bmm_dual3_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
         alias DOWN_K = f16_bmm_fat3_gpu[down_t, inner_ff, 4, prefill_rb, True, prefill_af]
-        alias LMHEAD_K = linear_fat_f16_gpu[256, inner, 8]
+        alias LMHEAD_K = linear_fat_f16_gpu[128, inner, 32]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -2469,8 +2479,13 @@ struct GpuSession:
                 _ = external_call["usleep", Int32](Int32(layer_gap_us))
                 prof_t0 = monotonic_ns()
 
+        # 一百六十：tail 子段计时基准（batch 分支内赋值，prof[9] 处结算）。
+        var ts0 = monotonic_ns()
+        var ts1 = ts0
+        var ts2 = ts0
         if batch:
             # 一百二十：B 行终 norm + B 行 lm_head + 行 argmax
+            ts0 = monotonic_ns()
             self.ctx.enqueue_function[rmsnorm_gpu](
                 self.d_xb.unsafe_ptr(),
                 self.d_norms[2 * self.n_layers].unsafe_ptr(),
@@ -2489,9 +2504,14 @@ struct GpuSession:
                 self.d_ws.unsafe_ptr(),
                 self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 8), t, 1),
-                block_dim=(256, 1, 1),
+                grid_dim=(ceildiv(self.vocab, 32), t, 1),
+                block_dim=(128, 1, 1),
             )
+            if profile and not prof_nosync:
+                self.ctx.synchronize()
+            ts1 = monotonic_ns()
+            if profile and not prof_nosync:
+                self.ts_lm += Float64(ts1 - ts0) / 1e6
             if per_row_sampling:
                 self.ctx.enqueue_copy(
                     dst_buf=self.d_stemp, src_buf=self.h_stemp
@@ -2542,6 +2562,11 @@ struct GpuSession:
                     grid_dim=(t, 1, 1),
                     block_dim=(256, 1, 1),
                 )
+            if profile and not prof_nosync:
+                self.ctx.synchronize()
+            ts2 = monotonic_ns()
+            if profile and not prof_nosync:
+                self.ts_samp += Float64(ts2 - ts1) / 1e6
             if copy_logits:
                 self.ctx.enqueue_copy(
                     dst_buf=self.h_logits_b, src_buf=self.d_logits_b
@@ -2567,13 +2592,24 @@ struct GpuSession:
                 self.d_ws.unsafe_ptr(),
                 self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 8), 1, 1),
-                block_dim=(256, 1, 1),
+                grid_dim=(ceildiv(self.vocab, 32), 1, 1),
+                block_dim=(128, 1, 1),
             )
             self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         if profile:
             if not prof_nosync:
                 self.ctx.synchronize()
+                var ts3 = monotonic_ns()
+                self.ts_copy += Float64(ts3 - ts2) / 1e6
+                self.ts_n += 1
+                if self.ts_n == 50:
+                    print("tail-sub avg (ms): lmhead=", self.ts_lm / 50.0,
+                          " samp=", self.ts_samp / 50.0,
+                          " copy=", self.ts_copy / 50.0)
+                    self.ts_n = 0
+                    self.ts_lm = 0.0
+                    self.ts_samp = 0.0
+                    self.ts_copy = 0.0
             prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
             prof_t0 = monotonic_ns()
         if sync_tail:

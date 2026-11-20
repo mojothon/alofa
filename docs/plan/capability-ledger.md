@@ -3952,3 +3952,9 @@
   - **CPU 套件**：run_tests.sh 41 套件无失败（首跑报 `unable to locate module 'std'` 系远程 mojo 未带 MODULAR_HOME 环境——补全 export 后全绿；CPU 门必须在 pixi 环境跑）。
   - **宣称值**：conc32 **450.6 tok/s**（450±，与 156 的 443.2/453.8 同噪声带）、solo 71.7、加速比 6.27×。
   - **发版**：pixi.toml / src/recipe.yaml（两处）/ docs/version.md（0.2.2 条目）/ batching-report.md——150-158 = 发射剖析与减发射时代。
+- **2026-11-20（一百六十）** —— **范式反转 + LMHEAD 粗化：tick 是 GPU-bound**
+  - **对账发现**（/health 计数器 + tickwall 打点）：① **tick 墙钟与批宽无关**（短压 12.6ms@5.5 行 vs 长生成 13.5ms@28.25 行）——批填充率只由客户端节奏决定：短请求（15 tok）活跃占比 17%、**450 tok/s 严重低估服务端合批能力**；长生成（120 tok）填充 88% → **真实 1403 tok/s**（v0.2.2 宣称值口径修正）。② **tickwall 打点**：fwd（forward host 发射链）仅 **0.75ms**、sync（GPU 排空）**13.4ms = tick 98%**、collect 0.03ms——**tick 是 GPU-bound**！154 的「7-8µs/发射 launch-bound」是 burst 口径混入尾部排空的假象，纯发射 ~2.5µs。**kernel 本体优化重新成为主杠杆**。
+  - **tail 段子解剖**（profile=1 + 子打点）：tail 9.7ms = **lmhead 9.55（tick 70%，单点最大靶）**+ samp 0.11 + copy 0.009（17MB D2H pinned 才 8.6µs）。LMHEAD_K 病根：`[256, 896, 8]` 每 block 仅 8 输出（53.6 万 block 网格）+ `THREADS×8=2048 > INNER=896` **56% 线程空转** + f64 累加——262MB 权重读 @27GB/s，效率 1.4%。
+  - **粗化落地**：`linear_fat_f16_gpu[128, inner, 32]` + grid vocab/32 + **f32 累加**（寄存器减半）。**过程教训**：首试 [64,64] 保持 f64——64 路 f64 累加器寄存器溢出，1413→915 tok/s 回归；[64,64]×f32 或 [128,32]×f32 才是甜点（patch 期间 block_dim 全局替换误伤 d_proj 核 3 处，git diff 逐处恢复——**全局字符串替换必须核对的行数**）。
+  - **验证**：门 PASS 十判据（f32 累加在 f16 判据族容差内）；长生成 **1407→1609/1649 tok/s（+16%）**、短压 conc32 450→**517.4（+15%）**、solo 71.7→75.5；profile 口径 lmhead 9.55→7.70ms。
+  - **161 候选**：① **LMHEAD MMA 化**（down 链 f16_mma 形态复用 + embed16 pack 权重 load 期一次）——lmhead 7.7 → 理论 <1ms，tick 13.5→~6ms，长生成冲 3000+ tok/s（**头号靶**）；② tri/o/ff/down 各段 GEMM 同法复查（tri 1.83、o 1.90 是否也有块粒度病）；③ 短请求场景的批填充率优化（客户端节奏不可控，服务端无解——记录口径即可）。

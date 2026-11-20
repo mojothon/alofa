@@ -47,6 +47,7 @@ batch 前向只读一个 session 的 store），而是**单 session 的 N 个批
 
 from max.gpu.host import DeviceContext
 
+from alofa.core.ffi.posix import monotonic_ns
 from alofa.gpu.session import GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
@@ -170,6 +171,12 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var prof_mode: Int
     var prof_n: Int
     var prof_sum: InlineArray[Float64, 10]
+    # 一百六十：tick 墙钟解剖——forward host 墙钟（发射链）/ sync 排空 /
+    # 收行循环（decode_bytes 全串重解码）三段累计，每 50 tick 打印。
+    var tw_n: Int
+    var tw_fwd: Float64
+    var tw_sync: Float64
+    var tw_coll: Float64
     # spawn_twin 要用的三个路径（与 ModelService 同款：存路径不存模型，
     # 孪生体按同一份权重重开）。
     var weights_dir: String
@@ -218,6 +225,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.prof_mode = env_int("ALOFA_PROFILE", 0, 0, 2)
         self.profiling = self.prof_mode >= 1
         self.prof_n = 0
+        self.tw_n = 0
+        self.tw_fwd = 0.0
+        self.tw_sync = 0.0
+        self.tw_coll = 0.0
         self.prof_sum = InlineArray[Float64, 10](fill=Float64(0))
         self.weights_dir = weights_dir
         self.config_path = config_path
@@ -436,6 +447,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 组合——argmax 是 temp=0 的核内特例（与 argmax_rb 逐位同），
         # 种子 host 直传与行号解耦，**合批条件彻底消失**：任何活跃行
         # 组合一次前向，每行与它单独前向逐位同。
+        var tw_t0 = monotonic_ns()
         _ = self.session.prefill_step[
             GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
             GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
@@ -449,6 +461,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             first_slot,
             True,  # per_row_sampling
         )
+        var tw_t1 = monotonic_ns()
+        self.tw_fwd += Float64(tw_t1 - tw_t0) / 1e6
         if self.profiling:
             for pi in range(10):
                 self.prof_sum[pi] += self.session.last_prof[pi]
@@ -469,6 +483,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     self.prof_sum[pi] = 0.0
                 self.prof_n = 0
         self.session.ctx.synchronize()
+        var tw_t2 = monotonic_ns()
+        self.tw_sync += Float64(tw_t2 - tw_t1) / 1e6
         # 收行：prompt 相位步（非尾枚）的 tokout 丢弃；尾枚步与生成步
         # 的 tokout 是生成 token，产帧。
         k = 0
@@ -515,6 +531,17 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 self.streams[slot].pidx += 1
                 self.streams[slot].pos += 1
             k += 1
+        var tw_t3 = monotonic_ns()
+        self.tw_coll += Float64(tw_t3 - tw_t2) / 1e6
+        self.tw_n += 1
+        if self.tw_n == 50:
+            print("tickwall avg over 50 ticks (ms): fwd=",
+                  self.tw_fwd / 50.0, " sync=", self.tw_sync / 50.0,
+                  " collect=", self.tw_coll / 50.0)
+            self.tw_n = 0
+            self.tw_fwd = 0.0
+            self.tw_sync = 0.0
+            self.tw_coll = 0.0
 
     def _tick(mut self) raises:
         """推进所有活跃行各一步。全 argmax → 合批（t = 最大活跃行号+1，
