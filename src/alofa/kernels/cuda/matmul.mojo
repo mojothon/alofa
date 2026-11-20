@@ -3681,3 +3681,140 @@ def f16_mma_dual_gpu[INNER: Int, CH: Int, WARP: Int](
             ] = Float32(
                 g3 / (Float64(1) + exp(-g3)) * Float64(v2[3])
             )
+
+
+def f16_mma_head_gpu[INNER: Int, CH: Int, OUTS: Int, WARP: Int](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    w: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """lm_head MMA（账本一百六十一）：`f16_mma_down_gpu` 的**直写版**
+    ——down 核写死残差累加（o 直连残差语义），lm_head 的 logits 无残差
+    基值，dst 直写（= acc，非 +=）。权重吃行主 [out_cols, INNER] f16
+    （d_embed16 原布局，**免 pack**）；x 为 rmsnorm 直出的 f16
+    （d_xnormb16）。约束同 down 核：out_cols % (WARP*OUTS*8) == 0、
+    CH % 32 == 0、INNER % 16 == 0、ceildiv(n_rows,16)*16 ≤ 缓冲行数。
+    LMHEAD 生产配置 [896, 608, 2, 8]：128 列/块、grid vocab/128 ×
+    ceildiv(t,16)——对比 fat 核 [256, 896, 8]（53.6 万块、56% 线程
+    空转、f64 累加）每块 128 输出 × tensor core。"""
+
+    var cb = Int(block_idx.x) * WARP * OUTS * 8
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    @parameter
+    for ch in range(INNER // CH):
+        var i = tid
+        while i < 16 * CH:
+            sxf[unsafe_offset=i] = xh[
+                unsafe_offset=(r0 + i // CH) * INNER + ch * CH + i % CH
+            ]
+            i += WARP * 32
+        barrier()
+        @parameter
+        for st in range(CH // 16):
+            var av = SIMD[DType.float16, 8](
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 1],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=gid * CH + st * 16 + tig * 2 + 9],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 8],
+                sxf[unsafe_offset=(gid + 8) * CH + st * 16 + tig * 2 + 9],
+            )
+            @parameter
+            for j in range(OUTS):
+                var col = cb + warp * 8 + j * (WARP * 8)
+                var bv = SIMD[DType.float16, 4](
+                    w[
+                        unsafe_offset=(col + gid) * INNER + ch * CH
+                        + st * 16 + tig * 2
+                    ],
+                    w[
+                        unsafe_offset=(col + gid) * INNER + ch * CH
+                        + st * 16 + tig * 2 + 1
+                    ],
+                    w[
+                        unsafe_offset=(col + gid) * INNER + ch * CH
+                        + st * 16 + tig * 2 + 8
+                    ],
+                    w[
+                        unsafe_offset=(col + gid) * INNER + ch * CH
+                        + st * 16 + tig * 2 + 9
+                    ],
+                )
+                var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+                comptime if st % 2 == 0:
+                    mma(dv, av, bv, accA[j])
+                    accA[j] = dv
+                else:
+                    mma(dv, av, bv, accB[j])
+                    accB[j] = dv
+        barrier()
+
+    @parameter
+    for ks in range((INNER % CH) // 16):
+        var k = (INNER // CH) * CH + ks * 16
+        var av = SIMD[DType.float16, 8](
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 1],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid) * INNER + k + tig * 2 + 9],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 8],
+            xh[unsafe_offset=(r0 + gid + 8) * INNER + k + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(OUTS):
+            var col = cb + warp * 8 + j * (WARP * 8)
+            var bv = SIMD[DType.float16, 4](
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 1],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 8],
+                w[unsafe_offset=(col + gid) * INNER + k + tig * 2 + 9],
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+
+    @parameter
+    for j in range(OUTS):
+        var col = cb + warp * 8 + j * (WARP * 8)
+        var acc = accA[j] + accB[j]
+        if r0 + gid < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2
+            ] = acc[0]
+            dst[
+                unsafe_offset=(r0 + gid) * Int(out_cols) + col + tig * 2 + 1
+            ] = acc[1]
+        if r0 + gid + 8 < Int(n_rows):
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2
+            ] = acc[2]
+            dst[
+                unsafe_offset=(r0 + gid + 8) * Int(out_cols) + col + tig * 2 + 1
+            ] = acc[3]

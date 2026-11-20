@@ -3958,3 +3958,9 @@
   - **粗化落地**：`linear_fat_f16_gpu[128, inner, 32]` + grid vocab/32 + **f32 累加**（寄存器减半）。**过程教训**：首试 [64,64] 保持 f64——64 路 f64 累加器寄存器溢出，1413→915 tok/s 回归；[64,64]×f32 或 [128,32]×f32 才是甜点（patch 期间 block_dim 全局替换误伤 d_proj 核 3 处，git diff 逐处恢复——**全局字符串替换必须核对的行数**）。
   - **验证**：门 PASS 十判据（f32 累加在 f16 判据族容差内）；长生成 **1407→1609/1649 tok/s（+16%）**、短压 conc32 450→**517.4（+15%）**、solo 71.7→75.5；profile 口径 lmhead 9.55→7.70ms。
   - **161 候选**：① **LMHEAD MMA 化**（down 链 f16_mma 形态复用 + embed16 pack 权重 load 期一次）——lmhead 7.7 → 理论 <1ms，tick 13.5→~6ms，长生成冲 3000+ tok/s（**头号靶**）；② tri/o/ff/down 各段 GEMM 同法复查（tri 1.83、o 1.90 是否也有块粒度病）；③ 短请求场景的批填充率优化（客户端节奏不可控，服务端无解——记录口径即可）。
+- **2026-11-20（一百六十一）** —— **LMHEAD MMA 化：lmhead 9.4×，长生成 +103%**
+  - **动刀**：新增 `f16_mma_head_gpu[INNER, CH, OUTS, WARP]`（`f16_mma_down_gpu` 的**直写版**——down 核写死残差累加语义，lm_head 的 logits 无残差基值）。关键省工：**权重吃行主 [out_cols, INNER] f16（d_embed16 原布局，免 pack）**，x 用 rmsnorm 直出的 `d_xnormb16`（三处调用点都已有 f16 直出，零新增转换）。生产配置 `[896, 608, 2, 8]`：128 列/块、grid vocab/128 × ceildiv(t,16)——对比 fat 核 53.6 万块/56% 线程空转/f64 累加，tensor core 每块 128 输出。三处调用全换（tail batch、tail 单行、decode）。
+  - **验证**：门 PASS 十判据（t=1 与 t=28 两路 parity 全绿）；soak 10 分钟 PASS（7889 ok / err=0 / RSS 2.0GB / GPU 17MiB 稳，ok/min 789 vs v0.2.2 soak 709 = +11%）。
+  - **数字**：**lmhead 7.70 → 0.82ms（9.4×）**、tail 9.7 → 0.98ms、tick 13.5 → **~8.2ms**；**长生成 1649 → 3254/3451 tok/s（+103%）**（v0.2.2 口径 1403 → **2.46×**）；短压 conc32 517.4 → **1117.0（+116%）**（450.6 → 2.48×）；speedup **15.3×**。
+  - **新分布**（profile=1）：tri 1.80 / o 1.89 / ff 1.34 / down 0.86 / comb 0.31 / tail 0.98——前向主体 GEMM 权重读带宽仅 ~100GB/s（HBM 3.35TB/s 的 **3%**）——MMA 核 fragment 载入模式与占用率是下一时代的靶。
+  - **162 候选**：① **前向主体 GEMM 核效率深挖**（tri/o/ff/down 权重读 3% 带宽利用率——扫 fragment 载入/占用率/CH，tick 8.2 → 3-4ms 空间，头号靶）；② o 段 1.89 细分子打点（x_to_f16/GEMM/残差哪步吃时间）；③ LMHEAD CH 扫描（608 vs 896，0.82 已近下限暂缓）。

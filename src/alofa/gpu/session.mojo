@@ -59,6 +59,7 @@ from alofa.kernels.cuda.matmul import (
     x_to_f16_gpu, f16_mma_down_gpu, f16_mma_dual_gpu,
     f16_mma_down_pk_gpu, f16_mma_down_spl_gpu, f16_mma_dual_pk_gpu,
     f16_mma_gemm_pk_gpu, f16_mma_gemm2_pk_gpu, f32_adds_gpu,
+    f16_mma_head_gpu,
     pack_w_mma_gpu, cat2_f16_gpu, cat2_f32_gpu,
         f16_matmul_dual_nx_gpu,
     f16_matmul_qkv_gpu,
@@ -1528,15 +1529,14 @@ struct GpuSession:
             # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
             # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
             # norm 单发更慢，头部保持分离发射。
-            self.ctx.enqueue_function[linear_fat_f16_gpu[128, inner, 32]](
-                self.d_normed.unsafe_ptr(),
+            self.ctx.enqueue_function[f16_mma_head_gpu[inner, 608, 2, 8]](
+                self.d_xnormb16.unsafe_ptr(),
                 self.d_embed16.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 32), 1, 1),
-                block_dim=(128, 1, 1),
+                Int32(1),
+                grid_dim=(ceildiv(self.vocab, 128), 1, 1),
+                block_dim=(256, 1, 1),
             )
         else:
             self.ctx.enqueue_function[noop_gpu](
@@ -1724,7 +1724,9 @@ struct GpuSession:
         alias O_K = f16_bmm_fat3_gpu[o_t, inner, 4, prefill_rb, True, prefill_af]
         alias DUAL_K = f16_bmm_dual3_gpu[dual_t, inner, 2, prefill_rb, prefill_af]
         alias DOWN_K = f16_bmm_fat3_gpu[down_t, inner_ff, 4, prefill_rb, True, prefill_af]
-        alias LMHEAD_K = linear_fat_f16_gpu[128, inner, 32]
+        # 一百六十一：MMA 直写版——fat 核（53.6 万块/56% 空转/f64）换
+        # tensor core；权重行主 d_embed16 免 pack，x 用 rmsnorm 直出 f16。
+        alias LMHEAD_K = f16_mma_head_gpu[inner, 608, 2, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -2498,14 +2500,13 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_function[LMHEAD_K](
-                self.d_normedb.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 self.d_embed16.unsafe_ptr(),
                 self.d_logits_b.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 32), t, 1),
-                block_dim=(128, 1, 1),
+                Int32(t),
+                grid_dim=(ceildiv(self.vocab, 128), ceildiv(t, 16), 1),
+                block_dim=(256, 1, 1),
             )
             if profile and not prof_nosync:
                 self.ctx.synchronize()
@@ -2586,14 +2587,13 @@ struct GpuSession:
                 block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_function[LMHEAD_K](
-                self.d_normed.unsafe_ptr(),
+                self.d_xnormb16.unsafe_ptr(),
                 self.d_embed16.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
-                self.d_ws.unsafe_ptr(),
-                self.eps,
                 Int32(self.vocab),
-                grid_dim=(ceildiv(self.vocab, 32), 1, 1),
-                block_dim=(128, 1, 1),
+                Int32(1),
+                grid_dim=(ceildiv(self.vocab, 128), 1, 1),
+                block_dim=(256, 1, 1),
             )
             self.ctx.enqueue_copy(dst_buf=self.h_logits, src_buf=self.d_logits)
         if profile:
