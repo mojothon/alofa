@@ -1234,6 +1234,7 @@ def attn_vt2_h_bb_gpu[
     head_dim: Int32,
     max_kv: Int32,
     dst: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
 ) -> None:
     """attn_vt2_h 的批解码变体（账本一百二十）：upto = pos_arr[b]，
     scores 行距 max_kv，v_store 行基址 b*max_kv*kv_cols。算序同
@@ -1325,9 +1326,9 @@ def attn_vt2_h_bb_gpu[
             )
             jj += 1
         comptime if FUSED and TILES == 1:
-            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = (
-                Float32(acc / stot[slot * TPP])
-            )
+            var av = Float32(acc / stot[slot * TPP])
+            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = av
+            dst16[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = Float16(av)
         else:
             vpart[unsafe_offset=(
                 (b * Int(n_heads) + head) * TILES + tile

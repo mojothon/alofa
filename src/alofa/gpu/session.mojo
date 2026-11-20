@@ -281,6 +281,12 @@ struct GpuSession:
     # 每 50 tick 打印；LMHEAD 粗化 [128, inner, 32] + f32 累加同批落地。
     var ts_n: Int
     var ts_lm: Float64
+    # 一百六十二：tri/o 段子解剖——tri_g（q2+merge）/ o_x（x_to_f16）/
+    # o_g（spl GEMM）/ o_r（adds+残余）四子段累计。
+    var ts_tri_g: Float64
+    var ts_o_x: Float64
+    var ts_o_g: Float64
+    var ts_o_r: Float64
     var ts_samp: Float64
     var ts_copy: Float64
     var n_forward_rows: Int
@@ -699,6 +705,10 @@ struct GpuSession:
         self.n_forwards = 0
         self.ts_n = 0
         self.ts_lm = 0.0
+        self.ts_tri_g = 0.0
+        self.ts_o_x = 0.0
+        self.ts_o_g = 0.0
+        self.ts_o_r = 0.0
         self.ts_samp = 0.0
         self.ts_copy = 0.0
         self.last_prof = InlineArray[Float64, 10](fill=Float64(0))
@@ -1854,6 +1864,10 @@ struct GpuSession:
                 self.wp_ready = True
 
         for layer in range(self.n_layers):
+            # 一百六十二：o 段子段计时基准（分支内赋值，prof[6] 处结算）。
+            var to0 = monotonic_ns()
+            var to1 = to0
+            var to2 = to0
             var ltri = 0.0
             var lattn = 0.0
             var lo = 0.0
@@ -1874,6 +1888,9 @@ struct GpuSession:
                 grid_dim=(t, 1, 1),
                 block_dim=(256, 1, 1),
             )
+            if profile and not prof_nosync:
+                self.ctx.synchronize()
+            var tt0 = monotonic_ns()
             # 一百零五：xnormb f16 预转前置（q MMA 与 dual MMA 共用）——
             # 一百五十五：x_to_f16 删除，rmsnorm 已直出 f16。
             comptime if prefill_af == DType.float32 and prefill_mma_q and (
@@ -1942,6 +1959,11 @@ struct GpuSession:
                     ceildiv(t, prefill_rb), 1),
                     block_dim=(tri_t, 1, 1),
                 )
+            if profile and not prof_nosync:
+                self.ctx.synchronize()
+            var tt1 = monotonic_ns()
+            if profile and not prof_nosync:
+                self.ts_tri_g += Float64(tt1 - tt0) / 1e6
             if prefill_kv and prefill_af == DType.float32 and prefill_wpack and (
                 inner % 16 == 0 and inner % 896 == 0
             ) and self.kv_dim % 64 == 0:
@@ -2159,6 +2181,7 @@ struct GpuSession:
                     Int32(self.head_dim),
                     Int32(self.max_tokens),
                     self.d_attnb.unsafe_ptr(),
+                    self.d_attnb16.unsafe_ptr(),
                     grid_dim=(self.n_kv_heads, attn_tiles, t),
                     block_dim=(attn_t, 1, 1),
                 )
@@ -2242,11 +2265,21 @@ struct GpuSession:
                 # o 是残差累加（ACC=True）——几何与 down 同，直接复用
                 # 一百五十六：FUSED 尾写直出 f16 时 x_to_f16 删除；
                 # 非 FUSED 路径（COMB 写回）保留独立预转。
+                # 一百六十二：batch 路径走 bb 版 VT2（FUSED=attn_tiles==1
+                # 同款直出，此前漏了 bb 变体——生产每层多一发冗余预转）。
                 if not (
-                    prefill_gqa and attn_t // 8 == self.head_dim
-                    and self.n_heads // self.n_kv_heads <= 8
-                    and attn_tiles == 1
+                    attn_tiles == 1
+                    and (
+                        batch
+                        or (
+                            prefill_gqa and attn_t // 8 == self.head_dim
+                            and self.n_heads // self.n_kv_heads <= 8
+                        )
+                    )
                 ):
+                    if profile and not prof_nosync:
+                        self.ctx.synchronize()
+                    to0 = monotonic_ns()
                     self.ctx.enqueue_function[x_to_f16_gpu](
                         self.d_attnb.unsafe_ptr(),
                         self.d_attnb16.unsafe_ptr(),
@@ -2254,6 +2287,11 @@ struct GpuSession:
                         grid_dim=((t * self.hidden + 255) // 256, 1, 1),
                         block_dim=(256, 1, 1),
                     )
+                if profile and not prof_nosync:
+                    self.ctx.synchronize()
+                to1 = monotonic_ns()
+                if profile and not prof_nosync:
+                    self.ts_o_x += Float64(to1 - to0) / 1e6
                 if prefill_spl and inner % 16 == 0 and (
                     inner // 4
                 ) % 224 == 0:
@@ -2270,6 +2308,11 @@ struct GpuSession:
                         grid_dim=(ceildiv(self.hidden, 128), ceildiv(t, 16), 4),
                         block_dim=(256, 1, 1),
                     )
+                    if profile and not prof_nosync:
+                        self.ctx.synchronize()
+                    to2 = monotonic_ns()
+                    if profile and not prof_nosync:
+                        self.ts_o_g += Float64(to2 - to1) / 1e6
                     self.ctx.enqueue_function[f32_adds_gpu[4]](
                         self.d_xb.unsafe_ptr(),
                         self.d_downpart.unsafe_ptr(),
@@ -2308,6 +2351,8 @@ struct GpuSession:
                 if not prof_nosync:
                     self.ctx.synchronize()
                 prof[6] += Float64(monotonic_ns() - prof_t0) / 1e6
+                if not prof_nosync:
+                    self.ts_o_r += Float64(monotonic_ns() - to2) / 1e6
                 lo = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
@@ -2606,10 +2651,18 @@ struct GpuSession:
                     print("tail-sub avg (ms): lmhead=", self.ts_lm / 50.0,
                           " samp=", self.ts_samp / 50.0,
                           " copy=", self.ts_copy / 50.0)
+                    print("seg-sub avg (ms): tri_g=", self.ts_tri_g / 50.0,
+                          " o_x=", self.ts_o_x / 50.0,
+                          " o_g=", self.ts_o_g / 50.0,
+                          " o_r=", self.ts_o_r / 50.0)
                     self.ts_n = 0
                     self.ts_lm = 0.0
                     self.ts_samp = 0.0
                     self.ts_copy = 0.0
+                    self.ts_tri_g = 0.0
+                    self.ts_o_x = 0.0
+                    self.ts_o_g = 0.0
+                    self.ts_o_r = 0.0
             prof[9] += Float64(monotonic_ns() - prof_t0) / 1e6
             prof_t0 = monotonic_ns()
         if sync_tail:
