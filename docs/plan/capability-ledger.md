@@ -3941,3 +3941,9 @@
   - **脏服务假象教训**：残留服务 + 显存 31.7GB 未清时压测得 369.5（-18.5% 假回归）——**压测前必须 pkill + nvidia-smi 确认显存干净**。
   - **发射侧弹药重估**（156 折扣因子 ~0.15 兑现）：split-K 收口融合（~3 发射/层，理论 0.62ms）预估净收益仅 ~2%；cat2 一次性化（1 发射/层）~1%——**发射侧单刀性价比趋枯竭**。
   - **结构性候选（158+）**：① **CUDA graph 批量发射**——把每层 ~23 发射打包成一次 graph launch，host 成本 760×7.4µs → 每图一次调用，是 tick launch-bound 的结构性解法（需查 max.gpu.host DeviceContext 是否暴露 capture/graph API）；② 接受现状（433.6→453.8，两时代累计 +4.7%），转 157 前的批行 rmsnorm/段间 gap 深挖。
+- **2026-11-20（一百五十八）** —— **CUDA graph 可行性 probe：API 存在但两道墙，暂停**
+  - **API 面发现**：`libAsyncRTMojoBindings.so` 暴露完整图构建 C ABI——`DeviceContext_createGraphBuilder / DeviceGraphBuilder_addFunctionDirect / instantiate / DeviceGraph_replay`（含 addCopy*/addSetMemory/addOutput）。Mojo 侧 `max.gpu.host` 能 import `DeviceGraphBuilder` 与 `DeviceGraph` 类型（模块存在）。
+  - **墙一（API 入口不可达）**：`DeviceContext` 无 `create_graph_builder/graph_builder/create_graph/device_graph_builder/begin_graph_capture` 方法，无模块级 `create_graph_builder`；`DeviceGraphBuilder[arena_origin: ImmOrigin]` 构造要求 origin 推断（handle 参数带 origin，None 推不出）——public 构造入口未暴露，文档 404、mojoc 二进制无明文。6 个候选探针全灭。
+  - **墙二（静态图 vs 动态参数，更根本）**：即便入口可达，graph 实例化后 replay 的 kernel 参数是捕获时固化的——alofa 每 tick 的 kv_len（每请求递增）、pos 数组、score buffer 偏移全在变；CUDA graph 需固定指针+固定形状，除非参数 indirect 化（kernel 从 device buffer 读参数）——addFunctionDirect 是否支持 indirect 未证实。改造成本：全 kernel 签名参数化重写。
+  - **结论**：CUDA graph 在当前 MAX/AsyncRT 版本**不可低成本落地**——暂停归档；若未来版本暴露 public graph API（特别是 indirect 参数支持）再启动。
+  - **发射 bound 的剩余路线**（158+）：① 双 DeviceContext（=双 stream）跨 tick 流水——当前 tick 的 down/ff 尾段与下一 tick 的 gather/调度重叠，架构改动中等；② 接受 453.8 tok/s 现状（两时代 +4.7%），转下一个产品级目标（batching-report 或版本发布）。
