@@ -471,6 +471,160 @@ def main() raises:
 
     print("probe163 done")
 
+    # ==== 一百六十四：CH/OUTS/S 扫描 ====
+    # head_pk CH=896（INNER%CH==0 无余数路径；当前 608 有 18 步全局散读）
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 896, 2, 8]](
+                dx16.unsafe_ptr(), dwp_e.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 896, 2, 8]](
+                dx16.unsafe_ptr(), dwp_e.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("head_pk_ch896 =", best, "us")
+
+    # head_pk OUTS=4（重 pack [896,4,8]）
+    var dwp_e4 = ctx.enqueue_create_buffer[DType.float16](151936 * INNER)
+    ctx.enqueue_function[pack_w_mma_gpu[INNER, 4, 8]](
+        dembed.unsafe_ptr(), dwp_e4.unsafe_ptr(),
+        grid_dim=(151936 // 256, INNER // 16, 1), block_dim=(128, 1, 1),
+    )
+    ctx.synchronize()
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 608, 4, 8]](
+                dx16.unsafe_ptr(), dwp_e4.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 256, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_head_pk_gpu[INNER, 608, 4, 8]](
+                dx16.unsafe_ptr(), dwp_e4.unsafe_ptr(), dlogits.unsafe_ptr(),
+                Int32(151936), Int32(T),
+                grid_dim=(151936 // 256, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("head_pk_outs4 =", best, "us")
+
+    # dual_pk CH=448（INNER=896%448==0 无余数；smem 14KB）
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_dual_pk_gpu[INNER, 448, 8]](
+                dx16.unsafe_ptr(), dwp_g.unsafe_ptr(), dwp_u.unsafe_ptr(),
+                dgate.unsafe_ptr(), dup.unsafe_ptr(),
+                dact.unsafe_ptr(), dact16.unsafe_ptr(),
+                Int32(INTER), Int32(T),
+                grid_dim=(INTER // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_dual_pk_gpu[INNER, 448, 8]](
+                dx16.unsafe_ptr(), dwp_g.unsafe_ptr(), dwp_u.unsafe_ptr(),
+                dgate.unsafe_ptr(), dup.unsafe_ptr(),
+                dact.unsafe_ptr(), dact16.unsafe_ptr(),
+                Int32(INTER), Int32(T),
+                grid_dim=(INTER // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("dual_pk_ff_ch448 =", best, "us")
+
+    # dual_pk CH=224（smem 7KB）
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_dual_pk_gpu[INNER, 224, 8]](
+                dx16.unsafe_ptr(), dwp_g.unsafe_ptr(), dwp_u.unsafe_ptr(),
+                dgate.unsafe_ptr(), dup.unsafe_ptr(),
+                dact.unsafe_ptr(), dact16.unsafe_ptr(),
+                Int32(INTER), Int32(T),
+                grid_dim=(INTER // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_dual_pk_gpu[INNER, 224, 8]](
+                dx16.unsafe_ptr(), dwp_g.unsafe_ptr(), dwp_u.unsafe_ptr(),
+                dgate.unsafe_ptr(), dup.unsafe_ptr(),
+                dact.unsafe_ptr(), dact16.unsafe_ptr(),
+                Int32(INTER), Int32(T),
+                grid_dim=(INTER // 128, 2, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("dual_pk_ff_ch224 =", best, "us")
+
+    # q2_spl S=4（CH=224）+ mergb4 对照
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f16_mma_down_spl_gpu[INNER, 224, 2, 8, 4]](
+                dx16.unsafe_ptr(), dwp_q.unsafe_ptr(), dqpart.unsafe_ptr(),
+                Int32(QOUT), Int32(T),
+                grid_dim=(QOUT // 128, 2, 4), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f16_mma_down_spl_gpu[INNER, 224, 2, 8, 4]](
+                dx16.unsafe_ptr(), dwp_q.unsafe_ptr(), dqpart.unsafe_ptr(),
+                Int32(QOUT), Int32(T),
+                grid_dim=(QOUT // 128, 2, 4), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("q2_spl_s4 =", best, "us")
+
+    best = 1e30
+    for _r in range(ROUNDS):
+        for _w in range(2):
+            ctx.enqueue_function[f32_mergb_gpu[4]](
+                dq.unsafe_ptr(), dqpart.unsafe_ptr(), dqb.unsafe_ptr(),
+                Int32(QOUT), Int32(T * QOUT),
+                grid_dim=((T * QOUT + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        t0 = monotonic_ns()
+        for _k in range(REP):
+            ctx.enqueue_function[f32_mergb_gpu[4]](
+                dq.unsafe_ptr(), dqpart.unsafe_ptr(), dqb.unsafe_ptr(),
+                Int32(QOUT), Int32(T * QOUT),
+                grid_dim=((T * QOUT + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+            )
+        ctx.synchronize()
+        us = Float64(monotonic_ns() - t0) / 1e3 / REP
+        if us < best:
+            best = us
+    print("mergb4_q =", best, "us")
+
+    print("probe164 done")
+
 
 def probe_variants() -> None:
     """一百六十二-b：A/B 变体——dual_pk WARP/占用扫描、down_spl CH 对照。"""

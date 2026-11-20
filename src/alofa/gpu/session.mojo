@@ -1565,7 +1565,9 @@ struct GpuSession:
             # lm_head 走 fat 版（账本六十六扫型 T256/O8 冠军）。NORM 融合
             # 试过（七十一）：18688 块 × 每块冗余归约 + 屏障链，实测比
             # norm 单发更慢，头部保持分离发射。
-            self.ctx.enqueue_function[f16_mma_head_pk_gpu[inner, 608, 2, 8]](
+            # 一百六十四：CH=608→896（INNER%CH==0 消除 18 步余数
+            # 全局散读；probe -27µs）。
+            self.ctx.enqueue_function[f16_mma_head_pk_gpu[inner, 896, 2, 8]](
                 self.d_xnormb16.unsafe_ptr(),
                 self.d_embedp.unsafe_ptr(),
                 self.d_logits.unsafe_ptr(),
@@ -1763,7 +1765,7 @@ struct GpuSession:
         # 一百六十一：MMA 直写版——fat 核（53.6 万块/56% 空转/f64）换
         # tensor core；权重行主 d_embed16 免 pack，x 用 rmsnorm 直出 f16。
         # 一百六十三：pack 布局版（w 从 d_embedp fragment 连续读）。
-        alias LMHEAD_K = f16_mma_head_pk_gpu[inner, 608, 2, 8]
+        alias LMHEAD_K = f16_mma_head_pk_gpu[inner, 896, 2, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -1944,6 +1946,8 @@ struct GpuSession:
                     # ~600 周期 DRAM 延迟，down_spl 同病同方）。
                     # 累加序变（~1e-4 级），门容差 + argmax 判据。
                     self.ctx.enqueue_function[
+                        # 一百六十四-a：S=4 生产未兑现孤立收益（同
+                        # 冷 L2 低估模式），回退 S=8。
                         f16_mma_down_spl_gpu[inner, 112, 2, 8, 8]
                     ](
                         self.d_xnormb16.unsafe_ptr(),
@@ -2417,6 +2421,9 @@ struct GpuSession:
             ):
                 comptime if prefill_wpack:
                     self.ctx.enqueue_function[
+                        # 一百六十四-a：CH=224 孤立 -24% 但生产回归
+                        # ——4 段 barrier 链在冷 L2 下藏不住 DRAM 延迟
+                        # （probe 20 连发全 L2 热，低估）。回退 CH=896。
                         f16_mma_dual_pk_gpu[
                             inner, 896 if prefill_tile else 608, 8
                         ]
