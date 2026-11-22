@@ -4064,3 +4064,8 @@
   - **三 spec 核**（attention.mojo，程序化生成=原核定点替换）：`kv_store_bb_spec`（rope 位置 pos_arr[seq]+j、KV 落位 store[seq]，q/k/v 源行仍为 token 行 b）、`attn_rs_h_bb_spec`（KV 窗 nsc=pos_arr[seq]+j+1、k_store 基址按 seq、scores/q_rot 行仍为 b）、`attn_vt2_h_bb_spec`（v_store 基址按 seq、scores/dst 行仍为 b）——签名加 rowseq/rowj 两指针（统一插在 max_kv 后）。
   - **验证**：probe175（tests/gpu/probe_175.mojo，B=4 不等 pos、恒等 rowseq/rowj，A 原核链 vs B spec 链，q_rot/k_store/v_store/scores/dst/dst16 全输出）——**mismatch=0 BIT-EXACT PASS**。
   - **174-c**：vt2 尾写段行化消费（dst 行=token 行 b ✓ 已同）+ 行映射贯通 session（输入行化 + rowseq/rowj 上传消费 + spec tick 分支）+ 验证回滚（argmax 前缀匹配 + pos_arr 推进）+ n-gram 草稿源。
+- **2026-11-22（一百七十四-c）** —— **session spec 分支贯通：行映射消费接线（原路径逐位同）**
+  - **接线**：①行缓冲扩容——`SPEC_MAX_ROWS = BMAX*5`（320）；mb 从 128 → max(128,320)；tokout/采样三兄弟/rowseq/rowj 行缓冲按 SPEC_MAX_ROWS 扩（pos_arr/store 是序列维度保留 BMAX）；②forward `row_mapped=True` 分支——t 上限 SPEC_MAX_ROWS、rowseq/rowj 上传、kv_store/rs/vt2 三发射点走 _spec 核（恒等映射数值同原核）。
+  - **踩坑三则**：①174-b 的核提取脚本把 vt2 原核后的无空行邻居（kv_store_b_gpu）一并复制进追加段（当时 probe 编译未触发，174-c 接线后 redefinition 才爆）——截断修复；②attention import 是 `\` 续行风格，补行漏 `\` 断裂；③ht host buffer 仍按 PREFILL_MAX_BATCH=128 创建而 d_tokenb 已 320 → 「not enough data in src」——同宽修复。
+  - **验证**：门 PASS（parity 逐位同，row_mapped=False 原路径不变）+ soak PASS（ok/min 824-835、err=0）。
+  - **174-c 第二刀**：spec tick 组装端（generate_batch 的 draft 注入：每序列携 k+1 token 行、rowseq/rowj 填充、logits 按行回读验证 argmax 前缀匹配、pos_arr 按 accept 推进、KV 天然覆写）+ n-gram 草稿源 + 接受率遥测。

@@ -40,7 +40,8 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
     attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
-    attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu
+    attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu, \
+    kv_store_bb_gpu_spec, attn_rs_h_bb_gpu_spec, attn_vt2_h_bb_gpu_spec
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, f32_adds_rmsnorm_f16_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
@@ -93,6 +94,9 @@ comptime F16_BUILD = True
 alias PREFILL_MAX_BATCH = 128
 # 一百二十-b：批解码序列上限（store/pos/logits 缓冲按此分配）
 alias BMAX = 64
+# 一百七十四-c：spec 行化 tick 的行数上限（每序列最多 4 draft
+# token + 1 真值行；行缓冲按此扩容）
+alias SPEC_MAX_ROWS = BMAX * 5
 from alofa.model.arch.qwen import (
     FINAL_NORM,
     Q4_SLOTS_PER_LAYER,
@@ -607,7 +611,8 @@ struct GpuSession:
             self.hidden * 8
         )
         # prefill 批缓冲（账本八十八，PREFILL_MAX_BATCH 行）
-        var mb = PREFILL_MAX_BATCH
+        # 一百七十四-c：spec 行化行数上限扩容（BMAX*5=320）
+        var mb = PREFILL_MAX_BATCH if PREFILL_MAX_BATCH > BMAX * 5 else BMAX * 5
         self.d_xb = self.ctx.enqueue_create_buffer[DType.float32](
             mb * self.hidden
         )
@@ -712,19 +717,19 @@ struct GpuSession:
         self.h_logits_b = self.ctx.enqueue_create_host_buffer[DType.float32](
             BMAX * self.vocab
         )
-        self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
-        self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
-        self.d_stemp = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
-        self.h_stemp = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
+        self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.d_stemp = self.ctx.enqueue_create_buffer[DType.float32](SPEC_MAX_ROWS)
+        self.h_stemp = self.ctx.enqueue_create_host_buffer[DType.float32](SPEC_MAX_ROWS)
         # 一百七十四-a：spec 行映射缓冲（host 直写 + forward 上传）
-        self.d_rowseq = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
-        self.d_rowj = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
-        self.h_rowseq = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
-        self.h_rowj = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
-        self.d_stopps = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
-        self.h_stopps = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
-        self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
-        self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
+        self.d_rowseq = self.ctx.enqueue_create_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.d_rowj = self.ctx.enqueue_create_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.h_rowseq = self.ctx.enqueue_create_host_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.h_rowj = self.ctx.enqueue_create_host_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.d_stopps = self.ctx.enqueue_create_buffer[DType.float32](SPEC_MAX_ROWS)
+        self.h_stopps = self.ctx.enqueue_create_host_buffer[DType.float32](SPEC_MAX_ROWS)
+        self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](SPEC_MAX_ROWS)
+        self.h_sseeds = self.ctx.enqueue_create_host_buffer[DType.int32](SPEC_MAX_ROWS)
         self.n_forwards = 0
         self.ts_n = 0
         self.ts_lm = 0.0
@@ -1741,7 +1746,7 @@ struct GpuSession:
         var pos0 = self.kv_pos
         var kv_len = pos0 + t
         comptime if batch:
-            if t > BMAX:
+            if t > (SPEC_MAX_ROWS if row_mapped else BMAX):
                 raise AlofaError(
                     ERR_INVALID_ARGUMENT, "batch decode cap is 64",
                     "t=" + String(t),
@@ -1783,11 +1788,12 @@ struct GpuSession:
         alias LMHEAD_K = f16_mma_head_pk_gpu[inner, 896, 2, 8]
 
         # host 侧与 d_tokenb 同宽（copy 要求同尺寸；尾部零填充无害）
+        # 一百七十四-c：与 d_tokenb 同宽（SPEC 行化扩容后 = mb）
         var ht = self.ctx.enqueue_create_host_buffer[DType.int32](
-            PREFILL_MAX_BATCH
+            SPEC_MAX_ROWS
         )
         self.ctx.synchronize()
-        for i in range(PREFILL_MAX_BATCH):
+        for i in range(SPEC_MAX_ROWS):
             ht[i] = Int32(tokens[i]) if i < t else Int32(0)
         self.ctx.enqueue_copy(dst_buf=self.d_tokenb, src_buf=ht)
 
@@ -2123,23 +2129,45 @@ struct GpuSession:
             var row_pos = self.d_posarr.unsafe_ptr() + row_base
             var score_off = row_base * self.n_heads * self.max_tokens
             if batch:
-                self.ctx.enqueue_function[kv_store_bb_gpu[attn_t]](
-                    self.d_qrot_b.unsafe_ptr(),
-                    self.d_qb.unsafe_ptr(),
-                    self.d_kb.unsafe_ptr(),
-                    self.d_vb.unsafe_ptr(),
-                    self.d_k_store_b[layer].unsafe_ptr() + row_off,
-                    self.d_v_store_b[layer].unsafe_ptr() + row_off,
-                    self.d_cos.unsafe_ptr(),
-                    self.d_sin.unsafe_ptr(),
-                    row_pos,
-                    Int32(self.n_heads),
-                    Int32(self.n_kv_heads),
-                    Int32(self.head_dim),
-                    Int32(self.max_tokens),
-                    grid_dim=(self.n_heads, 1, t),
-                    block_dim=(attn_t, 1, 1),
-                )
+                if row_mapped:
+                    # 一百七十四-c：spec 行化——行 b -> (seq, j)
+                    self.ctx.enqueue_function[kv_store_bb_gpu_spec[attn_t]](
+                        self.d_qrot_b.unsafe_ptr(),
+                        self.d_qb.unsafe_ptr(),
+                        self.d_kb.unsafe_ptr(),
+                        self.d_vb.unsafe_ptr(),
+                        self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_v_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_cos.unsafe_ptr(),
+                        self.d_sin.unsafe_ptr(),
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        self.d_rowseq.unsafe_ptr(),
+                        self.d_rowj.unsafe_ptr(),
+                        grid_dim=(self.n_heads, 1, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[kv_store_bb_gpu[attn_t]](
+                        self.d_qrot_b.unsafe_ptr(),
+                        self.d_qb.unsafe_ptr(),
+                        self.d_kb.unsafe_ptr(),
+                        self.d_vb.unsafe_ptr(),
+                        self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_v_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_cos.unsafe_ptr(),
+                        self.d_sin.unsafe_ptr(),
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        grid_dim=(self.n_heads, 1, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
             else:
                 self.ctx.enqueue_function[
                     KVS_K
@@ -2184,20 +2212,38 @@ struct GpuSession:
                 lattn += Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
             if batch:
-                self.ctx.enqueue_function[
-                    attn_rs_h_bb_gpu[attn_t, 8, True]
-                ](
-                    self.d_qrot_b.unsafe_ptr(),
-                    self.d_k_store_b[layer].unsafe_ptr() + row_off,
-                    self.d_scoresb.unsafe_ptr() + score_off,
-                    row_pos,
-                    Int32(self.n_heads),
-                    Int32(self.n_kv_heads),
-                    Int32(self.head_dim),
-                    Int32(self.max_tokens),
-                    grid_dim=(self.n_kv_heads, 1, t),
-                    block_dim=(attn_t, 1, 1),
-                )
+                if row_mapped:
+                    self.ctx.enqueue_function[
+                        attn_rs_h_bb_gpu_spec[attn_t, 8, True]
+                    ](
+                        self.d_qrot_b.unsafe_ptr(),
+                        self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_scoresb.unsafe_ptr() + score_off,
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        self.d_rowseq.unsafe_ptr(),
+                        self.d_rowj.unsafe_ptr(),
+                        grid_dim=(self.n_kv_heads, 1, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        attn_rs_h_bb_gpu[attn_t, 8, True]
+                    ](
+                        self.d_qrot_b.unsafe_ptr(),
+                        self.d_k_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_scoresb.unsafe_ptr() + score_off,
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        grid_dim=(self.n_kv_heads, 1, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
             else:
                 comptime if prefill_gqa and attn_tiles == 1 and attn_t % 8 == 0:
                     self.ctx.enqueue_function[
@@ -2230,23 +2276,46 @@ struct GpuSession:
                         block_dim=(attn_t, 1, 1),
                     )
             if batch:
-                self.ctx.enqueue_function[
-                    attn_vt2_h_bb_gpu[attn_t, 8, attn_tiles, attn_tiles == 1]
-                ](
-                    self.d_scoresb.unsafe_ptr() + score_off,
-                    self.d_v_store_b[layer].unsafe_ptr() + row_off,
-                    self.d_vpartb.unsafe_ptr(),
-                    self.d_attotb.unsafe_ptr(),
-                    row_pos,
-                    Int32(self.n_heads),
-                    Int32(self.n_kv_heads),
-                    Int32(self.head_dim),
-                    Int32(self.max_tokens),
-                    self.d_attnb.unsafe_ptr(),
-                    self.d_attnb16.unsafe_ptr(),
-                    grid_dim=(self.n_kv_heads, attn_tiles, t),
-                    block_dim=(attn_t, 1, 1),
-                )
+                if row_mapped:
+                    self.ctx.enqueue_function[
+                        attn_vt2_h_bb_gpu_spec[
+                            attn_t, 8, attn_tiles, attn_tiles == 1
+                        ]
+                    ](
+                        self.d_scoresb.unsafe_ptr() + score_off,
+                        self.d_v_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_vpartb.unsafe_ptr(),
+                        self.d_attotb.unsafe_ptr(),
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        self.d_rowseq.unsafe_ptr(),
+                        self.d_rowj.unsafe_ptr(),
+                        self.d_attnb.unsafe_ptr(),
+                        self.d_attnb16.unsafe_ptr(),
+                        grid_dim=(self.n_kv_heads, attn_tiles, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[
+                        attn_vt2_h_bb_gpu[attn_t, 8, attn_tiles, attn_tiles == 1]
+                    ](
+                        self.d_scoresb.unsafe_ptr() + score_off,
+                        self.d_v_store_b[layer].unsafe_ptr() + row_off,
+                        self.d_vpartb.unsafe_ptr(),
+                        self.d_attotb.unsafe_ptr(),
+                        row_pos,
+                        Int32(self.n_heads),
+                        Int32(self.n_kv_heads),
+                        Int32(self.head_dim),
+                        Int32(self.max_tokens),
+                        self.d_attnb.unsafe_ptr(),
+                        self.d_attnb16.unsafe_ptr(),
+                        grid_dim=(self.n_kv_heads, attn_tiles, t),
+                        block_dim=(attn_t, 1, 1),
+                    )
             elif prefill_gqa and attn_t // 8 == self.head_dim and (
                 self.n_heads // self.n_kv_heads <= 8
             ):
