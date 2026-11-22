@@ -4010,3 +4010,9 @@
   - **A 路线（发射链融合）正式关闭**：小核串联已收割（167 +1%）；GEMM 级融合仅剩 rs+vt2 合一（+2%）——**A 路线总天花板 <3%**，不值得数周工程。
   - **tick 8.2ms 终局盘点**：GEMM 本体 ~4.3ms（MMA 参数面已尽）+ attention 0.62 + rope/kv_store/卫星 ~0.5 + head 0.28 + sample 0.08 + 间隙 ~2.4ms（graph 类，唯一大块，封存待平台支持）。**常规优化空间全部探明并关闭。**
   - **169+ 战略方向**（B 路线开题）：①speculative decoding（草稿模型 + 批验证——tick 级 -30-50%，需小模型与接受率工程）；②权重量化（f16→int8/fp8——GEMM 本体 4.3ms 减半潜力，需量化管线与精度门）；③CUDA graph 解封评估（平台能力调研）。三者均为多周级项目，超出单条账本节奏，需用户定夺优先级。
+- **2026-11-22（一百六十九）** —— **B 路线③调研：graph 平台能力定论 + 预编译直发解锁（probe 实测 +1.7% 潜力）**
+  - **graph 路线定论（封存维持）**：stable 1.0.0 DeviceContext **无** capture/instantiate/launch API（仅 `is_graph_capturing` 只读查询，HAL 后端恒 False）；DeviceGraphBuilder（编译器直接构建设备图，比录制快 40%，CUDA/HIP 已支持，生产级 Gemma 验证）位于 MAX 内核层（nightly），不随 pixi mojo 分发——接入需迁移 MAX 平台/nightly，短期不可用。
+  - **新解法：预编译 DeviceFunction 直发**（官方「编译一次、多次 launch」路径）：probe169（tests/gpu/probe_169.mojo，rmsnorm t=28，500 发×5 轮取最小、纯 host 墙钟）——A 编译并启动 2.22µs/发 vs B 预编译直发 1.86µs/发，**省 0.35µs/发 × ~390 发/tick ≈ 137µs/tick（+1.7%）**。零正确性风险（同核同参，纯 host 查表路径变化）。发间 gap 与发射节奏主导 tick 前段（166），发射缩短直接换 tick 缩短。
+  - **参数类型检查是硬约束**：DeviceFunction 的 declared_arg_types 编译期逐参匹配（probe 踩坑：`1e-5` 字面量为 Float64 报 constraint failed，须显式 `Float32(1e-5)`）——改造时所有 Int/Float 字面量必须显式标注。
+  - **170 候选**：热点核预编译改造（每层多发核：rs_bb/vt2_bb/kv_store/rmsnorm/q2/kv2/o/dual/down + 卫星 ~15 个 DeviceFunction 字段、~35 处发射点替换）——预期 +1.3-1.7%。
+  - **B 路线总盘**：①量化（GEMM 4.3ms 减半潜力）②speculative（tick -30-50%）仍待用户定夺；③graph 封存维持；预编译直发为唯一当前可自主执行项。
