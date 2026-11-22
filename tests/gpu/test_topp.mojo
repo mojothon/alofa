@@ -31,7 +31,7 @@ def main() raises:
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, True, True, 0.0, 7)
+    ](toks, False, True, True, False, 0.0, 7)
     a.ctx.synchronize()
     var greedy = Int(a.h_tokout[0])
     print("greedy:", greedy)
@@ -101,7 +101,7 @@ def main() raises:
             INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
             DType.float32, True, True, True, True, True, True, True,
             True, False, True
-        ](toks, False, False, False, 1.0, Int32(2000 + n), Float32(TOP_P))
+        ](toks, False, False, False, False, 1.0, Int32(2000 + n), Float32(TOP_P))
         a.ctx.synchronize()
         var tok = Int(a.h_tokout[0])
         # 成员断言（边界 ε=0.01 logit 容差）
@@ -131,21 +131,21 @@ def main() raises:
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 77, Float32(TOP_P))
+    ](toks, False, False, False, False, 1.0, 77, Float32(TOP_P))
     a.ctx.synchronize()
     var s77a = Int(a.h_tokout[0])
     _ = a.prefill_step[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 77, Float32(TOP_P))
+    ](toks, False, False, False, False, 1.0, 77, Float32(TOP_P))
     a.ctx.synchronize()
     var s77b = Int(a.h_tokout[0])
     _ = a.prefill_step[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 78, Float32(TOP_P))
+    ](toks, False, False, False, False, 1.0, 78, Float32(TOP_P))
     a.ctx.synchronize()
     var s78 = Int(a.h_tokout[0])
     print("seed77:", s77a, s77b, " seed78:", s78)
@@ -168,7 +168,7 @@ def main() raises:
             INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
             DType.float32, True, True, True, True, True, True, True,
             True, False, True
-        ](toks, False, False, False, 1.0, Int32(3000 + n), 1.0)
+        ](toks, False, False, False, False, 1.0, Int32(3000 + n), 1.0)
         a.ctx.synchronize()
         var tok1 = Int(a.h_tokout[0])
         for k in range(6):

@@ -64,7 +64,7 @@ def main() raises:
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 0.0, 7)
+    ](toks, False, False, False, False, 0.0, 7)
     a.ctx.synchronize()
     var t0ok = Int(a.h_tokout[0]) == greedy
 
@@ -73,21 +73,21 @@ def main() raises:
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 42)
+    ](toks, False, False, False, False, 1.0, 42)
     a.ctx.synchronize()
     var s42a = Int(a.h_tokout[0])
     _ = a.prefill_step[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 42)
+    ](toks, False, False, False, False, 1.0, 42)
     a.ctx.synchronize()
     var s42b = Int(a.h_tokout[0])
     _ = a.prefill_step[
         INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
         DType.float32, True, True, True, True, True, True, True,
         True, False, True
-    ](toks, False, False, False, 1.0, 43)
+    ](toks, False, False, False, False, 1.0, 43)
     a.ctx.synchronize()
     var s43 = Int(a.h_tokout[0])
     print("seed42:", s42a, s42b, " seed43:", s43)
@@ -101,7 +101,7 @@ def main() raises:
             INNER, INNER_FF, 64, 4, 128, 128, 128, 512, 1, 8,
             DType.float32, True, True, True, True, True, True, True,
             True, False, True
-        ](toks, False, False, False, 1.0, Int32(1000 + n))
+        ](toks, False, False, False, False, 1.0, Int32(1000 + n))
         a.ctx.synchronize()
         var tok = Int(a.h_tokout[0])
         for k in range(4):
