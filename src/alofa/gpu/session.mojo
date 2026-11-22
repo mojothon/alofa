@@ -1010,6 +1010,8 @@ struct GpuSession:
         # 有效、pos += ln、next = 最后行预测。False = 贪心 draft
         # 验证语义（默认）。
         trust_all: Bool = False,
+        # 一百七十四-c：逐层校验和透传（定位 spec 路径重跑漂移用）。
+        dbg_layers: Bool = False,
     ) raises -> List[Int]:
         """speculative 解码 tick（一百七十四-c）：每序列携带
         [x0, d0..d_{k-1}]（x0 为上 tick 已接受的 token）——组装
@@ -1052,7 +1054,7 @@ struct GpuSession:
             prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
             prefill_spl, prefill_kv, True
         ](tokens_flat, False, True, False, False, 0.0, 0, 1.0, 0, 0,
-          0, False, True)
+          0, False, True, dbg_layers)
         self.ctx.synchronize()
         # host 验证：行 acc 的预测 y_acc 应等于 draft d_acc（即
         # tokens_flat[a0+acc+1]）；首个不匹配处的预测即新 token。
@@ -2816,14 +2818,20 @@ struct GpuSession:
             if dbg_layers:
                 var dbgf = self.ctx.enqueue_create_host_buffer[
                     DType.float32
-                ](self.hidden)
+                ](t * self.hidden)
                 self.ctx.enqueue_copy(dst_buf=dbgf, src_buf=self.d_xb)
                 self.ctx.synchronize()
                 var xsum = Float64(0)
-                for c in range(self.hidden):
+                for c in range(t * self.hidden):
                     xsum += Float64(dbgf[c])
+                var r0sum = Float64(0)
+                for c in range(self.hidden):
+                    r0sum += Float64(dbgf[c])
+                var r1sum = Float64(0)
+                for c in range(self.hidden, 2 * self.hidden):
+                    r1sum += Float64(dbgf[c])
                 print("DBGX af=", prefill_af, "layer", layer,
-                    "xsum =", xsum)
+                    "xsum =", xsum, " r0 =", r0sum, " r1 =", r1sum)
             if layer_gap_us > 0 and (layer + 1) % layer_gap_every == 0:
                 self.ctx.synchronize()
                 _ = external_call["usleep", Int32](Int32(layer_gap_us))
@@ -2874,6 +2882,34 @@ struct GpuSession:
                 grid_dim=(ceildiv(self.vocab, 128), ceildiv(t, 16), 1),
                 block_dim=(256, 1, 1),
             )
+            if dbg_layers:
+                # tail 检查点：xnormb16（f16）与 logits 逐行和——
+                # 定位验证 tick 漂移（d_xb 逐位一致而 logits 漂移）。
+                var dbxn = self.ctx.enqueue_create_host_buffer[
+                    DType.float16
+                ](t * self.hidden)
+                self.ctx.enqueue_copy(
+                    dst_buf=dbxn, src_buf=self.d_xnormb16
+                )
+                self.ctx.synchronize()
+                var xn0 = Float64(0)
+                var xn1 = Float64(0)
+                for c in range(self.hidden):
+                    xn0 += Float64(dbxn[c])
+                    xn1 += Float64(dbxn[self.hidden + c])
+                var dblg = self.ctx.enqueue_create_host_buffer[
+                    DType.float32
+                ](t * self.vocab)
+                self.ctx.enqueue_copy(
+                    dst_buf=dblg, src_buf=self.d_logits_b
+                )
+                self.ctx.synchronize()
+                print("DBGT xn0 =", xn0, " xn1 =", xn1)
+                for r in range(t):
+                    var lg = Float64(0)
+                    for c in range(r * self.vocab, (r + 1) * self.vocab):
+                        lg += Float64(dblg[c])
+                    print("DBGT logits r", r, " sum =", lg)
             if profile and not prof_nosync:
                 self.ctx.synchronize()
             ts1 = monotonic_ns()
