@@ -4016,3 +4016,9 @@
   - **参数类型检查是硬约束**：DeviceFunction 的 declared_arg_types 编译期逐参匹配（probe 踩坑：`1e-5` 字面量为 Float64 报 constraint failed，须显式 `Float32(1e-5)`）——改造时所有 Int/Float 字面量必须显式标注。
   - **170 候选**：热点核预编译改造（每层多发核：rs_bb/vt2_bb/kv_store/rmsnorm/q2/kv2/o/dual/down + 卫星 ~15 个 DeviceFunction 字段、~35 处发射点替换）——预期 +1.3-1.7%。
   - **B 路线总盘**：①量化（GEMM 4.3ms 减半潜力）②speculative（tick -30-50%）仍待用户定夺；③graph 封存维持；预编译直发为唯一当前可自主执行项。
+- **2026-11-22（一百七十）** —— **预编译直发生产验证：负结果回退 + 166 归因二次修正**
+  - **改造**：13 个热点核（norm1/q_spl/mergb/kv2/mergb2/kv_store/rs_bb/vt2_bb/o_spl/adds_rmsnorm/dual_pk/down_spl/adds8——364 发/tick）compile_function 一次 + enqueue_function(df) 直发（C 路径，免手写 DeviceFunction 字段类型——局部 var 推断 + 每 tick compile 13 次 × 0.35µs 缓存命中）。踩坑一处：dual_pk old_str 漏首行致残留旧发射头（语法错误，门抓到修复）。
+  - **门 PASS、生产持平**：长生成 3714、短压 1226.4、solo 76.4——probe169 预测的 +1.8% **未兑现**，按 164 纪律回退。
+  - **归因二次修正（166 修正版）**：probe169 的 0.35µs/发查表差在生产不构成临界路径——①fwd 段仅 0.75ms（发射 0.7ms 其中查表 ~0.14ms），且 fwd 与 GPU 执行部分重叠；②tick 8.2ms 中 GPU 空闲 ~2.4ms 是 **GPU 端核间切换延迟**（kernel-to-kernel launch latency，序列化依赖下每发 5-8µs），host 发射再快也不触碰。166 的「发射节奏主导 fwd 段」表述收回——正确表述：**fwd 段由发射耗时决定（0.7ms），但 tick 的空闲大头在 GPU 端核间切换，两者都不可被 host 发射优化压缩**。
+  - **host 发射路径路线正式关闭**：预编译/查表/参数打包等 host 侧优化全部到顶（总空间 ~0.14ms 且不临界）。剩余 gap 解法唯一：graph 类批发射（GPU 端一次性提交整段依赖链）——stable 无 API，封存维持（169）。
+  - **B 路线终局**：①权重量化（GEMM 4.3ms 减半潜力，多周）②speculative（tick -30-50%，多周）——两者均需用户定夺优先级后方可开工；③graph 平台解锁后重评。

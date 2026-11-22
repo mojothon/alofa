@@ -76,6 +76,32 @@ def main() raises:
         if us_b < best_b:
             best_b = us_b
 
+    # C：每 tick compile 一次（缓存命中成本）+ 直发
+    var best_c = Float64(1e30)
+    var best_cc = Float64(1e30)
+    for _r in range(ROUNDS):
+        var t0 = monotonic_ns()
+        var df2 = ctx.compile_function[rmsnorm_gpu]()
+        var t1 = monotonic_ns()
+        ctx.synchronize()
+        var us_cc = Float64(t1 - t0) / 1e3
+        if us_cc < best_cc:
+            best_cc = us_cc
+        t0 = monotonic_ns()
+        for _k in range(N):
+            ctx.enqueue_function(df2,
+                dx.unsafe_ptr(), dw.unsafe_ptr(), dnorm.unsafe_ptr(),
+                dnorm16.unsafe_ptr(), Int32(INNER), Int32(T), Float32(1e-5),
+                grid_dim=(T, 1, 1), block_dim=(256, 1, 1),
+            )
+        t1 = monotonic_ns()
+        ctx.synchronize()
+        var us_c = Float64(t1 - t0) / 1e3 / N
+        if us_c < best_c:
+            best_c = us_c
+    print("C compile-then-launch =", best_c, "us/launch (host)")
+    print("  (compile_function one-shot =", best_cc, "us incl sync)")
+
     print("A compile-per-launch =", best_a, "us/launch (host)")
     print("B precompiled        =", best_b, "us/launch (host)")
     print("delta =", best_a - best_b, "us/launch -> x390/tick =",
