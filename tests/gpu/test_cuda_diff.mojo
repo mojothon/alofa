@@ -44,8 +44,8 @@ CPU 算的数是同一个」这句话成立。写成块内规约会引入**共�
 了再谈性能内核 —— 那时换的是实现，不是这个门的判据。
 """
 
-from std.gpu import global_idx
-from std.math import ceildiv, sqrt
+from std.gpu import block_idx, global_idx, thread_idx
+from std.math import abs, ceildiv, sqrt
 
 from max.gpu.host import DeviceContext, HostBuffer
 from alofa.core.dtype import DT_FP32
@@ -132,6 +132,19 @@ comptime REL_TOLERANCE = Float64(1e-5)
 comptime F16_REL = Float64(0.05)
 
 
+def f16_up_gpu(
+    src: Pointer[Float16, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    n: Int32,
+) -> None:
+    """f16→f32 逐元素上转（测试专用）：rmsnorm 直出的 f16 输出回到
+    f32 域对账。设备侧转换让 rmsnorm_diff_check 复用既有 dd/hd 缓冲
+    ——这道门的 AsyncRT 对并发缓冲数敏感（文件头前科），不额外建。"""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if i < Int(n):
+        dst[i] = Float32(src[i])
+
+
 def scratch(mut arena: Arena, rows: Int, cols: Int) raises -> TensorView:
     var dims = List[Int]()
     dims.append(rows)
@@ -177,6 +190,9 @@ def rmsnorm_diff_check(mut ctx: DeviceContext) raises:
     var dx = ctx.enqueue_create_buffer[DT](ROWS * COLS)
     var dw = ctx.enqueue_create_buffer[DT](COLS)
     var dd = ctx.enqueue_create_buffer[DT](ROWS * COLS)
+    # 一百五十五：rmsnorm 直出 f16——核签名多一个 dst16，顺带对 f16
+    # 输出做差分（fp16 ulp 远大于 REL_TOLERANCE，另立 1e-2 相对容差）。
+    var dd16 = ctx.enqueue_create_buffer[DType.float16](ROWS * COLS)
     ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
     ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
 
@@ -184,6 +200,7 @@ def rmsnorm_diff_check(mut ctx: DeviceContext) raises:
         dx.unsafe_ptr(),
         dw.unsafe_ptr(),
         dd.unsafe_ptr(),
+        dd16.unsafe_ptr(),
         Int32(COLS),
         Int32(ROWS),
         EPS,
@@ -219,6 +236,84 @@ def rmsnorm_diff_check(mut ctx: DeviceContext) raises:
     if scale <= 0.0:
         raise Error("rmsnorm: the reference tensor is all zeros")
     print("*** RMSNORM GPU/SCALAR DIFF PASS *** diff=", diff, " tol=", tol)
+
+
+def rmsnorm_f16_diff_check(mut ctx: DeviceContext) raises:
+    """rmsnorm 直出 f16 的对账（一百五十五签名）：f16 输出经设备侧
+    上转回 f32 后与标量参照比。⚠️ 此前把这段追加在 rmsnorm_diff_check
+    尾部，实测稳定崩（AsyncRT syscall 栈，同文件头"上下文过多"病根
+    ——在已完成的 check 上追加发射触发）；独立成 check（自带 arena 与
+    缓冲）后消除。"""
+    var arena = Arena(1 << 20)
+    var x = scratch(arena, ROWS, COLS)
+    var w = scratch(arena, 1, COLS)
+    var dst_cpu = scratch(arena, ROWS, COLS)
+    fill(x, 1)
+    fill(w, 2)
+    rmsnorm(dst_cpu, x, w, EPS)
+
+    var hx = ctx.enqueue_create_host_buffer[DT](ROWS * COLS)
+    var hw = ctx.enqueue_create_host_buffer[DT](COLS)
+    var hd = ctx.enqueue_create_host_buffer[DT](ROWS * COLS)
+    ctx.synchronize()
+    var px = f32_data(x)
+    var pw = f32_data(w)
+    for i in range(ROWS * COLS):
+        hx[i] = px[unsafe_offset=i]
+    for i in range(COLS):
+        hw[i] = pw[unsafe_offset=i]
+
+    var dx = ctx.enqueue_create_buffer[DT](ROWS * COLS)
+    var dw = ctx.enqueue_create_buffer[DT](COLS)
+    var dd = ctx.enqueue_create_buffer[DT](ROWS * COLS)
+    var dd16 = ctx.enqueue_create_buffer[DType.float16](ROWS * COLS)
+    ctx.enqueue_copy(dst_buf=dx, src_buf=hx)
+    ctx.enqueue_copy(dst_buf=dw, src_buf=hw)
+
+    ctx.enqueue_function[rmsnorm_gpu](
+        dx.unsafe_ptr(),
+        dw.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        dd16.unsafe_ptr(),
+        Int32(COLS),
+        Int32(ROWS),
+        EPS,
+        grid_dim=(ROWS, 1, 1),
+        block_dim=(256,),
+    )
+    ctx.enqueue_function[f16_up_gpu](
+        dd16.unsafe_ptr(),
+        dd.unsafe_ptr(),
+        Int32(ROWS * COLS),
+        grid_dim=((ROWS * COLS + 255) // 256, 1, 1),
+        block_dim=(256,),
+    )
+    ctx.enqueue_copy(dst_buf=hd, src_buf=dd)
+    ctx.synchronize()
+
+    var n = ROWS * COLS
+    var d16 = Float64(0)
+    for i in range(n):
+        var r = Float64(f32_data(dst_cpu)[unsafe_offset=i])
+        var g = Float64(hd[i])
+        var d = abs(r - g)
+        if d > d16:
+            d16 = d
+    var scale = max_abs(f32_data(dst_cpu), n)
+    if scale < 1.0:
+        scale = 1.0
+    var t16 = Float64(0.01) * scale
+    arena.keep_alive()
+    if d16 > t16:
+        raise Error(
+            "rmsnorm f16: gpu vs scalar max_abs_diff="
+            + String(d16)
+            + " tolerance="
+            + String(t16)
+            + " ref_max="
+            + String(scale)
+        )
+    print("*** RMSNORM F16 DIFF PASS *** diff=", d16, " tol=", t16)
 
 
 def dequant_q4_diff_check(mut ctx: DeviceContext) raises:
@@ -2060,6 +2155,7 @@ def main() raises:
     var ctx = DeviceContext()
     rope2_diff_check(ctx)
     rmsnorm_diff_check(ctx)
+    rmsnorm_f16_diff_check(ctx)
     dequant_q4_diff_check(ctx)
     dequant_q8_diff_check(ctx)
     linear_diff_check(ctx)

@@ -1,6 +1,10 @@
 """启动序列最小门（账本一百三十九）：serve_gpu 在 GpuService 构造段
 稳定崩 CUDA_ERROR_INVALID_VALUE，而 test_gpu_service 门（同构造）全
-绿——逐步复制 serve_gpu 的启动序列并打印，二分定位崩溃步。"""
+绿——逐步复制 serve_gpu 的启动序列并打印，二分定位崩溃步。
+
+端口取 ServeConfig.from_env()（默认 8000）。共享主机上 8000 常被
+别的服务占着：`ALOFA_PORT=<空闲端口> a100.sh run <gpu> 本文件`
+（a100.sh 已透传 ALOFA_* 运行时变量）。"""
 
 from flare.net import IpAddr, SocketAddr
 

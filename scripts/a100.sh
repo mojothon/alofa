@@ -78,12 +78,20 @@ cmd_run() {
   shift
   local file="${1:?用法: a100.sh run <GPU_ID> <FILE.mojo> [args...]}"
   shift || true
+  # 透传调用方的 ALOFA_* 运行时变量（ALOFA_PORT/ALOFA_SEED/...）；
+  # ALOFA_A100_* 是本脚本的远端控制变量，不透传。
+  local pass_env=""
+  local vname
+  for vname in $(env | grep -oE '^ALOFA_[A-Z0-9_]+' | grep -v '^ALOFA_A100_' || true); do
+    pass_env="$pass_env export $vname=${!vname};"
+  done
   echo "==> GPU $gpu 上运行 $file"
   # shellcheck disable=SC2029
   ssh -p "$REMOTE_PORT" -o BatchMode=yes "$REMOTE_HOST" \
     "$(remote_env)
      cd $REMOTE_ROOT || exit 1
      export CUDA_VISIBLE_DEVICES=$gpu
+     $pass_env
      mojo run -I src $file $*"
 }
 
