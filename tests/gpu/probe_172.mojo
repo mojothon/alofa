@@ -74,8 +74,8 @@ def main() raises:
         db.unsafe_ptr(), dwpq.unsafe_ptr(),
         grid_dim=(NCB, INNER // 16, 1), block_dim=(128, 1, 1),
     )
-    ctx.enqueue_function[q4_pack_scales_gpu[NBLK]](
-        db.unsafe_ptr(), dwps.unsafe_ptr(),
+    ctx.enqueue_function[q4_pack_scales_gpu](
+        db.unsafe_ptr(), dwps.unsafe_ptr(), Int32(NBLK),
         grid_dim=(ceildiv(NBLK, 256), 1, 1), block_dim=(256, 1, 1),
     )
     ctx.synchronize()

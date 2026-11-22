@@ -4011,14 +4011,16 @@ def f32_mergb2_v4_gpu[S: Int](
         dst_a.store[4](i4, aa + bias.load[4](c))
         dst_b.store[4](i4, ab + bias.load[4](cb))
 
-def q4_pack_scales_gpu[NBLK: Int](
+def q4_pack_scales_gpu(
     blocks: Pointer[UInt8, MutUntrackedOrigin],
     wps: Pointer[UInt8, MutUntrackedOrigin],
+    nblk: Int32,
 ) -> None:
     """q4_0 块头 scale 抽取（账本一百七十二）：一块一线程，把块头
-    2B fp16 位模式原样拷进 wps（2B/块）。装载期一次性。"""
+    2B fp16 位模式原样拷进 wps（2B/块）。装载期一次性。nblk 运行时
+    （块数随权重形状变化，不进 comptime）。"""
     var b = Int(global_idx.x)
-    if b < NBLK:
+    if b < Int(nblk):
         wps[unsafe_offset = b * 2] = blocks[unsafe_offset = b * 18]
         wps[unsafe_offset = b * 2 + 1] = blocks[unsafe_offset = b * 18 + 1]
 
