@@ -4029,3 +4029,10 @@
   - **方案**：①离线量化脚本（per-channel 对称：per output-channel w_max/127 → scale f16 随权重上传）；②五 GEMM 核 int8 变体（q_spl/kv2_spl/o_spl/dual_pk/down_spl——w 载入改 int8+反量化，MMA 流不变）；③**容差门**（diff 阈值 ~1e-2 + argmax 一致率 + EOS 一致性——**破坏逐位同纪律，属架构决策**）；④生产 A/B + soak。
   - **风险**：per-channel int8 近无损（业界标准）但数值漂移必然产生；五核改造 + pack/上传链路工程量中等（数天）；KV cache / activation 量化不在本轮（KV int8 是后续候选）。
   - **172 实施顺序**：量化脚本 → 单核 int8 正确性 probe → 五核接线 → 容差门 → 生产 A/B。**精度纪律变更（逐位同→容差同）需用户确认后动生产。**
+- **2026-11-22（一百七十二）** —— **q4 直读 GEMM 单核突破：down_spl_q4 逐位同 PASS（重大路线修正）**
+  - **路线重大修正**：权重大小早已是 **q4（4-bit）** 存储（加载链 q4 块流 → GPU q4_dequant_f16 反量化 → pack_w_mma fragment 布局 → GEMM 读 f16）——**生产数值本来就是 q4 精度**！正确路线不是 int8 再量化，而是 **GEMM 核内 q4 直读**：权重流量 2B → 0.5B（**4× 减**，比 int8 方案翻倍），且反量化数学与 q4_dequant 完全一致——**数值逐位同，无需容差门，不破坏项目纪律**。
+  - **三新核**：①`q4_pack_scales_gpu[NBLK]`（块头 scale 2B/块抽取）；②`pack_w_mma_q4_gpu[INNER,OUTS,WARP]`（槽位公式同 pack_w_mma，每槽 4bit nib、两槽拼一字节、每线程每字节单写者无半字节竞态）；③`f16_mma_down_spl_q4_gpu[INNER,CH,OUTS,WARP,S]`（down_spl 逐行同构——同 ks 循环/x 重载/barrier/mma 序——bv 从 nibble 布局读 2B + scale，核内 `(nib-8)*d` f32 精确乘 → f16 舍入，与 q4_dequant 逐位同）。bv 载入流量 8B → 4B（3× 减）。
+  - **验证**：probe172（tests/gpu/probe_172.mojo，INNER=4864/CH=608/S=8/t=28，A 链 dequant→pack→down_spl vs B 链 pack_q4→down_spl_q4，f32_adds[8] 归并后逐位比对）——**25088 元素 mismatch=0 BIT-EXACT PASS**。
+  - **踩坑三则**：①pack 块基址遗漏（每 (cb,ks) 段覆写同一区间——原 pack 的 `(cb*(INNER//16)+ks)*(COLS*16)` 基址必须同构带上）；②HostBuffer 下标不支持 unsafe_offset 读（普通 `h[i]`）；③`fn` 已从 Mojo 1.0 移除（用 `def`）、helper 内运行时参数不可作 comptime。
+  - **收益预期**：down 21.8µs → ~9µs；五 GEMM 全换后 GEMM 2.70 → ~1.1-1.3ms（**-1.5ms/tick，tick +22-30%**）。
+  - **173 计划**：down_spl_q4 接线生产（q4 权重直读缓冲 wpq/wps 装载 + down 段 comptime 开关）→ 生产 A/B；随后推广 q2_spl/kv2_spl/o_spl/dual_pk（同一 pack 公式与反量化模式，纯模板复制）。

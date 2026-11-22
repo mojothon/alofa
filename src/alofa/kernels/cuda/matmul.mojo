@@ -4010,3 +4010,185 @@ def f32_mergb2_v4_gpu[S: Int](
         var cb = Int(out_cols) + c
         dst_a.store[4](i4, aa + bias.load[4](c))
         dst_b.store[4](i4, ab + bias.load[4](cb))
+
+def q4_pack_scales_gpu[NBLK: Int](
+    blocks: Pointer[UInt8, MutUntrackedOrigin],
+    wps: Pointer[UInt8, MutUntrackedOrigin],
+) -> None:
+    """q4_0 块头 scale 抽取（账本一百七十二）：一块一线程，把块头
+    2B fp16 位模式原样拷进 wps（2B/块）。装载期一次性。"""
+    var b = Int(global_idx.x)
+    if b < NBLK:
+        wps[unsafe_offset = b * 2] = blocks[unsafe_offset = b * 18]
+        wps[unsafe_offset = b * 2 + 1] = blocks[unsafe_offset = b * 18 + 1]
+
+
+def pack_w_mma_q4_gpu[INNER: Int, OUTS: Int, WARP: Int](
+    blocks: Pointer[UInt8, MutUntrackedOrigin],
+    wpq: Pointer[UInt8, MutUntrackedOrigin],
+) -> None:
+    """q4_0 块流 -> nibble fragment 布局（账本一百七十二）。与
+    pack_w_mma_gpu 同一槽位公式，但每槽存 4bit nib（0-15 原值，
+    反量化在 GEMM 侧做），两槽拼一字节——每线程每迭代处理一个字节
+    （槽对 2j/2j+1），单写者无半字节竞态。scale 由
+    q4_pack_scales_gpu 单独抽取。装载期一次性。
+    要求 INNER % 32 == 0、out_cols % COLS == 0（同 pack_w_mma）。"""
+    comptime COLS = WARP * OUTS * 8
+    var cb_idx = Int(block_idx.x)
+    var ks = Int(block_idx.y)
+    var j = Int(thread_idx.x)
+    var nbytes = COLS * 16 // 2
+    # 块基址（每 (cb_idx, ks) 段连续——与 pack_w_mma 的槽序同构）
+    var base = (cb_idx * (INNER // 16) + ks) * nbytes
+    while j < nbytes:
+        var n0 = _q4_slot_nib(
+            blocks, 2 * j, cb_idx, ks, INNER, OUTS, WARP
+        )
+        var n1 = _q4_slot_nib(
+            blocks, 2 * j + 1, cb_idx, ks, INNER, OUTS, WARP
+        )
+        wpq[unsafe_offset = base + j] = UInt8(n0 | (n1 << 4))
+        j += 128
+
+
+@always_inline
+def _q4_slot_nib(
+    blocks: Pointer[UInt8, MutUntrackedOrigin],
+    i: Int,
+    cb_idx: Int,
+    ks: Int,
+    INNER: Int,
+    OUTS: Int,
+    WARP: Int,
+) -> Int:
+    """pack_w_mma_gpu 槽位公式的 q4 nib 版（一百七十二）：槽 i ->
+    (col, koff) -> 全局权重 idx -> 块内 nib（0-15）。"""
+    var COLS = WARP * OUTS * 8
+    var wj = i // 128
+    var lane = (i // 4) % 32
+    var hi = i % 4
+    var wq = wj // OUTS
+    var jj = wj % OUTS
+    var col = cb_idx * COLS + wq * 8 + jj * (WARP * 8) + (lane >> 2)
+    var koff = (lane % 4) * 2 + (hi // 2) * 8 + hi % 2
+    var gi = col * INNER + ks * 16 + koff
+    var b = gi // 32
+    var idx = gi % 32
+    var byte = blocks[unsafe_offset = b * 18 + 2 + idx % 16]
+    if idx < 16:
+        return Int(byte) & 0x0F
+    return (Int(byte) >> 4) & 0x0F
+
+
+def f16_mma_down_spl_q4_gpu[
+    INNER: Int, CH: Int, OUTS: Int, WARP: Int, S: Int,
+](
+    xh: Pointer[Float16, MutUntrackedOrigin],
+    wpq: Pointer[UInt8, MutUntrackedOrigin],
+    wps: Pointer[UInt8, MutUntrackedOrigin],
+    part: Pointer[Float32, MutUntrackedOrigin],
+    out_cols: Int32,
+    n_rows: Int32,
+) -> None:
+    """down_spl 的 **q4 直读** 版（账本一百七十二）：与
+    f16_mma_down_spl_gpu 逐行同构（同一 ks 循环/x 重载条件/barrier
+    位置/mma 序），唯一差别是 bv 从 nibble fragment 布局读 2B + 块
+    scale，核内反量化 `(nib-8)*d`（f32 精确乘后舍入 f16——与装载期
+    q4_dequant_f16_gpu 逐位同）——**数值逐位同于 f16 链**。bv 载入
+    流量 8B -> 2B+2B(scale)（3x 减）。要求 INNER % 32 == 0、
+    (INNER // S) % CH == 0（同 down_spl）；wpq/wps 由
+    pack_w_mma_q4_gpu / q4_pack_scales_gpu 装载期产出。"""
+
+    var split = Int(block_idx.z)
+    var cb = Int(block_idx.x) * WARP * OUTS * 8
+    var r0 = Int(block_idx.y) * 16
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var gid = lane >> 2
+    var tig = lane % 4
+
+    var sxf = stack_allocation[
+        16 * CH, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var accA = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+    var accB = InlineArray[SIMD[DType.float32, 4], OUTS](
+        fill=SIMD[DType.float32, 4](0, 0, 0, 0)
+    )
+
+    comptime KTOT = INNER // 16
+    comptime KPS = KTOT // S
+    comptime STEPS = CH // 16
+    comptime COLS = WARP * OUTS * 8
+    var ks0 = split * KPS
+
+    @parameter
+    for ks in range(KPS):
+        comptime if ks % STEPS == 0:
+            var i = tid
+            while i < 16 * CH:
+                sxf[unsafe_offset=i] = xh[
+                    unsafe_offset=(r0 + i // CH) * INNER
+                    + (ks0 + ks) * 16 + i % CH
+                ]
+                i += WARP * 32
+            barrier()
+        var av = SIMD[DType.float16, 8](
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 1],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 1],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 8],
+            sxf[unsafe_offset=gid * CH + (ks % STEPS) * 16 + tig * 2 + 9],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 8],
+            sxf[unsafe_offset=(gid + 8) * CH + (ks % STEPS) * 16 + tig * 2 + 9],
+        )
+        @parameter
+        for j in range(OUTS):
+            var col = cb + warp * 8 + j * (WARP * 8)
+            var pkq = (
+                (cb // COLS) * (INNER // 16) + (ks0 + ks)
+            ) * (COLS * 16) + ((warp * OUTS + j) * 32 + lane) * 4
+            var q0 = wpq[unsafe_offset=pkq // 2]
+            var q1 = wpq[unsafe_offset=pkq // 2 + 1]
+            var sb = (col + gid) * (INNER // 32) + (ks0 + ks) // 2
+            var dl = Int(wps[unsafe_offset=sb * 2])
+            var dh = Int(wps[unsafe_offset=sb * 2 + 1])
+            var d = _fp16_bits_to_f32_device(dl | (dh << 8))
+            var bv = SIMD[DType.float16, 4](
+                Float16(Float32(Int(q0 & 0x0F) - 8) * d),
+                Float16(Float32(Int(q0 >> 4) - 8) * d),
+                Float16(Float32(Int(q1 & 0x0F) - 8) * d),
+                Float16(Float32(Int(q1 >> 4) - 8) * d),
+            )
+            var dv = SIMD[DType.float32, 4](0, 0, 0, 0)
+            comptime if ks % 2 == 0:
+                mma(dv, av, bv, accA[j])
+                accA[j] = dv
+            else:
+                mma(dv, av, bv, accB[j])
+                accB[j] = dv
+        # 段末同步：下一次 tile 重载前，全部 warp 须读完 sxf
+        comptime if (ks + 1) % STEPS == 0:
+            barrier()
+
+    @parameter
+    for j in range(OUTS):
+        var col = cb + warp * 8 + j * (WARP * 8)
+        var acc = accA[j] + accB[j]
+        var base = (split * Int(n_rows) + r0) * Int(out_cols) + col
+        if r0 + gid < Int(n_rows):
+            part[unsafe_offset=base + gid * Int(out_cols) + tig * 2] = acc[0]
+            part[unsafe_offset=base + gid * Int(out_cols) + tig * 2 + 1] = acc[
+                1
+            ]
+        if r0 + gid + 8 < Int(n_rows):
+            part[
+                unsafe_offset=base + (gid + 8) * Int(out_cols) + tig * 2
+            ] = acc[2]
+            part[
+                unsafe_offset=base + (gid + 8) * Int(out_cols) + tig * 2 + 1
+            ] = acc[3]
