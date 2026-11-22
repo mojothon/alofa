@@ -4085,4 +4085,11 @@
   - **门**（新 `tests/gpu/test_spec_gen.mojo`）：重复 4-gram 提示词（×4），48 token 生成——①parity：spec 链 vs t=1 贪心参照逐位同（mismatch=0）；②跨会话确定性（rerun diff=0）；③遥测：10 验证 tick / 10 命中 / 40 草稿 40 接受（**hit_rate=1.0、accept_rate=1.0、tokens/tick=4.8**）；④墙钟 spec 60ms vs t=1 参照 289~313ms（**~5×**，重复模式=接受率上限场景；对话域 55-70% 接受率外推净收益 ~1.7-2.1×，与开题模型一致）。
   - **回归**：test_session_batch / test_generate_batch / test_session_prefill 全 PASS（各两轮）。
   - **174-d（下一刀）**：serving 接入（GpuService tick 的草稿注入 + 合批约束：spec 行要求全 argmax/同 trust_all 相位）+ 生产 A/B（solo 短压/长生成，真实对话域接受率遥测）。
+- **2026-11-23（一百七十四-d）** —— **spec 接入 serving：solo 草稿验证 tick + A/B（story +1.8% 零惩罚、pattern 3.1×），默认开**
+  - **接线**（`srv/gpu_service.mojo`）：`_tick` 加 solo spec 分支——触发条件：**池内恰一条活跃流 + 生成相位（pidx==plen）+ temp==0**（贪心验证面）；`_spec_tick`：prompt+out 查草稿（复用 spec_draft.spec_lookup，K=4/NGRAM=4）→ `spec_step`（f32 comptime 与 `_forward_rows` 同表，seqs=[slot]）→ acc+1 token 逐枚消化（`_emit_token`/`_finish_eos` 与 `_forward_rows` 帧语义逐位同——多帧入队，eos 不进链）。pos 以 spec_step 内部推进的 `h_posarr[slot]` 回读对齐；KV 窗口不足缩行不报错。多流/采样/prompt 相位完全照旧合批。
+  - **开关**：`ALOFA_GPU_SPEC`（默认 **开**——A/B 双域零惩罚/大赢后翻转；=0 一键回退）；遥测进 `/health` stats_json（spec_on/ticks/calls/hits/drafted/accepted）。
+  - **门**（新 `tests/gpu/test_service_spec.mojo`）：①spec vs base 链 parity 逐位同（32/32）；②并发双流回退 parity 逐位同（后完成者转 solo spec 混合链仍同——接受即贪心链的推论验证）；③pattern prompt 接受 28 草稿、**4.57 tokens/tick**（32 token 仅 7 前向）。门自踩两坑：链对比预算不等（16 vs 32，_same 恒 False——probe_194 归因：t=2 合批 vs t=1 数值面干净，分叉是门的 bug 非数值）+ 遥测差分未扣前相（并发阶段 solo spec tick 计入）。
+  - **A/B**（`bench_specd.mojo`，单 service 拨 spec_on、每相两轮取后轮）：story（叙事，接受率≈0）231.4 → **235.5 tps（+1.8%，零惩罚）**；pattern（计数序列，接受率 1.0）214.6 → **662.8 tps（3.1×）**。与 174 开题收益模型吻合：草稿未命中域退化为 t=1 + 验证开销≈0，命中域 tick 数大减。
+  - **回归**：test_gpu_service（默认开重跑——流式 vs generate_batch parity 全过）、test_session_batch、test_generate_batch、serve_boot（ALL STEPS OK）全 PASS。
+  - **174-d 余项**：HTTP 级生产三数（长生成/短压/solo）+ 多流 spec（批行验证的行化组装进 GpuService 合批 tick——trust_all 逐序列语义需核内扩展，架构级）；小模型草稿源接口已预留。
 

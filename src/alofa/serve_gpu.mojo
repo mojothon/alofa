@@ -69,6 +69,11 @@ def main() raises:
         "  model loaded: " + cfg.model_name + " (gpu q4 path, window "
         + String(WINDOW) + ", session pool " + String(n_sessions) + ")"
     )
+    print(
+        "  spec (prompt-lookup solo greedy): "
+        + ("on" if svc.spec_on else "off")
+        + " (ALOFA_GPU_SPEC)"
+    )
     if cfg.engine_threads != 0:
         print(
             "  [warn] ALOFA_ENGINE_THREADS ignored on the gpu path (v0"
