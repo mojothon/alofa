@@ -4022,3 +4022,10 @@
   - **归因二次修正（166 修正版）**：probe169 的 0.35µs/发查表差在生产不构成临界路径——①fwd 段仅 0.75ms（发射 0.7ms 其中查表 ~0.14ms），且 fwd 与 GPU 执行部分重叠；②tick 8.2ms 中 GPU 空闲 ~2.4ms 是 **GPU 端核间切换延迟**（kernel-to-kernel launch latency，序列化依赖下每发 5-8µs），host 发射再快也不触碰。166 的「发射节奏主导 fwd 段」表述收回——正确表述：**fwd 段由发射耗时决定（0.7ms），但 tick 的空闲大头在 GPU 端核间切换，两者都不可被 host 发射优化压缩**。
   - **host 发射路径路线正式关闭**：预编译/查表/参数打包等 host 侧优化全部到顶（总空间 ~0.14ms 且不临界）。剩余 gap 解法唯一：graph 类批发射（GPU 端一次性提交整段依赖链）——stable 无 API，封存维持（169）。
   - **B 路线终局**：①权重量化（GEMM 4.3ms 减半潜力，多周）②speculative（tick -30-50%，多周）——两者均需用户定夺优先级后方可开工；③graph 平台解锁后重评。
+- **2026-11-22（一百七十一）** —— **B 路线①权重量化开题：技术选型定论（int8 权重存储 + GEMM 内反量化，预期 tick +12-18%）**
+  - **技术选型排除**：①Mojo `max.gpu.compute.mma` 仅浮点（f16/bf16/f32/fp8），**int8 IMMA 无官方 API**（裸 inline_asm mma.sync s8 工程量过大，排除）；②fp8 tensor core 需 sm_89+（A100 sm_80 不支持，排除）。
+  - **可行路线：int8 权重存储 + GEMM 内反量化**——A100 decode GEMM 是 M=28 的 skinny GEMM，带宽瓶颈（核内权重载入有效带宽仅 136-438GB/s = 峰值 9-28%；q2 1.6MB/11.8µs、dual 17.4MB/39.8µs、down 8.7MB/21.8µs）。int8 per-channel 对称量化减半权重流量，核内 `cvt` 反量化到 f16 后走原 MMA 流（ALU 开销可忽略），**不需要 int8 MMA**。
+  - **收益测算**：GEMM 本体 2.70ms/tick（96.6µs×28）→ 预期 1.6-1.9ms（-0.8~1.1ms/tick，**tick +12-18%**）——常规路线关闭后最大单项。附带显存权重减半（835MB→459MB/tick 流量）。
+  - **方案**：①离线量化脚本（per-channel 对称：per output-channel w_max/127 → scale f16 随权重上传）；②五 GEMM 核 int8 变体（q_spl/kv2_spl/o_spl/dual_pk/down_spl——w 载入改 int8+反量化，MMA 流不变）；③**容差门**（diff 阈值 ~1e-2 + argmax 一致率 + EOS 一致性——**破坏逐位同纪律，属架构决策**）；④生产 A/B + soak。
+  - **风险**：per-channel int8 近无损（业界标准）但数值漂移必然产生；五核改造 + pack/上传链路工程量中等（数天）；KV cache / activation 量化不在本轮（KV int8 是后续候选）。
+  - **172 实施顺序**：量化脚本 → 单核 int8 正确性 probe → 五核接线 → 容差门 → 生产 A/B。**精度纪律变更（逐位同→容差同）需用户确认后动生产。**
