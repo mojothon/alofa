@@ -1184,7 +1184,7 @@ struct GpuSession:
             # 一百七十四-c：120-b 插 copy_logits 时此死路径调用未
             # 同步（门不实例化 generate_batch，probe 首次触发）——
             # 补 copy_logits=False（只回 tokout，逐行消化语义不变）。
-            ](toks, False, False, False, False, temperature, seed,
+            ](toks, False, True, False, False, temperature, seed,
               top_p)
             self.ctx.synchronize()
             # 3) 逐行消化 tokout
@@ -1811,6 +1811,9 @@ struct GpuSession:
         # 一百七十四-a：True 时上传 h_rowseq/h_rowj（spec 行映射）——
         # 本期无核消费，纯备料；174-b 起由 kv_store/attention 消费。
         row_mapped: Bool = False,
+        # 一百七十六-b：True 时每层末打印 d_xb 行 0 校验和（定位层级
+        # 数值发散用；每次拷 896 f32 + sync，仅诊断开启）。
+        dbg_layers: Bool = False,
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -2500,6 +2503,17 @@ struct GpuSession:
                     grid_dim=(self.n_heads, 1, t),
                     block_dim=(attn_t, 1, 1),
                 )
+            if dbg_layers:
+                var dbga = self.ctx.enqueue_create_host_buffer[
+                    DType.float32
+                ](self.hidden)
+                self.ctx.enqueue_copy(dst_buf=dbga, src_buf=self.d_attnb)
+                self.ctx.synchronize()
+                var asum = Float64(0)
+                for c in range(self.hidden):
+                    asum += Float64(dbga[c])
+                print("DBGX af=", prefill_af, "layer", layer,
+                    "attnb =", asum)
             # o：真 GEMM 分块 + ACC 残差（八十九）
             comptime if prefill_af == DType.float32 and prefill_mma_o and (
                 prefill_wpack and inner % 16 == 0
@@ -2607,14 +2621,31 @@ struct GpuSession:
                     self.ts_o_r += Float64(monotonic_ns() - to2) / 1e6
                 lo = Float64(monotonic_ns() - prof_t0) / 1e6
                 prof_t0 = monotonic_ns()
+            if dbg_layers:
+                var dbgo = self.ctx.enqueue_create_host_buffer[
+                    DType.float32
+                ](self.hidden)
+                self.ctx.enqueue_copy(dst_buf=dbgo, src_buf=self.d_xb)
+                self.ctx.synchronize()
+                var osum = Float64(0)
+                for c in range(self.hidden):
+                    osum += Float64(dbgo[c])
+                print("DBGX af=", prefill_af, "layer", layer,
+                    "post_o =", osum)
             # dual：norm 前置单发 + 真 GEMM 分块（八十九），act 尾同款
             # 一百五十五：直出 f16 镜像——一百零五修正的场景（norm2 覆写
             # d_xnormb 后 dual 的 f16 输入必须重转）由直出天然满足。
             # 一百六十七：o 链 spl 分支已把 norm2 融进残加核——此发射
             # 在该路径编译期消除。
+            # 一百七十六-c：消除条件补 af/mma_o/wpack 守卫——融合残加
+            # 核（f32_adds_rmsnorm_f16）仅在 af==f32 的 o MMA spl 分支
+            # 发射；此前无条件消除令 f64 路径 norm2 无人写出，dual 读
+            # 到 attention 前的陈旧 d_xnormb（f32-vs-f64 门 diff 19.9
+            # 的真凶）。
             comptime if not (
-                prefill_spl and inner % 16 == 0
-                and (inner // 4) % 224 == 0
+                prefill_af == DType.float32 and prefill_mma_o
+                and prefill_wpack and prefill_spl
+                and inner % 16 == 0 and (inner // 4) % 224 == 0
             ):
                 self.ctx.enqueue_function[rmsnorm_gpu](
                     self.d_xb.unsafe_ptr(),
@@ -2782,6 +2813,17 @@ struct GpuSession:
             # 每 layer_gap_every 层末 sync+usleep(layer_gap_us)；默认 0=关闭
             # （安静环境连续执行即最优 22.3ms）。热环境推荐 (4,300)/(2,30)：
             # 实测 40.6→23.3ms。安静环境开启反而略亏（23.3 vs 22.3）。
+            if dbg_layers:
+                var dbgf = self.ctx.enqueue_create_host_buffer[
+                    DType.float32
+                ](self.hidden)
+                self.ctx.enqueue_copy(dst_buf=dbgf, src_buf=self.d_xb)
+                self.ctx.synchronize()
+                var xsum = Float64(0)
+                for c in range(self.hidden):
+                    xsum += Float64(dbgf[c])
+                print("DBGX af=", prefill_af, "layer", layer,
+                    "xsum =", xsum)
             if layer_gap_us > 0 and (layer + 1) % layer_gap_every == 0:
                 self.ctx.synchronize()
                 _ = external_call["usleep", Int32](Int32(layer_gap_us))
@@ -2791,6 +2833,24 @@ struct GpuSession:
         var ts0 = monotonic_ns()
         var ts1 = ts0
         var ts2 = ts0
+        # 一百七十六：embedp 就地补 pack——prefill_af ≠ float32 时 wp-pack
+        # 块（comptime if prefill_af == float32 ...）整体剔除，d_embedp
+        # 停留 init 的 size-1 占位，LMHEAD_K 满 vocab 网格越界读 arena
+        # （与 K-store 别名）→ 假 logits/NaN。与 decode 路径（一百六十
+        # 三）同款守卫，批路 tail 此前缺失。
+        comptime if F16_BUILD:
+            if not self.embedp_ready:
+                self.d_embedp = self.ctx.enqueue_create_buffer[
+                    DType.float16
+                ](self.vocab * inner)
+                self.ctx.enqueue_function[pack_w_mma_gpu[inner, 2, 8]](
+                    self.d_embed16.unsafe_ptr(),
+                    self.d_embedp.unsafe_ptr(),
+                    grid_dim=(ceildiv(self.vocab, 128), inner // 16, 1),
+                    block_dim=(128, 1, 1),
+                )
+                self.ctx.synchronize()
+                self.embedp_ready = True
         if batch:
             # 一百二十：B 行终 norm + B 行 lm_head + 行 argmax
             ts0 = monotonic_ns()
