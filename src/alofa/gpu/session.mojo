@@ -26,6 +26,8 @@ host 往返。
 
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from alofa.core.ffi.posix import monotonic_ns
+
+from alofa.gpu.spec_draft import SpecGenResult, SpecTelemetry, spec_lookup
 from std.ffi import external_call
 
 from alofa.core.error import (
@@ -1080,6 +1082,110 @@ struct GpuSession:
             )
             a0 += ln
         return out^
+
+    def generate_spec[
+        inner: Int, inner_ff: Int
+    ](
+        mut self,
+        prompt: List[Int],
+        max_new: Int,
+        eos: Int,
+        spec_k: Int = 4,
+        spec_ngram: Int = 4,
+    ) raises -> SpecGenResult:
+        """speculative 生成闭环（一百七十四-c 第四刀）：单序列贪心
+        链，prompt-lookup 草稿源（`spec_draft.spec_lookup`）驱动
+        `spec_step` 验证 tick。
+
+        结构：建底 tick（trust_all，prompt 全量建 KV）→ 循环
+        「查草稿 → [x0, d0..dk] 验证 tick → 按 acc 接受草稿 + next
+        入链」。接受即贪心链（与 `generate_batch` temp=0 逐位同——
+        草稿 d_i 只有在模型 argmax 恰好产出 d_i 时才被接受，next
+        是首个不匹配位置的 argmax），草稿质量只影响 tick 数。
+
+        截断序：eos（eos 不进链，与 129 语义同）→ max_new → KV
+        窗口（草稿不足时缩行而非报错）。前置：独占槽 0（本方法清
+        h_posarr[0]）；spec_step 的 comptime 形参走其默认（f64，
+        与探针/门同一配置面）。
+        """
+        if len(prompt) == 0:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "spec prompt tokenizes to nothing", ""
+            )
+        if len(prompt) >= self.max_tokens:
+            raise AlofaError(
+                ERR_OUT_OF_RANGE,
+                "spec prompt exceeds the KV window",
+                "plen=" + String(len(prompt))
+                + " cap=" + String(self.max_tokens),
+            )
+        self.h_posarr[0] = Int32(0)
+        var gen = List[Int]()
+        var tel = SpecTelemetry()
+        var ticks = 0
+        # 建底 tick：prompt 全量进 KV，next = 末行预测（gen[0]）。
+        var ln = List[Int]()
+        ln.append(len(prompt))
+        var sq = List[Int]()
+        sq.append(0)
+        var base = self.spec_step[inner, inner_ff](prompt, ln, sq, True)
+        ticks += 1
+        tel.n_tokens += 1
+        if eos < 0 or base[1] != eos:
+            gen.append(base[1])
+        while (
+            len(gen) < max_new and (eos < 0 or gen[len(gen) - 1] != eos)
+        ):
+            # 草稿查询：ctx = prompt + 已生成链（末元素即 x0）。
+            var ctx = List[Int]()
+            for t in prompt:
+                ctx.append(t)
+            for t in gen:
+                ctx.append(t)
+            var drafts = List[Int]()
+            var hit = spec_lookup(ctx^, spec_k, spec_ngram, drafts)
+            # 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens，不足缩行。
+            var pos = Int(self.h_posarr[0])
+            while pos + 1 + len(drafts) > self.max_tokens and len(drafts) > 0:
+                _ = drafts.pop()
+            if pos + 1 > self.max_tokens:
+                break
+            # 验证 tick：x0 = 链尾（已领的最新一枚）。
+            var toks = List[Int]()
+            toks.append(ctx[len(ctx) - 1])
+            for d in drafts:
+                toks.append(d)
+            var lnv = List[Int]()
+            lnv.append(len(toks))
+            var sqv = List[Int]()
+            sqv.append(0)
+            var out = self.spec_step[inner, inner_ff](toks, lnv, sqv, False)
+            ticks += 1
+            var acc = out[0]
+            var nxt = out[1]
+            tel.n_calls += 1
+            if hit:
+                tel.n_hits += 1
+                tel.n_drafted += len(drafts)
+                tel.n_accepted += acc
+            # 接受链入链（eos 不进链；预算逐枚截到 max_new）。
+            var stop = False
+            for j in range(acc):
+                if eos >= 0 and drafts[j] == eos:
+                    stop = True
+                    break
+                if len(gen) >= max_new:
+                    stop = True
+                    break
+                gen.append(drafts[j])
+            if not stop and eos >= 0 and nxt == eos:
+                stop = True
+            if not stop and len(gen) < max_new:
+                gen.append(nxt)
+            if stop or len(gen) >= max_new:
+                break
+        tel.n_tokens = len(gen)
+        return SpecGenResult(gen^, tel^, ticks)
 
     def generate_batch[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,

@@ -4073,3 +4073,16 @@
   - **机制落地**：`spec_step` 方法（每序列 [x0, d0..d_{k-1}] 行化组装 → rowmap 上传 → _bb spec 核前向 → 贪心 argmax 前缀匹配 → pos_arr 按 acc+1 推进；trust_all 模式供 prompt 建底 tick）。probe176：单行/两行同序列/两行异序列/tick A（11 行建底）全正确——行化组装、行映射消费、验证回滚、pos 推进全链通。
   - **修四坑**：①generate_batch 死路径 120-b 未同步 copy_logits（门不实例化，probe 首次触发）；②rowmap 上传在 tail 段晚于层循环消费（核读垃圾非确定）——前移至前向段开头；③`d_logits_b/h_logits_b` 只 BMAX=64 行——spec tick t≤320 全行 lm_head/argmax 越界隐患——扩 SPEC_MAX_ROWS；④spec_step `return out^`。
   - **发现（174-c 第三刀主攻）**：MMA 核族（dual_pk/down_spl）在 **t%rb≠0 尾组部分填充**时非确定/f16 溢出（logits 全 inf、同输入重跑漂移）——no-mma 路径（关 dual/down/tile/spl）同输入**逐位正确**。t=11（rb=8 尾组 3 行）触发；生产 t=64/128 恰为整组从未暴露。修复方向：尾组行掩码/smem 未初始化归因 → 核内修复。
+- **2026-11-22（一百七十四-c 第三刀）** —— **「MMA 尾组竞态」平反：双重假象（embedp 别名 + h_logits_b 探针陷阱），spec 路径 CPU 对账全过**
+  - **平反证据链**（probe_182~193，六探针）：①`dbg_layers` 升级为全 t 行 `d_xb` 校验和 + tail 检查点（`d_xnormb16`/`d_logits_b` 行和）——同输入双会话**逐层逐位一致**；②设备侧 `enqueue_copy` 直读 `d_logits_b`：建底+验证 tick 双会话 **worst=0.0 逐位确定**（三轮稳定）；③全 4 验证行 vs CPU 累积真值 worst≈**0.007**（f16 tail 量级，与 PASS 门同级）。
+  - **假象一（主）**：`spec_step` 固定 `copy_logits=False`（贪心 spec 只回 tokout 4B/行）——`h_logits_b` 在纯 spec 流程**从不写入**，probe_176/183/185/186/187 读到的全是未初始化 host 页：-3.39e38 哨兵、~0.14 的 a/b 互换「漂移」、行和近零，全部垃圾。**判据教训：spec tick 后读 logits 一律 `enqueue_copy` 自 `d_logits_b`，永不读 `h_logits_b`。**
+  - **假象二**：`prefill_step` 的 `batch` 是 comptime 参数且默认 False（t=1 专用非批 tail）——多行 tick 不显式传 batch=True 属误用；其 logits 写 `d_logits/h_logits`，同样骗过 `h_logits_b` 探针。
+  - **修一坑**：`generate_spec` 首跑暴露预算 bug——接受草稿入链未逐枚查 `max_new`（46+acc=4 → 50>48，门参照越界断言炸）。
+  - **收尾**：probe_182/183/188/189/192/193 留档，184~187/190/191 删；「MMA 尾组 bug」在第二刀账目中应读作「embedp 别名（已修）+ h_logits_b 探针假象」。
+- **2026-11-22（一百七十四-c 第四刀）** —— **n-gram 草稿源 + generate_spec 生成闭环 + 遥测：门 PASS（parity 逐位同）**
+  - **草稿源**（新 `src/alofa/gpu/spec_draft.mojo`）：prompt-lookup——扫「最近 n-gram 命中」的连续后缀链（k=4、ngram=4 默认）；纯 host、确定性、零权重，接口预留换小模型源。`SpecTelemetry`（calls/hits/drafted/accepted/tokens + hit_rate/accept_rate/tokens_per_tick）与 `SpecGenResult` 一并落此模块。
+  - **`GpuSession.generate_spec`**：单序列贪心闭环——建底 tick（trust_all）→ 循环「查草稿 → [x0,d0..dk] 验证 tick → 按 acc 入链 + next」；截断序 eos（不进链）→ max_new（逐枚）→ KV 窗口（缩行不报错）。接受即贪心链：草稿 d_i 只有在模型 argmax 恰好产出 d_i 时才被接受，草稿只省 tick 不改输出。
+  - **门**（新 `tests/gpu/test_spec_gen.mojo`）：重复 4-gram 提示词（×4），48 token 生成——①parity：spec 链 vs t=1 贪心参照逐位同（mismatch=0）；②跨会话确定性（rerun diff=0）；③遥测：10 验证 tick / 10 命中 / 40 草稿 40 接受（**hit_rate=1.0、accept_rate=1.0、tokens/tick=4.8**）；④墙钟 spec 60ms vs t=1 参照 289~313ms（**~5×**，重复模式=接受率上限场景；对话域 55-70% 接受率外推净收益 ~1.7-2.1×，与开题模型一致）。
+  - **回归**：test_session_batch / test_generate_batch / test_session_prefill 全 PASS（各两轮）。
+  - **174-d（下一刀）**：serving 接入（GpuService tick 的草稿注入 + 合批约束：spec 行要求全 argmax/同 trust_all 相位）+ 生产 A/B（solo 短压/长生成，真实对话域接受率遥测）。
+
