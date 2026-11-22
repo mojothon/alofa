@@ -4069,3 +4069,7 @@
   - **踩坑三则**：①174-b 的核提取脚本把 vt2 原核后的无空行邻居（kv_store_b_gpu）一并复制进追加段（当时 probe 编译未触发，174-c 接线后 redefinition 才爆）——截断修复；②attention import 是 `\` 续行风格，补行漏 `\` 断裂；③ht host buffer 仍按 PREFILL_MAX_BATCH=128 创建而 d_tokenb 已 320 → 「not enough data in src」——同宽修复。
   - **验证**：门 PASS（parity 逐位同，row_mapped=False 原路径不变）+ soak PASS（ok/min 824-835、err=0）。
   - **174-c 第二刀**：spec tick 组装端（generate_batch 的 draft 注入：每序列携 k+1 token 行、rowseq/rowj 填充、logits 按行回读验证 argmax 前缀匹配、pos_arr 按 accept 推进、KV 天然覆写）+ n-gram 草稿源 + 接受率遥测。
+- **2026-11-22（一百七十四-c 第二刀）** —— **spec_step 机制全链搭通 + 发现 MMA 核族非整行组竞态**
+  - **机制落地**：`spec_step` 方法（每序列 [x0, d0..d_{k-1}] 行化组装 → rowmap 上传 → _bb spec 核前向 → 贪心 argmax 前缀匹配 → pos_arr 按 acc+1 推进；trust_all 模式供 prompt 建底 tick）。probe176：单行/两行同序列/两行异序列/tick A（11 行建底）全正确——行化组装、行映射消费、验证回滚、pos 推进全链通。
+  - **修四坑**：①generate_batch 死路径 120-b 未同步 copy_logits（门不实例化，probe 首次触发）；②rowmap 上传在 tail 段晚于层循环消费（核读垃圾非确定）——前移至前向段开头；③`d_logits_b/h_logits_b` 只 BMAX=64 行——spec tick t≤320 全行 lm_head/argmax 越界隐患——扩 SPEC_MAX_ROWS；④spec_step `return out^`。
+  - **发现（174-c 第三刀主攻）**：MMA 核族（dual_pk/down_spl）在 **t%rb≠0 尾组部分填充**时非确定/f16 溢出（logits 全 inf、同输入重跑漂移）——no-mma 路径（关 dual/down/tile/spl）同输入**逐位正确**。t=11（rb=8 尾组 3 行）触发；生产 t=64/128 恰为整组从未暴露。修复方向：尾组行掩码/smem 未初始化归因 → 核内修复。

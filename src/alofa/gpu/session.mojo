@@ -711,11 +711,13 @@ struct GpuSession:
         self.d_normedb = self.ctx.enqueue_create_buffer[DType.float32](
             BMAX * self.hidden
         )
+        # 一百七十四-c：spec 行化行数上限（t<=SPEC_MAX_ROWS 全行
+        # lm_head/argmax——BMAX 只够普通批解码）
         self.d_logits_b = self.ctx.enqueue_create_buffer[DType.float32](
-            BMAX * self.vocab
+            SPEC_MAX_ROWS * self.vocab
         )
         self.h_logits_b = self.ctx.enqueue_create_host_buffer[DType.float32](
-            BMAX * self.vocab
+            SPEC_MAX_ROWS * self.vocab
         )
         self.d_tokout = self.ctx.enqueue_create_buffer[DType.int32](SPEC_MAX_ROWS)
         self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](SPEC_MAX_ROWS)
@@ -980,6 +982,103 @@ struct GpuSession:
 
     # ---- 整步入口 ----
 
+    # 一百七十四-c：speculative tick——行化前向 + host 验证回滚。
+    def spec_step[
+        inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
+        tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
+        attn_t: Int = 512, attn_tiles: Int = 1,
+        prefill_rb: Int = 8,
+        prefill_af: DType = DType.float64,
+        prefill_mma_dual: Bool = True,
+        prefill_mma_down: Bool = True,
+        prefill_wpack: Bool = True,
+        prefill_mma_q: Bool = True,
+        prefill_mma_o: Bool = True,
+        prefill_tile: Bool = True,
+        prefill_gqa: Bool = True,
+        prefill_spl: Bool = True,
+        prefill_kv: Bool = False,
+    ](
+        mut self,
+        # 扁平 token 行（行序：序列连续）：每段 = [x0, d0..d_{k-1}]
+        tokens_flat: List[Int],
+        # 每段 token 数（1 + k_s）
+        lens: List[Int],
+        # 每段的序列槽号（绝对槽；行映射走 rowseq/rowj）
+        seqs: List[Int],
+        # True = 全部喂入 token 视为真值（prompt 建底 tick）：KV 全
+        # 有效、pos += ln、next = 最后行预测。False = 贪心 draft
+        # 验证语义（默认）。
+        trust_all: Bool = False,
+    ) raises -> List[Int]:
+        """speculative 解码 tick（一百七十四-c）：每序列携带
+        [x0, d0..d_{k-1}]（x0 为上 tick 已接受的 token）——组装
+        Σ(1+k) 个 token 行，rowseq/rowj 行映射上传，_bb spec 核
+        前向，贪心 argmax 前缀匹配验证。返回扁平 [accept_s,
+        next_s, ...]；h_posarr 按接受数推进（x0 + acc 个 draft
+        的 KV 有效；未接受 draft 段留作垃圾，下 tick 从新 pos
+        覆写——KV 天然回收零搬运）。前置：pos_arr[seq] +
+        lens[s] ≤ max_tokens、Σlens ≤ SPEC_MAX_ROWS。
+        """
+        var n = len(seqs)
+        var t = len(tokens_flat)
+        var tok_total = 0
+        for s in range(n):
+            tok_total += lens[s]
+        if tok_total != t:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "spec lens sum != tokens", ""
+            )
+        if t > SPEC_MAX_ROWS:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "spec rows cap", "t=" + String(t)
+            )
+        var row = 0
+        for s in range(n):
+            if Int(self.h_posarr[seqs[s]]) + lens[s] > self.max_tokens:
+                raise AlofaError(
+                    ERR_OUT_OF_RANGE, "kv store is full (spec)", ""
+                )
+            for j in range(lens[s]):
+                self.h_rowseq[row] = Int32(seqs[s])
+                self.h_rowj[row] = Int32(j)
+                row += 1
+        # 贪心 spec：copy_logits=False（只回 tokout 4B×t）、temp=0、
+        # row_base=0（rowseq 存绝对槽号，pos_arr 从基址 0 索引）。
+        _ = self.prefill_step[
+            inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
+            attn_t, attn_tiles, prefill_rb, prefill_af,
+            prefill_mma_dual, prefill_mma_down, prefill_wpack,
+            prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
+            prefill_spl, prefill_kv, True
+        ](tokens_flat, False, True, False, False, 0.0, 0, 1.0, 0, 0,
+          0, False, True)
+        self.ctx.synchronize()
+        # host 验证：行 acc 的预测 y_acc 应等于 draft d_acc（即
+        # tokens_flat[a0+acc+1]）；首个不匹配处的预测即新 token。
+        var out = List[Int]()
+        var a0 = 0
+        for s in range(n):
+            var ln = lens[s]
+            var acc = 0
+            if trust_all:
+                # 建底 tick：全真值——KV 全有效，pos += ln。
+                acc = ln - 1
+            else:
+                while (
+                    acc < ln - 1
+                    and Int(self.h_tokout[a0 + acc])
+                    == Int(tokens_flat[a0 + acc + 1])
+                ):
+                    acc += 1
+            out.append(acc)
+            out.append(Int(self.h_tokout[a0 + acc]))
+            self.h_posarr[seqs[s]] = Int32(
+                Int(self.h_posarr[seqs[s]]) + acc + 1
+            )
+            a0 += ln
+        return out^
+
     def generate_batch[
         inner: Int, inner_ff: Int, dual_t: Int = 64, dual_o: Int = 4,
         tri_t: Int = 128, down_t: Int = 128, o_t: Int = 128,
@@ -1082,7 +1181,11 @@ struct GpuSession:
                 prefill_mma_dual, prefill_mma_down, prefill_wpack,
                 prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
                 prefill_spl, prefill_kv, True
-            ](toks, False, False, False, temperature, seed, top_p)
+            # 一百七十四-c：120-b 插 copy_logits 时此死路径调用未
+            # 同步（门不实例化 generate_batch，probe 首次触发）——
+            # 补 copy_logits=False（只回 tokout，逐行消化语义不变）。
+            ](toks, False, False, False, False, temperature, seed,
+              top_p)
             self.ctx.synchronize()
             # 3) 逐行消化 tokout
             for i in range(b):
@@ -1796,6 +1899,14 @@ struct GpuSession:
         for i in range(SPEC_MAX_ROWS):
             ht[i] = Int32(tokens[i]) if i < t else Int32(0)
         self.ctx.enqueue_copy(dst_buf=self.d_tokenb, src_buf=ht)
+        if row_mapped:
+            # 一百七十四-c：rowmap 上传必须先于层循环（spec 核消费）
+            self.ctx.enqueue_copy(
+                dst_buf=self.d_rowseq, src_buf=self.h_rowseq
+            )
+            self.ctx.enqueue_copy(
+                dst_buf=self.d_rowj, src_buf=self.h_rowj
+            )
 
         # gather：t 行 embedding（gather_gpu 本就按 t 行索引）
         self.ctx.enqueue_function[gather_gpu](
@@ -2708,15 +2819,8 @@ struct GpuSession:
             ts1 = monotonic_ns()
             if profile and not prof_nosync:
                 self.ts_lm += Float64(ts1 - ts0) / 1e6
-            if row_mapped:
-                # 一百七十四-a：行映射上传（k=1 恒等时数值逐位同——
-                # 本期无核消费，为 174-b 备料）
-                self.ctx.enqueue_copy(
-                    dst_buf=self.d_rowseq, src_buf=self.h_rowseq
-                )
-                self.ctx.enqueue_copy(
-                    dst_buf=self.d_rowj, src_buf=self.h_rowj
-                )
+            # 一百七十四-c：rowmap 上传已移至前向段开头（spec 核在
+            # 层循环即消费——tail 段上传晚于消费，核读垃圾致非确定）。
             if per_row_sampling:
                 self.ctx.enqueue_copy(
                     dst_buf=self.d_stemp, src_buf=self.h_stemp
@@ -2840,6 +2944,10 @@ struct GpuSession:
             print("prof down:", prof[8], "ms")
             print("prof tail:", prof[9], "ms")
         if batch:
+            if row_mapped:
+                # 一百七十四-c：spec tick 的 pos 推进由 spec_step 按
+                # 接受数做（host 验证后）——此处不推。
+                return self.h_logits_b.unsafe_ptr()
             for i in range(t):
                 self.h_posarr[i] = self.h_posarr[i] + 1
             return self.h_logits_b.unsafe_ptr()
