@@ -278,6 +278,12 @@ struct GpuSession:
     var h_stopps: HostBuffer[DType.float32]
     var d_sseeds: DeviceBuffer[DType.int32]
     var h_sseeds: HostBuffer[DType.int32]
+    # 一百七十四-a：speculative 行映射备料——行 b 的序列槽与行内
+    # 位置（k=1 恒等映射时行为逐位同；核消费在 174-b 接线）
+    var d_rowseq: DeviceBuffer[DType.int32]
+    var d_rowj: DeviceBuffer[DType.int32]
+    var h_rowseq: HostBuffer[DType.int32]
+    var h_rowj: HostBuffer[DType.int32]
     # 一百三十八：干净吞吐口径——n_ticks 混空转 tick（无活跃行
     # early-return），n_batched 混 padding 行；真前向次数与行·步总数
     # 在 prefill_step 入口计数（batched/单路/服务层全走这里）。
@@ -710,6 +716,11 @@ struct GpuSession:
         self.h_tokout = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.d_stemp = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
         self.h_stemp = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
+        # 一百七十四-a：spec 行映射缓冲（host 直写 + forward 上传）
+        self.d_rowseq = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
+        self.d_rowj = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
+        self.h_rowseq = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
+        self.h_rowj = self.ctx.enqueue_create_host_buffer[DType.int32](BMAX)
         self.d_stopps = self.ctx.enqueue_create_buffer[DType.float32](BMAX)
         self.h_stopps = self.ctx.enqueue_create_host_buffer[DType.float32](BMAX)
         self.d_sseeds = self.ctx.enqueue_create_buffer[DType.int32](BMAX)
@@ -1689,6 +1700,9 @@ struct GpuSession:
         # h_stemp/h_stopps/h_sseeds[b]（host 直写，forward 时整块上传）。
         # 一个 launch 吃任意 temp/top_p 组合（核内每行自选分支）。
         per_row_sampling: Bool = False,
+        # 一百七十四-a：True 时上传 h_rowseq/h_rowj（spec 行映射）——
+        # 本期无核消费，纯备料；174-b 起由 kv_store/attention 消费。
+        row_mapped: Bool = False,
     ) raises -> Pointer[Float32, MutUntrackedOrigin]:
         """t 行批量前向（账本八十八，prefill/chunked prefill 之路）：
         gather → 每层 tri/attention 三趟 b 版/o/dual/down → 末行终
@@ -2625,6 +2639,15 @@ struct GpuSession:
             ts1 = monotonic_ns()
             if profile and not prof_nosync:
                 self.ts_lm += Float64(ts1 - ts0) / 1e6
+            if row_mapped:
+                # 一百七十四-a：行映射上传（k=1 恒等时数值逐位同——
+                # 本期无核消费，为 174-b 备料）
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_rowseq, src_buf=self.h_rowseq
+                )
+                self.ctx.enqueue_copy(
+                    dst_buf=self.d_rowj, src_buf=self.h_rowj
+                )
             if per_row_sampling:
                 self.ctx.enqueue_copy(
                     dst_buf=self.d_stemp, src_buf=self.h_stemp

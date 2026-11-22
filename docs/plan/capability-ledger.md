@@ -4054,3 +4054,8 @@
   - **收益模型**：k=4、贪心接受率 55-70%（对话域）→ 每 tick 产出 ~2.7-3.4 token/序列（现 1）；tick 时长估 ×1.4-1.6（行数×5 但 GEMM 行效率升、attention 窗不变）——**净 tps ×1.7-2.1**。
   - **风险**：行语义 k 化触及全部 tick 核的行假设——**架构级手术**（数周）；短批（solo）场景 k_b=1 直接退化为现路径（须保留原分支）。
   - **分期**：174-a 行语义基建（行映射 + t 动态化审计）；174-b kv_store/attention k 化；174-c 验证回滚 + n-gram 源；174-d 生产 A/B + 接受率遥测。每期独立门验证。
+- **2026-11-22（一百七十四-a）** —— **spec 行映射基建：row_mapped 参数 + 缓冲贯通（行为逐位同）**
+  - **基建**：`d_rowseq/d_rowj`（Int32[BMAX]）+ host 镜像（仿一百三十六 per-row 采样模式：调用方 host 直写 + forward 内 `row_mapped=True` 整块上传）——行 b 的序列槽与行内位置 j。本期无核消费（k=1 恒等映射下数值逐位同），为 174-b 的 kv_store/attention 消费备料。
+  - **审计结论（落账备查）**：行假设点全景——`d_tokenb[mb]`（输入 token/行）、`pos_arr[b]`（KV 落位与 rope 位置）、`kv_store_bb`（grid z=b）、attention bb（query 行=序列当前 pos）、`d_tokout[BMAX]`（行 argmax）、服务层槽位回收（134 的 row_base 行基址机制已具备「行≠物理位」雏形）。k 化改造时以上全部需行映射语义。
+  - **验证**：门 PASS（parity 逐位同）+ soak PASS（ok/min 806-841、err=0）。
+  - **174-b**：kv_store_bb k-token 连续落位（rope pos+i 连加）+ attention bb 因果 mask 变体 + 下游行映射消费——spec 结构主刀。
