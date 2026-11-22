@@ -4059,3 +4059,8 @@
   - **审计结论（落账备查）**：行假设点全景——`d_tokenb[mb]`（输入 token/行）、`pos_arr[b]`（KV 落位与 rope 位置）、`kv_store_bb`（grid z=b）、attention bb（query 行=序列当前 pos）、`d_tokout[BMAX]`（行 argmax）、服务层槽位回收（134 的 row_base 行基址机制已具备「行≠物理位」雏形）。k 化改造时以上全部需行映射语义。
   - **验证**：门 PASS（parity 逐位同）+ soak PASS（ok/min 806-841、err=0）。
   - **174-b**：kv_store_bb k-token 连续落位（rope pos+i 连加）+ attention bb 因果 mask 变体 + 下游行映射消费——spec 结构主刀。
+- **2026-11-22（一百七十四-b）** —— **spec 行化三核落地：恒等映射逐位同 PASS**
+  - **设计定稿（行化模型）**：**每 token 一行**——spec tick 的 t 行 = Σ(k_b+1) 个 token 行，每行有 (seq, j)——GEMM/norm/ff **零改动**（t 变大即可），kv_store/attention/尾段只需「行 b → (seq, pos_arr[seq]+j)」索引换算——比「行×k 批核」设计大幅简化。
+  - **三 spec 核**（attention.mojo，程序化生成=原核定点替换）：`kv_store_bb_spec`（rope 位置 pos_arr[seq]+j、KV 落位 store[seq]，q/k/v 源行仍为 token 行 b）、`attn_rs_h_bb_spec`（KV 窗 nsc=pos_arr[seq]+j+1、k_store 基址按 seq、scores/q_rot 行仍为 b）、`attn_vt2_h_bb_spec`（v_store 基址按 seq、scores/dst 行仍为 b）——签名加 rowseq/rowj 两指针（统一插在 max_kv 后）。
+  - **验证**：probe175（tests/gpu/probe_175.mojo，B=4 不等 pos、恒等 rowseq/rowj，A 原核链 vs B spec 链，q_rot/k_store/v_store/scores/dst/dst16 全输出）——**mismatch=0 BIT-EXACT PASS**。
+  - **174-c**：vt2 尾写段行化消费（dst 行=token 行 b ✓ 已同）+ 行映射贯通 session（输入行化 + rowseq/rowj 上传消费 + spec tick 分支）+ 验证回滚（argmax 前缀匹配 + pos_arr 推进）+ n-gram 草稿源。

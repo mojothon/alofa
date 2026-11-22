@@ -2068,3 +2068,328 @@ def attn_vt2_h_gpu[
             vpart[unsafe_offset=(
                 (b * Int(n_heads) + head) * TILES + tile
             ) * hd + d] = Float32(acc)
+
+def kv_store_bb_gpu_spec[THREADS: Int](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    cos_tab: Pointer[Float32, MutUntrackedOrigin],
+    sin_tab: Pointer[Float32, MutUntrackedOrigin],
+    pos_arr: Pointer[Int32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    max_kv: Int32,
+    rowseq: Pointer[Int32, MutUntrackedOrigin],
+    rowj: Pointer[Int32, MutUntrackedOrigin],
+) -> None:
+    """**spec 行化版**（一百七十四-b）每 token 行 b -> (seq, j)，rope 位置 pos_arr[seq]+j、KV 落位
+    store[seq]；q/k/v 源行仍为 token 行 b：kv_store_b 的批解码变体（账本一百二十）：行 b = 序列 b 的当前
+    token——rope 位置取 pos_arr[b]（每序列独立），KV 落位
+    [b][pos_arr[b]]（store 布局 [B][max_kv][kv_cols]）。其余逐指令
+    同 kv_store_b_gpu（rope 同式同序，数值逐位同）。grid=(n_heads,1,B)。
+    竞态注记同源：本批各行互不读（每序列只有 1 行），scores 在下
+    一 launch 读，跨 kernel 可见。"""
+    var b = Int(block_idx.z)
+    var head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    # 一百七十四-b：行化 spec——行 b 是序列 seq 的第 j 个
+    # token；KV 窗口与落位基址按 (seq, pos_arr[seq]+j) 换算。
+    var seq = Int(rowseq[unsafe_offset=b])
+    var upto = Int(pos_arr[unsafe_offset=seq]) + Int(
+        rowj[unsafe_offset=b]
+    )
+    var sbase = seq * Int(max_kv) * kv_cols
+    var half = hd // 2
+    var cos_row = cos_tab + upto * hd
+    var sin_row = sin_tab + upto * hd
+    if tid < half:
+        var d = tid
+        var a = q_src[unsafe_offset=q_base + d]
+        var bb = q_src[unsafe_offset=q_base + d + half]
+        q_rot[unsafe_offset=q_base + d] = a * cos_row[
+            unsafe_offset=d
+        ] - bb * sin_row[unsafe_offset=d]
+        q_rot[unsafe_offset=q_base + d + half] = (
+            bb * cos_row[unsafe_offset=d + half]
+            + a * sin_row[unsafe_offset=d + half]
+        )
+        var ka = k_src[unsafe_offset=b * kv_cols + kv_head_base + d]
+        var kb = k_src[unsafe_offset=b * kv_cols + kv_head_base + d + half]
+        k_store[unsafe_offset=sbase + upto * kv_cols + kv_head_base + d] = (
+            ka * cos_row[unsafe_offset=d] - kb * sin_row[unsafe_offset=d]
+        )
+        k_store[
+            unsafe_offset=sbase + upto * kv_cols + kv_head_base + d + half
+        ] = (
+            kb * cos_row[unsafe_offset=d + half]
+            + ka * sin_row[unsafe_offset=d + half]
+        )
+    if tid < hd:
+        v_store[unsafe_offset=sbase + upto * kv_cols + kv_head_base + tid] = (
+            v_src[unsafe_offset=b * kv_cols + kv_head_base + tid]
+        )
+
+
+def attn_rs_h_bb_gpu_spec[
+    THREADS: Int, HMAX: Int = 8, VEC: Bool = True,
+](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    pos_arr: Pointer[Int32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    max_kv: Int32,
+    rowseq: Pointer[Int32, MutUntrackedOrigin],
+    rowj: Pointer[Int32, MutUntrackedOrigin],
+) -> None:
+    """**spec 行化版**（一百七十四-b）query 行 b -> (seq, j)，KV 窗 nsc=pos_arr[seq]+j+1、
+    k_store 基址按 seq；scores/q_rot 行仍为 token 行 b：attn_rs_h 的批解码变体（账本一百二十）：upto = pos_arr[b]，
+    scores 行距 max_kv（buffer [B][heads][max_kv]），k_store 行基址
+    b*max_kv*kv_cols。线程映射/算序与 rs_h 逐指令同构（scores 数值
+    与单序列逐位同）。grid=(n_kv_heads, 1, B)。"""
+    comptime LPR = THREADS // HMAX
+    var b = Int(block_idx.z)
+    var kv_head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var h_off = tid % HMAX
+    var lane = tid // HMAX
+    var group = Int(n_heads) // Int(n_kv_heads)
+    if h_off >= group:
+        return
+    var head = kv_head * group + h_off
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    # 一百七十四-b：行化 spec——行 b 是序列 seq 的第 j 个
+    # token；KV 窗口与落位基址按 (seq, pos_arr[seq]+j) 换算。
+    var seq = Int(rowseq[unsafe_offset=b])
+    var upto = Int(pos_arr[unsafe_offset=seq]) + Int(
+        rowj[unsafe_offset=b]
+    )
+    var kbase_row = seq * Int(max_kv) * kv_cols
+    var row = (b * Int(n_heads) + head) * Int(max_kv)
+    var nsc = upto + 1
+    var scale = Float32(1.0) / sqrt(Float32(hd))
+
+    var jj = lane
+    while jj < nsc:
+        var acc = Float64(0)
+        if jj < upto:
+            comptime if VEC:
+                var kbase = kbase_row + jj * kv_cols + kv_head_base
+                var c8 = hd // 8
+                for c in range(c8):
+                    var kv8 = k_store.load[8](kbase + c * 8)
+                    @parameter
+                    for dd in range(8):
+                        acc += Float64(
+                            q_rot[unsafe_offset=q_base + c * 8 + dd]
+                        ) * Float64(Float32(kv8[dd]))
+                for d in range(c8 * 8, hd):
+                    acc += Float64(
+                        q_rot[unsafe_offset=q_base + d]
+                    ) * Float64(k_store[unsafe_offset=kbase + d])
+        else:
+            for d in range(hd):
+                acc += Float64(q_rot[unsafe_offset=q_base + d]) * Float64(
+                    k_store[
+                        unsafe_offset=kbase_row
+                        + upto * kv_cols + kv_head_base + d
+                    ]
+                )
+        scores[unsafe_offset=row + jj] = Float32(acc) * scale
+        jj += LPR
+
+
+def attn_vt2_h_bb_gpu_spec[
+    THREADS: Int, HMAX: Int = 8, TILES: Int = 8, FUSED: Bool = False,
+](
+    scores: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    vpart: Pointer[Float32, MutUntrackedOrigin],
+    tsum: Pointer[Float64, MutUntrackedOrigin],
+    pos_arr: Pointer[Int32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    max_kv: Int32,
+    rowseq: Pointer[Int32, MutUntrackedOrigin],
+    rowj: Pointer[Int32, MutUntrackedOrigin],
+    dst: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
+) -> None:
+    """**spec 行化版**（一百七十四-b）行 b -> (seq, j)，v_store 基址按 seq、scores/dst 行仍为
+    token 行 b：attn_vt2_h 的批解码变体（账本一百二十）：upto = pos_arr[b]，
+    scores 行距 max_kv，v_store 行基址 b*max_kv*kv_cols。算序同
+    vt2_h（~1e-7 求和树漂移由门覆盖）。FUSED+TILES=1 尾写 dst
+    （批解码生产路径同单序列）。grid=(n_kv_heads, TILES, B)。"""
+    comptime TPP = THREADS // HMAX
+    var b = Int(block_idx.z)
+    var kv_head = Int(block_idx.x)
+    var tile = Int(block_idx.y)
+    var tid = Int(thread_idx.x)
+    var slot = tid // TPP
+    var lane = tid % TPP
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var active = slot < group
+    var head = kv_head * group + slot
+    var hd = Int(head_dim)
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    # 一百七十四-b：行化 spec——行 b 是序列 seq 的第 j 个
+    # token；KV 窗口与落位基址按 (seq, pos_arr[seq]+j) 换算。
+    var seq = Int(rowseq[unsafe_offset=b])
+    var upto = Int(pos_arr[unsafe_offset=seq]) + Int(
+        rowj[unsafe_offset=b]
+    )
+    var vbase_row = seq * Int(max_kv) * kv_cols
+    var row = (b * Int(n_heads) + head) * Int(max_kv)
+    var nsc = upto + 1
+    var chunk = (nsc + TILES - 1) // TILES
+    var t0 = tile * chunk
+    var t1 = t0 + chunk
+    if t1 > nsc:
+        t1 = nsc
+
+    var smax = stack_allocation[
+        THREADS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var stot = stack_allocation[
+        THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+    var e_s = stack_allocation[
+        HMAX * THREADS, Float64, address_space = AddressSpace.SHARED
+    ]()
+
+    var best = LOWEST_FP32
+    if active:
+        var j = lane
+        while j < nsc:
+            var s = scores[unsafe_offset=row + j]
+            if s > best:
+                best = s
+            j += TPP
+    smax[tid] = best
+    barrier()
+    var stride = TPP // 2
+    while stride > 0:
+        if lane < stride:
+            if smax[tid + stride] > smax[tid]:
+                smax[tid] = smax[tid + stride]
+        barrier()
+        stride //= 2
+    var gmax = smax[slot * TPP]
+
+    var tl = Float64(0)
+    if active:
+        var jt = t0 + lane
+        while jt < t1:
+            var e = Float64(exp(Float64(scores[unsafe_offset=row + jt] - gmax)))
+            e_s[unsafe_offset=slot * THREADS + (jt - t0)] = e
+            tl += e
+            jt += TPP
+    stot[tid] = tl
+    barrier()
+    stride = TPP // 2
+    while stride > 0:
+        if lane < stride:
+            stot[tid] += stot[tid + stride]
+        barrier()
+        stride //= 2
+    if active and lane == 0:
+        tsum[unsafe_offset=(b * Int(n_heads) + head) * TILES + tile] = stot[
+            slot * TPP
+        ]
+
+    var d = lane
+    var acc = Float64(0)
+    if active:
+        var jj = t0
+        while jj < t1:
+            acc += e_s[unsafe_offset=slot * THREADS + (jj - t0)] * Float64(
+                v_store[
+                    unsafe_offset=vbase_row
+                    + jj * kv_cols + kv_head_base + d
+                ]
+            )
+            jj += 1
+        comptime if FUSED and TILES == 1:
+            var av = Float32(acc / stot[slot * TPP])
+            dst[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = av
+            dst16[unsafe_offset=b * Int(n_heads) * hd + head * hd + d] = Float16(av)
+        else:
+            vpart[unsafe_offset=(
+                (b * Int(n_heads) + head) * TILES + tile
+            ) * hd + d] = Float32(acc)
+def kv_store_b_gpu[THREADS: Int](
+    q_rot: Pointer[Float32, MutUntrackedOrigin],
+    q_src: Pointer[Float32, MutUntrackedOrigin],
+    k_src: Pointer[Float32, MutUntrackedOrigin],
+    v_src: Pointer[Float32, MutUntrackedOrigin],
+    k_store: Pointer[Float32, MutUntrackedOrigin],
+    v_store: Pointer[Float32, MutUntrackedOrigin],
+    cos_tab: Pointer[Float32, MutUntrackedOrigin],
+    sin_tab: Pointer[Float32, MutUntrackedOrigin],
+    n_heads: Int32,
+    n_kv_heads: Int32,
+    head_dim: Int32,
+    pos0: Int32,
+) -> None:
+    """prefill KV 落位核（账本八十八）：rope q -> q_rot、rope k ->
+    store 行 pos0+b、v 拷贝。grid=(n_heads, 1, B)。
+
+    单独一发的原因：行 b 的 scores 要读行 pos0..pos0+b-1 的 store
+    行 —— 同 launch 跨 block 写读是竞态（decode 无此问题：只读
+    旧 launch 的行 + 当前行走 smem）。store 与 scores 分跨 launch
+    边界，跨 kernel 可见无竞态。k rope 按 kv_head 分组冗余
+    （group 个 head 块写同一行，同值幂等）。"""
+    var b = Int(block_idx.z)
+    var head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var group = Int(n_heads) // Int(n_kv_heads)
+    var kv_head = head // group
+    var hd = Int(head_dim)
+    var q_base = b * Int(n_heads) * hd + head * hd
+    var kv_head_base = kv_head * hd
+    var kv_cols = Int(n_kv_heads) * hd
+    var upto = Int(pos0) + b
+    var half = hd // 2
+    var cos_row = cos_tab + (Int(pos0) + b) * hd
+    var sin_row = sin_tab + (Int(pos0) + b) * hd
+    if tid < half:
+        var d = tid
+        var a = q_src[unsafe_offset=q_base + d]
+        var bb = q_src[unsafe_offset=q_base + d + half]
+        q_rot[unsafe_offset=q_base + d] = a * cos_row[
+            unsafe_offset=d
+        ] - bb * sin_row[unsafe_offset=d]
+        q_rot[unsafe_offset=q_base + d + half] = (
+            bb * cos_row[unsafe_offset=d + half]
+            + a * sin_row[unsafe_offset=d + half]
+        )
+        var ka = k_src[unsafe_offset=b * kv_cols + kv_head_base + d]
+        var kb = k_src[unsafe_offset=b * kv_cols + kv_head_base + d + half]
+        k_store[unsafe_offset=upto * kv_cols + kv_head_base + d] = (
+            ka * cos_row[unsafe_offset=d] - kb * sin_row[unsafe_offset=d]
+        )
+        k_store[unsafe_offset=upto * kv_cols + kv_head_base + d + half] = (
+            kb * cos_row[unsafe_offset=d + half]
+            + ka * sin_row[unsafe_offset=d + half]
+        )
+    if tid < hd:
+        v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = (
+            v_src[unsafe_offset=b * kv_cols + kv_head_base + tid]
+        )
