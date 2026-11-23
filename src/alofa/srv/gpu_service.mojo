@@ -48,7 +48,7 @@ batch 前向只读一个 session 的 store），而是**单 session 的 N 个批
 from max.gpu.host import DeviceContext
 
 from alofa.core.ffi.posix import monotonic_ns
-from alofa.gpu.session import GpuSession
+from alofa.gpu.session import SPEC_MAX_ROWS, GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.config import env_int
@@ -80,12 +80,14 @@ alias GPU_ATTN_TILES = 8
 # （= 151645，fixture special.tsv 第 3 行钉着十六进制）。
 alias DEFAULT_EOS = 151645
 
-# 一百七十四-d：solo spec（prompt-lookup 草稿源）参数——池内恰一条
-# 活跃流、生成相位、temp==0（贪心验证）时，_tick 走 spec 分支：一次
-# 验证前向产出 acc+1 token。草稿质量只影响 tick 数，不改输出链。
-# ALOFA_GPU_SPEC 门控（默认开——A/B 定，见 bench_specd；=0 一键关）；
-# K/NGRAM 沿用门与 generate_spec 的定值。
-alias SPEC_K = 4
+# 一百七十四-d/一百七十五：spec（prompt-lookup 草稿源）参数——全贪心
+# 批次走 _spec_forward 验证（一次前向多 token）。草稿质量只影响
+# tick 数，不改输出链。ALOFA_GPU_SPEC 门控（默认开——A/B 定，见
+# bench_specd；=0 一键关）；K/NGRAM 运行时可调（ALOFA_SPEC_K/NGRAM）。
+# 默认 k=8/ngram=4：bench_speck 域扫描——pattern 域 657→853 tps
+# （+30%，acc_rate 仍 93.75%）、story 域零惩罚；ngram=6 在 story 域
+# −2%（查表变贵）不取。
+alias SPEC_K = 8
 alias SPEC_NGRAM = 4
 
 # `complete()` 在池里占坑的标记：它没有 `request` 号可挂，用这个
@@ -196,6 +198,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var spec_on: Bool
     var spec_tel: SpecTelemetry
     var n_spec_ticks: Int
+    # 一百七十五：草稿参数运行时可调（ALOFA_SPEC_K / ALOFA_SPEC_NGRAM，
+    # 默认 4/4——174-d 定值；域扫描 bench_speck 定最优）。
+    var spec_k: Int
+    var spec_ngram: Int
 
     def __init__(
         out self,
@@ -252,6 +258,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.spec_on = env_int("ALOFA_GPU_SPEC", 1, 0, 1) == 1
         self.spec_tel = SpecTelemetry()
         self.n_spec_ticks = 0
+        self.spec_k = env_int("ALOFA_SPEC_K", SPEC_K, 1, 16)
+        self.spec_ngram = env_int("ALOFA_SPEC_NGRAM", SPEC_NGRAM, 2, 16)
 
     def _slot_of(self, request: Int) -> Int:
         var slot = 0
@@ -586,6 +594,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 列表（List[List] 的 move-out 撞 origin 规则）——消费期按同
         # 一 ctx 重查（查表确定，结果一致）。
         var kinds = List[Int]()
+        var rows_total = 0
         var i = 0
         while i < len(act):
             var slot = act[i]
@@ -595,6 +604,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     self.streams[slot].prompt[self.streams[slot].pidx]
                 )
                 lens.append(1)
+                rows_total += 1
                 seqs.append(slot)
                 if (
                     self.streams[slot].pidx
@@ -611,17 +621,27 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 for t in self.streams[slot].out:
                     ctx.append(t)
                 var drafts = List[Int]()
-                var hit = spec_lookup(ctx^, SPEC_K, SPEC_NGRAM, drafts)
-                # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens。
+                var hit = spec_lookup(
+                    ctx^, self.spec_k, self.spec_ngram, drafts
+                )
+                # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens；
+                # 总行预算收缩：Σ rows ≤ SPEC_MAX_ROWS（spec_step 超
+                # cap 会 raise——大池 × 长 k 时必现，缩行不报错）。
                 while (
                     self.streams[slot].pos + 1 + len(drafts)
                     > self.session.max_tokens
                     and len(drafts) > 0
                 ):
                     _ = drafts.pop()
+                while (
+                    rows_total + 1 + len(drafts) > SPEC_MAX_ROWS
+                    and len(drafts) > 0
+                ):
+                    _ = drafts.pop()
                 toks.append(self.streams[slot].cur)
                 for d in drafts:
                     toks.append(d)
+                rows_total += 1 + len(drafts)
                 lens.append(1 + len(drafts))
                 seqs.append(slot)
                 kinds.append(2)
@@ -672,7 +692,9 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 for t in self.streams[slot].out:
                     ctx.append(t)
                 var drafts = List[Int]()
-                _ = spec_lookup(ctx^, SPEC_K, SPEC_NGRAM, drafts)
+                _ = spec_lookup(
+                    ctx^, self.spec_k, self.spec_ngram, drafts
+                )
                 var nd = lens[i] - 1
                 while len(drafts) > nd:
                     _ = drafts.pop()

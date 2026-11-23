@@ -4108,4 +4108,11 @@
   - **远端清点**（GPU3，20 门）：multi_e2e / gpu_service / service_spec / spec_gen / serve_boot / sample / topp / session×6 / cuda_diff / heap×2 / pool_repro / rowprobe 全 PASS（serve_boot 遇共享主机 8000 被占——ALOFA_PORT 透传绕开；AsyncRT 间歇崩重试即可）。session 级门与 spec 无交集，确认 spec 默认开无暗伤。
   - **rowprobe c11 假 False 平反**：探针在 c8/c11 合批场景**不看 `waiting` 盲采 `last`**（他流节奏滞后时采到 stale 值，链长 30 vs 20 恒 False）——spec OFF 同样 False 证明非 spec 引入。补 waiting 门控后**十三刀全绿**（c11-mixed True，24/16 帧正确）；真实门 test_gpu_service 的 mb==c1 判据（有门控）一直 PASS。
   - **本地**：run_tests.sh + check-ledger 全绿（42 组 0 failed，含账本格式校验）。
+- **2026-11-23（一百七十五）** —— **spec 草稿参数域扫描：k=4→8（pattern 域 +30%、HTTP conc8 +12%），运行时可调 + 行预算守卫**
+  - **动机**：174-d 的 K=4/NGRAM=4 是拍脑袋定值；生产域接受率 90%+ 说明链长没吃满。
+  - **改造**（gpu_service）：`spec_k/spec_ngram` 变运行时字段（ALOFA_SPEC_K/ALOFA_SPEC_NGRAM，默认走 alias）；`_spec_forward` 加**总行预算守卫**——Σ rows ≤ SPEC_MAX_ROWS（session 导出 alias，spec_step 超 cap 会 raise；大池 × 长 k 必现，缩行不报错）。服务级默认 k=8；session 级 generate_spec 参数默认保持 4（门定值口径）。
+  - **扫描**（bench_speck，新，(k,ngram) 六配置 × story/pattern 两域，预热+计测各一轮，parity 全 True）：pattern 域 k2→k8 单调升 488.9→**852.9 tps**（128 token 16 tick = 8.0 tokens/tick，acc_rate 仍 93.75%）；story 域全 k 零惩罚（~235 flat）；ngram=6 在 story 域 **−2%**（查表变贵，n6 story accepted=0）不取。**定案 k=8/ngram=4**。
+  - **HTTP 级验证**（conc8 长生成 120tok 同轮）：2302.3（k=4）→ **2570.5 tok/s（+12%；spec OFF 1199.4 的 2.14×）**，零错误；计数器：接受率 90.4%（61006/67496）、~12.2 tokens/tick。
+  - **回归**：test_service_spec / test_gpu_service / test_multi_e2e 全 PASS（预算守卫与 k=8 默认下）。
+  - **运维教训**：serve_gpu -O2 冷启动（编译+装载）可超 40s——启动后必须**轮询日志 "listening"** 再压测，定时 sleep 撞装载期会得到全 connect_failed 假象（本轮即踩）。
 
