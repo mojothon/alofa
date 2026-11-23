@@ -4097,4 +4097,11 @@
   - **结果**（tok/s）：solo（conc1/120tok）184.7 → **380.9（2.06×）**；长生成（conc8/120tok）1203.4 → 1205.2（持平）；短压（conc32/15tok）1248.8 → 1248.1（持平）——多流景 spec 分支按构造不触发，零惩罚证实。绝对值与 172/173 时代不可比（客户端位置/机器负载/多轮优化后），只作本轮相对。
   - **归因**（spec ON solo 轮 /health）：4826 spec tick、hit_rate 57.9%、**接受率 95.5%**（11176 草稿 10668 接受）、~3.2 tokens/tick——叙事续写域 prompt-lookup 命中质量远超预期（模型复述近期文本的倾向），2.06× 全部由草稿接受兑换。
   - **结论**：solo spec（174-d 接线）生产口径收益兑现——低并发/单流场景 2× 级，高并发场景零扰动。174-d 主体收案；余项只剩多流 spec（架构级，trust_all 逐序列化进合批 tick）。
+- **2026-11-23（一百七十四-d 终刀）** —— **多流 spec：全贪心批次一次 spec_step 验证（零 padding），HTTP conc8 长生成 1.92×，174-d 全案收结**
+  - **关键认识：不需要 per-seq trust_all**——prompt 行本身就是 ln=1 的验证行（acc=0、next = argmax after x0），与合批 tick 的单 token 行语义**逐位等价**；原架构级障碍（trust_all 是 per-call）不存在。全贪心批次（全部活跃行 temp==0）直接进 `_spec_forward`：prompt 中段行 ln=1、尾枚行 ln=1（next 即 gen[0]）、生成行 [cur, d0..dk]（逐行窗口收缩）→ 一次 spec_step（f32 同表）→ 逐行消化。**零 padding**（spec_step 显式 seqs，比合批路径还省 padding 行——合批的 padding 浪费顺带消失）。任一行采样 → 整批回退 `_forward_rows`（spec 尾核只做 argmax）。
+  - **实现要点**：solo 专用 `_spec_tick` 删除（被一般化路径覆盖）；`List[List[Int]]` 草稿存储撞 origin 规则（move-out 禁止）——消费期按同一 ctx 重查（查表确定）；`GpuStream` 不可隐拷——一律 `self.streams[slot].x` 就地访问；遥测口径修正——n_calls 只计产 token 的验证行（prompt 中段行不计，否则 tokens/tick 被 prompt 相位稀释 4.57→1.19）。
+  - **门**（test_service_spec 升级）：①③⑤全 PASS 两轮——并发双贪心流走多流 spec 主路径链与 solo 逐位同；**新增混合温度并发**（贪心流+采样流，共享 tick 回退合批）贪心链仍与 solo 逐位同。pattern prompt 32 token / 8 验证 tick = **4.0 tokens/tick**。回归：test_gpu_service（默认开全过）、test_session_batch、test_generate_batch 全 PASS。
+  - **HTTP A/B**（conc8 长生成 120tok，30s 同轮）：spec OFF 1199.4 → spec ON **2302.3 tok/s（1.92×）**，零错误；计数器归因（风暴轮捕获）：1267 tick、命中 56.4%、接受率 **95.4%**（9944 草稿 9492）、**~10.7 tokens/tick @ batch 8**。solo/conc1 维持 2.06×。
+  - **环境噪声教训**：首轮 conc8 出现 349566 connect_failed——共享主机瞬时过载（复跑 uptime 0.04 零错误）；压测异常先查机器负载与复跑，再怀疑代码。
+  - **174-d 全案收结**：投机解码从 session（generate_spec）→ solo serving（_spec_tick）→ 多流 serving（_spec_forward）三层全部落地并生产验证；solo 2.06×、conc8 1.92×、多采样混合零扰动。遗留：小模型草稿源（接口已预留）、spec 行进合批 tick 的采样混合（需要核内 per-row 采样+验证混合尾核，收益低不做）。
 

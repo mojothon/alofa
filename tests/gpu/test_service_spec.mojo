@@ -100,8 +100,10 @@ def main() raises:
           svc.spec_tel.n_drafted, " accepted =", svc.spec_tel.n_accepted,
           " tokens/tick =", tpt)
 
-    # ③ 多流回退：spec 开着，两条流并发（len(act)=2 → 合批路径），
-    # 各自完成且链确定（重放逐位同）。
+    # ③ 多流 spec：spec 开着，两条贪心流并发——全贪心批次走
+    # `_spec_forward`（多流 spec 主路径，非回退），各自完成且链与
+    # solo 重放逐位同（后完成者转 solo spec 的混合链也逐位同——
+    # 接受即贪心链的推论验证）。
     svc.spec_on = True
     svc.stream_begin(PROMPT, 16, 0.0, 1.0, 3)
     svc.stream_begin(PROMPT, 16, 0.0, 1.0, 4)
@@ -127,14 +129,44 @@ def main() raises:
     svc.stream_end(3)
     svc.stream_end(4)
     # 并发链 vs solo 重放链（**同预算 16**——probe_194 教训：长度不
-    # 等的链 _same 恒 False）。spec 分支只在 solo 触发；并发两条流
-    # 都走合批路径（但后完成者可能转 solo spec——接受即贪心链，仍
-    # 应逐位同）。
+    # 等的链 _same 恒 False）。
     var solo3 = _chain(svc, 3, 16)
     var solo4 = _chain(svc, 4, 16)
     var conc_parity = _same(n3, solo3) and _same(n4, solo4)
-    print("concurrent fallback: len3 =", len(n3), " len4 =", len(n4),
+    print("concurrent spec: len3 =", len(n3), " len4 =", len(n4),
           " parity vs solo =", conc_parity)
+
+    # ⑤ 混合温度并发：一条贪心流 + 一条采样流（T=1, top_p=0.9）
+    # ——任一行采样使共享 tick 回退合批路径；贪心流链仍应与其
+    # solo 重放逐位同（回退链 == spec 链 == 贪心链）。两条都完成。
+    svc.spec_on = True
+    svc.stream_begin(PROMPT, 16, 0.0, 1.0, 5)
+    svc.stream_begin(PROMPT, 16, 1.0, 0.9, 6)
+    var slot5 = svc._slot_of(5)
+    var slot6 = svc._slot_of(6)
+    var done5 = False
+    var done6 = False
+    var n5 = List[Int]()
+    var c6 = 0
+    while not (done5 and done6):
+        if not done5:
+            var f5 = svc.stream_next(5)
+            if not f5.waiting:
+                n5.append(svc.streams[slot5].last)
+                if f5.done:
+                    done5 = True
+        if not done6:
+            var f6 = svc.stream_next(6)
+            if not f6.waiting:
+                c6 += 1
+                if f6.done:
+                    done6 = True
+    svc.stream_end(5)
+    svc.stream_end(6)
+    var solo5 = _chain(svc, 5, 16)
+    var mixed_parity = _same(n5, solo5)
+    print("mixed-temp conc: greedy len =", len(n5), " sampled frames =",
+          c6, " greedy parity vs solo =", mixed_parity)
 
     # ④ 草稿命中场景：重复模式 prompt（计数序列）——模型应延续模式，
     # prompt-lookup 命中且接受，tokens/tick 显著 > 1。快照差分：
@@ -160,6 +192,7 @@ def main() raises:
         and pat_calls >= 1
         and pat_tpt > 1.0
         and conc_parity
+        and mixed_parity
         and len(c_spec) == MAXNEW
     )
     if ok:

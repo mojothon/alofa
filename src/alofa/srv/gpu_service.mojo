@@ -568,73 +568,138 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             self.tw_sync = 0.0
             self.tw_coll = 0.0
 
-    def _spec_tick(mut self, slot: Int) raises:
-        """solo spec tick（一百七十四-d）：唯一活跃行 + 生成相位 +
-        贪心时，prompt-lookup 草稿驱动 `spec_step` 验证 tick——一次
-        前向产出 acc+1 token，帧语义与 `_forward_rows` 生成分支逐位
-        同（多帧入队，逐 token eos/预算判断）。
-
-        接受即贪心链：草稿 d_i 只有在模型 argmax 恰好产出 d_i 时才
-        被接受，草稿质量只影响 tick 数。pos 以 spec_step 内部推进的
-        h_posarr[slot] 为准（预算/eos 提前收流时它可能超前——流已
-        完结，无人再读）。数值面与 `_forward_rows` 同（f32 comptime
-        同表）。
+    def _spec_forward(mut self, act: List[Int]) raises:
+        """多流 spec tick（一百七十四-d 终刀）：全贪心批次走一次
+        `spec_step` 验证——prompt 行就是 ln=1 的验证行（acc=0、
+        next = argmax after x0，与合批 tick 的单 token 行语义逐位
+        等价），生成行 [cur, d0..dk]（逐行窗口收缩）。零 padding
+        （spec_step 显式 seqs）。消费复用 `_emit_token`/`_finish_eos`
+        （帧语义与 `_forward_rows` 逐位同）；pos 以 spec_step 内部
+        推进的 h_posarr[slot] 回读对齐。任一行采样由调用方回退
+        `_forward_rows`（spec 尾核只做 argmax）。
         """
-        # ctx = prompt + 已生成链（out 末元素即 cur = x0）。
-        var ctx = List[Int]()
-        for t in self.streams[slot].prompt:
-            ctx.append(t)
-        for t in self.streams[slot].out:
-            ctx.append(t)
-        var drafts = List[Int]()
-        var hit = spec_lookup(ctx^, SPEC_K, SPEC_NGRAM, drafts)
-        # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens。
-        var pos = Int(self.session.h_posarr[slot])
-        while (
-            pos + 1 + len(drafts) > self.session.max_tokens
-            and len(drafts) > 0
-        ):
-            _ = drafts.pop()
-        if pos + 1 > self.session.max_tokens:
-            # 窗口满：本 tick 放弃（理论不可达——steps 预算 ≤ 窗口）。
-            return
         var toks = List[Int]()
-        toks.append(self.streams[slot].cur)
-        for d in drafts:
-            toks.append(d)
-        var ln = List[Int]()
-        ln.append(len(toks))
-        var sq = List[Int]()
-        sq.append(slot)
+        var lens = List[Int]()
+        var seqs = List[Int]()
+        # 每行分类：0 = prompt 中段（tokout 丢弃）、1 = prompt 尾枚
+        # （next = gen[0]）、2 = 生成行（acc+1 个 token）。草稿不存
+        # 列表（List[List] 的 move-out 撞 origin 规则）——消费期按同
+        # 一 ctx 重查（查表确定，结果一致）。
+        var kinds = List[Int]()
+        var i = 0
+        while i < len(act):
+            var slot = act[i]
+            self.session.h_posarr[slot] = Int32(self.streams[slot].pos)
+            if self.streams[slot].pidx < len(self.streams[slot].prompt):
+                toks.append(
+                    self.streams[slot].prompt[self.streams[slot].pidx]
+                )
+                lens.append(1)
+                seqs.append(slot)
+                if (
+                    self.streams[slot].pidx
+                    == len(self.streams[slot].prompt) - 1
+                ):
+                    kinds.append(1)
+                else:
+                    kinds.append(0)
+            else:
+                # ctx = prompt + 已生成链（out 末元素即 cur = x0）。
+                var ctx = List[Int]()
+                for t in self.streams[slot].prompt:
+                    ctx.append(t)
+                for t in self.streams[slot].out:
+                    ctx.append(t)
+                var drafts = List[Int]()
+                var hit = spec_lookup(ctx^, SPEC_K, SPEC_NGRAM, drafts)
+                # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens。
+                while (
+                    self.streams[slot].pos + 1 + len(drafts)
+                    > self.session.max_tokens
+                    and len(drafts) > 0
+                ):
+                    _ = drafts.pop()
+                toks.append(self.streams[slot].cur)
+                for d in drafts:
+                    toks.append(d)
+                lens.append(1 + len(drafts))
+                seqs.append(slot)
+                kinds.append(2)
+                if hit:
+                    self.spec_tel.n_hits += 1
+            i += 1
         var out = self.session.spec_step[
             GPU_INNER, GPU_FF, GPU_BMAX, GPU_HQ, GPU_KV_DIM,
             GPU_HEAD_DIM, GPU_ATTN_T, GPU_MAX_TOKENS, GPU_MB,
             GPU_ATTN_TILES,
             DType.float32, True, True, True, True, True, True, True,
             True, False
-        ](toks^, ln, sq, False)
-        var acc = out[0]
-        var nxt = out[1]
-        self.spec_tel.n_calls += 1
-        if hit:
-            self.spec_tel.n_hits += 1
-            self.spec_tel.n_drafted += len(drafts)
-            self.spec_tel.n_accepted += acc
-        # 逐 token 消化（eos 不进链，与 _forward_rows 语义逐位同）。
-        for j in range(acc):
-            var tv = drafts[j]
-            if tv == self.eos:
-                self._finish_eos(slot)
-                return
-            self._emit_token(slot, tv)
-            if self.streams[slot].count >= self.streams[slot].steps:
+        ](toks^, lens, seqs, False)
+        # 逐行消化：out 扁平 [acc_s, next_s, ...]。
+        var a = 0
+        i = 0
+        while i < len(act):
+            var slot = act[i]
+            var acc = out[a]
+            var nxt = out[a + 1]
+            a += 2
+            var kind = kinds[i]
+            if kind == 0:
+                # prompt 中段：KV 已写，推游标（pos 已由 spec_step +1）。
+                # 不计 n_calls——遥测口径只算产 token 的验证行。
+                self.streams[slot].pidx += 1
                 self.streams[slot].pos = Int(self.session.h_posarr[slot])
-                return
-        if nxt == self.eos:
-            self._finish_eos(slot)
-        else:
-            self._emit_token(slot, nxt)
-        self.streams[slot].pos = Int(self.session.h_posarr[slot])
+            elif kind == 1:
+                # 尾枚步：next 即 gen[0]，按生成 token 消化。
+                self.spec_tel.n_calls += 1
+                self.streams[slot].pidx = len(self.streams[slot].prompt)
+                if nxt == self.eos:
+                    self._finish_eos(slot)
+                else:
+                    self._emit_token(slot, nxt)
+                    self.streams[slot].pos = Int(
+                        self.session.h_posarr[slot]
+                    )
+            else:
+                self.spec_tel.n_calls += 1
+                # 同一 ctx 重查草稿（查表确定；len 与建行时一致——
+                # pos 在本 tick 内已由 spec_step 推进，但收缩判定用的
+                # 是建行时快照，重查后 len 只可能 ≥ 建行值，取建行
+                # lens[i]-1 截断即可）。
+                var ctx = List[Int]()
+                for t in self.streams[slot].prompt:
+                    ctx.append(t)
+                for t in self.streams[slot].out:
+                    ctx.append(t)
+                var drafts = List[Int]()
+                _ = spec_lookup(ctx^, SPEC_K, SPEC_NGRAM, drafts)
+                var nd = lens[i] - 1
+                while len(drafts) > nd:
+                    _ = drafts.pop()
+                self.spec_tel.n_drafted += nd
+                self.spec_tel.n_accepted += acc
+                # 逐 token 消化（eos 不进链；预算逐枚截断）。
+                var stop = False
+                for j in range(acc):
+                    var tv = drafts[j]
+                    if tv == self.eos:
+                        self._finish_eos(slot)
+                        stop = True
+                        break
+                    self._emit_token(slot, tv)
+                    if (
+                        self.streams[slot].count
+                        >= self.streams[slot].steps
+                    ):
+                        stop = True
+                        break
+                if not stop:
+                    if nxt == self.eos:
+                        self._finish_eos(slot)
+                    else:
+                        self._emit_token(slot, nxt)
+                self.streams[slot].pos = Int(self.session.h_posarr[slot])
+            i += 1
 
     def _emit_token(mut self, slot: Int, tv: Int) raises:
         """生成分支的单 token 消化（与 `_forward_rows` 逐位同）。"""
@@ -659,9 +724,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.streams[slot].pos = Int(self.session.h_posarr[slot])
 
     def _tick(mut self) raises:
-        """推进所有活跃行各一步。solo（恰一条活跃流）+ 生成相位 +
-        贪心 + spec 开 → spec 分支（一次前向多 token）；其余全走
-        合批（t = 最大活跃行号+1，padding 补齐，row_base=0）。"""
+        """推进所有活跃行各一步。spec 开且全部活跃行贪心（temp==0）
+        → 全批走 `_spec_forward`（一次 spec_step 验证，prompt 行
+        ln=1 等价单 token 行，生成行带草稿——多流合批约束消失）；
+        任一行采样 → 回退合批（t = 最大活跃行号+1，padding 补齐，
+        row_base=0）。"""
         self.n_ticks += 1
         # 活跃 = 占着行且未交完（done 的行不再推进）。
         var act = List[Int]()
@@ -678,17 +745,20 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             i += 1
         if max_slot < 0:
             return
-        # solo spec 分支（一百七十四-d）：唯一活跃流、生成相位、贪心
-        # ——草稿验证一次前向多 token。多流/采样/prompt 相位照旧合批。
-        if (
-            self.spec_on
-            and len(act) == 1
-            and self.streams[act[0]].temp == 0
-            and self.streams[act[0]].pidx >= len(self.streams[act[0]].prompt)
-        ):
-            self.n_spec_ticks += 1
-            self._spec_tick(act[0])
-            return
+        # spec 分支（一百七十四-d 终刀）：spec 开 + 全部活跃行贪心
+        # ——一次 spec_step 验证，零 padding。任一行采样即回退。
+        if self.spec_on:
+            var all_greedy = True
+            var si = 0
+            while si < len(act):
+                if self.streams[act[si]].temp != 0:
+                    all_greedy = False
+                    break
+                si += 1
+            if all_greedy:
+                self.n_spec_ticks += 1
+                self._spec_forward(act)
+                return
         # 合批（一百三十六：per-row 采样核让合批条件彻底消失——任意
         # temp/top_p 组合一批搞定，每行与它单独前向逐位同）。
         self.n_batched += 1
