@@ -142,6 +142,11 @@ struct GpuStream(Movable):
     # 推 last 会让它跑到帧前面，门的逐位同链收集就错了）。
     var frame_tokens: List[Int]
     var frame_head: Int
+    # 一百七十五-补五：本流滚动接受率 EMA（accepted/drafted，α=0.1，
+    # 新流乐观起 1.0）。junk 草稿行烧 GPU 不产 token——冷尾域实测
+    # 0.61×（低于 OFF）；EMA 映射 k_eff：热链满 k，冷尾缩 2-4，
+    # 纯 junk 到 1，行数向 OFF 收拢。
+    var spec_ema: Float64
 
     def __init__(out self):
         self.request = NO_REQUEST
@@ -162,6 +167,7 @@ struct GpuStream(Movable):
         self.frame_dones = List[Bool]()
         self.frame_tokens = List[Int]()
         self.frame_head = 0
+        self.spec_ema = 1.0
 
 
 struct GpuService(Service, Movable, Deinitable, Twinable):
@@ -672,6 +678,22 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     ctx.append(t)
                 var drafts = List[Int]()
                 var hit = self._drafts_of(ctx^, drafts)
+                # 自适应草稿数：EMA→k_eff 映射 k×(2·ema−0.6) 截到
+                # [1, k]——ema≥0.8 满预算，0.5→0.4k，≤0.3→1。消费
+                # 相重查按建行 lens 截断，与本值无关（两相一致不受
+                # EMA 中途变化影响——EMA 只在消费末更新）。仍受
+                # per_gen_extra 硬预算钳制。
+                var kf = (
+                    Float64(self.spec_k)
+                    * (2.0 * self.streams[slot].spec_ema - 0.6)
+                )
+                if kf < 1.0:
+                    kf = 1.0
+                var k_eff = Int(kf + 0.5)
+                if k_eff > self.spec_k:
+                    k_eff = self.spec_k
+                while len(drafts) > k_eff:
+                    _ = drafts.pop()
                 # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens；
                 # 行预算收缩：每生成流最多 per_gen_extra 枚草稿（均匀
                 # 分配，行序无关 → 无饥饿；预算 ≤ k 上限取小者）。
@@ -743,6 +765,14 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     _ = drafts.pop()
                 self.spec_tel.n_drafted += nd
                 self.spec_tel.n_accepted += acc
+                # EMA 更新（消费末——建/消两相内不变）：本 tick 实际
+                # 验证行的接受率。nd=0 无信息不更新。
+                if nd > 0:
+                    var old_ema = self.streams[slot].spec_ema
+                    self.streams[slot].spec_ema = (
+                        0.9 * old_ema
+                        + 0.1 * (Float64(acc) / Float64(nd))
+                    )
                 # 逐 token 消化（eos 不进链；预算逐枚截断）。
                 var stop = False
                 for j in range(acc):

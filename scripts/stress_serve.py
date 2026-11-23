@@ -203,8 +203,22 @@ def one_request(host, port, body, timeout_s, counter, stream=False):
             pass
 
 
-def worker_loop(host, port, body, deadline, timeout_s, counter, stream=False):
+def worker_loop(
+    host, port, bodies, repeat_rate, deadline, timeout_s, counter, stream=False
+):
+    """bodies 长度 > 1 时按请求序号确定性选 prompt：序号散列 < 重复率
+    → 热门 prompt（bodies[0]），否则长尾轮转。混合统计量与线程调度
+    无关，ON/OFF 两轮同口径。"""
+    n = 0
     while time.monotonic() < deadline:
+        if len(bodies) > 1:
+            if ((n * 2654435761) % 10000) < int(repeat_rate * 10000):
+                body = bodies[0]
+            else:
+                body = bodies[1 + (n % (len(bodies) - 1))]
+            n += 1
+        else:
+            body = bodies[0]
         one_request(host, port, body, timeout_s, counter, stream)
 
 
@@ -215,6 +229,14 @@ def main():
     ap.add_argument("--duration", type=float, default=30.0)
     ap.add_argument("--max-tokens", type=int, default=8)
     ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument(
+        "--prompt-file", default="",
+        help="每行一个 prompt；首行是热门 prompt（配合 --repeat-rate）",
+    )
+    ap.add_argument(
+        "--repeat-rate", type=float, default=0.0,
+        help="热门 prompt 的请求占比（0-1；需 --prompt-file）",
+    )
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--request-timeout", type=float, default=120.0)
     ap.add_argument("--stream", action="store_true",
@@ -227,13 +249,24 @@ def main():
 
     host = args.url.split("//")[1].split(":")[0]
     port = int(args.url.split(":")[-1].split("/")[0])
-    body = json.dumps({
-        "model": "qwen2.5-0.5b",
-        "messages": [{"role": "user", "content": args.prompt}],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "stream": bool(args.stream),
-    }).encode()
+
+    def _body(prompt):
+        return json.dumps({
+            "model": "qwen2.5-0.5b",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "stream": bool(args.stream),
+        }).encode()
+
+    bodies = [_body(args.prompt)]
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompts = [ln.strip() for ln in f if ln.strip()]
+        if len(prompts) < 2:
+            raise SystemExit("--prompt-file 需要至少两行（首行 = 热门）")
+        # 热门 prompt 恒为 bodies[0]（--prompt），池文件只供长尾。
+        bodies = bodies + [_body(p) for p in prompts]
 
     loadavg = ""
     try:
@@ -250,7 +283,8 @@ def main():
     for _ in range(args.concurrency):
         th = threading.Thread(
             target=worker_loop,
-            args=(host, port, body, deadline, args.request_timeout, counter, args.stream),
+            args=(host, port, bodies, args.repeat_rate, deadline,
+                  args.request_timeout, counter, args.stream),
             daemon=True,
         )
         th.start()
@@ -270,7 +304,8 @@ def main():
     lines.append("")
     lines.append(f"- date: {datetime.date.today().isoformat()} host: {os.uname().nodename} ({os.uname().machine})")
     lines.append(f"- loadavg(1/5/15) at start: {' '.join(loadavg)} — 本机长期过载，**以下数字只能作同轮相对比较，不得当绝对吞吐外引**")
-    lines.append(f"- target: {args.url} concurrency={args.concurrency} duration={args.duration:.0f}s max_tokens={args.max_tokens} temperature={args.temperature} stream={bool(args.stream)} prompt_tokens≈{len(args.prompt.split())}")
+    lines.append(f"- target: {args.url} concurrency={args.concurrency} duration={args.duration:.0f}s max_tokens={args.max_tokens} temperature={args.temperature} stream={bool(args.stream)} prompt_tokens≈{len(args.prompt.split())}"
+                 + (f" prompts={len(bodies)} repeat_rate={args.repeat_rate}" if len(bodies) > 1 else ""))
     if args.master_pid:
         lines.append(
             f"- server pid tree: {before['processes']} procs; "
