@@ -41,7 +41,7 @@ from std.math import ceildiv
 from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     attn_vt_gpu, attn_comb_gpu, attn_vt2_gpu, attn_comb2_gpu, \
     kv_store_b_gpu, attn_rs_b_gpu, attn_rs_h_gpu, attn_vt2_b_gpu, \
-    attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
+    kv_rows_copy_gpu, attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
     attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu, \
     kv_store_bb_gpu_spec, attn_rs_h_bb_gpu_spec, attn_vt2_h_bb_gpu_spec
 from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, f32_adds_rmsnorm_f16_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
@@ -1110,6 +1110,37 @@ struct GpuSession:
             )
             a0 += ln
         return out^
+
+    def copy_prefix_b(
+        mut self, dst_seq: Int, src_seq: Int, nrows: Int
+    ) raises:
+        """槽间 KV 前缀拷贝（一百七十六）：把 src 槽的 KV 行
+        [0, nrows) 逐层复制到 dst 槽（store_b 布局
+        [B][max_tokens][kv_dim]，k/v 各一发/层，末尾一次 sync）。
+        KV 行内容由位置索引唯一决定（rope 相位 = 位置）——同前缀
+        同 KV 逐位同，拷贝后 dst 槽从 pos=nrows 起步即可续 forward
+        （省掉 nrows 行的 prompt prefill）。前置：src 槽的行
+        [0, nrows) 是有效 KV（完整 prefill 过同前缀）、nrows ≤
+        两槽的 max_tokens、dst 槽是空闲/即将启用的槽。"""
+        if nrows <= 0 or nrows > self.max_tokens:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT, "prefix copy row count", ""
+            )
+        var stride = self.max_tokens * self.kv_dim
+        for layer in range(self.n_layers):
+            var pk = self.d_k_store_b[layer].unsafe_ptr()
+            var pv = self.d_v_store_b[layer].unsafe_ptr()
+            self.ctx.enqueue_function[kv_rows_copy_gpu](
+                pk, Int32(self.kv_dim), Int32(stride),
+                Int32(dst_seq), Int32(src_seq), Int32(nrows),
+                grid_dim=(nrows, 1, 1), block_dim=(256, 1, 1),
+            )
+            self.ctx.enqueue_function[kv_rows_copy_gpu](
+                pv, Int32(self.kv_dim), Int32(stride),
+                Int32(dst_seq), Int32(src_seq), Int32(nrows),
+                grid_dim=(nrows, 1, 1), block_dim=(256, 1, 1),
+            )
+        self.ctx.synchronize()
 
     def generate_spec[
         inner: Int, inner_ff: Int

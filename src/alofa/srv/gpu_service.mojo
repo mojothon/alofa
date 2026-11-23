@@ -217,6 +217,22 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     # 的 tick 不再整批回退 plain 路，spec 验证行走 per-row 采样
     # （种子 = 流种子 + 生成步，与 136 的 plain 派生逐位同）。
     var spec_sample: Bool
+    # 一百七十六：槽间 KV 前缀复用（ALOFA_KV_PREFIX 默认开）——同
+    # prompt 的请求直接拷贝源槽的 KV 行 [0, plen-1)，从末枚 prompt
+    # token 起步，免掉整段 prompt prefill（多轮对话 1000+ token 历史
+    # 下 prefill 占大头）。安全面：KV 行内容由位置索引唯一决定
+    # （rope 相位=位置）——同前缀同 KV 逐位同。验证：h1（63-bit
+    # FNV-1a）为键 + h2（独立盐）+ plen 三重核对 + 槽占用态校验
+    # （slot_cur/slot_prefix：源槽当前/上一条流确为同 prompt 才可信
+    # ——防活跃流换 prompt 后旧条目指向已覆写的行）。
+    var kv_prefix: Bool
+    var prefix_slot: Dict[Int, Int]
+    var prefix_h2: Dict[Int, Int]
+    var prefix_plen: Dict[Int, Int]
+    var slot_cur: List[Int]
+    var slot_prefix: List[Int]
+    var n_prefix_hits: Int
+    var n_prefix_rows: Int
 
     def __init__(
         out self,
@@ -278,6 +294,18 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.spec_table = SpecTable()
         self.spec_shared = env_int("ALOFA_SPEC_SHARED", 1, 0, 1) == 1
         self.spec_sample = env_int("ALOFA_SPEC_SAMPLE", 1, 0, 1) == 1
+        # 一百七十六：前缀复用初始化。
+        self.kv_prefix = env_int("ALOFA_KV_PREFIX", 1, 0, 1) == 1
+        self.prefix_slot = Dict[Int, Int]()
+        self.prefix_h2 = Dict[Int, Int]()
+        self.prefix_plen = Dict[Int, Int]()
+        self.slot_cur = List[Int]()
+        self.slot_prefix = List[Int]()
+        for _i in range(self.n_rows):
+            self.slot_cur.append(-1)
+            self.slot_prefix.append(-1)
+        self.n_prefix_hits = 0
+        self.n_prefix_rows = 0
 
     def _drafts_of(
         mut self, var ctx: List[Int], mut drafts: List[Int]
@@ -361,6 +389,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             + ",\"spec_accepted\":" + String(self.spec_tel.n_accepted)
             + ",\"spec_shared_hits\":" + String(self.spec_table.n_shared_hits)
             + ",\"spec_table_entries\":" + String(len(self.spec_table.map))
+            + ",\"prefix_hits\":" + String(self.n_prefix_hits)
+            + ",\"prefix_rows\":" + String(self.n_prefix_rows)
         )
 
     def complete(
@@ -408,6 +438,49 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.stream_end(COMPLETE_MARKER)
         return Completion(text, n_in, n_out)
 
+    def _phash(self, ids: List[Int], seed: UInt64) -> UInt64:
+        """FNV-1a 64-bit prompt 哈希（一百七十六）：双盐两枚独立哈希
+        ——h1 做键、h2 做验证，等效 128 位核对（碰撞概率天文小）。
+        UInt64 算术回绕无陷阱。参数默认借用（List 不可隐式拷贝，
+        调用方传名即可，无转移无拷贝）。"""
+        var h = seed
+        for t in ids:
+            h = (h ^ (UInt64(t) & UInt64(0xFFFFFFFF))) * UInt64(
+                1099511628211
+            )
+        return h
+
+    def _prefix_lookup(
+        mut self, ids: List[Int]
+    ) raises -> Int:
+        """前缀命中查询（一百七十六）：返回源槽号（-1 = 无命中）。
+        三重核对——h2/plen/源槽占用态。占用态判据：源槽的**当前**
+        流（slot_cur）或**上一条**流（slot_prefix）的 prompt 哈希
+        与本请求一致——前者是活跃同 prompt 流（生成只写 pos 行，
+        前缀行完好），后者是已结束流（行保留到被新流覆写为止）。
+        其他情形（活跃流换了 prompt）行可能已被覆写——拒绝。"""
+        var plen = len(ids)
+        var h1u = self._phash(ids, UInt64(0xcbf29ce484222325))
+        var h1 = Int(h1u & UInt64(0x7FFFFFFFFFFFFFFF))
+        if h1 not in self.prefix_slot:
+            return -1
+        var src = self.prefix_slot[h1]
+        if src < 0 or src >= self.n_rows:
+            return -1
+        var h2i = Int(
+            self._phash(ids, UInt64(0x9e3779b97f4a7c15)) & UInt64(
+                0x7FFFFFFFFFFFFFFF
+            )
+        )
+        if self.prefix_h2[h1] != h2i or self.prefix_plen[h1] != plen:
+            return -1
+        # 占用态校验：源槽当前流或上一条流确为同 prompt（h1 同）。
+        var cur = Int(self.slot_cur[src])
+        var prev = Int(self.slot_prefix[src])
+        if cur != h1 and prev != h1:
+            return -1
+        return src
+
     def stream_begin(
         mut self,
         prompt: String,
@@ -445,12 +518,40 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.session.h_posarr[slot] = Int32(0)
         var st = GpuStream()
         st.request = request
-        st.prompt = ids^
         st.steps = steps
         st.temp = Float32(temperature)
         st.topp = Float32(top_p)
         st.seed = self.seed
+        # 一百七十六：前缀复用命中判定（在 ids 移入流状态**前**做；
+        # 此处 raise 时槽尚未占用，无泄漏）。
+        var h1 = -1
+        var psrc = -1
+        var prows = 0
+        if self.kv_prefix and len(ids) >= 2:
+            h1 = Int(
+                self._phash(ids, UInt64(0xcbf29ce484222325))
+                & UInt64(0x7FFFFFFFFFFFFFFF)
+            )
+            psrc = self._prefix_lookup(ids)
+            if psrc >= 0:
+                prows = len(ids) - 1
+        st.prompt = ids^
         self.streams[slot] = st^
+        if psrc >= 0:
+            # 命中：拷贝源槽 KV 行 [0, plen-1)，从末枚 prompt token
+            # 起步（kind-1 行预测 gen[0]），整段 prompt prefill 免掉。
+            # 同槽命中（空闲槽即上条同 prompt 流）行原样有效——只推
+            # pos/pidx 不拷贝。
+            if psrc != slot:
+                self.session.copy_prefix_b(slot, psrc, prows)
+            self.session.h_posarr[slot] = Int32(prows)
+            self.streams[slot].pos = prows
+            self.streams[slot].pidx = prows
+            self.n_prefix_hits += 1
+            self.n_prefix_rows += prows
+        # 槽占用态：新流占槽——记本流哈希；行被本流 prefill 覆写后，
+        # 指向本槽的旧条目靠此字段失活（查询侧占用态校验）。
+        self.slot_cur[slot] = h1
 
     def _frame_of(mut self, slot: Int) raises -> String:
         """出队一帧：`emitted` 前移到队头帧的 end，文本 = 两 end 之间
@@ -1040,6 +1141,27 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         对端断开再收是常态）。"""
         var slot = self._slot_of(request)
         if slot >= 0:
+            # 一百七十六：流结束——前缀行 [0, plen-1) 完整有效，登记
+            # 条目（slot_cur 带着本流 begin 时算好的 h1）。溢出整表
+            # 重建（多付一次 prefill 的代价可忽略）。
+            var h1 = Int(self.slot_cur[slot])
+            var plen = len(self.streams[slot].prompt)
+            if self.kv_prefix and h1 >= 0 and plen >= 2:
+                if len(self.prefix_slot) > 4096:
+                    self.prefix_slot = Dict[Int, Int]()
+                    self.prefix_h2 = Dict[Int, Int]()
+                    self.prefix_plen = Dict[Int, Int]()
+                var h2 = Int(
+                    self._phash(
+                        self.streams[slot].prompt,
+                        UInt64(0x9e3779b97f4a7c15)
+                    ) & UInt64(0x7FFFFFFFFFFFFFFF)
+                )
+                self.prefix_slot[h1] = slot
+                self.prefix_h2[h1] = h2
+                self.prefix_plen[h1] = plen
+            self.slot_prefix[slot] = h1
+            self.slot_cur[slot] = -1
             self.streams[slot].request = NO_REQUEST
             self.streams[slot].prompt = List[Int]()
             self.streams[slot].out = List[Int]()

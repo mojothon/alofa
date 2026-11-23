@@ -10,7 +10,7 @@ exp+sum → V 累加 / total）与 `kernels/cpu/scalar.mojo` 的 `attention` 同
 性能版（块内并行规约）等这个串行版在门里立足之后再做：串行版就是它的对照臂。
 """
 
-from std.gpu import block_idx, global_idx, thread_idx
+from std.gpu import block_idx, block_dim, global_idx, thread_idx
 from std.math import exp, sqrt
 from std.memory import stack_allocation
 
@@ -1392,6 +1392,36 @@ def kv_store_b_gpu[THREADS: Int](
         v_store[unsafe_offset=upto * kv_cols + kv_head_base + tid] = (
             v_src[unsafe_offset=b * kv_cols + kv_head_base + tid]
         )
+
+
+def kv_rows_copy_gpu(
+    store: Pointer[Float32, MutUntrackedOrigin],
+    kv_dim: Int32,
+    mt_stride: Int32,
+    s_dst: Int32,
+    s_src: Int32,
+    nrows: Int32,
+) -> None:
+    """槽间 KV 前缀拷贝核（一百七十六）：同层 store_b 内把 src 槽的
+    行 [0, nrows) 逐元素复制到 dst 槽——布局 [B][max_tokens][kv_dim]，
+    槽 s 行 p 的偏移 = s*mt_stride + p*kv_dim。**单指针参数**（dst/
+    src 槽必在同一 per-layer buffer，槽号内核内展开——enqueue_function
+    的变参按可变引用捕获，同 origin 双参触发别名拒编译）。KV 行内容
+    由**位置索引**决定（rope 相位 = 位置）——同前缀的 KV 行逐位相同，
+    拷贝即复用，免重算 prompt prefill。grid=(nrows,)，每块吃一行。
+    调用方逐层 × {k,v} 发射 + 一次 sync。
+    """
+    var row = Int(block_idx.x)
+    if row >= Int(nrows):
+        return
+    var dst_base = Int(s_dst) * Int(mt_stride) + row * Int(kv_dim)
+    var src_base = Int(s_src) * Int(mt_stride) + row * Int(kv_dim)
+    var tid = Int(thread_idx.x)
+    var step = Int(block_dim.x)
+    for i in range(tid, Int(kv_dim), step):
+        store[unsafe_offset=dst_base + i] = store[
+            unsafe_offset=src_base + i
+        ]
 
 
 def attn_rs_b_gpu[
