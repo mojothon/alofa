@@ -4125,4 +4125,15 @@
   - **门**（新 `tests/gpu/test_service_deep.mojo`）：32 流 × 120 token 全贪心并发——**全部链长 120**（min=max=120）+ stream0 parity vs solo 逐位同 + spec_ticks ≥ 1，两轮 PASS。t=288+ 的深生成场景封住这一类回归（conc8 的 t≤72 从未触界，旧门全是盲区）。
   - **HTTP 重测（修复后，全 120 token 真实——p50×并发自洽）**：conc32 6289 / conc48 6885 / conc64 7527 tok/s；vs OFF conc48 5228 → **conc48 +32%**；conc32 短压 1398.5（vs OFF 1248.8，+12%）。**改写结论：多流景不是「持平」而是 +12-32%**（昨天与今晨的「conc32 持平/短压」数字全部是坏数据——t=288 早截断；conc8 数字不受影响，t≤72）。计数器：接受率 96.3%（302131/313565，三景累计与交付 token 自洽）。
   - **回归**：service_spec / gpu_service / multi_e2e / spec_gen / session_batch / generate_batch 六门全 PASS（prefill_step 检查变更影响面全量）。
+- **2026-11-23（一百七十五-补三）** —— **全量 21 门收官清点 + 生产域接受率画像：真对话域 prompt-lookup ≈ 零收益，「对话域 2×」须加域限定**
+  - **全量门清点**（prefill_step 检查变更后的收官纪律）：21/21 门全绿——含 pool_repro（F1-F8 全 True）、rowprobe（c12/c13 True）、session_probe（layer 0 chain clean）、topp、cuda_diff 等六个此轮未单独跑的门。
+  - **生产域画像**（5 域 × conc8 × 120 token × ON/OFF 同轮，QPS 比为增益口径——贪心链确定，eos 早停两侧等位，QPS 比公平；/health 差分归因每域）：
+    | 域 | accept | hit | ON QPS | OFF QPS | 增益 |
+    |---|---|---|---|---|---|
+    | story（龙烹饪续写） | 90.4% | 43.3% | 21.58 | 9.96 | **2.17×** |
+    | 对话①（climate 问答） | 12.5% | 0.8% | 9.55 | 9.54 | **1.00×** |
+    | 对话②（pancakes 步骤） | 23.2% | 6.5% | 10.31 | 9.86 | **1.05×** |
+    | code（fib 续写） | 94.5% | 21.1% | 12.82 | 9.39 | **1.37×** |
+    | pattern（计数循环） | 83.3% | 62.5% | 20.37 | 9.34 | **2.18×** |
+  - **判读**：①prompt-lookup 的收益完全由 **prompt 内可复用 n-gram** 决定——真问答对话（无复现结构）hit 0.8-6.5%，接受率 12-23%，增益 **1.00-1.05×**；此前「对话域 2×」的外推来自含复现结构的 story prompt，**不适用于真问答域**，生产口径改为「复现/续写域 1.4-2.2×，真问答域 ~1×」。②**零开销性质确认**：dialog1 无草稿可查（hit 0.8%）时 ON=OFF 逐位同（9.55/9.54、p50 832/834ms）——spec 路退化为 ln=1 行与合批语义等价，无草稿零成本。③code 域 hit 21% 但 accept 94.5%、3.09 accepted/tick → 1.37×：草稿短链全接受，增益与草稿量同向。
 
