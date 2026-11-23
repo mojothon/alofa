@@ -4115,4 +4115,7 @@
   - **HTTP 级验证**（conc8 长生成 120tok 同轮）：2302.3（k=4）→ **2570.5 tok/s（+12%；spec OFF 1199.4 的 2.14×）**，零错误；计数器：接受率 90.4%（61006/67496）、~12.2 tokens/tick。
   - **回归**：test_service_spec / test_gpu_service / test_multi_e2e 全 PASS（预算守卫与 k=8 默认下）。
   - **运维教训**：serve_gpu -O2 冷启动（编译+装载）可超 40s——启动后必须**轮询日志 "listening"** 再压测，定时 sleep 撞装载期会得到全 connect_failed 假象（本轮即踩）。
+- **2026-11-23（一百七十五 补）** —— **HTTP 级 pattern 域验证：conc8 1124 → 2438 tok/s（2.17×），预算守卫并发下成立**
+  - 175 的 HTTP 验证只做了 story 域（+12%）；本轮补 pattern 域 conc8（多流全贪心 × k=8 长链的组合，真正行使总行预算守卫）：spec OFF 1124.0 → spec ON(k=8) **2437.7 tok/s（2.17×）**，零错误；计数器：命中 62.3%、接受率 **83.3%**（81900/98280）、**11.8 tokens/tick @ batch 8**（8 流 × 9 行 = 72 ≤ 320，守卫未收缩任何行）。
+  - **至此 spec 全景定型**：solo 2.14×（story 域）、conc8 story 1.92×、conc8 pattern 2.17×；service 级 pattern 域 4.1×（853/207）；生产口径「对话域 2× 级、高接受域 2-4×、采样混合零扰动」。k=8 默认经门 + HTTP 双面验证；ALOFA_SPEC_K/NGRAM 运行时可调留作部署侧旋钮。
 
