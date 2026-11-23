@@ -58,7 +58,7 @@ from alofa.srv.sse import StreamToken
 from alofa.tokenizer import Tokenizer, load_tokenizer_json
 
 from alofa.core.error import ERR_CAPACITY, ERR_INVALID_ARGUMENT, AlofaError
-from alofa.gpu.spec_draft import SpecTelemetry, spec_lookup
+from alofa.gpu.spec_draft import SpecTable, SpecTelemetry, spec_lookup
 
 
 # prefill_step 的形状实参（comptime，见各门）。⚠️ 目前钉在
@@ -202,6 +202,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     # 默认 4/4——174-d 定值；域扫描 bench_speck 定最优）。
     var spec_k: Int
     var spec_ngram: Int
+    # 一百七十五-补四：会话级共享输出 n-gram 表（跨流草稿源——重复
+    # 请求 / 并发同 prompt / 多轮对话的召回面；ALOFA_SPEC_SHARED 门
+    # 控默认开）。表在单 tick 的建/消两相间冻结（见 _spec_forward）。
+    var spec_table: SpecTable
+    var spec_shared: Bool
 
     def __init__(
         out self,
@@ -260,6 +265,28 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.n_spec_ticks = 0
         self.spec_k = env_int("ALOFA_SPEC_K", SPEC_K, 1, 16)
         self.spec_ngram = env_int("ALOFA_SPEC_NGRAM", SPEC_NGRAM, 2, 16)
+        self.spec_table = SpecTable()
+        self.spec_shared = env_int("ALOFA_SPEC_SHARED", 1, 0, 1) == 1
+
+    def _drafts_of(
+        mut self, var ctx: List[Int], mut drafts: List[Int]
+    ) raises -> Bool:
+        """草稿查询统一入口（建行与消费期**必须共用**——两相同源同
+        果，消费期重查才与建行 lens 一致）。先自身 ctx 扫描（最近
+        历史，精度优先）；脱靶且共享表开启时以 ctx 末 n-gram 窗口
+        链式跟随共享表（跨流/跨请求召回）。"""
+        var hit = spec_lookup(ctx^, self.spec_k, self.spec_ngram, drafts)
+        if not hit and self.spec_shared:
+            var n = len(ctx)
+            var start = n - self.spec_ngram
+            if start >= 0:
+                var tail = List[Int]()
+                for p in range(start, n):
+                    tail.append(ctx[p])
+                hit = self.spec_table.follow(tail, self.spec_k, drafts)
+                if hit:
+                    self.spec_table.n_shared_hits += 1
+        return hit
 
     def _slot_of(self, request: Int) -> Int:
         var slot = 0
@@ -321,6 +348,8 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             + ",\"spec_hits\":" + String(self.spec_tel.n_hits)
             + ",\"spec_drafted\":" + String(self.spec_tel.n_drafted)
             + ",\"spec_accepted\":" + String(self.spec_tel.n_accepted)
+            + ",\"spec_shared_hits\":" + String(self.spec_table.n_shared_hits)
+            + ",\"spec_table_entries\":" + String(len(self.spec_table.map))
         )
 
     def complete(
@@ -611,9 +640,14 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             i0 += 1
         var per_gen_extra = (PREFILL_MAX_BATCH - len(act)) // max(n_gen, 1)
         var rows_total = 0
+        # 共享表插桩基线（一百七十五-补四）：建行时各流的 out 长度
+        # ——消费后 out 增量即本 tick 新产 token，插表在**消费循环完
+        # 全结束后**统一做（建/消两相的表态冻结，重查同源同果）。
+        var befores = List[Int]()
         var i = 0
         while i < len(act):
             var slot = act[i]
+            befores.append(len(self.streams[slot].out))
             self.session.h_posarr[slot] = Int32(self.streams[slot].pos)
             if self.streams[slot].pidx < len(self.streams[slot].prompt):
                 toks.append(
@@ -637,9 +671,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 for t in self.streams[slot].out:
                     ctx.append(t)
                 var drafts = List[Int]()
-                var hit = spec_lookup(
-                    ctx^, self.spec_k, self.spec_ngram, drafts
-                )
+                var hit = self._drafts_of(ctx^, drafts)
                 # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens；
                 # 行预算收缩：每生成流最多 per_gen_extra 枚草稿（均匀
                 # 分配，行序无关 → 无饥饿；预算 ≤ k 上限取小者）。
@@ -705,9 +737,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 for t in self.streams[slot].out:
                     ctx.append(t)
                 var drafts = List[Int]()
-                _ = spec_lookup(
-                    ctx^, self.spec_k, self.spec_ngram, drafts
-                )
+                _ = self._drafts_of(ctx^, drafts)
                 var nd = lens[i] - 1
                 while len(drafts) > nd:
                     _ = drafts.pop()
@@ -735,6 +765,38 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                         self._emit_token(slot, nxt)
                 self.streams[slot].pos = Int(self.session.h_posarr[slot])
             i += 1
+        # 共享表插桩（消费全结束后——两相间表态冻结）：本 tick 每流
+        # 的新产 token 逐枚入表，键 = 链（prompt + out 前缀）的末
+        # n-gram 窗口滚动哈希，值 = 该 token。同前缀的历史生成由此
+        # 可被后续请求/并发流逐位重放。
+        if self.spec_shared:
+            i = 0
+            while i < len(act):
+                var slot = act[i]
+                var plen = len(self.streams[slot].prompt)
+                var before = befores[i]
+                var outn = len(self.streams[slot].out)
+                var j = before
+                while j < outn:
+                    var win = List[Int]()
+                    var total = plen + j
+                    var start = total - self.spec_ngram
+                    if start < 0:
+                        start = 0
+                    var w = start
+                    while w < total:
+                        if w < plen:
+                            win.append(self.streams[slot].prompt[w])
+                        else:
+                            win.append(
+                                self.streams[slot].out[w - plen]
+                            )
+                        w += 1
+                    self.spec_table.insert(
+                        win, self.streams[slot].out[j]
+                    )
+                    j += 1
+                i += 1
 
     def _emit_token(mut self, slot: Int, tv: Int) raises:
         """生成分支的单 token 消化（与 `_forward_rows` 逐位同）。"""

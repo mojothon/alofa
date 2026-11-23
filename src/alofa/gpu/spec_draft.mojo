@@ -25,6 +25,70 @@
 from alofa.core.error import ERR_INVALID_ARGUMENT, AlofaError
 
 
+def _win_hash(win: List[Int]) -> Int:
+    """n-gram 窗口滚动哈希（2^62 掩码防溢出）。碰撞 → 错草稿，验证
+    层拒绝只浪费预算行——正确性不依赖哈希唯一性。"""
+    var h = 0
+    for t in win:
+        h = ((h * 1000003) + t) & ((1 << 62) - 1)
+    return h
+
+
+struct SpecTable(Movable):
+    """会话级共享输出 n-gram 表（一百七十五-补四）——跨流草稿源。
+
+    175-补三画像暴露 prompt-lookup 在真问答域 hit≈0（草稿只能来自
+    prompt 内部复现）。本表把**每条流的产出**（贪心与采样一致收，
+    _emit_token 侧钩子）以滑动 n-gram 窗口写入共享 Dict[Int, Int]
+    （窗口滚动哈希 → 下一 token），查询时**链式跟随**重建完整草稿
+    链：同前缀的历史生成被逐位重放（重复请求 / 并发同 prompt /
+    多轮对话），异前缀自然脱靶。正确性不受表污染——草稿经 spec
+    验证（argmax 前缀匹配），错草稿只浪费预算行；表在单个 service
+    生命周期内单调增长，cap 封顶后停止写入（确定性：同读写序列同
+    表态）。
+    """
+
+    var map: Dict[Int, Int]
+    var cap: Int
+    var n_inserts: Int
+    var n_shared_hits: Int
+
+    def __init__(out self, cap: Int = 1 << 18):
+        self.map = Dict[Int, Int]()
+        self.cap = cap
+        self.n_inserts = 0
+        self.n_shared_hits = 0
+
+    def insert(mut self, win: List[Int], nxt: Int) raises:
+        """写一条（窗口哈希 → 下一 token）。同键覆写（最近生成最
+        能代表当前分布）；cap 满即停写——只影响新键召回，旧键照常。"""
+        if len(self.map) >= self.cap:
+            return
+        self.map[_win_hash(win)] = nxt
+        self.n_inserts += 1
+
+    def follow(
+        mut self, tail: List[Int], k: Int, mut drafts: List[Int]
+    ) raises -> Bool:
+        """从 ctx 末 n-gram 窗口 `tail` 起链式跟随，至多 `k` 枚草稿。
+        窗口滑动推进（追加入草稿 token），任一环脱靶即止。"""
+        var win = List[Int]()
+        for t in tail:
+            win.append(t)
+        var any = False
+        for _ in range(k):
+            var h = _win_hash(win)
+            if h not in self.map:
+                break
+            var nxt = self.map[h]
+            drafts.append(nxt)
+            any = True
+            for j in range(len(win) - 1):
+                win[j] = win[j + 1]
+            win[len(win) - 1] = nxt
+        return any
+
+
 struct SpecTelemetry(Movable):
     """spec 生成的草稿命中/接受遥测（174-d 生产 A/B 的口径面）。"""
 
