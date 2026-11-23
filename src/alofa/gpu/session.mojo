@@ -93,7 +93,14 @@ comptime F16_BUILD = True
 
 # prefill 批上限（账本八十八）：缓冲按此定宽；超长 prompt 由调用方分块
 # （分块间 KV 连续，天然 chunked prefill）。
-alias PREFILL_MAX_BATCH = 128
+# 一百七十五-补八：128→256。设备侧批缓冲自 174-c 起按
+# mb = max(PREFILL_MAX_BATCH, BMAX*5) = 320 尺寸（d_xb/d_qb/d_kb/d_vb/
+# d_kbpart/d_qpart 全套），128 只是守卫值——扩到 256 零新增显存，
+# 行上限仍受 row_mapped 批路的 SPEC_MAX_ROWS=320 兜底；非 spec 的
+# batch 解码路另有 BMAX=64 独立守卫不受此值影响。动机：均匀草稿
+# 预算 (128−c)//c 在 c≥32 时把草稿钳到 ≤3，增益坍缩（补七实测
+# 2.6×→1.3×）；256 下 c=64 恢复 3 枚、c=32 恢复 7 枚。
+alias PREFILL_MAX_BATCH = 256
 # 一百二十-b：批解码序列上限（store/pos/logits 缓冲按此分配）
 alias BMAX = 64
 # 一百七十四-c：spec 行化 tick 的行数上限（每序列最多 4 draft
