@@ -4104,4 +4104,8 @@
   - **HTTP A/B**（conc8 长生成 120tok，30s 同轮）：spec OFF 1199.4 → spec ON **2302.3 tok/s（1.92×）**，零错误；计数器归因（风暴轮捕获）：1267 tick、命中 56.4%、接受率 **95.4%**（9944 草稿 9492）、**~10.7 tokens/tick @ batch 8**。solo/conc1 维持 2.06×。
   - **环境噪声教训**：首轮 conc8 出现 349566 connect_failed——共享主机瞬时过载（复跑 uptime 0.04 零错误）；压测异常先查机器负载与复跑，再怀疑代码。
   - **174-d 全案收结**：投机解码从 session（generate_spec）→ solo serving（_spec_tick）→ 多流 serving（_spec_forward）三层全部落地并生产验证；solo 2.06×、conc8 1.92×、多采样混合零扰动。遗留：小模型草稿源（接口已预留）、spec 行进合批 tick 的采样混合（需要核内 per-row 采样+验证混合尾核，收益低不做）。
+- **2026-11-23（一百七十四-d 收官清点）** —— **GPU 全套门 + 本地 CPU 套件全绿；rowprobe 十三刀恢复全绿（探针自身缺陷）**
+  - **远端清点**（GPU3，20 门）：multi_e2e / gpu_service / service_spec / spec_gen / serve_boot / sample / topp / session×6 / cuda_diff / heap×2 / pool_repro / rowprobe 全 PASS（serve_boot 遇共享主机 8000 被占——ALOFA_PORT 透传绕开；AsyncRT 间歇崩重试即可）。session 级门与 spec 无交集，确认 spec 默认开无暗伤。
+  - **rowprobe c11 假 False 平反**：探针在 c8/c11 合批场景**不看 `waiting` 盲采 `last`**（他流节奏滞后时采到 stale 值，链长 30 vs 20 恒 False）——spec OFF 同样 False 证明非 spec 引入。补 waiting 门控后**十三刀全绿**（c11-mixed True，24/16 帧正确）；真实门 test_gpu_service 的 mb==c1 判据（有门控）一直 PASS。
+  - **本地**：run_tests.sh + check-ledger 全绿（42 组 0 failed，含账本格式校验）。
 

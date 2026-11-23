@@ -19,7 +19,8 @@ def _run(mut svc: GpuService, prompt: String, rid: Int) raises -> List[Int]:
     var done = False
     while not done:
         var fr = svc.stream_next(rid)
-        c.append(svc.streams[0].last)
+        if not fr.waiting:
+            c.append(svc.streams[0].last)
         if fr.done:
             done = True
     svc.stream_end(rid)
@@ -70,12 +71,14 @@ def main() raises:
     while (not da) or (not db):
         if not da:
             var fa = svc.stream_next(11)
-            ca.append(svc.streams[0].last)
+            if not fa.waiting:
+                ca.append(svc.streams[0].last)
             if fa.done:
                 da = True
         if not db:
             var fb = svc.stream_next(12)
-            cb.append(svc.streams[1].last)
+            if not fb.waiting:
+                cb.append(svc.streams[1].last)
             if fb.done:
                 db = True
     svc.stream_end(11)
@@ -101,12 +104,14 @@ def main() raises:
     while (not da2) or (not db2):
         if not da2:
             var fa = svc.stream_next(21)
-            ma.append(svc.streams[0].last)
+            if not fa.waiting:
+                ma.append(svc.streams[0].last)
             if fa.done:
                 da2 = True
         if not db2:
             var fb = svc.stream_next(22)
-            mb.append(svc.streams[1].last)
+            if not fb.waiting:
+                mb.append(svc.streams[1].last)
             if round < 6:
                 print("  round", round, "A.last", svc.streams[0].last,
                       "B.last", svc.streams[1].last,
