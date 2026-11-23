@@ -4118,4 +4118,11 @@
 - **2026-11-23（一百七十五 补）** —— **HTTP 级 pattern 域验证：conc8 1124 → 2438 tok/s（2.17×），预算守卫并发下成立**
   - 175 的 HTTP 验证只做了 story 域（+12%）；本轮补 pattern 域 conc8（多流全贪心 × k=8 长链的组合，真正行使总行预算守卫）：spec OFF 1124.0 → spec ON(k=8) **2437.7 tok/s（2.17×）**，零错误；计数器：命中 62.3%、接受率 **83.3%**（81900/98280）、**11.8 tokens/tick @ batch 8**（8 流 × 9 行 = 72 ≤ 320，守卫未收缩任何行）。
   - **至此 spec 全景定型**：solo 2.14×（story 域）、conc8 story 1.92×、conc8 pattern 2.17×；service 级 pattern 域 4.1×（853/207）；生产口径「对话域 2× 级、高接受域 2-4×、采样混合零扰动」。k=8 默认经门 + HTTP 双面验证；ALOFA_SPEC_K/NGRAM 运行时可调留作部署侧旋钮。
+- **2026-11-23（一百七十五-补二）** —— **多流 spec 高并发早收流 bug：三层缺陷链（容量面用错 + 越界 pos 检查 + SSE 补 [DONE] 掩盖），修复 + 新门 + 高并发收益改写**
+  - **发现**：175-补的 HTTP 验证后追加 conc64 时 tok/s 报 34k（超带宽上限 13×）——tok/s 口径 = ok × 名义 max_tokens / 墙钟，而压测客户端只在收到 `[DONE]` 才计 ok：服务端异常收流会被 SSE 清理路径**补 [DONE]**，客户端看到协议完整但内容 ~6-10 token 的响应，零错误零截断计数，tok/s 虚高 80×。**判据教训：tok/s 与「p50 延迟 × 并发 × 名义 token」自洽校验是压测的必做步骤；「零错误」在 SSE 补终止符的架构下不等于零异常。**
+  - **缺陷链三层**（probe_195 逐层归因）：①`_spec_forward` 行预算守卫用 SPEC_MAX_ROWS=320——那是缓冲尺寸，spec_step 底下 prefill_step 批路硬容量是 **PREFILL_MAX_BATCH=128**，t=288（conc32×k=8）直接炸「prefill batch exceeds capacity」；②prefill_step 的逐行 pos 检查按「行 b = 槽 b」假设扫 h_posarr[0..t]——row_mapped 的 spec 行是绝对槽号映射，t=128 > 槽表 64，越界读垃圾位假报「kv store is full (batch)」（spec_step 上游本就逐 seq 校验过）；③每流至少贡献 1 行（cur），行数触顶后缩草稿到 0 也压不下去——初版守卫结构性不可行。
+  - **修复**：①守卫改**均匀草稿预算**——`per_gen_extra = (128 - 流数) // 生成流数`，每生成流等额分配，无饥饿无截断（32 流 → 3 草稿/流，64 流 → 1）；②pos 检查 skip row_mapped（prefill_step 内 `comptime if` 嵌套解析受限，最终用块内 plain-if 参数折叠写法）；③spec_step 补 t ≤ PREFILL_MAX_BATCH 显式校验（清晰报错面）。
+  - **门**（新 `tests/gpu/test_service_deep.mojo`）：32 流 × 120 token 全贪心并发——**全部链长 120**（min=max=120）+ stream0 parity vs solo 逐位同 + spec_ticks ≥ 1，两轮 PASS。t=288+ 的深生成场景封住这一类回归（conc8 的 t≤72 从未触界，旧门全是盲区）。
+  - **HTTP 重测（修复后，全 120 token 真实——p50×并发自洽）**：conc32 6289 / conc48 6885 / conc64 7527 tok/s；vs OFF conc48 5228 → **conc48 +32%**；conc32 短压 1398.5（vs OFF 1248.8，+12%）。**改写结论：多流景不是「持平」而是 +12-32%**（昨天与今晨的「conc32 持平/短压」数字全部是坏数据——t=288 早截断；conc8 数字不受影响，t≤72）。计数器：接受率 96.3%（302131/313565，三景累计与交付 token 自洽）。
+  - **回归**：service_spec / gpu_service / multi_e2e / spec_gen / session_batch / generate_batch 六门全 PASS（prefill_step 检查变更影响面全量）。
 

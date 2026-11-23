@@ -1037,6 +1037,15 @@ struct GpuSession:
             raise AlofaError(
                 ERR_INVALID_ARGUMENT, "spec rows cap", "t=" + String(t)
             )
+        # 一百七十五-补：底下的 prefill_step 批路容量是 128 行（组装
+        # 时超限会在核里炸「prefill batch exceeds capacity」）——多流
+        # spec 的 t 可远超 solo 的 ≤9 行，必须在这里就按有效上限拒。
+        if t > PREFILL_MAX_BATCH:
+            raise AlofaError(
+                ERR_INVALID_ARGUMENT,
+                "spec rows exceed the prefill batch capacity",
+                "t=" + String(t) + " cap=" + String(PREFILL_MAX_BATCH),
+            )
         var row = 0
         for s in range(n):
             if Int(self.h_posarr[seqs[s]]) + lens[s] > self.max_tokens:
@@ -1965,11 +1974,17 @@ struct GpuSession:
                     ERR_INVALID_ARGUMENT, "batch decode cap is 64",
                     "t=" + String(t),
                 )
-            for i in range(t):
-                if Int(self.h_posarr[i]) + 1 > self.max_tokens:
-                    raise AlofaError(
-                        ERR_OUT_OF_RANGE, "kv store is full (batch)", ""
-                    )
+            # 一百七十五-补：pos 检查按「行 b = 槽 b」假设，只对非
+            # row_mapped 批路成立。spec（row_mapped）行映射是绝对槽
+            # 号，h_posarr 按 seq 索引且 spec_step 上游已逐 seq 校验
+            # （pos + lens ≤ max_tokens）；这里扫 0..t 会越过槽表读
+            # 垃圾位（probe_195 的「kv full」假象）。
+            if row_mapped == False:
+                for i in range(t):
+                    if Int(self.h_posarr[i]) + 1 > self.max_tokens:
+                        raise AlofaError(
+                            ERR_OUT_OF_RANGE, "kv store is full (batch)", ""
+                        )
             self.ctx.enqueue_copy(
                 dst_buf=self.d_posarr, src_buf=self.h_posarr
             )

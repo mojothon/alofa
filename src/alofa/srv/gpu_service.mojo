@@ -48,7 +48,7 @@ batch 前向只读一个 session 的 store），而是**单 session 的 N 个批
 from max.gpu.host import DeviceContext
 
 from alofa.core.ffi.posix import monotonic_ns
-from alofa.gpu.session import SPEC_MAX_ROWS, GpuSession
+from alofa.gpu.session import PREFILL_MAX_BATCH, GpuSession
 from alofa.model.arch.qwen import QwenForward
 from alofa.srv.engine_thread import Twinable, heap_place
 from alofa.srv.config import env_int
@@ -594,6 +594,22 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 列表（List[List] 的 move-out 撞 origin 规则）——消费期按同
         # 一 ctx 重查（查表确定，结果一致）。
         var kinds = List[Int]()
+        # 草稿行预算（一百七十五-补）：prefill_step 批路硬容量 128 行
+        # （spec_step 底下超限会炸「prefill batch exceeds capacity」；
+        # SPEC_MAX_ROWS=320 只是缓冲尺寸）。每流至少贡献 1 行（cur/
+        # prompt），基行数 = len(act) ≤ 池 ≤ 128 恒成立；余量按生成
+        # 流数**均匀分**——per_gen_extra = (128 - n) // n_gen。先数
+        # 相位，再建行（预算要提前算，行序无关→无饥饿）。
+        var n_gen = 0
+        var i0 = 0
+        while i0 < len(act):
+            if (
+                self.streams[act[i0]].pidx
+                >= len(self.streams[act[i0]].prompt)
+            ):
+                n_gen += 1
+            i0 += 1
+        var per_gen_extra = (PREFILL_MAX_BATCH - len(act)) // max(n_gen, 1)
         var rows_total = 0
         var i = 0
         while i < len(act):
@@ -625,18 +641,15 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     ctx^, self.spec_k, self.spec_ngram, drafts
                 )
                 # KV 窗口收缩：pos + 1 + len(drafts) ≤ max_tokens；
-                # 总行预算收缩：Σ rows ≤ SPEC_MAX_ROWS（spec_step 超
-                # cap 会 raise——大池 × 长 k 时必现，缩行不报错）。
+                # 行预算收缩：每生成流最多 per_gen_extra 枚草稿（均匀
+                # 分配，行序无关 → 无饥饿；预算 ≤ k 上限取小者）。
                 while (
                     self.streams[slot].pos + 1 + len(drafts)
                     > self.session.max_tokens
                     and len(drafts) > 0
                 ):
                     _ = drafts.pop()
-                while (
-                    rows_total + 1 + len(drafts) > SPEC_MAX_ROWS
-                    and len(drafts) > 0
-                ):
+                while len(drafts) > per_gen_extra:
                     _ = drafts.pop()
                 toks.append(self.streams[slot].cur)
                 for d in drafts:
