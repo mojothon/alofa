@@ -213,6 +213,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     # 控默认开）。表在单 tick 的建/消两相间冻结（见 _spec_forward）。
     var spec_table: SpecTable
     var spec_shared: Bool
+    # 一百七十五-补九：采样验证（ALOFA_SPEC_SAMPLE 默认开）——temp>0
+    # 的 tick 不再整批回退 plain 路，spec 验证行走 per-row 采样
+    # （种子 = 流种子 + 生成步，与 136 的 plain 派生逐位同）。
+    var spec_sample: Bool
 
     def __init__(
         out self,
@@ -273,6 +277,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         self.spec_ngram = env_int("ALOFA_SPEC_NGRAM", SPEC_NGRAM, 2, 16)
         self.spec_table = SpecTable()
         self.spec_shared = env_int("ALOFA_SPEC_SHARED", 1, 0, 1) == 1
+        self.spec_sample = env_int("ALOFA_SPEC_SAMPLE", 1, 0, 1) == 1
 
     def _drafts_of(
         mut self, var ctx: List[Int], mut drafts: List[Int]
@@ -636,8 +641,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # 流数**均匀分**——per_gen_extra = (128 - n) // n_gen。先数
         # 相位，再建行（预算要提前算，行序无关→无饥饿）。
         var n_gen = 0
+        var any_sampled = False
         var i0 = 0
         while i0 < len(act):
+            if self.spec_sample and self.streams[act[i0]].temp != 0.0:
+                any_sampled = True
             if (
                 self.streams[act[i0]].pidx
                 >= len(self.streams[act[i0]].prompt)
@@ -650,6 +658,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
         # ——消费后 out 增量即本 tick 新产 token，插表在**消费循环完
         # 全结束后**统一做（建/消两相的表态冻结，重查同源同果）。
         var befores = List[Int]()
+        # per-row 采样参数（一百七十五-补九）：行 j 的种子 = 流种子 +
+        # 生成步序（count + 行内偏移），与 plain 合批路 136 的派生
+        # 逐位同。行序与 toks 展平序一致（row_i 追踪）。
+        var row_i = 0
         var i = 0
         while i < len(act):
             var slot = act[i]
@@ -667,8 +679,26 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     == len(self.streams[slot].prompt) - 1
                 ):
                     kinds.append(1)
+                    # 尾枚行的预测即 gen[0]（步 0）——按流采样。
+                    if self.spec_sample:
+                        self.session.h_stemp[row_i] = (
+                            self.streams[slot].temp
+                        )
+                        self.session.h_stopps[row_i] = (
+                            self.streams[slot].topp
+                        )
+                        self.session.h_sseeds[row_i] = Int32(
+                            self.streams[slot].seed
+                            + self.streams[slot].count
+                        )
                 else:
                     kinds.append(0)
+                    # 中段行 tokout 丢弃——argmax 分支即可。
+                    if self.spec_sample:
+                        self.session.h_stemp[row_i] = Float32(0)
+                        self.session.h_stopps[row_i] = Float32(1)
+                        self.session.h_sseeds[row_i] = Int32(0)
+                row_i += 1
             else:
                 # ctx = prompt + 已生成链（out 末元素即 cur = x0）。
                 var ctx = List[Int]()
@@ -712,6 +742,23 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 lens.append(1 + len(drafts))
                 seqs.append(slot)
                 kinds.append(2)
+                # 验证行 j 预测步 count+j（行 0 的输入是 cur=上步已
+                # 定 token）——种子 seed+count+j 与 plain 逐位同。
+                if self.spec_sample:
+                    var j = 0
+                    while j <= len(drafts):
+                        self.session.h_stemp[row_i + j] = (
+                            self.streams[slot].temp
+                        )
+                        self.session.h_stopps[row_i + j] = (
+                            self.streams[slot].topp
+                        )
+                        self.session.h_sseeds[row_i + j] = Int32(
+                            self.streams[slot].seed
+                            + self.streams[slot].count + j
+                        )
+                        j += 1
+                row_i += 1 + len(drafts)
                 if hit:
                     self.spec_tel.n_hits += 1
             i += 1
@@ -721,7 +768,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             GPU_ATTN_TILES,
             DType.float32, True, True, True, True, True, True, True,
             True, False
-        ](toks^, lens, seqs, False)
+        ](toks^, lens, seqs, False, False, any_sampled)
         # 逐行消化：out 扁平 [acc_s, next_s, ...]。
         var a = 0
         i = 0
@@ -872,8 +919,11 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             i += 1
         if max_slot < 0:
             return
-        # spec 分支（一百七十四-d 终刀）：spec 开 + 全部活跃行贪心
-        # ——一次 spec_step 验证，零 padding。任一行采样即回退。
+        # spec 分支（一百七十四-d 终刀；一百七十五-补九放宽）：spec 开
+        # + 全贪心，或采样验证开启（per-row 采样核吃任意 temp/top_p
+        # 组合，temp=0 行走核内 argmax 分支与贪心逐位同）——一次
+        # spec_step 验证，零 padding。采样验证关闭（ALOFA_SPEC_SAMPLE
+        # =0）时保留 174-d 语义：任一行采样即回退。
         if self.spec_on:
             var all_greedy = True
             var si = 0
@@ -882,7 +932,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                     all_greedy = False
                     break
                 si += 1
-            if all_greedy:
+            if all_greedy or self.spec_sample:
                 self.n_spec_ticks += 1
                 self._spec_forward(act)
                 return

@@ -1021,6 +1021,15 @@ struct GpuSession:
         trust_all: Bool = False,
         # 一百七十四-c：逐层校验和透传（定位 spec 路径重跑漂移用）。
         dbg_layers: Bool = False,
+        # 一百七十五-补九：采样验证——True 时验证行走 per-row 采样
+        # （调用方先填 h_stemp/h_stopps/h_sseeds：行 j 的种子 =
+        # 流种子 + 生成步序，与 plain 合批路 136 的派生逐位同）。
+        # 验证判据不变：h_tokout 从 argmax 变样本，tokout[j]==草稿
+        # 才接受、首失配处的样本即 next——输出分布恒等于目标分布
+        # （拒绝时输出的就是样本本身，无偏）。temp=0 的行走核内
+        # argmax 分支（与 argmax_rb 逐位同，136 已证），贪心混合
+        # 批次无需分支。
+        per_row_sample: Bool = False,
     ) raises -> List[Int]:
         """speculative 解码 tick（一百七十四-c）：每序列携带
         [x0, d0..d_{k-1}]（x0 为上 tick 已接受的 token）——组装
@@ -1065,6 +1074,9 @@ struct GpuSession:
                 row += 1
         # 贪心 spec：copy_logits=False（只回 tokout 4B×t）、temp=0、
         # row_base=0（rowseq 存绝对槽号，pos_arr 从基址 0 索引）。
+        # 采样验证（补九）：per_row_sample=True 时走 per-row 采样核
+        # （调用方已填 h_stemp/h_stopps/h_sseeds；参数值是运行期的
+        # ——单实例化，无 KGEN 多实例风险）。
         _ = self.prefill_step[
             inner, inner_ff, dual_t, dual_o, tri_t, down_t, o_t,
             attn_t, attn_tiles, prefill_rb, prefill_af,
@@ -1072,7 +1084,7 @@ struct GpuSession:
             prefill_mma_q, prefill_mma_o, prefill_tile, prefill_gqa,
             prefill_spl, prefill_kv, True
         ](tokens_flat, False, True, False, False, 0.0, 0, 1.0, 0, 0,
-          0, False, True, dbg_layers)
+          0, per_row_sample, True, dbg_layers)
         self.ctx.synchronize()
         # host 验证：行 acc 的预测 y_acc 应等于 draft d_acc（即
         # tokens_flat[a0+acc+1]）；首个不匹配处的预测即新 token。
@@ -1108,6 +1120,12 @@ struct GpuSession:
         eos: Int,
         spec_k: Int = 4,
         spec_ngram: Int = 4,
+        # 一百七十五-补九：采样验证（默认贪心=原语义零回归）。
+        # 种子按生成步派生（步 s 用 seed+s），与 plain 批路逐位同
+        # ——同种子下 spec 链与 generate_batch 采样链逐位一致。
+        temperature: Float32 = 0.0,
+        seed: Int32 = 0,
+        top_p: Float32 = 1.0,
     ) raises -> SpecGenResult:
         """speculative 生成闭环（一百七十四-c 第四刀）：单序列贪心
         链，prompt-lookup 草稿源（`spec_draft.spec_lookup`）驱动
@@ -1144,7 +1162,22 @@ struct GpuSession:
         ln.append(len(prompt))
         var sq = List[Int]()
         sq.append(0)
-        var base = self.spec_step[inner, inner_ff](prompt, ln, sq, True)
+        # 建底 tick：只有末行的预测被用（gen[0]，步 0 → seed+0）；
+        # 采样时末行带流采样参数，其余行 temp=0（tokout 丢弃）。
+        if temperature > Float32(0):
+            var plen = len(prompt)
+            for j in range(plen):
+                if j == plen - 1:
+                    self.h_stemp[j] = temperature
+                    self.h_stopps[j] = top_p
+                    self.h_sseeds[j] = seed
+                else:
+                    self.h_stemp[j] = Float32(0)
+                    self.h_stopps[j] = Float32(1)
+                    self.h_sseeds[j] = Int32(0)
+        var base = self.spec_step[inner, inner_ff](
+            prompt, ln, sq, True, False, temperature > Float32(0)
+        )
         ticks += 1
         tel.n_tokens += 1
         if eos < 0 or base[1] != eos:
@@ -1175,7 +1208,16 @@ struct GpuSession:
             lnv.append(len(toks))
             var sqv = List[Int]()
             sqv.append(0)
-            var out = self.spec_step[inner, inner_ff](toks, lnv, sqv, False)
+            # 验证 tick：行 j 预测生成步 len(gen)+j → 种子 seed+步序
+            # （与 plain 批路的 seed+count 派生逐位同）。
+            if temperature > Float32(0):
+                for j in range(len(toks)):
+                    self.h_stemp[j] = temperature
+                    self.h_stopps[j] = top_p
+                    self.h_sseeds[j] = Int32(seed) + Int32(len(gen) + j)
+            var out = self.spec_step[inner, inner_ff](
+                toks, lnv, sqv, False, False, temperature > Float32(0)
+            )
             ticks += 1
             var acc = out[0]
             var nxt = out[1]

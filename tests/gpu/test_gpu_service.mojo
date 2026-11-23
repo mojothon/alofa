@@ -430,9 +430,13 @@ def main() raises:
     svc.stream_end(82)
     print("  B rerun2 == rerun1:", _same(ib3, ib2),
           " == cchain:", _same(ib3, cchain))
-    if svc.n_batched == 0:
+    if svc.n_batched == 0 and svc.n_spec_ticks == 0:
         # temp=0 的两条流交替必须真合批（一次前向推两行）。
-        print("  NO batched tick despite two argmax streams!")
+        # 一百七十五-补九：混参数批（temp0 + temp0.8）改由 spec 路
+        # per-row 采样承载（bit-parity 由 test_spec_sample 保证，
+        # 「各与独跑逐位同链」上面已验）——n_batched 不再是唯一
+        # 承载面，n_spec_ticks>0 同样合格。
+        print("  NO batched/spec tick despite two argmax streams!")
         inter_ok = False
 
     # complete 走合批路径（一百三十七）：占一行进 tick 池，与并发流
