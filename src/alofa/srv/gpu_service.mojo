@@ -233,6 +233,18 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
     var slot_prefix: List[Int]
     var n_prefix_hits: Int
     var n_prefix_rows: Int
+    # 一百七十六-b：部分前缀复用——多轮对话/共享 preamble 场景，新
+    # prompt 是旧 prompt 的**延长**（精确全等匹配永远 miss）。chunk
+    # 链式哈希：流结束时对 prompt 的每个 16-token 边界登记
+    # （FNV 增量链，O(plen)）；请求侧同链增量推进，取**最高有效
+    # 边界** = 最长公共前缀（按 chunk 对齐）。条目值带登记方的全
+    # prompt h1——占用态校验沿用 v1 语义（源槽当前/上一条流确为
+    # 该 prompt 才可信）。命中即拷贝行 [0, lcp)，剩余 prompt 行
+    # lcp..plen-1 正常 kind-0/1 喂入（末枚照喂，gen[0] 正确）。
+    var chunk_slot: Dict[Int, Int]
+    var chunk_h2: Dict[Int, Int]
+    var chunk_full: Dict[Int, Int]
+    var n_chunk_hits: Int
 
     def __init__(
         out self,
@@ -306,6 +318,10 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             self.slot_prefix.append(-1)
         self.n_prefix_hits = 0
         self.n_prefix_rows = 0
+        self.chunk_slot = Dict[Int, Int]()
+        self.chunk_h2 = Dict[Int, Int]()
+        self.chunk_full = Dict[Int, Int]()
+        self.n_chunk_hits = 0
 
     def _drafts_of(
         mut self, var ctx: List[Int], mut drafts: List[Int]
@@ -391,6 +407,7 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             + ",\"spec_table_entries\":" + String(len(self.spec_table.map))
             + ",\"prefix_hits\":" + String(self.n_prefix_hits)
             + ",\"prefix_rows\":" + String(self.n_prefix_rows)
+            + ",\"chunk_hits\":" + String(self.n_chunk_hits)
         )
 
     def complete(
@@ -481,6 +498,49 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             return -1
         return src
 
+    def _chunk_lcp(self, ids: List[Int]) raises -> Tuple[Int, Int]:
+        """部分前缀命中（一百七十六-b）：对请求 prompt 做 16-token
+        边界的增量 FNV 链推进，逐边界查 chunk 表——**最高**有效边界
+        即最长公共前缀（边界独立校验，低边界缺失不影响高边界）。
+        边界 blen 必须 ≤ plen-1（至少喂末枚 token，gen[0] 才有来源）。
+        返回 (行数, 源槽)（-1, -1 = 无命中）。校验三重：h2 对上 +
+        源槽合法 + 占用态（chunk_full 登记的全 prompt h1 与源槽
+        当前/上一条流一致）。"""
+        var plen = len(ids)
+        var h1 = UInt64(0xcbf29ce484222325)
+        var h2 = UInt64(0x9e3779b97f4a7c15)
+        var lcp = -1
+        var src = -1
+        var i = 0
+        while i < plen - 1:
+            var t = ids[i]
+            h1 = (h1 ^ (UInt64(t) & UInt64(0xFFFFFFFF))) * UInt64(
+                1099511628211
+            )
+            h2 = (h2 ^ (UInt64(t) & UInt64(0xFFFFFFFF))) * UInt64(
+                1099511628211
+            )
+            i += 1
+            if i % 16 != 0:
+                continue
+            var k = Int(h1 & UInt64(0x7FFFFFFFFFFFFFFF))
+            if k not in self.chunk_slot:
+                continue
+            var s = self.chunk_slot[k]
+            if s < 0 or s >= self.n_rows:
+                continue
+            var h2v = Int(h2 & UInt64(0x7FFFFFFFFFFFFFFF))
+            if self.chunk_h2[k] != h2v:
+                continue
+            var fh = self.chunk_full[k]
+            var cur = Int(self.slot_cur[s])
+            var prev = Int(self.slot_prefix[s])
+            if cur != fh and prev != fh:
+                continue
+            lcp = i
+            src = s
+        return (lcp, src)
+
     def stream_begin(
         mut self,
         prompt: String,
@@ -535,6 +595,14 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
             psrc = self._prefix_lookup(ids)
             if psrc >= 0:
                 prows = len(ids) - 1
+            else:
+                # 精确全等 miss → 部分前缀（一百七十六-b）：最长公共
+                # 前缀按 chunk 对齐，剩余行正常 prefill。
+                var r = self._chunk_lcp(ids)
+                if r[0] >= 16:
+                    psrc = r[1]
+                    prows = r[0]
+                    self.n_chunk_hits += 1
         st.prompt = ids^
         self.streams[slot] = st^
         if psrc >= 0:
@@ -1160,6 +1228,34 @@ struct GpuService(Service, Movable, Deinitable, Twinable):
                 self.prefix_slot[h1] = slot
                 self.prefix_h2[h1] = h2
                 self.prefix_plen[h1] = plen
+                # chunk 边界登记（一百七十六-b）：增量链推进到
+                # plen-1（行 [0, blen) 在 prefill 后全有效），每个
+                # 16-token 边界记录 (h1键 → 槽, h2, 全prompt h1)。
+                # 溢出整表重建（多付一次 prefill 代价可忽略）。
+                var ch1 = UInt64(0xcbf29ce484222325)
+                var ch2 = UInt64(0x9e3779b97f4a7c15)
+                var ci = 0
+                while ci < plen - 1:
+                    var t = self.streams[slot].prompt[ci]
+                    ch1 = (ch1 ^ (UInt64(t) & UInt64(0xFFFFFFFF))) * UInt64(
+                        1099511628211
+                    )
+                    ch2 = (ch2 ^ (UInt64(t) & UInt64(0xFFFFFFFF))) * UInt64(
+                        1099511628211
+                    )
+                    ci += 1
+                    if ci % 16 != 0:
+                        continue
+                    if len(self.chunk_slot) > 16384:
+                        self.chunk_slot = Dict[Int, Int]()
+                        self.chunk_h2 = Dict[Int, Int]()
+                        self.chunk_full = Dict[Int, Int]()
+                    var ck = Int(ch1 & UInt64(0x7FFFFFFFFFFFFFFF))
+                    self.chunk_slot[ck] = slot
+                    self.chunk_h2[ck] = Int(
+                        ch2 & UInt64(0x7FFFFFFFFFFFFFFF)
+                    )
+                    self.chunk_full[ck] = h1
             self.slot_prefix[slot] = h1
             self.slot_cur[slot] = -1
             self.streams[slot].request = NO_REQUEST
