@@ -4092,4 +4092,9 @@
   - **A/B**（`bench_specd.mojo`，单 service 拨 spec_on、每相两轮取后轮）：story（叙事，接受率≈0）231.4 → **235.5 tps（+1.8%，零惩罚）**；pattern（计数序列，接受率 1.0）214.6 → **662.8 tps（3.1×）**。与 174 开题收益模型吻合：草稿未命中域退化为 t=1 + 验证开销≈0，命中域 tick 数大减。
   - **回归**：test_gpu_service（默认开重跑——流式 vs generate_batch parity 全过）、test_session_batch、test_generate_batch、serve_boot（ALL STEPS OK）全 PASS。
   - **174-d 余项**：HTTP 级生产三数（长生成/短压/solo）+ 多流 spec（批行验证的行化组装进 GpuService 合批 tick——trust_all 逐序列语义需核内扩展，架构级）；小模型草稿源接口已预留。
+- **2026-11-23（一百七十四-d 补）** —— **HTTP 级生产三数 A/B：solo 2.06×（接受率 95.5% 归因）、多流持平，默认开落定**
+  - **口径**（scripts/stress_serve.py，远端 GPU3，-O2 build，SSE 全流式，每景 40s，A/B 同轮相对比较——账本铁律；prompt 用「跑满 120 token」的叙事文（标定 finish=length；默认 prompt 会 eos 早停导致 tok/s 虚高 ~2.6×，压测必须带自定义 --prompt）。池 ALOFA_GPU_SESSIONS=32（默认 1 会让并发景全拒）。服务端 spec 计数器经 /health 归因。
+  - **结果**（tok/s）：solo（conc1/120tok）184.7 → **380.9（2.06×）**；长生成（conc8/120tok）1203.4 → 1205.2（持平）；短压（conc32/15tok）1248.8 → 1248.1（持平）——多流景 spec 分支按构造不触发，零惩罚证实。绝对值与 172/173 时代不可比（客户端位置/机器负载/多轮优化后），只作本轮相对。
+  - **归因**（spec ON solo 轮 /health）：4826 spec tick、hit_rate 57.9%、**接受率 95.5%**（11176 草稿 10668 接受）、~3.2 tokens/tick——叙事续写域 prompt-lookup 命中质量远超预期（模型复述近期文本的倾向），2.06× 全部由草稿接受兑换。
+  - **结论**：solo spec（174-d 接线）生产口径收益兑现——低并发/单流场景 2× 级，高并发场景零扰动。174-d 主体收案；余项只剩多流 spec（架构级，trust_all 逐序列化进合批 tick）。
 
