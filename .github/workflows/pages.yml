@@ -24,6 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 安装 pandoc（ubuntu-latest 不再预装）
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pandoc
+
       - name: 构建静态站点（pandoc，gfm 方言）
         run: |
           mkdir -p site
