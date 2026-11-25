@@ -485,6 +485,7 @@ struct ModelService(Service, Twinable):
         prompt: String,
         max_tokens: Int,
         temperature: Float64,
+        top_p: Float64,
         request: Int,
     ) raises:
         """开始一次流式生成：**只** reset、分词与校验，不走前向。

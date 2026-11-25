@@ -131,6 +131,14 @@ struct Stub(Service, Twinable):
         self.stream_step += 1
         return StreamToken(text, False, False)
 
+    def stream_pending(mut self, request: Int) -> Bool:
+        # 替身没有池级积压概念——恒 False（trait 文档给的默认语义）。
+        return False
+
+    def stats_json(mut self) -> String:
+        # 替身没有计数器——空 JSON 对象即可。
+        return "{}"
+
 
 def child_serve() raises:
     var server = Server.bind(PORT)
