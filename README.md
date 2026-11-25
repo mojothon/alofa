@@ -137,7 +137,7 @@ core/         张量视图、arena、mmap、具名错误、结构化日志
 - **CPU 服务路无批调度**（GPU 路才有）：同时能生成几条 = engine 线程数，默认 1；无 TLS。
 - 垂直切片只验 **1 条请求 / 16 token / scalar 后端**——只负责"链路通"。
 - 权重形态只认两种（HF safetensors 就地放宽 fp32、fp32 裸二进制 + TSV）；GGUF 不支持。
-- 只有一个模型架构（Qwen2.5-0.5B，fp32）；Llama / Mistral 未开始。
+- 架构只有 Qwen2.5 一族：0.5B 全验证；**1.5B 冒烟已通**（无自动门）；Llama / Qwen3 被加载器三处硬阻断（qkv bias 必需、分片 safetensors、fp32 显存）。
 - 量化只有 q4_0，整网教师强制贪心一致率实测 **0.8164**（未达自设 ≥0.90 门，账本按 `missing` 如实记录）。
 - 性能数字只在 A100 远程验证机测得（共享机）；llama.cpp 对比基线尚未做。
 

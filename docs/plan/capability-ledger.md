@@ -4222,6 +4222,11 @@
     | 0.0 | 484 | 407 | **1.19×** | 62.1% | 0.088 |
 
   - **判读**：①**接受率随 R 平滑衰减**（99.7% → 62.1%）——采样验证的接受率 = q(草稿)，与理论逐点吻合（R=0 的 0.62 正落在补九预测的 0.6-0.9 区间下沿）；②**全谱系为正，无灾难**——补五的贪心 junk 灾难（R≤0.25 时 0.39×）在采样域未复现：自适应 k_eff + 真实接受率（0.62 而非贪心重放域的虚高）把 R=0 钳在 1.19×；③与贪心曲线对比：高温 R 曲线整体下移（贪心 R=0 1.61× vs 采样 1.19×）——采样接受率天然低于 argmax 接受率（分布发散度代价），高 R 端受固定种子重放保护不受损（2.29× ≈ 贪心 2.0-2.5× 区间）；④spec_ticks 全点 > 0、遥测自洽。**生产矩阵最终闭合：三轴 × 交叉格全谱系正增益，最差格（R=0 × temp 0.7 × junk 草稿域）1.19×，无任何惩罚格。**
+- **2026-11-25（一百七十七）** —— **同族扩展冒烟：Qwen2.5-1.5B-Instruct 端到端跑通（CPU 路）——架构层通用性假说的首次实测**
+  - **动机**：账本长期记「只有一个模型架构」。架构层（`QwenConfig`）对 config.json 是通用读取（head_dim / rope_theta / tie_word_embeddings / GQA 校验全不过 0.5B 特定值），但从未用第二个权重实测。1.5B-Instruct 与 0.5B 同族：hidden 1536 / 28 层 / 12Q-2KV / head_dim 128（≠0.5B 的 64）/ rope_theta 1e6 / qkv bias 存在 / 单文件 safetensors bf16（就地放宽 fp32，6GB）。
+  - **实验**：`ALOFA_WEIGHTS=<HF 快照> pixi run serve`（本机 CPU，fp32）→ `/health` ok → 短补全 ×2。**无任何代码改动。**
+  - **结果**：加载成功、推理输出语义正确（"The capital of France is Paris."）、同请求两次逐字相同（确定性 ✓）、日志零错误。10s 内完成 24 token（标量后端）。
+  - **边界（如实记）**：①此为**冒烟**，非自动门——按纪律不升 `verified`，同族扩展的自动门（config 驱动的整网差分）是下一刀；②生成越过 `<|im_end|>` 未早停（eos 停止判定是 0.5B 时代的边界，清单里如实挂）；③GPU 路未测（批池/spec/前缀复用对 1.5B 的行为未知）；④Qwen3-8B 同日实测**不可加载**（qkv bias 必需 + 分片 safetensors 不支持 + fp32 32GB 超本机 40GB 卡）——同族内通用、跨族被三处硬阻断，边界清晰。
 - **2026-11-24（一百七十六）** —— **槽间 KV 前缀复用：重复流量 prompt prefill 全免，spec 之上再 +3.0×（合计 ~6.8×）**
   - **动机**：175 系列收敛后扫描的下一座山——重复/多轮流量仍在**每请求全量重付 prompt prefill**（共享表只省生成步，不省 prefill）。KV 行内容由**位置索引**唯一决定（rope 相位 = 位置）——同前缀的 KV 行逐位相同，**拷贝即复用**：同 prompt 请求直接拷贝源槽行 [0, plen-1)，从末枚 prompt token 起步（kind-1 行预测 gen[0]），整段 prefill 免掉。多轮对话（1000+ token 历史）下 prefill 占延迟大头——此轴价值随上下文长度超线性增长。
   - **实现**：①`kv_rows_copy_gpu`（attention.mojo）——**单指针参数**（dst/src 槽必在同一 per-layer store_b buffer，槽号内核内展开；enqueue_function 变参按可变引用捕获，同 origin 双参触发别名拒编译——本轮踩坑两次后定型单指针形态），grid=(nrows,) 每块一行 kv_dim 步进；②session `copy_prefix_b(dst, src, nrows)`——逐层 k/v 各一发 + 一次 sync（0.5B = 48 launch × ~µs 级 vs 25 tick × 20ms 级 prefill，量级碾压）；③服务层 `ALOFA_KV_PREFIX`（默认开）——**双盐 FNV-1a 哈希**（h1 键 + h2 验证，等效 128 位核对）+ plen 核对 + **槽占用态校验**（slot_cur/slot_prefix：源槽当前流或上一条流确为同 prompt 才可信——防活跃流换 prompt 后旧条目指向已覆写的行）；④命中在 stream_begin 内同步完成（判定移至 ids 移入流状态**前**——raise 时槽未占用无泄漏；Mojo 坑连踩三次：List 不可隐式拷贝/借用参数不能 `^` 转移/use-after-move）；⑤complete() 走 stream_begin/end 封装自动受益；⑥条目上限 4096 溢出整表重建。
