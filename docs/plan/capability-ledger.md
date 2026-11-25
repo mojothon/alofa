@@ -4222,10 +4222,10 @@
     | 0.0 | 484 | 407 | **1.19×** | 62.1% | 0.088 |
 
   - **判读**：①**接受率随 R 平滑衰减**（99.7% → 62.1%）——采样验证的接受率 = q(草稿)，与理论逐点吻合（R=0 的 0.62 正落在补九预测的 0.6-0.9 区间下沿）；②**全谱系为正，无灾难**——补五的贪心 junk 灾难（R≤0.25 时 0.39×）在采样域未复现：自适应 k_eff + 真实接受率（0.62 而非贪心重放域的虚高）把 R=0 钳在 1.19×；③与贪心曲线对比：高温 R 曲线整体下移（贪心 R=0 1.61× vs 采样 1.19×）——采样接受率天然低于 argmax 接受率（分布发散度代价），高 R 端受固定种子重放保护不受损（2.29× ≈ 贪心 2.0-2.5× 区间）；④spec_ticks 全点 > 0、遥测自洽。**生产矩阵最终闭合：三轴 × 交叉格全谱系正增益，最差格（R=0 × temp 0.7 × junk 草稿域）1.19×，无任何惩罚格。**
-- **2026-11-25（一百七十八）** —— **第三方绝对基线落定：llama.cpp CUDA 同机同压测——aloafa 服务默认态 c=8 慢 7.1×，fp32/fp16 精度差占 ~2×，其余为 kernel 成熟度差距**
+- **2026-11-25（一百七十八）** —— **第三方绝对基线落定：llama.cpp CUDA 同机同压测——alofa 服务默认态 c=8 慢 7.1×，fp32/fp16 精度差占 ~2×，其余为 kernel 成熟度差距**
   - **动机**：账本纪律是「紧邻对相对值」，绝对坐标一直是空白（README 明文「不当绝对吞吐外引」）。补第一条：llama.cpp（master，GGML_CUDA=1，cmake 12.1，A100-PCIE-40GB）vs alofa 服务默认态，**同机同卡（GPU 4，0% util 空闲窗口）同压测工具（aloaf 自己的 stress_serve.py 对两边打）**——口径完全一致。
   - **协议**：Qwen2.5-0.5B-Instruct；llama.cpp 侧 fp16 GGUF（`-ngl 99 -np 8 -c 4096`），alofa 侧 fp32 HF safetensors（`ALOFA_GPU_SESSIONS=8`，spec/前缀复用默认开）；流量：固定 prompt × c=8 × temp 0 × max_tokens 128 × 60s 非流式。紧邻对顺序 A(llama)→B(alofa)，间隔 <10 分钟。
-  - **数据**：llama.cpp **13,283 tok/s**（QPS 103.8，p50 77ms，零错误）；aloafa **1,858 tok/s**（QPS 14.5，p50 206ms，零错误）→ **7.1×**。aloaf 侧 spec+前缀复用已开（同 prompt 流量，此前口径应为 ~2-3× 相对增益）——即「满血态」仍 7.1× 落后。
+  - **数据**：llama.cpp **13,283 tok/s**（QPS 103.8，p50 77ms，零错误）；alofa **1,858 tok/s**（QPS 14.5，p50 206ms，零错误）→ **7.1×**。aloaf 侧 spec+前缀复用已开（同 prompt 流量，此前口径应为 ~2-3× 相对增益）——即「满血态」仍 7.1× 落后。
   - **判读**：①**2× 来自精度**（fp16 vs fp32 权重流量差），公平对比需 alofa 的 fp16 权重驻留（f16_w 实验已在 134 系列验证数值可行性，未接服务路）；②其余 ~3.5× 是 **kernel 成熟度差距**——llama.cpp 多年调优的 attention/matmul kernel（FA、tile 调优、KV 量化）vs aloaf 一年内从零写的 kernel；③这不是坏消息，是**第一个可追的绝对标尺**：每刀 kernel 优化现在都有了「离 llama.cpp 还有几倍」的读数；④口径注记：llama.cpp 侧 llama-server 对同 prompt 也有 slot 级 KV 复用，双方都在各自默认态，属「serving 默认 vs serving 默认」快照。
 - **2026-11-25（一百七十七）** —— **同族扩展冒烟：Qwen2.5-1.5B-Instruct 端到端跑通（CPU 路）——架构层通用性假说的首次实测**
   - **动机**：账本长期记「只有一个模型架构」。架构层（`QwenConfig`）对 config.json 是通用读取（head_dim / rope_theta / tie_word_embeddings / GQA 校验全不过 0.5B 特定值），但从未用第二个权重实测。1.5B-Instruct 与 0.5B 同族：hidden 1536 / 28 层 / 12Q-2KV / head_dim 128（≠0.5B 的 64）/ rope_theta 1e6 / qkv bias 存在 / 单文件 safetensors bf16（就地放宽 fp32，6GB）。
