@@ -1596,6 +1596,11 @@ struct QwenForward(Movable):
     # 做任何名字查找。空列表 = 走 fp32 通路。
     var q4_arena: SharedRegion
     var q4_blocks: List[RawPtr]
+    # 逐槽位开关（一百七十九，混合精度实验）：`q4_blocks[slot]` 有效 ⇔ 该位为
+    # True。fp32 原始映射一直在（`enable_q4` 的注释），被关掉的槽位走 fp32 通路
+    # —— 一次投影落在哪个通路由 `project` 的**逐槽位**判定决定，不再是全局
+    # `q4_enabled` 一刀切。
+    var q4_slot_on: List[Bool]
     var q4_enabled: Bool
     # 输出投影（`self.head`）的 q8_0 块流，单独一条通路。
     #
@@ -1625,6 +1630,7 @@ struct QwenForward(Movable):
         config_path: String,
         max_tokens: Int,
         quantize: Bool = False,
+        skip_layers: List[Int] = List[Int](),
     ) raises AlofaError:
         if max_tokens <= 0:
             raise AlofaError(
@@ -1727,6 +1733,7 @@ struct QwenForward(Movable):
         # 层崩，那时已经跑了二十几层。
         self.q4_enabled = False
         self.q4_blocks = List[RawPtr]()
+        self.q4_slot_on = List[Bool]()
         # q8 那条通路默认**关**：它的块流要占 165 MB，而"要不要为省流量付这份钱"
         # 得由调用方说了算（与 `set_shards` 同一个道理）。`enable_q8_output()`
         # 里才按实际张量大小开 arena，这里给 1 字节只是为了让字段有个值。
@@ -1746,7 +1753,7 @@ struct QwenForward(Movable):
                 q4_bytes += n // Q4_BLOCK * Q4_BYTES
         self.q4_arena = SharedRegion(q4_bytes + q4_slot_count(self.cfg.n_layers) * 64)
         if quantize:
-            self.enable_q4()
+            self.enable_q4(skip_layers)
 
         # Every parameter the forward pass names is checked now. A missing
         # parameter discovered on the last layer of a long generation is far
@@ -1833,6 +1840,7 @@ struct QwenForward(Movable):
         self.q4_arena = proto.q4_arena.borrowed()
         self.q4_blocks = proto.q4_blocks.copy()
         self.q4_enabled = proto.q4_enabled
+        self.q4_slot_on = proto.q4_slot_on.copy()
         self.q8_arena = proto.q8_arena.borrowed()
         self.q8_blocks = proto.q8_blocks.copy()
         self.q8_enabled = proto.q8_enabled
@@ -1870,16 +1878,34 @@ struct QwenForward(Movable):
         self.scores_ptr = self.act_arena.alloc(max_tokens * max_tokens * 4)
         self.logits_ptr = self.act_arena.alloc(logits_bytes)
 
-    def enable_q4(mut self) raises AlofaError:
+    def enable_q4(mut self, skip_layers: List[Int] = List[Int]()) raises AlofaError:
         """把所有投影矩阵就地压成 q4_0，之后的前向走量化通路。
+
+        `skip_layers`（一百七十九）：保持 fp32 的层号清单 —— **混合精度实验**
+        的挂钩。跳过的层不量化（`q4_blocks` 里留一个**永不解引用**的占位指针，
+        下标必须对齐），`project` 的逐槽位判定让这些投影走 fp32 通路。不传 =
+        全量化，与改动前逐位同一条路径。
 
         ⚠️ fp32 原始权重**仍然映射着**：这样一来同一进程里可以直接拿 fp32 的结
         果当参照，但常驻内存会是 fp32 + q4 两份 —— 内存门量的是默认通路，不是
         这条。要省内存得先丢掉原始映射，那是加载器的事，本轮没做。
+
+        ⚠️ **GPU 会话不认这个开关**：`gpu/session.mojo` 把 `q4_blocks` 整体上传，
+        占位指针会带垃圾上卡 —— 混合精度本轮只定义在 CPU 前向上。
         """
         for layer in range(self.cfg.n_layers):
+            var skip = False
+            for s in skip_layers:
+                if s == layer:
+                    skip = True
             for slot in range(Q4_SLOTS_PER_LAYER):
-                self.quantize_one(layer * Q4_SLOTS_PER_LAYER + slot)
+                if skip:
+                    # 占位：1 字节从量化 arena 出，**永不解引用**（project 的逐槽
+                    # 位判定让该槽走 fp32 通路），只为列表下标对齐。
+                    self.q4_blocks.append(self.q4_arena.alloc(1))
+                    self.q4_slot_on.append(False)
+                else:
+                    self.quantize_one(layer * Q4_SLOTS_PER_LAYER + slot)
         # 输出投影（`lm_head`，与 embedding 绑定）**不量化**，这不是省事：
         # 本轮量过，连同它一起压成 4 bit，教师强制贪心一致率只有 0.77 —— 词表
         # 那一维的 151936 个 logits 全靠这一步的精度决定谁最大，4 bit 在这里
@@ -1894,6 +1920,7 @@ struct QwenForward(Movable):
         var blocks = self.q4_arena.alloc(n // Q4_BLOCK * Q4_BYTES)
         quantize_q4_0(blocks, self.params.ptr(name), n)
         self.q4_blocks.append(blocks)
+        self.q4_slot_on.append(True)
 
     def enable_q8_output(mut self) raises AlofaError:
         """把输出投影压成 q8_0，之后的输出投影走量化通路。
@@ -1944,7 +1971,11 @@ struct QwenForward(Movable):
         通路还有没有向量实现"是一个会在下一轮变的事实，而签名不该跟着翻烧饼。
         （2026-09-20：它变了。现在两条通路都按 `backend` 分发。）
         """
-        if not self.q4_enabled or slot == Q4_NO_SLOT:
+        if (
+            not self.q4_enabled
+            or slot == Q4_NO_SLOT
+            or not self.q4_slot_on[slot]
+        ):
             comptime if ALOFA_PROFILE:
                 var _t_v = self.prof.now()
                 _ = self.params.view(name)
