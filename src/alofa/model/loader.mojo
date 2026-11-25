@@ -31,6 +31,7 @@ from alofa.core.error import (
     ERR_UNSUPPORTED,
     AlofaError,
 )
+from alofa.core.ffi.mem import RawPtr
 from alofa.core.memory import Arena, SharedRegion
 from alofa.core.mmap import MappedFile
 from alofa.core.tensor import F32Ptr, Shape, TensorView, f32_data
@@ -56,6 +57,82 @@ def _text_slice(raw: String, start: Int, end: Int) -> String:
     for i in range(start, end):
         bytes.append(source[i])
     return String(unsafe_from_utf8=bytes)
+
+
+def _encode_shape(encoded: String) -> String:
+    """`"[a,b]"` → `"axb"`（TensorFile 的形状文本口径）。"""
+    var clean = ""
+    var raw_shape = encoded.as_bytes()
+    for j in range(len(raw_shape)):
+        if raw_shape[j] == 91 or raw_shape[j] == 93:
+            continue
+        if raw_shape[j] == 44:
+            clean += "x"
+        else:
+            clean += _text_slice(encoded, j, j + 1)
+    return clean
+
+
+struct WeightMap(Movable):
+    """safetensors index.json 的 `weight_map` 解析结果：张量名 → 分片文件名。"""
+
+    var names: List[String]
+    var files: List[String]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.files = List[String]()
+
+
+def _parse_weight_map(text: String) raises AlofaError -> WeightMap:
+    """safetensors 分片 index.json 的 `weight_map` 扫描器。
+
+    只收录"值为带 `.safetensors` 后缀的字符串"的键值对：张量名不含引号，
+    `metadata` / `weight_map` 这类容器键的值是对象或数字，天然不会成对。
+    扫描顺序即 JSON 顺序（HF 导出按名排序），所以结果确定。
+    """
+    var out = WeightMap()
+    var raw = text.as_bytes()
+    var i = 0
+    while i < len(raw):
+        if raw[i] != 34:
+            i += 1
+            continue
+        # 一个引号字符串
+        var start = i + 1
+        var end = start
+        while end < len(raw) and raw[end] != 34:
+            end += 1
+        if end >= len(raw):
+            break
+        var key = _text_slice(text, start, end)
+        i = end + 1
+        # 跳过空白，看下一个有效字符是不是 `:`
+        while i < len(raw) and (raw[i] == 32 or raw[i] == 10 or raw[i] == 13 or raw[i] == 9):
+            i += 1
+        if i >= len(raw) or raw[i] != 58:
+            continue
+        i += 1
+        while i < len(raw) and (raw[i] == 32 or raw[i] == 10 or raw[i] == 13 or raw[i] == 9):
+            i += 1
+        if i < len(raw) and raw[i] == 34:
+            var vstart = i + 1
+            var vend = vstart
+            while vend < len(raw) and raw[vend] != 34:
+                vend += 1
+            if vend >= len(raw):
+                break
+            var value = _text_slice(text, vstart, vend)
+            i = vend + 1
+            if _has_suffix(value, ".safetensors"):
+                out.names.append(key)
+                out.files.append(value)
+        # 值是对象/数组/数字：不碰，下一轮扫描自然跳过
+    if len(out.names) == 0:
+        raise AlofaError(
+            ERR_PARSE, "safetensors index has no weight_map entries", ""
+        )
+    return out^
 
 
 def config_value(path: String, key: String) raises AlofaError -> String:
@@ -108,10 +185,19 @@ struct TensorFile(Movable):
     # 用于孪生体重新映射同一份文件（映射本身是 MAP_PRIVATE 只读，同一份文件的
     # 页在进程内共享）。
     var path: String
+    # 分片 safetensors（一百八十）：`model.safetensors.index.json` + N 个 shard。
+    # `safes` 持有每片的元数据与映射；`shard_of[i]` 是张量 i 所在分片。
+    # 非分片路这两个字段为空，一切走原有字段 —— 判定只看 `len(safes) > 0`。
+    var safes: List[SafeTensorFile]
+    var shard_paths: List[String]
+    var shard_of: List[Int]
 
     def __init__(out self, dir_path: String) raises AlofaError:
         self.path = dir_path
         self.converted = False
+        self.safes = List[SafeTensorFile]()
+        self.shard_paths = List[String]()
+        self.shard_of = List[Int]()
         if _has_suffix(dir_path, ".safetensors"):
             var safe = SafeTensorFile(dir_path)
             var n = len(safe.names)
@@ -119,17 +205,7 @@ struct TensorFile(Movable):
             self.names = safe.names.copy()
             self.shape_text = List[String]()
             for i in range(n):
-                var encoded = safe.shapes[i]
-                var raw_shape = encoded.as_bytes()
-                var clean = ""
-                for j in range(len(raw_shape)):
-                    if raw_shape[j] == 91 or raw_shape[j] == 93:
-                        continue
-                    if raw_shape[j] == 44:
-                        clean += "x"
-                    else:
-                        clean += _text_slice(encoded, j, j + 1)
-                self.shape_text.append(clean)
+                self.shape_text.append(_encode_shape(safe.shapes[i]))
             self.offsets = List[Int]()
             self.counts = List[Int]()
             var total = 0
@@ -175,6 +251,110 @@ struct TensorFile(Movable):
                         "name=" + safe.names[i] + " dtype=" + elem_name(kind),
                     )
                 cursor += self.counts[i] * 4
+            return
+        # 分片路（一百八十）：目录下有 `model.safetensors.index.json`。
+        # 现代大 checkpoint 都长这样（Qwen3-8B = 5 片 + index）；HF 的 index 只
+        # 有一张映射表 `weight_map`（张量名 → 分片文件名），本分支把它展开成与
+        # 单文件完全一致的 TensorFile API —— 上面的架构层一行都不用改。
+        var index_text = ""
+        try:
+            index_text = read_text(dir_path + "/model.safetensors.index.json")
+        except:
+            pass
+        if index_text.byte_length() > 0:
+            var wm = _parse_weight_map(index_text)
+            # 分片文件按首次出现顺序开（HF 导出即排序序）；每片独立解析元数据。
+            var shard_index = List[Int]()
+            for j in range(len(wm.files)):
+                var file = wm.files[j]
+                var which = -1
+                for s in range(len(self.shard_paths)):
+                    if self.shard_paths[s] == file:
+                        which = s
+                if which == -1:
+                    self.shard_paths.append(dir_path + "/" + file)
+                    self.safes.append(
+                        SafeTensorFile(dir_path + "/" + file)
+                    )
+                    which = len(self.safes) - 1
+                shard_index.append(which)
+            # `mapped` 在分片路上无消费方（view 走 safes），但每个字段都必须
+            # 在每条路上被初始化 —— 用第一片占位。
+            self.mapped = MappedFile(self.shard_paths[0])
+            # 校验：每片张量名都必须在 index 里 —— 多出来的意味着 index 与
+            # 分片内容脱钩（导出错、传输缺），宁可拒绝也不静默读半套。
+            var n = len(wm.names)
+            for s in range(len(self.safes)):
+                for t in range(len(self.safes[s].names)):
+                    var found = False
+                    for j in range(n):
+                        if wm.names[j] == self.safes[s].names[t]:
+                            found = True
+                    if not found:
+                        raise AlofaError(
+                            ERR_PARSE,
+                            "shard contains a tensor the index does not know",
+                            "shard=" + self.shard_paths[s]
+                            + " tensor=" + self.safes[s].names[t],
+                        )
+            self.names = List[String]()
+            self.shape_text = List[String]()
+            self.offsets = List[Int]()
+            self.counts = List[Int]()
+            # 每张量在**其分片映射内**的字节偏移与 dtype（扁平化，避免从
+            # `self.safes` 里拷结构体 —— SafeTensorFile 不可隐式拷贝）。
+            var src_off = List[Int]()
+            var src_kind = List[Int]()
+            var total = 0
+            var widens = False
+            for j in range(n):
+                var which = shard_index[j]
+                var t = self.safes[which].index_of(wm.names[j])
+                if t == -1:
+                    raise AlofaError(
+                        ERR_PARSE,
+                        "index names a tensor its shard does not have",
+                        "name=" + wm.names[j] + " shard=" + self.shard_paths[which],
+                    )
+                self.names.append(wm.names[j])
+                self.shard_of.append(which)
+                self.counts.append(self.safes[which].numel(wm.names[j]))
+                self.shape_text.append(_encode_shape(self.safes[which].shapes[t]))
+                src_off.append(
+                    self.safes[which].data_base + self.safes[which].begins[t]
+                )
+                src_kind.append(self.safes[which].dtypes[t])
+                total += self.counts[j]
+                if src_kind[j] != DT_FP32:
+                    widens = True
+            if not widens:
+                self.arena = SharedRegion(1)
+                for j in range(n):
+                    self.offsets.append(src_off[j])
+                return
+            self.converted = True
+            self.arena = SharedRegion(total * 4 + 16 * (n + 1))
+            var base = self.arena.alloc(total * 4)
+            var cursor = 0
+            for j in range(n):
+                cursor = (cursor + 15) // 16 * 16
+                self.offsets.append(cursor)
+                var source = self.safes[shard_index[j]].mapped.ptr().unsafe_offset(
+                    src_off[j]
+                )
+                var target = base.unsafe_offset(cursor).unsafe_bitcast[Float32]()
+                var kind = src_kind[j]
+                if kind == DT_FP32:
+                    f32_copy(source, target, self.counts[j])
+                elif kind == DT_BF16:
+                    bf16_to_f32(source, target, self.counts[j])
+                else:
+                    raise AlofaError(
+                        ERR_UNSUPPORTED,
+                        "safetensors dtype is unsupported",
+                        "name=" + wm.names[j] + " dtype=" + elem_name(kind),
+                    )
+                cursor += self.counts[j] * 4
             return
         self.arena = SharedRegion(1)
         var index = read_text(dir_path + "/tensors.tsv")
@@ -249,6 +429,14 @@ struct TensorFile(Movable):
         self.counts = proto.counts.copy()
         self.arena = proto.arena.borrowed()
         self.converted = proto.converted
+        self.safes = List[SafeTensorFile]()
+        self.shard_paths = proto.shard_paths.copy()
+        self.shard_of = proto.shard_of.copy()
+        # 分片路：每片重新解析映射（同一文件，页在进程内共享）。分片路上的
+        # `mapped` 同样只是占位（与原型同路径重开，无消费方）。
+        if len(self.shard_paths) > 0:
+            for s in range(len(self.shard_paths)):
+                self.safes.append(SafeTensorFile(self.shard_paths[s]))
 
     def keep_alive(self):
         """State that the mapping is still in use here.
@@ -258,6 +446,8 @@ struct TensorFile(Movable):
         """
         self.mapped.keep_alive()
         self.arena.keep_alive()
+        for s in range(len(self.safes)):
+            self.safes[s].keep_alive()
 
     def index_of(self, name: String) raises AlofaError -> Int:
         """Position of `name` in the index, or a named error.
@@ -306,7 +496,15 @@ struct TensorFile(Movable):
         — fp32, contiguous, row-major.
         """
         var i = self.index_of(name)
-        var base = self.arena.data if self.converted else self.mapped.ptr()
+        var base: RawPtr
+        if self.converted:
+            base = self.arena.data
+        elif len(self.safes) > 0:
+            # 分片路：非加宽视图的偏移是"分片映射内"字节偏移（data_base+begin），
+            # 基址取张量所在分片的映射。
+            base = self.safes[self.shard_of[i]].mapped.ptr()
+        else:
+            base = self.mapped.ptr()
         var ptr = base.unsafe_offset(self.offsets[i])
         return TensorView(ptr, Shape(self.dims(name)), DT_FP32)
 

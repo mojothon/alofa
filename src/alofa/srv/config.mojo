@@ -12,7 +12,7 @@
 from std.os import getenv
 
 from alofa.core.error import ERR_INVALID_ARGUMENT, AlofaError
-from alofa.core.text import parse_int
+from alofa.core.text import parse_int, read_text
 
 
 def env_str(name: String, default: String) -> String:
@@ -100,6 +100,15 @@ struct ServeConfig(Movable):
     @staticmethod
     def from_env() raises -> ServeConfig:
         var weights = env_str("ALOFA_WEIGHTS", "tests/fixtures/qwen2.5-0.5b-hf")
+        # 权重形态解析（一百八十）：目录下有 `model.safetensors` → 单文件路，
+        # 传文件路径；只有 `model.safetensors.index.json` + N 片（大 checkpoint
+        # 的标准形态）→ 分片路，TensorFile 拿目录自己去读 index。
+        var weights_file = weights + "/model.safetensors"
+        try:
+            _ = read_text(weights + "/model.safetensors.index.json")
+            weights_file = weights
+        except:
+            pass
         return ServeConfig(
             host=env_str("ALOFA_HOST", "127.0.0.1"),
             port=UInt16(env_int("ALOFA_PORT", 8000, 1, 65535)),
@@ -107,7 +116,7 @@ struct ServeConfig(Movable):
             config_path=weights + "/config.json",
             # `QwenForward` 的 `params_dir` 要是权重文件自己（见 serve.mojo 的
             # 历史注释），不是目录。
-            weights_file=weights + "/model.safetensors",
+            weights_file=weights_file,
             tokenizer_json=env_str(
                 "ALOFA_TOKENIZER", "tests/fixtures/qwen2.5-0.5b/tokenizer.json"
             ),

@@ -1620,6 +1620,10 @@ struct QwenForward(Movable):
     # 它是**实例**的属性而不是方法的参数：一次前向里有 169 次投影，让调用方每
     # 次都把这个数传一遍，只是给了 169 个把它传错的机会。
     var shards: Int
+    # attention 偏置开关（一百八十）：Qwen2.5 系的 q/k/v 带 bias，**Qwen3 系删了**
+    # ——判据看权重清单（层 0 有没有 `q_proj.bias` 张量），不问 config：文件里
+    # 有就是有，加载器的 `require` 清单与三个投影调用点都跟着这个开关走。
+    var attn_bias: Bool
     # 屏障探针的样本缓冲（`alofa/model/probe_barrier.mojo`）。开关是那里的
     # 编译期常量：关着时这块只是几十 KB 的匿名映射，写点全被折掉。
     var probe: RawPtr
@@ -1643,6 +1647,19 @@ struct QwenForward(Movable):
         self.params = TensorFile(params_dir)
         self.max_tokens = max_tokens
         self.kv_len = 0
+        # QK-norm（Qwen3 架构）显式拒绝：Qwen3 在 RoPE 前对每个头做 RMSNorm
+        # （`q_norm` / `k_norm`，无 config 开关）。前向没实现它，而张量清单里
+        # 它显然存在 —— 宁可在这里具名拒绝，也不让前向静默少算一个归一化
+        # （账本一百八十：那会是"能跑但悄悄错"，比加载失败恶劣得多）。
+        if self.params.has("model.layers.0.self_attn.q_norm.weight"):
+            raise AlofaError(
+                ERR_UNSUPPORTED,
+                "checkpoint uses QK-norm (Qwen3), which this forward does not implement",
+                "tensor=model.layers.0.self_attn.q_norm.weight",
+            )
+        # attention 偏置：看层 0 的张量清单（Qwen2.5 有 / Qwen3 无），同族内
+        # 各层一致 —— 不一致属于畸形 checkpoint，require 循环会抓住它。
+        self.attn_bias = self.params.has("model.layers.0.self_attn.q_proj.bias")
         # 默认按核数切（`default_shards()`，上限是实测过的 8）。端到端实测见
         # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
         # 想退回不切就显式 `set_shards(1)` —— 那条路与分片之前逐位相同。
@@ -1768,11 +1785,14 @@ struct QwenForward(Movable):
             self.require(p + "input_layernorm.weight")
             self.require(p + "post_attention_layernorm.weight")
             self.require(p + "self_attn.q_proj.weight")
-            self.require(p + "self_attn.q_proj.bias")
+            if self.attn_bias:
+                self.require(p + "self_attn.q_proj.bias")
             self.require(p + "self_attn.k_proj.weight")
-            self.require(p + "self_attn.k_proj.bias")
+            if self.attn_bias:
+                self.require(p + "self_attn.k_proj.bias")
             self.require(p + "self_attn.v_proj.weight")
-            self.require(p + "self_attn.v_proj.bias")
+            if self.attn_bias:
+                self.require(p + "self_attn.v_proj.bias")
             self.require(p + "self_attn.o_proj.weight")
             self.require(p + "mlp.gate_proj.weight")
             self.require(p + "mlp.up_proj.weight")
@@ -1828,6 +1848,7 @@ struct QwenForward(Movable):
         self.probe = probe_alloc()
         self.prof = ForwardProf()
         self.junk_arm = 0
+        self.attn_bias = proto.attn_bias
         self.head = proto.head
         # rope 表：派生表的字节在 `rope_arena` 里（借用）；checkpoint 自带的那
         # 两张表的视图指向 `params` 的映射（孪生体自己重新映射了同一份文件，
@@ -2227,29 +2248,39 @@ struct QwenForward(Movable):
             var _t_n1 = self.prof.now()
             rmsnorm_k[backend](normed, hidden, self.params.view(p + "input_layernorm.weight"), self.cfg.eps)
             _ = self.prof.tick(K_NORM, _t_n1)
+            # bias 实参按开关选名：开 = 真 bias 视图；关 = 权重视图占位
+            # （bias 张量不存在，`params.view` 会 raise；`project` 只在
+            # `has_bias=True` 时才解引用 bias，占位一个元素都不会被读）。
+            var q_bias_name = p + "self_attn.q_proj.weight"
+            var k_bias_name = p + "self_attn.k_proj.weight"
+            var v_bias_name = p + "self_attn.v_proj.weight"
+            if self.attn_bias:
+                q_bias_name = p + "self_attn.q_proj.bias"
+                k_bias_name = p + "self_attn.k_proj.bias"
+                v_bias_name = p + "self_attn.v_proj.bias"
             self.project[backend](
                 q,
                 normed,
                 p + "self_attn.q_proj.weight",
                 layer * Q4_SLOTS_PER_LAYER + Q4_SLOT_Q,
-                self.params.view(p + "self_attn.q_proj.bias"),
-                True,
+                self.params.view(q_bias_name),
+                self.attn_bias,
             )
             self.project[backend](
                 k,
                 normed,
                 p + "self_attn.k_proj.weight",
                 layer * Q4_SLOTS_PER_LAYER + Q4_SLOT_K,
-                self.params.view(p + "self_attn.k_proj.bias"),
-                True,
+                self.params.view(k_bias_name),
+                self.attn_bias,
             )
             self.project[backend](
                 v,
                 normed,
                 p + "self_attn.v_proj.weight",
                 layer * Q4_SLOTS_PER_LAYER + Q4_SLOT_V,
-                self.params.view(p + "self_attn.v_proj.bias"),
-                True,
+                self.params.view(v_bias_name),
+                self.attn_bias,
             )
             var _t_ra = self.prof.now()
             rope_k[backend](q_rot, k_rot, q, k, table_cos, table_sin, self.cfg.head_dim)
