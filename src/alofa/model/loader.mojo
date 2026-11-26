@@ -422,7 +422,6 @@ struct TensorFile(Movable):
         相对映射基址，两种口径在孪生体上都成立（基址来源一一对应）。
         """
         self.path = proto.path
-        self.mapped = MappedFile(proto.path)
         self.names = proto.names.copy()
         self.shape_text = proto.shape_text.copy()
         self.offsets = proto.offsets.copy()
@@ -432,11 +431,16 @@ struct TensorFile(Movable):
         self.safes = List[SafeTensorFile]()
         self.shard_paths = proto.shard_paths.copy()
         self.shard_of = proto.shard_of.copy()
-        # 分片路：每片重新解析映射（同一文件，页在进程内共享）。分片路上的
-        # `mapped` 同样只是占位（与原型同路径重开，无消费方）。
+        # 分片路：每片重新解析映射（同一文件，页在进程内共享）。`mapped` 与
+        # 原型侧一致取第一片占位 —— **不能重开 `proto.path`**：分片路上它是
+        # 目录，mmap 目录必然失败（一百八十一排障实录：serve 的引擎线程里
+        # 这个 raise 无人接，进程裸崩无任何输出）。
         if len(self.shard_paths) > 0:
+            self.mapped = MappedFile(self.shard_paths[0])
             for s in range(len(self.shard_paths)):
                 self.safes.append(SafeTensorFile(self.shard_paths[s]))
+        else:
+            self.mapped = MappedFile(proto.path)
 
     def keep_alive(self):
         """State that the mapping is still in use here.

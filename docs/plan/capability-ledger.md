@@ -4222,6 +4222,14 @@
     | 0.0 | 484 | 407 | **1.19×** | 62.1% | 0.088 |
 
   - **判读**：①**接受率随 R 平滑衰减**（99.7% → 62.1%）——采样验证的接受率 = q(草稿)，与理论逐点吻合（R=0 的 0.62 正落在补九预测的 0.6-0.9 区间下沿）；②**全谱系为正，无灾难**——补五的贪心 junk 灾难（R≤0.25 时 0.39×）在采样域未复现：自适应 k_eff + 真实接受率（0.62 而非贪心重放域的虚高）把 R=0 钳在 1.19×；③与贪心曲线对比：高温 R 曲线整体下移（贪心 R=0 1.61× vs 采样 1.19×）——采样接受率天然低于 argmax 接受率（分布发散度代价），高 R 端受固定种子重放保护不受损（2.29× ≈ 贪心 2.0-2.5× 区间）；④spec_ticks 全点 > 0、遥测自洽。**生产矩阵最终闭合：三轴 × 交叉格全谱系正增益，最差格（R=0 × temp 0.7 × junk 草稿域）1.19×，无任何惩罚格。**
+- **2026-11-26（一百八十一）** —— **QK-norm 前向落地 + Qwen3-8B CPU 全链打通：教师强制 logits 与 HF fp32 逐位一致，闭环 3 题 × 16 token 逐 token 全同**
+  - **动机**：180 的加载器两刀之后，Qwen3-8B 具名拒绝在 QK-norm 上。本轮把最后一堵前向墙拆掉。
+  - **刀一（QK-norm 接线）**：Qwen3 在 RoPE 前对**每个头**做 RMSNorm（`q_norm`/`k_norm`，无 config 开关）。实现零新核：q/k 缓冲是 `[t, q_dim]` 行主序，与 `[t·n_heads, head_dim]` / `[t·n_kv, head_dim]` 逐字节同构——换 `rows_view` 直接复用 rmsnorm 核（权重长 = head_dim，核按列数自检）。**原位安全**：核先算完整行统计量再同下标回写（avx2 实现读毕才写）。开关判定与 `attn_bias` 同源：层 0 张量清单。
+  - **刀二（层数上限）**：`MAX_LAYERS 32→40`——Qwen3-8B 的 36 层撞在为 Qwen2.5 编译的旧上限上（分页 KV 块表按 `MAX_LAYERS` 静态定容，代价 ×1.25）。
+  - **排障实录（裸崩无输出）**：serve 起来即死（exit 255，连 mojo 驱动都没输出）。定位：**TensorFile 孪生体在分片路上重开 `proto.path`——而分片路上它是目录**，mmap 目录必然失败；在引擎线程里 raise 无人接 → 进程级裸崩。最小复现脚本（单线程建 proto→twin）把"裸崩"变"具名报错"：`mmap(file) failed [size=4096]`（4096 = 目录 fstat 尺寸）。修复：孪生的 `mapped` 占位改取第一分片。**教训：线程里构造的东西，其失败模式必须先在单线程里看过**。
+  - **差分验证（三层递进）**：① 教师强制 logits 对拍（`scripts/qwen3_logits_dump.mojo`，沿 HF fp32 轨迹喂入、不吃自己 argmax）：16 步 top-3 的 id 与 logit 值**逐位一致到 1e-4**——数学正确性钉死；② 闭环首跑 3 题只同 2 题，第 2 题第 6 步分歧——追查发现**口径不同**：serve 的 ChatML 渲染注入 Qwen2.5 默认 system 段（"You are Qwen, created by Alibaba Cloud..."），输入根本不同，非数学偏差；③ 含 system 输入重跑：**3/3 题 × 16 token 逐 token 全同**（48/48）。①里的"分歧步 HF 边距 0.6646"事后看正是口径差的产物。
+  - **回归**：Qwen2.5 侧全量套件 33+16+7 全绿、test-q4 0.8691 不变（`qk_norm=False` 家族与改动前逐位同路）。
+  - **边界更新**：**Qwen3-8B CPU 全链打通**（分片加载 → 无 bias → QK-norm → 36 层 → 端到端与 HF fp32 贪心一致）。GPU 路仍剩两处：bias-optional（六条 bias 设备缓冲是硬形态）与 QK-norm 的 GPU 上传通路。显存（fp32 32GB vs 40GB 卡）在 CPU 路（755GB RAM）不构成阻断。
 - **2026-11-25（一百八十）** —— **加载器两刀落地：分片 safetensors index + qkv bias optional——Qwen3-8B 真机加载通过、干净拒绝在 QK-norm（新钉死的第三阻断）**
   - **动机**：177/180 前的边界是「同族内免费、跨族三处硬阻断」（qkv bias 必需、分片不支持、显存）。本轮落两刀，把跨族墙推到只剩前向数学本身。
   - **刀一（分片）**：`TensorFile` 新增第三分支——目录含 `model.safetensors.index.json` 时解析 `weight_map`（扫描器只收录"值为 .safetensors 字符串"的键值对，顺序即 JSON 序），逐片 `SafeTensorFile` 解析 + 双向校验（index 引用的张量片里必须有、片里的张量 index 必须认识），bf16 跨片加宽进同一 fp32 arena；`view()` 基址按 `shard_of[i]` 选片。API 不变——架构层一行未改。`srv/config.mojo` 解析：有单文件传文件、只有 index 传目录。

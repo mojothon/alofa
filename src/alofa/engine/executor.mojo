@@ -85,7 +85,10 @@ from alofa.model.arch.qwen import (
 comptime BATCH_MUL = 1000003
 comptime BATCH_MOD = 2147483647
 comptime MAX_ROWS = 64
-comptime MAX_LAYERS = 32
+# 分页 KV 的块表按 `MAX_LAYERS` 静态定容（`[MAX_LAYERS * MAX_BLOCKS, ...]`）。
+# 放宽到 40 是为 Qwen3-8B（36 层，账本一百八十一）：Qwen2.5 全族 ≤ 32 层，
+# Qwen3 的 36 层撞在旧上限上。40 留出同族余量，代价是块表缓冲 ×1.25。
+comptime MAX_LAYERS = 40
 comptime MAX_GEN = 32
 comptime NO_ROW = -1
 comptime NO_TOKEN = -1

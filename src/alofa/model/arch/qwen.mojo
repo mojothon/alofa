@@ -1624,6 +1624,11 @@ struct QwenForward(Movable):
     # ——判据看权重清单（层 0 有没有 `q_proj.bias` 张量），不问 config：文件里
     # 有就是有，加载器的 `require` 清单与三个投影调用点都跟着这个开关走。
     var attn_bias: Bool
+    # QK-norm（一百八十一，Qwen3 架构）：RoPE 前对**每个头**做 RMSNorm
+    # （`q_norm` / `k_norm`，无 config 开关，只能看张量清单）。判据同
+    # `attn_bias`：层 0 有没有 `q_norm.weight`。前向把它实现为换视图复用
+    # rmsnorm 核（见前向里的注释），不再拒绝。
+    var qk_norm: Bool
     # 屏障探针的样本缓冲（`alofa/model/probe_barrier.mojo`）。开关是那里的
     # 编译期常量：关着时这块只是几十 KB 的匿名映射，写点全被折掉。
     var probe: RawPtr
@@ -1647,18 +1652,10 @@ struct QwenForward(Movable):
         self.params = TensorFile(params_dir)
         self.max_tokens = max_tokens
         self.kv_len = 0
-        # QK-norm（Qwen3 架构）显式拒绝：Qwen3 在 RoPE 前对每个头做 RMSNorm
-        # （`q_norm` / `k_norm`，无 config 开关）。前向没实现它，而张量清单里
-        # 它显然存在 —— 宁可在这里具名拒绝，也不让前向静默少算一个归一化
-        # （账本一百八十：那会是"能跑但悄悄错"，比加载失败恶劣得多）。
-        if self.params.has("model.layers.0.self_attn.q_norm.weight"):
-            raise AlofaError(
-                ERR_UNSUPPORTED,
-                "checkpoint uses QK-norm (Qwen3), which this forward does not implement",
-                "tensor=model.layers.0.self_attn.q_norm.weight",
-            )
-        # attention 偏置：看层 0 的张量清单（Qwen2.5 有 / Qwen3 无），同族内
-        # 各层一致 —— 不一致属于畸形 checkpoint，require 循环会抓住它。
+        # QK-norm 与 attention 偏置都看层 0 的张量清单（Qwen3：有 norm 无 bias；
+        # Qwen2.5：反之），同族内各层一致 —— 不一致属于畸形 checkpoint，
+        # require 循环会抓住它。
+        self.qk_norm = self.params.has("model.layers.0.self_attn.q_norm.weight")
         self.attn_bias = self.params.has("model.layers.0.self_attn.q_proj.bias")
         # 默认按核数切（`default_shards()`，上限是实测过的 8）。端到端实测见
         # `scripts/bench_model_shards.mojo`：批 = 1 的单流 decode 快 1.66–1.84×。
@@ -1787,6 +1784,9 @@ struct QwenForward(Movable):
             self.require(p + "self_attn.q_proj.weight")
             if self.attn_bias:
                 self.require(p + "self_attn.q_proj.bias")
+            if self.qk_norm:
+                self.require(p + "self_attn.q_norm.weight")
+                self.require(p + "self_attn.k_norm.weight")
             self.require(p + "self_attn.k_proj.weight")
             if self.attn_bias:
                 self.require(p + "self_attn.k_proj.bias")
@@ -1849,6 +1849,7 @@ struct QwenForward(Movable):
         self.prof = ForwardProf()
         self.junk_arm = 0
         self.attn_bias = proto.attn_bias
+        self.qk_norm = proto.qk_norm
         self.head = proto.head
         # rope 表：派生表的字节在 `rope_arena` 里（借用）；checkpoint 自带的那
         # 两张表的视图指向 `params` 的映射（孪生体自己重新映射了同一份文件，
@@ -2283,6 +2284,24 @@ struct QwenForward(Movable):
                 self.attn_bias,
             )
             var _t_ra = self.prof.now()
+            # QK-norm（Qwen3）：RoPE 前对**每个头**做 RMSNorm。q/k 缓冲是
+            # [t, q_dim]/[t, kv_dim] 行主序，与 [t·n_heads, head_dim] /
+            # [t·n_kv, head_dim] 逐字节同构 —— 换视图直接复用 rmsnorm 核
+            # （权重长度 = head_dim，核按列数自检）。原位安全：核先算完整行
+            # 统计量再同下标回写。
+            if self.qk_norm:
+                rmsnorm_k[backend](
+                    rows_view(self.q_ptr, t * self.cfg.n_heads, self.cfg.head_dim),
+                    rows_view(self.q_ptr, t * self.cfg.n_heads, self.cfg.head_dim),
+                    self.params.view(p + "self_attn.q_norm.weight"),
+                    self.cfg.eps,
+                )
+                rmsnorm_k[backend](
+                    rows_view(self.k_ptr, t * self.cfg.n_kv_heads, self.cfg.head_dim),
+                    rows_view(self.k_ptr, t * self.cfg.n_kv_heads, self.cfg.head_dim),
+                    self.params.view(p + "self_attn.k_norm.weight"),
+                    self.cfg.eps,
+                )
             rope_k[backend](q_rot, k_rot, q, k, table_cos, table_sin, self.cfg.head_dim)
 
             # Append this step's keys and values, then attend over everything
