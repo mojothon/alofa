@@ -205,6 +205,11 @@ struct GpuSession:
     # 一百一十五-b：qkv 打包权重（q+2kv 单矩阵 f16，cat3 一次）
     var d_wp_qkv: List[DeviceBuffer[DType.float16]]
     var d_bias_kv: List[DeviceBuffer[DType.float32]]
+    # bias-optional（一百八十四）：Qwen3 家族无 q/k/v bias。判据与 CPU 路
+    # 同源（层 0 张量清单，`attn_bias` 一刀的 GPU 侧影子）：False 时
+    # bias 缓冲 List 留空、cat2 打包与所有核的 bias 实参走占位
+    # （`d_ws`，HAS_BIAS=False 不读——q4_matmul_fused_gpu 的约定）。
+    var attn_bias: Bool
     # 拼接打包的 scratch（同流顺序复用）
     var d_kvraw: DeviceBuffer[DType.float16]
     # lm_head 权重的 f16 副本（d_embed 本体留给 gather）
@@ -237,6 +242,10 @@ struct GpuSession:
     var d_act: DeviceBuffer[DType.float32]
     var d_xnorm: DeviceBuffer[DType.float32]
     var d_ws: DeviceBuffer[DType.float32]
+    # 零占位 bias（一百八十四）：bias-off 家族的核 bias 实参。HAS_BIAS=True
+    # 的核读它 = 加 0.0（f32 加零精确）——与 False 实例数学等价，调用点
+    # 只需换指针、模板不翻倍。加载时 memset 零一次，此后无写者。
+    var d_zbias: DeviceBuffer[DType.float32]
     var d_scores: DeviceBuffer[DType.float32]
     var d_vpart: DeviceBuffer[DType.float32]
     var d_attot: DeviceBuffer[DType.float64]
@@ -514,6 +523,19 @@ struct GpuSession:
             self.ctx.synchronize()
 
         # ---- fp32 小权重：norms（每层两个 + 终 norm）、q/k/v 偏置 ----
+        # bias-optional（一百八十四）：判据看层 0 张量清单（权重是唯一
+        # 事实），bias-off 家族三个 bias List 留空。
+        self.attn_bias = model.params.has(
+            "model.layers.0.self_attn.q_proj.bias"
+        )
+        # 零占位（大小取 q/k/v bias 的最大者）：一次性零填充。
+        var zsize = max(self.q_out, 2 * self.kv_dim)
+        var hz = self.ctx.enqueue_create_host_buffer[DType.float32](zsize)
+        for i in range(zsize):
+            hz[i] = 0.0
+        self.d_zbias = self.ctx.enqueue_create_buffer[DType.float32](zsize)
+        self.ctx.enqueue_copy(dst_buf=self.d_zbias, src_buf=hz)
+        self.ctx.synchronize()
         for layer in range(self.n_layers):
             var p = "model.layers." + String(layer) + "."
             self.d_norms.append(
@@ -524,15 +546,23 @@ struct GpuSession:
                     self.ctx, model.params.view(p + "post_attention_layernorm.weight")
                 )
             )
-            var bq = _upload_f32(self.ctx, model.params.view(p + "self_attn.q_proj.bias"))
-            var bk = _upload_f32(self.ctx, model.params.view(p + "self_attn.k_proj.bias"))
-            var bv = _upload_f32(self.ctx, model.params.view(p + "self_attn.v_proj.bias"))
-            self.d_biases.append(bq)
-            self.d_biases.append(bk)
-            self.d_biases.append(bv)
-            self.d_bias_q.append(bq)
-            self.d_bias_k.append(bk)
-            self.d_bias_v.append(bv)
+            if self.attn_bias:
+                var bq = _upload_f32(self.ctx, model.params.view(p + "self_attn.q_proj.bias"))
+                var bk = _upload_f32(self.ctx, model.params.view(p + "self_attn.k_proj.bias"))
+                var bv = _upload_f32(self.ctx, model.params.view(p + "self_attn.v_proj.bias"))
+                self.d_biases.append(bq)
+                self.d_biases.append(bk)
+                self.d_biases.append(bv)
+                self.d_bias_q.append(bq)
+                self.d_bias_k.append(bk)
+                self.d_bias_v.append(bv)
+            else:
+                # 零占位也填进 List（每层同一缓冲）：调用点的下标访问
+                # 保持合法，条件表达式的未选分支也不越界。
+                self.d_bias_q.append(self.d_zbias)
+                self.d_bias_k.append(self.d_zbias)
+                self.d_bias_v.append(self.d_zbias)
+                self.d_biases.append(self.d_zbias)
         self.d_norms.append(_upload_f32(self.ctx, model.params.view(FINAL_NORM)))
     
         # ---- rope 表与 embedding（tied 输出投影）----
@@ -857,31 +887,57 @@ struct GpuSession:
     ) raises:
         """带偏置 q4 matmul（q/k/v）：bias 融合在写回尾缀（账本六十五），
         一次发射直写目标缓冲 —— 原 matmul 进 `d_ws` 再 `add_gpu` 的两步撤销。
+        bias-optional（一百八十四）：attn_bias=False 时走 HAS_BIAS=False
+        实例，bias 实参传 `d_ws` 占位（不读，q4 核先例）。
         """
         var src = self._src(src_sel)
         var dst = self._dst(dst_sel)
-        comptime if inner <= 1024:
-            self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
-                src.unsafe_ptr(),
-                self.d_q4[slot].unsafe_ptr(),
-                dst.unsafe_ptr(),
-                self.d_biases[bias_idx].unsafe_ptr(),
-                Int32(inner),
-                Int32(n_out),
-                grid_dim=(n_out, 1, 1),
-                block_dim=(32, 1, 1),
-            )
+        if self.attn_bias:
+            comptime if inner <= 1024:
+                self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
+                    src.unsafe_ptr(),
+                    self.d_q4[slot].unsafe_ptr(),
+                    dst.unsafe_ptr(),
+                    self.d_biases[bias_idx].unsafe_ptr(),
+                    Int32(inner),
+                    Int32(n_out),
+                    grid_dim=(n_out, 1, 1),
+                    block_dim=(32, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[q4_matmul_fused_gpu[128, inner, True]](
+                    src.unsafe_ptr(),
+                    self.d_q4[slot].unsafe_ptr(),
+                    dst.unsafe_ptr(),
+                    self.d_biases[bias_idx].unsafe_ptr(),
+                    Int32(inner),
+                    Int32(n_out),
+                    grid_dim=(n_out, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
         else:
-            self.ctx.enqueue_function[q4_matmul_fused_gpu[128, inner, True]](
-                src.unsafe_ptr(),
-                self.d_q4[slot].unsafe_ptr(),
-                dst.unsafe_ptr(),
-                self.d_biases[bias_idx].unsafe_ptr(),
-                Int32(inner),
-                Int32(n_out),
-                grid_dim=(n_out, 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            comptime if inner <= 1024:
+                self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, False]](
+                    src.unsafe_ptr(),
+                    self.d_q4[slot].unsafe_ptr(),
+                    dst.unsafe_ptr(),
+                    self.d_ws.unsafe_ptr(),
+                    Int32(inner),
+                    Int32(n_out),
+                    grid_dim=(n_out, 1, 1),
+                    block_dim=(32, 1, 1),
+                )
+            else:
+                self.ctx.enqueue_function[q4_matmul_fused_gpu[128, inner, False]](
+                    src.unsafe_ptr(),
+                    self.d_q4[slot].unsafe_ptr(),
+                    dst.unsafe_ptr(),
+                    self.d_ws.unsafe_ptr(),
+                    Int32(inner),
+                    Int32(n_out),
+                    grid_dim=(n_out, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
 
 
 
@@ -918,16 +974,29 @@ struct GpuSession:
                 "inner=" + String(inner) + " hidden=" + String(self.hidden),
             )
         # 与 decode 同一 fused 路径（账本六十五）：单发射直写 dq。
-        self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
-            dnormed.unsafe_ptr(),
-            self.d_q4[Q4_SLOT_Q].unsafe_ptr(),
-            dq.unsafe_ptr(),
-            self.d_biases[0].unsafe_ptr(),
-            Int32(inner),
-            Int32(self.q_out),
-            grid_dim=(self.q_out, 1, 1),
-            block_dim=(32, 1, 1),
-        )
+        # bias-optional（一百八十四）：attn_bias=False 走占位实例。
+        if self.attn_bias:
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, True]](
+                dnormed.unsafe_ptr(),
+                self.d_q4[Q4_SLOT_Q].unsafe_ptr(),
+                dq.unsafe_ptr(),
+                self.d_biases[0].unsafe_ptr(),
+                Int32(inner),
+                Int32(self.q_out),
+                grid_dim=(self.q_out, 1, 1),
+                block_dim=(32, 1, 1),
+            )
+        else:
+            self.ctx.enqueue_function[q4_matmul_fused_gpu[32, inner, False]](
+                dnormed.unsafe_ptr(),
+                self.d_q4[Q4_SLOT_Q].unsafe_ptr(),
+                dq.unsafe_ptr(),
+                self.d_ws.unsafe_ptr(),
+                Int32(inner),
+                Int32(self.q_out),
+                grid_dim=(self.q_out, 1, 1),
+                block_dim=(32, 1, 1),
+            )
 
     # ---- 诊断原语（探针用；方法内部发射绕开外部 aliasing）----
 
@@ -2210,14 +2279,15 @@ struct GpuSession:
                             inner // 16, 1),
                             block_dim=(128, 1, 1),
                         )
-                        self.ctx.enqueue_function[cat2_f32_gpu](
-                            self.d_bias_k[pl].unsafe_ptr(),
-                            self.d_bias_v[pl].unsafe_ptr(),
-                            self.d_bias_kv[pl].unsafe_ptr(),
-                            Int32(self.kv_dim),
-                            grid_dim=(ceildiv(2 * self.kv_dim, 256), 1, 1),
-                            block_dim=(256, 1, 1),
-                        )
+                        if self.attn_bias:
+                            self.ctx.enqueue_function[cat2_f32_gpu](
+                                self.d_bias_k[pl].unsafe_ptr(),
+                                self.d_bias_v[pl].unsafe_ptr(),
+                                self.d_bias_kv[pl].unsafe_ptr(),
+                                Int32(self.kv_dim),
+                                grid_dim=(ceildiv(2 * self.kv_dim, 256), 1, 1),
+                                block_dim=(256, 1, 1),
+                            )
                     comptime if prefill_mma_o:
                         self.ctx.enqueue_function[
                             pack_w_mma_gpu[inner, 2, 8]
@@ -2300,7 +2370,7 @@ struct GpuSession:
                     )
                     # 一百六十五：SIMD4 版（每线程 4 连续元素，
                     # 两条 16B 事务；同轮 probe -32%）。
-                    self.ctx.enqueue_function[f32_mergb_v4_gpu[8]](
+                    self.ctx.enqueue_function[f32_mergb_v4_gpu[8, True]](
                         self.d_qb.unsafe_ptr(),
                         self.d_qpart.unsafe_ptr(),
                         self.d_bias_q[layer].unsafe_ptr(),
@@ -2377,7 +2447,7 @@ struct GpuSession:
                         ),
                         block_dim=(256, 1, 1),
                     )
-                    self.ctx.enqueue_function[f32_mergb2_gpu[8]](
+                    self.ctx.enqueue_function[f32_mergb2_gpu[8, True]](
                         self.d_kb.unsafe_ptr(),
                         self.d_kbpart.unsafe_ptr(),
                         self.d_vb.unsafe_ptr(),
@@ -2394,6 +2464,7 @@ struct GpuSession:
                             inner,
                             896 if inner >= 896 and inner % 896 == 0 else inner,
                             8,
+                            True,
                         ]
                     ](
                         self.d_xnormb16.unsafe_ptr(),

@@ -1,0 +1,4 @@
+source: /home/rontom/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987
+transform: 72 *.bias tensors zero-filled (shapes kept)
+purpose: GPU bias-optional gate - bias-on path over zero-filled
+bias must equal the bias-off path over the deleted-bias twin

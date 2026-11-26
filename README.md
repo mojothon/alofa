@@ -137,7 +137,7 @@ core/         张量视图、arena、mmap、具名错误、结构化日志
 - **CPU 服务路无批调度**（GPU 路才有）：同时能生成几条 = engine 线程数，默认 1；无 TLS。
 - 垂直切片只验 **1 条请求 / 16 token / scalar 后端**——只负责"链路通"。
 - 权重形态只认两种（HF safetensors 就地放宽 fp32、fp32 裸二进制 + TSV）；GGUF 不支持。
-- 架构主验证面是 Qwen2.5：0.5B 全验证；1.5B 冒烟已通（无自动门）。**Qwen3-8B CPU 全链已打通**（分片加载 + bias optional + QK-norm，端到端与 HF fp32 贪心逐 token 一致）；GPU 路跨族还剩 bias-optional 与 QK-norm 上传两处。
+- 架构主验证面是 Qwen2.5：0.5B 全验证；1.5B 冒烟已通（无自动门）。**Qwen3-8B CPU 全链已打通**（分片加载 + bias optional + QK-norm，端到端与 HF fp32 贪心逐 token 一致）；GPU bias-optional 已落（zeroed/deleted 双 fixture 自证门）；GPU 路跨族只剩 QK-norm 上传一处。
 - 量化只有 q4_0，整网教师强制贪心一致率实测 **0.8691**（0.8164 是修 bug 前旧数）；混合精度（留 12 层 fp32）实测 0.9102 可过 0.90 门但丢大半速度收益——账本 179，通道级感知量化是下一个杠杆。
 - 性能数字只在 A100 远程验证机测得（共享机）；llama.cpp 对比基线尚未做。
 

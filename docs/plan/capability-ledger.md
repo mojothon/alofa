@@ -4222,6 +4222,13 @@
     | 0.0 | 484 | 407 | **1.19×** | 62.1% | 0.088 |
 
   - **判读**：①**接受率随 R 平滑衰减**（99.7% → 62.1%）——采样验证的接受率 = q(草稿)，与理论逐点吻合（R=0 的 0.62 正落在补九预测的 0.6-0.9 区间下沿）；②**全谱系为正，无灾难**——补五的贪心 junk 灾难（R≤0.25 时 0.39×）在采样域未复现：自适应 k_eff + 真实接受率（0.62 而非贪心重放域的虚高）把 R=0 钳在 1.19×；③与贪心曲线对比：高温 R 曲线整体下移（贪心 R=0 1.61× vs 采样 1.19×）——采样接受率天然低于 argmax 接受率（分布发散度代价），高 R 端受固定种子重放保护不受损（2.29× ≈ 贪心 2.0-2.5× 区间）；④spec_ticks 全点 > 0、遥测自洽。**生产矩阵最终闭合：三轴 × 交叉格全谱系正增益，最差格（R=0 × temp 0.7 × junk 草稿域）1.19×，无任何惩罚格。**
+- **2026-11-26（一百八十四）** —— **GPU bias-optional 落地：零占位 + 融合核 HAS_BIAS 模板位——Qwen3-8B GPU 路的前置墙拆除，门用 deleted/zeroed 双 fixture 自证**
+  - **动机**：180 留下的明牌下一刀（"GPU 的 bias-optional 是下一刀"）。Qwen3 家族无 q/k/v bias，而 GPU session 的 bias 消费是硬参数（qkv 三融合、MMA、mergb、bmm、q4 fused 五族核全部融合 bias）——不拆这堵墙 Qwen3 上不了 GPU。
+  - **实现（零占位为主、模板位为辅）**：①**零占位缓冲 `d_zbias`**（大小 max(q_out, 2·kv_dim)，加载时 memset 零一次、此后无写者）——HAS_BIAS=True 的核读它 = 加 0.0（f32 加零精确），与 False 实例数学等价；②`attn_bias` 判据与 CPU 路 `attn_bias` 一刀同源（层 0 张量清单），bias-off 家族三个 bias List **填零占位引用**——调用点下标保持合法、条件表达式的未选分支也不越界；③cat2 bias_kv 打包分支跳过；④核级 HAS_BIAS 模板位补齐：`f16_mma_gemm2_pk_gpu`（原裸指针）、`f32_mergb_gpu/mergb2_gpu/mergb_v4_gpu/mergb2_v4_gpu`（原裸指针）、`f16_matmul_qkv_fat_gpu`（原裸指针）——qkv 三融合与 q4 fused 本就有 HAS_BIAS 位，调用点直接用。
+  - **门（自证设计）**：双 fixture——`qwen2.5-0.5b-nobias`（删 72 个 `*.bias` 张量 → bias-off 路）与 `qwen2.5-0.5b-zerobias`（72 个 bias 张量**形状不变全零填充** → bias-on 路）——两者数学严格等价（bias-on 加 0.0 = bias-off 不加），GPU 全链两条贪心链**逐 token 一致（16/16）**。⚠️ 第一版门设计有错：拿 0.5B 真 bias fixture 对删 bias fixture 判等——0.5B 的 bias **非零**，"删 bias ≠ 加 0"，第一步即分歧（这是数学设计错而非实现 bug）；zeroed/deleted 镜像对才是自证的正确组合。
+  - **回归**：CPU 33+16+7 全绿；远端 GPU 门 gpu_service / service_deep / service_spec / service_prefix 全 PASS（bias-on 路逐位同路）。
+  - **两个编译器注记**：①本地 `-O0` build serve 撞 LLVM NVPTX `Cannot select: mma.m16n8k16...f32.f32` 崩（`f16_mma_head_pk_gpu` 实例化，非本轮改动核）——远端 JIT 与 `-O2` build 均正常，标准口径不受影响；②`comptime if` 内声明的变量不透出作用域（b0/b1 需提到 if 外再赋值）。
+  - **下一步**：QK-norm 的 GPU 上传通路（rmsnorm_gpu 已有 rows 参数，q/k 缓冲 f32 换视图即可）——之后 Qwen3-8B GPU 全链的两堵墙只剩 QK-norm 一处。
 - **2026-11-26（一百八十三）** —— **②续矩阵补测（同轮相对口径）：饱和形态复现——c=8→32 吞吐持平、延迟翻倍；182 的"GPU 4 驻留干扰"判明为间歇性；绝对锚点仍待 178 型窗口**
   - **窗口**：loadavg 三档全低（0.03）+ GPU 4 干扰消失（单请求 13-14s，与上轮 GPU 2 的 12-15s 噪声内一致）——182 判定的"驻留干扰"是**间歇性**的：32GB 驻留不必然持续干扰，逐窗口实测才是判据。
   - **数据（178 口径：固定 prompt × temp 0 × max_tokens 128 × 非流式；同轮紧邻对）**：

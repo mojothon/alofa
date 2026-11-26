@@ -1030,7 +1030,9 @@ def f16_matmul_dual_gpu[
                     )
 
 
-def f16_matmul_qkv_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int](
+def f16_matmul_qkv_fat_gpu[
+    THREADS: Int, INNER: Int, OUTS: Int, HAS_BIAS: Bool
+](
     x: Pointer[Float32, MutUntrackedOrigin],
     w: Pointer[Float16, MutUntrackedOrigin],
     dst_q: Pointer[Float32, MutUntrackedOrigin],
@@ -1136,14 +1138,24 @@ def f16_matmul_qkv_fat_gpu[THREADS: Int, INNER: Int, OUTS: Int](
             var o = o0 + oo
             if o < total:
                 var v = Float32(sacc[unsafe_offset=oo * THREADS])
-                if o < Int(q_out):
-                    dst_q[unsafe_offset=o] = v + bias_q[unsafe_offset=o]
-                elif o < Int(q_out) + Int(kv_out):
-                    var r = o - Int(q_out)
-                    dst_k[unsafe_offset=r] = v + bias_k[unsafe_offset=r]
+                comptime if HAS_BIAS:
+                    if o < Int(q_out):
+                        dst_q[unsafe_offset=o] = v + bias_q[unsafe_offset=o]
+                    elif o < Int(q_out) + Int(kv_out):
+                        var r = o - Int(q_out)
+                        dst_k[unsafe_offset=r] = v + bias_k[unsafe_offset=r]
+                    else:
+                        var r = o - Int(q_out) - Int(kv_out)
+                        dst_v[unsafe_offset=r] = v + bias_v[unsafe_offset=r]
                 else:
-                    var r = o - Int(q_out) - Int(kv_out)
-                    dst_v[unsafe_offset=r] = v + bias_v[unsafe_offset=r]
+                    if o < Int(q_out):
+                        dst_q[unsafe_offset=o] = v
+                    elif o < Int(q_out) + Int(kv_out):
+                        var r = o - Int(q_out)
+                        dst_k[unsafe_offset=r] = v
+                    else:
+                        var r = o - Int(q_out) - Int(kv_out)
+                        dst_v[unsafe_offset=r] = v
 
 
 def cat3_f16_gpu(
@@ -2928,7 +2940,7 @@ def f16_mma_gemm2_spl_gpu[
             ] = acc[3]
 
 
-def f32_mergb_gpu[S: Int](
+def f32_mergb_gpu[S: Int, HAS_BIAS: Bool](
     dst: Pointer[Float32, MutUntrackedOrigin],
     part: Pointer[Float32, MutUntrackedOrigin],
     bias: Pointer[Float32, MutUntrackedOrigin],
@@ -2937,14 +2949,17 @@ def f32_mergb_gpu[S: Int](
 ) -> None:
     """q2 split-K 归并（账本一百一十七-b）：dst[i] = Σ_s part[s][i]
     + bias[i % out_cols]。part 按 [S][n] 连续布局，S 编译期（必须
-    与 spl 的 S 一致——不一致静默丢段）。mergb2 的单路版。"""
+    与 spl 的 S 一致——不一致静默丢段）。mergb2 的单路版。
+    HAS_BIAS（一百八十四）：False 时纯归并，bias 不读（占位指针）。"""
     var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
     if i < Int(n):
         var nn = Int(n)
         var acc = Float32(0)
         for s in range(S):
             acc += part[unsafe_offset=s * nn + i]
-        dst[unsafe_offset=i] = acc + bias[unsafe_offset=i % Int(out_cols)]
+        comptime if HAS_BIAS:
+            acc += bias[unsafe_offset=i % Int(out_cols)]
+        dst[unsafe_offset=i] = acc
 
 
 def f32_mergsw_gpu[S: Int](
@@ -2972,7 +2987,7 @@ def f32_mergsw_gpu[S: Int](
         )
 
 
-def f32_mergb2_gpu[S: Int](
+def f32_mergb2_gpu[S: Int, HAS_BIAS: Bool](
     dst_a: Pointer[Float32, MutUntrackedOrigin],
     part_a: Pointer[Float32, MutUntrackedOrigin],
     dst_b: Pointer[Float32, MutUntrackedOrigin],
@@ -2984,7 +2999,8 @@ def f32_mergb2_gpu[S: Int](
     """kv2 split-K 归并（账本一百一十四-a）：dst_a[i] = Σ part_a +
     bias[i % out_cols]，dst_b[i] = Σ part_b + bias[out_cols + i %
     out_cols]（k/v 两侧 bias 在拼接 bias 里相邻）。part 按
-    [S][n] 连续，S 编译期（必须与 spl 的 S 一致——不一致静默丢段）。"""
+    [S][n] 连续，S 编译期（必须与 spl 的 S 一致——不一致静默丢段）。
+    HAS_BIAS（一百八十四）：False 时纯归并，bias 不读（占位指针）。"""
     var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
     if i < Int(n):
         var nn = Int(n)
@@ -2993,12 +3009,15 @@ def f32_mergb2_gpu[S: Int](
         for s in range(S):
             aa += part_a[unsafe_offset=s * nn + i]
             ab += part_b[unsafe_offset=s * nn + i]
-        var c = i % Int(out_cols)
-        dst_a[unsafe_offset=i] = aa + bias[unsafe_offset=c]
-        dst_b[unsafe_offset=i] = ab + bias[unsafe_offset=Int(out_cols) + c]
+        comptime if HAS_BIAS:
+            var c = i % Int(out_cols)
+            aa += bias[unsafe_offset=c]
+            ab += bias[unsafe_offset=Int(out_cols) + c]
+        dst_a[unsafe_offset=i] = aa
+        dst_b[unsafe_offset=i] = ab
 
 
-def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int](
+def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int, HAS_BIAS: Bool](
     xh: Pointer[Float16, MutUntrackedOrigin],
     wp: Pointer[Float16, MutUntrackedOrigin],
     dst_a: Pointer[Float32, MutUntrackedOrigin],
@@ -3012,7 +3031,9 @@ def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int](
     dst = [x@Wk^T + bk | x@Wv^T + bv] 按列拆到 dst_a/dst_b。OUTS=2
     时块 0 的列全落在 [0, out_cols)（→ k），块 1 全落在
     [out_cols, 2*out_cols)（→ v），要求 out_cols % (WARP*16) == 0
-    保证块内列不跨界。主循环与 f16_mma_gemm_pk_gpu 逐指令相同。"""
+    保证块内列不跨界。主循环与 f16_mma_gemm_pk_gpu 逐指令相同。
+    HAS_BIAS（一百八十四，bias-optional）：False 时不读 bias 指针
+    （bias-optional 家族传占位，同 q4_matmul_fused_gpu 的约定）。"""
 
     comptime OUTS = 2
     var cb = Int(block_idx.x) * WARP * OUTS * 8
@@ -3113,8 +3134,11 @@ def f16_mma_gemm2_pk_gpu[INNER: Int, CH: Int, WARP: Int](
         var is_a = col < Int(out_cols)
         var dp = dst_a if is_a else dst_b
         var cbase = col - Int(out_cols) if not is_a else col
-        var b0 = bias[unsafe_offset=col + tig * 2]
-        var b1 = bias[unsafe_offset=col + tig * 2 + 1]
+        var b0 = Float32(0)
+        var b1 = Float32(0)
+        comptime if HAS_BIAS:
+            b0 = bias[unsafe_offset=col + tig * 2]
+            b1 = bias[unsafe_offset=col + tig * 2 + 1]
         if r0 + gid < Int(n_rows):
             dp[
                 unsafe_offset=(r0 + gid) * Int(out_cols) + cbase + tig * 2
@@ -3965,7 +3989,7 @@ def f32_adds_v4_gpu[S: Int](
         dst.store[4](i4, dst.load[4](i4) + acc)
 
 
-def f32_mergb_v4_gpu[S: Int](
+def f32_mergb_v4_gpu[S: Int, HAS_BIAS: Bool](
     dst: Pointer[Float32, MutUntrackedOrigin],
     part: Pointer[Float32, MutUntrackedOrigin],
     bias: Pointer[Float32, MutUntrackedOrigin],
@@ -3974,19 +3998,21 @@ def f32_mergb_v4_gpu[S: Int](
 ) -> None:
     """mergb 的 SIMD4 版（账本一百六十五）：结构同 adds_v4——
     Σ_s SIMD 累加 + bias SIMD 载入（4 连续 i 的 i%out_cols 也连续，
-    要求 out_cols % 4 == 0 ✓）。grid = ceildiv(n//4, 256)。"""
+    要求 out_cols % 4 == 0 ✓）。grid = ceildiv(n//4, 256)。
+    HAS_BIAS（一百八十四）：False 时纯归并，bias 不读（占位指针）。"""
     var i4 = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
     var nn = Int(n)
     if i4 < nn:
         var acc = SIMD[DType.float32, 4](0, 0, 0, 0)
         for s in range(S):
             acc += part.load[4](s * nn + i4)
-        var c = i4 % Int(out_cols)
-        var bv = bias.load[4](c)
-        dst.store[4](i4, acc + bv)
+        comptime if HAS_BIAS:
+            var c = i4 % Int(out_cols)
+            acc += bias.load[4](c)
+        dst.store[4](i4, acc)
 
 
-def f32_mergb2_v4_gpu[S: Int](
+def f32_mergb2_v4_gpu[S: Int, HAS_BIAS: Bool](
     dst_a: Pointer[Float32, MutUntrackedOrigin],
     part_a: Pointer[Float32, MutUntrackedOrigin],
     dst_b: Pointer[Float32, MutUntrackedOrigin],
@@ -3997,7 +4023,8 @@ def f32_mergb2_v4_gpu[S: Int](
 ) -> None:
     """mergb2 的 SIMD4 版（账本一百六十五）：k/v 双路并行 SIMD
     累加——两路 load[4] 交错发出，DRAM 延迟重叠。bias 双段各一载。
-    grid = ceildiv(n//4, 256)。"""
+    grid = ceildiv(n//4, 256)。
+    HAS_BIAS（一百八十四）：False 时纯归并，bias 不读（占位指针）。"""
     var i4 = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
     var nn = Int(n)
     if i4 < nn:
@@ -4006,10 +4033,12 @@ def f32_mergb2_v4_gpu[S: Int](
         for s in range(S):
             aa += part_a.load[4](s * nn + i4)
             ab += part_b.load[4](s * nn + i4)
-        var c = i4 % Int(out_cols)
-        var cb = Int(out_cols) + c
-        dst_a.store[4](i4, aa + bias.load[4](c))
-        dst_b.store[4](i4, ab + bias.load[4](cb))
+        comptime if HAS_BIAS:
+            var c = i4 % Int(out_cols)
+            aa += bias.load[4](c)
+            ab += bias.load[4](Int(out_cols) + c)
+        dst_a.store[4](i4, aa)
+        dst_b.store[4](i4, ab)
 
 def q4_pack_scales_gpu(
     blocks: Pointer[UInt8, MutUntrackedOrigin],
