@@ -1,0 +1,6 @@
+source: /home/rontom/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987
+transform: injected 48 all-ones q_norm/k_norm weights (14x64 q, 2x64 k per layer)
+purpose: GPU QK-norm gate - switches attn_bias(True) and qk_norm(True) coexist
+independently; GPU greedy chain must equal the CPU reference chain
+(CPU QK-norm already token-exact vs HF fp32 per ledger 181)
+note: q_norm/k_norm are [head_dim] shared weights (HF Qwen3RMSNorm semantics), all ones

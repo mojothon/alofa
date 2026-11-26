@@ -83,6 +83,60 @@ def rmsnorm_gpu(
         i += 256
 
 
+def rmsnorm_inplace_gpu(
+    x: Pointer[Float32, MutUntrackedOrigin],
+    w: Pointer[Float32, MutUntrackedOrigin],
+    dst16: Pointer[Float16, MutUntrackedOrigin],
+    cols: Int32,
+    rows: Int32,
+    eps: Float32,
+) -> None:
+    """`rmsnorm_gpu` 的原位版（一百八十五，QK-norm 专用）：`x` 同址读
+    写（一行一 block，先归约出 sum_sq 再同下标写回——归约完成前该行
+    的读全部结束，原位安全），f16 镜像照出。
+
+    为什么单独一份：发射器的 aliasing 检查拒绝「x 与 dst 传同一
+    缓冲」（编译期按表达式判），而 QK-norm 恰恰需要真原位 —— rope
+    紧接着读的就是 norm 后的缓冲。数学上与 `rmsnorm_gpu(x, w, x, ...)
+    等价；统计量归约（f64 树）与写回顺序同 rmsnorm_gpu，数值逐位同。
+    """
+    var row = Int(block_idx.x)
+    if row >= Int(rows):
+        return
+    var tid = Int(thread_idx.x)
+    var base = row * Int(cols)
+    var n = Int(cols)
+
+    var local = Float64(0)
+    var i = tid
+    while i < n:
+        var v = Float64(x[unsafe_offset=base + i])
+        local += v * v
+        i += 256
+
+    var smem = stack_allocation[256, Float64, address_space = AddressSpace.SHARED]()
+    smem[unsafe_offset=tid] = local
+    barrier()
+    var stride = 128
+    while stride > 0:
+        if tid < stride:
+            smem[unsafe_offset=tid] = (
+                smem[unsafe_offset=tid] + smem[unsafe_offset=tid + stride]
+            )
+        barrier()
+        stride //= 2
+
+    var scale = Float64(1.0) / sqrt(
+        smem[unsafe_offset=0] / Float64(n) + Float64(eps)
+    )
+    i = tid
+    while i < n:
+        var v = Float32(Float64(x[unsafe_offset=base + i]) * scale * Float64(w[unsafe_offset=i]))
+        x[unsafe_offset=base + i] = v
+        dst16[unsafe_offset=base + i] = Float16(v)
+        i += 256
+
+
 def _fp16_bits_to_f32_device(half: Int) -> Float32:
     """设备端 fp16 位模式 → fp32，与 `kernels/cpu/quant.mojo` 的
     `fp16_bits_to_f32` **同一个算法与同一个顺序**（指数/尾数用整数移位与 2 的

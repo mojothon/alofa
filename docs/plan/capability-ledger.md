@@ -4222,6 +4222,12 @@
     | 0.0 | 484 | 407 | **1.19×** | 62.1% | 0.088 |
 
   - **判读**：①**接受率随 R 平滑衰减**（99.7% → 62.1%）——采样验证的接受率 = q(草稿)，与理论逐点吻合（R=0 的 0.62 正落在补九预测的 0.6-0.9 区间下沿）；②**全谱系为正，无灾难**——补五的贪心 junk 灾难（R≤0.25 时 0.39×）在采样域未复现：自适应 k_eff + 真实接受率（0.62 而非贪心重放域的虚高）把 R=0 钳在 1.19×；③与贪心曲线对比：高温 R 曲线整体下移（贪心 R=0 1.61× vs 采样 1.19×）——采样接受率天然低于 argmax 接受率（分布发散度代价），高 R 端受固定种子重放保护不受损（2.29× ≈ 贪心 2.0-2.5× 区间）；④spec_ticks 全点 > 0、遥测自洽。**生产矩阵最终闭合：三轴 × 交叉格全谱系正增益，最差格（R=0 × temp 0.7 × junk 草稿域）1.19×，无任何惩罚格。**
+- **2026-11-26（一百八十五）** —— **GPU QK-norm 落地：换视图论证照搬 + 原位核 rmsnorm_inplace_gpu——Qwen3-8B GPU 全链的最后一堵墙拆除，门用 CPU 参照链判等**
+  - **动机**：184 留下的最后一刀。Qwen3 的逐头 RMSNorm（RoPE 前对每头做 norm）在 CPU 路（181）是零新核的换视图复用；GPU 路上 `rmsnorm_gpu` 的 rows/cols 参数化（一百五十五）让同一论证直接成立——session 侧只是每层 rope 前两发发射。
+  - **实现**：①`attn_bias` 同款开关（层 0 `q_norm.weight` 有无）+ `d_qknorm_q/k` 权重上传（f32 [head_dim]）；②**decode**：SKIP_ATTN 内 rope 前两发（t=1，rows=头数）；③**prefill**：kv_store_bb 融合核前两发（rows=t·头数）；④**专用原位核 `rmsnorm_inplace_gpu`**——发射器的 aliasing 检查按编译期表达式拒绝「x 与 dst 同缓冲」，局部指针变量也绕不过；QK-norm 恰恰需要真原位（rope 紧接着读 norm 后的缓冲），所以单独一份（先归约后同下标写回，数值与 rmsnorm_gpu 逐位同）。⑤dst16 镜像独立分配 `d_qknorm16`（max_tokens·qkv）——不借 d_embed16/d_xnormb16：非 F16 构建下前者是 1 元素占位、后者装不下 prefill 的行量。
+  - **fixture 语义课（两次返工）**：Qwen3 的 q_norm/k_norm 是 **[head_dim] 一维共享权重**（HF `Qwen3RMSNorm(head_dim)`——所有头共用同一权重），不是每头一份。第一版注入 [n_heads·hd] 平铺（896），第二版误"修"成 2D [14,64]——两次都被 CPU rmsnorm 的 `expect_vector(w, head_dim)` 抓住（got=896 want=64），这个校验本身就把权重语义钉死了。第三版 [64] 全 1 才对。**门的判据**：注入 fixture（attn_bias 与 qk_norm 两开关同开的组合覆盖）上，CPU 参照链（181 已对 HF fp32 逐 token 一致）vs GPU 链逐 token 一致（12/12）。
+  - **回归**：CPU 33+16+7 全绿；远端 GPU 门集 gpu_service / bias_off / service_deep / service_spec / service_prefix 全 PASS。
+  - **里程碑**：Qwen3-8B GPU 全链的前置墙清零（bias-optional 184 + QK-norm 本刀）——8B 上 GPU 只差一次真实加载验证（16GB f16 权重 + MAX_LAYERS=40 已备）。
 - **2026-11-26（一百八十四）** —— **GPU bias-optional 落地：零占位 + 融合核 HAS_BIAS 模板位——Qwen3-8B GPU 路的前置墙拆除，门用 deleted/zeroed 双 fixture 自证**
   - **动机**：180 留下的明牌下一刀（"GPU 的 bias-optional 是下一刀"）。Qwen3 家族无 q/k/v bias，而 GPU session 的 bias 消费是硬参数（qkv 三融合、MMA、mergb、bmm、q4 fused 五族核全部融合 bias）——不拆这堵墙 Qwen3 上不了 GPU。
   - **实现（零占位为主、模板位为辅）**：①**零占位缓冲 `d_zbias`**（大小 max(q_out, 2·kv_dim)，加载时 memset 零一次、此后无写者）——HAS_BIAS=True 的核读它 = 加 0.0（f32 加零精确），与 False 实例数学等价；②`attn_bias` 判据与 CPU 路 `attn_bias` 一刀同源（层 0 张量清单），bias-off 家族三个 bias List **填零占位引用**——调用点下标保持合法、条件表达式的未选分支也不越界；③cat2 bias_kv 打包分支跳过；④核级 HAS_BIAS 模板位补齐：`f16_mma_gemm2_pk_gpu`（原裸指针）、`f32_mergb_gpu/mergb2_gpu/mergb_v4_gpu/mergb2_v4_gpu`（原裸指针）、`f16_matmul_qkv_fat_gpu`（原裸指针）——qkv 三融合与 q4 fused 本就有 HAS_BIAS 位，调用点直接用。

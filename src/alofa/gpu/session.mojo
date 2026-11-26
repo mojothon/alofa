@@ -44,7 +44,7 @@ from alofa.kernels.cuda.attention import attn_rope_gpu, attn_rs_gpu, \
     kv_rows_copy_gpu, attn_vt2_h_gpu, attn_comb2_b_gpu, kv_store_bb_gpu, \
     attn_rs_h_bb_gpu, attn_vt2_h_bb_gpu, \
     kv_store_bb_gpu_spec, attn_rs_h_bb_gpu_spec, attn_vt2_h_bb_gpu_spec
-from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, f32_adds_rmsnorm_f16_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
+from alofa.kernels.cuda.basic import linear_fat_f16_gpu, linear_fat_gpu, rmsnorm_gpu, rmsnorm_inplace_gpu, f32_adds_rmsnorm_f16_gpu, argmax_f32_gpu, argmax_comb_gpu, argmax_rb_gpu, sample_rb_gpu, sample_topp_gpu, sample_topp_row_gpu
 from alofa.kernels.cuda.elementwise import (
     add_into_gpu,
     f32_to_f16_gpu,
@@ -210,6 +210,17 @@ struct GpuSession:
     # bias 缓冲 List 留空、cat2 打包与所有核的 bias 实参走占位
     # （`d_ws`，HAS_BIAS=False 不读——q4_matmul_fused_gpu 的约定）。
     var attn_bias: Bool
+    # QK-norm（一百八十五，Qwen3 架构）：RoPE 前对每个头做 RMSNorm。
+    # 判据与 CPU 路 `qk_norm` 一刀同源（层 0 张量清单）。GPU 实现 =
+    # CPU 181 的换视图论证照搬：q/k 缓冲 [t, q_dim] 行主序与
+    # [t·n_heads, head_dim] 逐字节同构，`rmsnorm_gpu` 的 rows/cols
+    # 参数化（一百五十五）直接吃 —— 每层 rope 前两发，原位（核先
+    # 归约后写回，CPU 侧同性质）。权重 f32 每层两个（head_dim）。
+    var qk_norm: Bool
+    var d_qknorm_q: List[DeviceBuffer[DType.float32]]
+    var d_qknorm_k: List[DeviceBuffer[DType.float32]]
+    # rmsnorm 直出 f16 的镜像写目标（无读者；只在 qk_norm 家族分配）。
+    var d_qknorm16: DeviceBuffer[DType.float16]
     # 拼接打包的 scratch（同流顺序复用）
     var d_kvraw: DeviceBuffer[DType.float16]
     # lm_head 权重的 f16 副本（d_embed 本体留给 gather）
@@ -377,6 +388,8 @@ struct GpuSession:
             self.d_embedp = self.ctx.enqueue_create_buffer[DType.float16](1)
         self.d_bias_q = List[DeviceBuffer[DType.float32]]()
         self.d_bias_k = List[DeviceBuffer[DType.float32]]()
+        self.d_qknorm_q = List[DeviceBuffer[DType.float32]]()
+        self.d_qknorm_k = List[DeviceBuffer[DType.float32]]()
         self.d_bias_v = List[DeviceBuffer[DType.float32]]()
         self.d_norms = List[DeviceBuffer[DType.float32]]()
         self.d_biases = List[DeviceBuffer[DType.float32]]()
@@ -528,6 +541,14 @@ struct GpuSession:
         self.attn_bias = model.params.has(
             "model.layers.0.self_attn.q_proj.bias"
         )
+        self.qk_norm = model.params.has(
+            "model.layers.0.self_attn.q_norm.weight"
+        )
+        # dst16 镜像缓冲无条件分配（确定性初始化要求；qk_norm=False
+        # 家族只浪费 ~1MB，换来一条无分支的初始化路径）。
+        self.d_qknorm16 = self.ctx.enqueue_create_buffer[DType.float16](
+            max_tokens * (self.q_out + 2 * self.kv_dim)
+        )
         # 零占位（大小取 q/k/v bias 的最大者）：一次性零填充。
         var zsize = max(self.q_out, 2 * self.kv_dim)
         var hz = self.ctx.enqueue_create_host_buffer[DType.float32](zsize)
@@ -563,6 +584,15 @@ struct GpuSession:
                 self.d_bias_k.append(self.d_zbias)
                 self.d_bias_v.append(self.d_zbias)
                 self.d_biases.append(self.d_zbias)
+            # QK-norm（一百八十五）：判据与 CPU 路 181 同源（层 0
+            # q_norm.weight 有无）。Qwen2.5 无这两张量，Qwen3 有。
+            if self.qk_norm:
+                self.d_qknorm_q.append(
+                    _upload_f32(self.ctx, model.params.view(p + "self_attn.q_norm.weight"))
+                )
+                self.d_qknorm_k.append(
+                    _upload_f32(self.ctx, model.params.view(p + "self_attn.k_norm.weight"))
+                )
         self.d_norms.append(_upload_f32(self.ctx, model.params.view(FINAL_NORM)))
     
         # ---- rope 表与 embedding（tied 输出投影）----
@@ -1703,6 +1733,34 @@ struct GpuSession:
             var pk = self.d_k_store_b[layer].unsafe_ptr()
             var pv = self.d_v_store_b[layer].unsafe_ptr()
             if skip & SKIP_ATTN == 0:
+                if self.qk_norm:
+                    # QK-norm（一百八十五）：rope 前逐头 RMSNorm，换
+                    # 视图复用 rmsnorm_gpu（CPU 181 同构；decode t=1，
+                    # 行数 = 头数）。dst16 镜像传 d_embed16（无读者，
+                    # 155 约定；d_xnormb16 的 896 容量恰好也够，统一
+                    # 用大缓冲省一次推敲）。
+                    var qdp = self.d_q.unsafe_ptr()
+                    self.ctx.enqueue_function[rmsnorm_inplace_gpu](
+                        qdp,
+                        self.d_qknorm_q[layer].unsafe_ptr(),
+                        self.d_qknorm16.unsafe_ptr(),
+                        Int32(self.head_dim),
+                        Int32(self.n_heads),
+                        self.eps,
+                        grid_dim=(self.n_heads, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    var kdp = self.d_k.unsafe_ptr()
+                    self.ctx.enqueue_function[rmsnorm_inplace_gpu](
+                        kdp,
+                        self.d_qknorm_k[layer].unsafe_ptr(),
+                        self.d_qknorm16.unsafe_ptr(),
+                        Int32(self.head_dim),
+                        Int32(self.n_kv_heads),
+                        self.eps,
+                        grid_dim=(self.n_kv_heads, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
                 comptime if attn_tiles < 0:
                     # 负 tiles = 旧 K2/K3（八十二，8× 冗余 softmax），留 A/B 复现。
                     self.ctx.enqueue_function[
@@ -2516,6 +2574,32 @@ struct GpuSession:
             var row_off = row_base * self.max_tokens * self.kv_dim
             var row_pos = self.d_posarr.unsafe_ptr() + row_base
             var score_off = row_base * self.n_heads * self.max_tokens
+            if self.qk_norm:
+                # QK-norm（一百八十五）：prefill 路同 decode——d_qb/d_kb
+                # 原位逐头 RMSNorm，rows = t·头数（换视图论证同 CPU 181）。
+                # dst16 镜像写 d_qknorm16（容量 max_tokens·qkv，覆盖全 t）。
+                var qxp = self.d_qb.unsafe_ptr()
+                self.ctx.enqueue_function[rmsnorm_inplace_gpu](
+                    qxp,
+                    self.d_qknorm_q[layer].unsafe_ptr(),
+                    self.d_qknorm16.unsafe_ptr(),
+                    Int32(self.head_dim),
+                    Int32(t * self.n_heads),
+                    self.eps,
+                    grid_dim=(t * self.n_heads, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                var kxp = self.d_kb.unsafe_ptr()
+                self.ctx.enqueue_function[rmsnorm_inplace_gpu](
+                    kxp,
+                    self.d_qknorm_k[layer].unsafe_ptr(),
+                    self.d_qknorm16.unsafe_ptr(),
+                    Int32(self.head_dim),
+                    Int32(t * self.n_kv_heads),
+                    self.eps,
+                    grid_dim=(t * self.n_kv_heads, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
             if batch:
                 if row_mapped:
                     # 一百七十四-c：spec 行化——行 b -> (seq, j)
